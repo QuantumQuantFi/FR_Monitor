@@ -20,9 +20,12 @@ class ExchangeDataCollector:
                 }
         
         self.current_symbol = DEFAULT_SYMBOL  # 前端显示的当前币种
-        self.supported_symbols = SUPPORTED_SYMBOLS  # 同时监听的币种列表
+        self.supported_symbols = SUPPORTED_SYMBOLS.copy()  # 同时监听的币种列表
         self.ws_connections = {}
         self.running = False
+        self.reconnect_attempts = {}  # 记录每个连接的重连次数
+        self.max_reconnect_attempts = 10  # 最大重连次数
+        self.reconnect_delay = 5  # 重连延迟(秒)
 
     def set_symbol(self, symbol):
         """切换前端显示的币种（无需重连WebSocket）"""
@@ -33,20 +36,29 @@ class ExchangeDataCollector:
     def start_all_connections(self):
         """启动所有交易所的WebSocket连接"""
         self.running = True
+        # 重置重连计数器
+        self.reconnect_attempts = {
+            'okx': 0,
+            'binance_spot': 0, 
+            'binance_futures': 0,
+            'bybit_spot': 0,
+            'bybit_linear': 0,
+            'bitget': 0
+        }
         
         # OKX连接
-        threading.Thread(target=self._connect_okx, daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('okx', self._connect_okx), daemon=True).start()
         
         # Binance连接
-        threading.Thread(target=self._connect_binance_spot, daemon=True).start()
-        threading.Thread(target=self._connect_binance_futures, daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('binance_spot', self._connect_binance_spot), daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('binance_futures', self._connect_binance_futures), daemon=True).start()
         
         # Bybit连接
-        threading.Thread(target=self._connect_bybit_spot, daemon=True).start()
-        threading.Thread(target=self._connect_bybit_linear, daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('bybit_spot', self._connect_bybit_spot), daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('bybit_linear', self._connect_bybit_linear), daemon=True).start()
         
         # Bitget连接
-        threading.Thread(target=self._connect_bitget, daemon=True).start()
+        threading.Thread(target=self._connect_with_retry, args=('bitget', self._connect_bitget), daemon=True).start()
 
     def restart_connections(self):
         """重启所有连接（通常用于网络错误恢复）"""
@@ -62,6 +74,38 @@ class ExchangeDataCollector:
             if ws:
                 ws.close()
         self.ws_connections.clear()
+        self.reconnect_attempts.clear()
+
+    def _connect_with_retry(self, connection_name, connect_func):
+        """统一的重连机制包装器"""
+        while self.running:
+            try:
+                print(f"{connection_name} 开始连接...")
+                connect_func()
+                # 如果连接正常结束，重置重连计数
+                self.reconnect_attempts[connection_name] = 0
+            except Exception as e:
+                if not self.running:
+                    break
+                    
+                self.reconnect_attempts[connection_name] += 1
+                print(f"{connection_name} 连接失败 (第{self.reconnect_attempts[connection_name]}次): {e}")
+                
+                if self.reconnect_attempts[connection_name] >= self.max_reconnect_attempts:
+                    print(f"{connection_name} 达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+                    break
+                
+                # 指数退避延迟，但不超过60秒
+                delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts[connection_name] - 1)), 60)
+                print(f"{connection_name} {delay}秒后重试...")
+                
+                for _ in range(int(delay)):
+                    if not self.running:
+                        break
+                    time.sleep(1)
+                    
+                if not self.running:
+                    break
 
     def _connect_okx(self):
         """连接OKX WebSocket - 多币种监听"""
@@ -519,6 +563,80 @@ class ExchangeDataCollector:
         except Exception as e:
             print(f"重新订阅Bybit时异常: {e}")
 
+    def _handle_bitget_subscription_error(self, error_data):
+        """处理Bitget订阅错误，移除不支持的币种"""
+        try:
+            ret_msg = error_data.get('msg', '')
+            
+            # 检测无效币种错误模式
+            if 'Invalid symbol' in ret_msg or 'symbol not exist' in ret_msg.lower() or 'instrument not exist' in ret_msg.lower() or 'doesn\'t exist' in ret_msg:
+                # 从错误消息中提取币种名称
+                import re
+                
+                # 匹配模式: instId:MATICUSDT 或 instId=BTCUSDT
+                symbol_match = re.search(r'instId[=:]([A-Z]+)USDT', ret_msg)
+                if symbol_match:
+                    invalid_symbol = symbol_match.group(1)
+                    
+                    # 从支持的币种列表中移除
+                    if invalid_symbol in self.supported_symbols:
+                        self.supported_symbols.remove(invalid_symbol)
+                        print(f"⚠️  检测到Bitget不支持的币种 {invalid_symbol}，已从监控列表中移除")
+                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
+                        
+                        # 重新订阅剩余的有效币种
+                        self._resubscribe_bitget()
+                        
+            # 处理没有错误消息但有arg字段的订阅失败
+            elif 'arg' in error_data and 'instId' in error_data['arg']:
+                inst_id = error_data['arg']['instId']
+                # 提取币种名称（从 ADAUSDT 提取 ADA）
+                if inst_id.endswith('USDT'):
+                    invalid_symbol = inst_id[:-4]  # 移除 USDT 后缀
+                    
+                    # 从支持的币种列表中移除
+                    if invalid_symbol in self.supported_symbols:
+                        self.supported_symbols.remove(invalid_symbol)
+                        print(f"⚠️  检测到Bitget不支持的币种 {invalid_symbol}，已从监控列表中移除")
+                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
+                        
+                        # 重新订阅剩余的有效币种
+                        self._resubscribe_bitget()
+                        
+        except Exception as e:
+            print(f"处理Bitget订阅错误时异常: {e}")
+
+    def _resubscribe_bitget(self):
+        """重新订阅Bitget的有效币种"""
+        try:
+            if 'bitget' in self.ws_connections:
+                ws = self.ws_connections['bitget']
+                # 分批订阅，每50个币种一组
+                batch_size = 50
+                for i in range(0, len(self.supported_symbols), batch_size):
+                    batch_symbols = self.supported_symbols[i:i+batch_size]
+                    args = []
+                    
+                    for symbol in batch_symbols:
+                        symbol_id = f"{symbol}USDT"
+                        
+                        # 订阅现货
+                        args.append({"instType": "SPOT", "channel": "ticker", "instId": symbol_id})
+                        
+                        # 订阅所有币种的期货（如果不存在会返回错误但不会影响其他订阅）
+                        args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
+                    
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "args": args
+                    }
+                    print(f"Bitget重新订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
+                    ws.send(json.dumps(subscribe_msg))
+                    time.sleep(0.1)
+                    
+        except Exception as e:
+            print(f"重新订阅Bitget时异常: {e}")
+
     def _connect_bitget(self):
         """连接Bitget WebSocket - 多币种监听"""
         def on_message(ws, message):
@@ -534,15 +652,20 @@ class ExchangeDataCollector:
                 
                 # 处理订阅确认消息和错误消息
                 if data.get('event') == 'subscribe':
-                    if data.get('code') == '0':
+                    if data.get('code') == '0' or 'arg' in data:
                         print(f"Bitget 订阅成功: {data}")
                     else:
                         print(f"Bitget 订阅失败: {data}")
+                        # 检测无效币种并移除
+                        self._handle_bitget_subscription_error(data)
                     return
+                
                 
                 # 处理错误消息
                 if data.get('event') == 'error':
                     print(f"Bitget 订阅错误: {data}")
+                    # 检测无效币种并移除
+                    self._handle_bitget_subscription_error(data)
                     return
                 
                 # 处理数据推送 - 支持 action: snapshot/update 格式
@@ -604,43 +727,42 @@ class ExchangeDataCollector:
             print(f"Bitget WebSocket连接关闭: {close_status_code}, {close_msg}")
 
         def on_open(ws):
-            print("Bitget WebSocket连接已建立 - 多币种模式")
-            # 订阅所有支持币种的现货和永续合约数据
-            args = []
-            for symbol in self.supported_symbols:
-                # 根据Bitget API文档，现货和期货都使用相同的instId格式
-                symbol_id = f"{symbol}USDT"
-                
-                # 只为有期货市场的币种添加期货订阅
-                # WLFI可能没有期货市场，所以需要特殊处理
-                args.append({"instType": "SPOT", "channel": "ticker", "instId": symbol_id})
-                
-                # 对于主流币种，添加期货订阅
-                if symbol in ['BTC', 'ETH', 'LINK']:  # 只为确定有期货的币种订阅
-                    args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
-                elif symbol == 'WLFI':
-                    # 尝试订阅WLFI期货，如果不存在会返回错误但不会影响其他订阅
-                    args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
+            print("Bitget WebSocket连接已建立 - 分批订阅模式")
             
-            subscribe_msg = {
-                "op": "subscribe",
-                "args": args
-            }
-            print(f"Bitget 发送订阅消息: {json.dumps(subscribe_msg)}")
-            ws.send(json.dumps(subscribe_msg))
+            # 分批订阅，每50个币种一组
+            batch_size = 50
+            for i in range(0, len(self.supported_symbols), batch_size):
+                batch_symbols = self.supported_symbols[i:i+batch_size]
+                args = []
+                
+                for symbol in batch_symbols:
+                    symbol_id = f"{symbol}USDT"
+                    
+                    # 订阅现货
+                    args.append({"instType": "SPOT", "channel": "ticker", "instId": symbol_id})
+                    
+                    # 订阅所有币种的期货（如果不存在会返回错误但不会影响其他订阅）
+                    args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
+                
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": args
+                }
+                print(f"Bitget 订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                ws.send(json.dumps(subscribe_msg))
+                
+                # 添加延迟避免请求过快
+                time.sleep(0.1)
 
-        try:
-            ws = websocket.WebSocketApp(EXCHANGE_WEBSOCKETS['bitget']['public'],
-                                        on_message=on_message,
-                                        on_error=on_error,
-                                        on_open=on_open,
-                                        on_close=on_close)
-            
-            self.ws_connections['bitget'] = ws
-            print(f"Bitget 尝试连接: {EXCHANGE_WEBSOCKETS['bitget']['public']}")
-            ws.run_forever()
-        except Exception as e:
-            print(f"Bitget 连接异常: {e}")
+        ws = websocket.WebSocketApp(EXCHANGE_WEBSOCKETS['bitget']['public'],
+                                    on_message=on_message,
+                                    on_error=on_error,
+                                    on_open=on_open,
+                                    on_close=on_close)
+        
+        self.ws_connections['bitget'] = ws
+        print(f"Bitget 尝试连接: {EXCHANGE_WEBSOCKETS['bitget']['public']}")
+        ws.run_forever()
 
     def get_all_data(self):
         """获取所有交易所的实时数据"""
