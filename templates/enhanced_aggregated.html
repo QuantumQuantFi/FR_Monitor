@@ -561,9 +561,9 @@
                 }
 
                 html += `
-                    <div class="symbol-card">
+                    <div class="symbol-card" onclick="goToSymbolDetails('${symbol}')" style="cursor: pointer;">
                         <div class="symbol-header">
-                            <div class="symbol-name">${symbol}</div>
+                            <div class="symbol-name">${symbol} <span style="font-size:12px;color:#f0b90b;font-weight:600;">📊 详情</span></div>
                             <div class="exchange-count">${exchanges.length} 交易所</div>
                         </div>
                         ${priceDiffDisplay}
@@ -791,6 +791,11 @@
                 startAutoRefresh();
             }
         });
+
+        // 跳转到币种详情页面
+        function goToSymbolDetails(symbol) {
+            window.location.href = `/charts?symbol=${symbol}`;
+        }
     </script>
 </body>
 </html>

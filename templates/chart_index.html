@@ -190,7 +190,7 @@
 </head>
 <body>
     <div class="header">
-        <div class="title">WLFI 时序图表监控</div>
+        <div class="title">{{ current_symbol }} - 时序图表监控</div>
         <div class="controls">
             <div class="control-group">
                 <span class="control-label">币种:</span>
@@ -219,7 +219,7 @@
                 </select>
             </div>
             <button class="refresh-btn" onclick="updateCharts()">刷新</button>
-            <a href="/" class="refresh-btn" style="text-decoration: none; display: inline-block;">实时监控</a>
+            <a href="/" class="refresh-btn" style="text-decoration: none; display: inline-block;">← 返回主页</a>
         </div>
     </div>
     
@@ -415,54 +415,71 @@
                 });
         }
         
+        // 检查数据是否有效（不全为0或null）
+        function isValidDataset(dataArray) {
+            if (!dataArray || dataArray.length === 0) return false;
+            return dataArray.some(value => value !== null && value !== 0 && !isNaN(value));
+        }
+        
         // 更新所有图表
         function updateAllCharts() {
             const exchangeFilter = document.getElementById('exchangeFilter').value;
             const exchanges = exchangeFilter ? [exchangeFilter] : Object.keys(chartData);
             
-            // 现货价格图表
-            const spotDatasets = exchanges.map(exchange => ({
+            // 现货价格图表 - 过滤掉无效数据
+            const spotDatasets = exchanges.filter(exchange => 
+                chartData[exchange] && isValidDataset(chartData[exchange].spot_prices)
+            ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 现货',
-                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                data: chartData[exchange].labels.map((label, index) => ({
                     x: label,
                     y: chartData[exchange].spot_prices[index]
-                })) : [],
+                })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
                 backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                 fill: false
             }));
             
-            // 期货价格图表
-            const futuresDatasets = exchanges.map(exchange => ({
+            // 期货价格图表 - 过滤掉无效数据
+            const futuresDatasets = exchanges.filter(exchange => 
+                chartData[exchange] && isValidDataset(chartData[exchange].futures_prices)
+            ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 期货',
-                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                data: chartData[exchange].labels.map((label, index) => ({
                     x: label,
                     y: chartData[exchange].futures_prices[index]
-                })) : [],
+                })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
                 backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                 fill: false
             }));
             
-            // 资金费率图表
-            const fundingDatasets = exchanges.map(exchange => ({
+            // 资金费率图表 - 过滤掉无效数据
+            const fundingDatasets = exchanges.filter(exchange => 
+                chartData[exchange] && isValidDataset(chartData[exchange].funding_rates)
+            ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 资金费率',
-                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
-                    x: label,
-                    y: chartData[exchange].funding_rates[index] * 100 // 转换为百分比
-                })) : [],
+                data: chartData[exchange].labels.map((label, index) => {
+                    const rate = chartData[exchange].funding_rates[index];
+                    return {
+                        x: label,
+                        y: rate !== null ? rate * 100 : null // 转换为百分比
+                    };
+                }).filter(point => point.y !== null), // 移除null值
                 borderColor: exchangeColors[exchange] || '#ffffff',
                 backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                 fill: false
             }));
             
-            // 溢价指数图表
-            const premiumDatasets = exchanges.map(exchange => ({
+            // 溢价指数图表 - 过滤掉无效数据
+            const premiumDatasets = exchanges.filter(exchange => 
+                chartData[exchange] && isValidDataset(chartData[exchange].premiums)
+            ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 溢价',
-                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                data: chartData[exchange].labels.map((label, index) => ({
                     x: label,
                     y: chartData[exchange].premiums[index]
-                })) : [],
+                })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
                 backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                 fill: false
@@ -487,22 +504,31 @@
             exchanges.forEach(exchange => {
                 const exchangeData = data.chart_data[exchange];
                 if (exchangeData && exchangeData.spot_prices.length > 0) {
-                    const latestSpot = exchangeData.spot_prices[exchangeData.spot_prices.length - 1];
-                    const latestFutures = exchangeData.futures_prices[exchangeData.futures_prices.length - 1];
-                    const latestFunding = exchangeData.funding_rates[exchangeData.funding_rates.length - 1];
-                    const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
+                    // 检查是否有有效的现货数据
+                    const hasValidSpot = isValidDataset(exchangeData.spot_prices);
+                    const hasValidFutures = isValidDataset(exchangeData.futures_prices);
+                    const hasValidFunding = isValidDataset(exchangeData.funding_rates);
+                    const hasValidPremium = isValidDataset(exchangeData.premiums);
                     
-                    statsHtml += `
-                        <div class="stat-card">
-                            <div class="stat-label">${exchange.toUpperCase()} 最新数据</div>
-                            <div class="stat-value" style="color: ${exchangeColors[exchange]}">
-                                现货: $${latestSpot.toFixed(4)}<br>
-                                期货: $${latestFutures.toFixed(4)}<br>
-                                资金费率: ${(latestFunding * 100).toFixed(4)}%<br>
-                                溢价: ${latestPremium.toFixed(4)}%
+                    // 只显示有至少一种有效数据的交易所
+                    if (hasValidSpot || hasValidFutures || hasValidFunding || hasValidPremium) {
+                        const latestSpot = exchangeData.spot_prices[exchangeData.spot_prices.length - 1];
+                        const latestFutures = exchangeData.futures_prices[exchangeData.futures_prices.length - 1];
+                        const latestFunding = exchangeData.funding_rates[exchangeData.funding_rates.length - 1];
+                        const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
+                        
+                        statsHtml += `
+                            <div class="stat-card">
+                                <div class="stat-label">${exchange.toUpperCase()} 最新数据</div>
+                                <div class="stat-value" style="color: ${exchangeColors[exchange]}">
+                                    ${hasValidSpot ? `现货: $${latestSpot.toFixed(4)}<br>` : ''}
+                                    ${hasValidFutures ? `期货: $${latestFutures.toFixed(4)}<br>` : ''}
+                                    ${hasValidFunding && latestFunding !== null ? `资金费率: ${(latestFunding * 100).toFixed(4)}%<br>` : ''}
+                                    ${hasValidPremium ? `溢价: ${latestPremium.toFixed(4)}%` : ''}
+                                </div>
                             </div>
-                        </div>
-                    `;
+                        `;
+                    }
                 }
             });
             

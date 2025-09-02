@@ -89,7 +89,7 @@ memory_manager = MemoryDataManager()
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
-    maintenance_interval = 300   # 5分钟执行一次维护任务（从1分钟改为5分钟）
+    maintenance_interval = 60    # 1分钟执行一次维护任务（聚合与清理）
     
     # 批处理缓冲区
     batch_buffer = []
@@ -227,9 +227,18 @@ def aggregated_index():
 @app.route('/charts')
 def charts():
     """图表页面"""
+    # 获取URL参数中的symbol，如果有的话就切换到该symbol
+    requested_symbol = request.args.get('symbol')
+    if requested_symbol and requested_symbol in SUPPORTED_SYMBOLS:
+        # 切换到请求的symbol
+        data_collector.set_symbol(requested_symbol)
+        current_symbol = requested_symbol
+    else:
+        current_symbol = data_collector.current_symbol
+    
     return render_template('chart_index.html',
                          symbols=SUPPORTED_SYMBOLS,
-                         current_symbol=data_collector.current_symbol)
+                         current_symbol=current_symbol)
 
 @app.route('/api/data')
 def get_current_data():
