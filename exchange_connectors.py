@@ -3,39 +3,212 @@ import asyncio
 import websocket
 import threading
 import time
-from datetime import datetime
-from config import EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS
+from datetime import datetime, timedelta
+from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
+                   CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, 
+                   update_supported_symbols_async)
+from market_info import get_exchange_symbols
 
 class ExchangeDataCollector:
     def __init__(self):
+        # 使用动态币种列表作为默认值
+        self.supported_symbols = CURRENT_SUPPORTED_SYMBOLS.copy()
+        
+        # 获取各交易所特定的币种列表
+        self.exchange_symbols = {}
+        self._load_exchange_symbols()
+        
         # 多币种数据结构：交易所 -> 币种 -> 现货/期货数据
         self.data = {}
-        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
-            self.data[exchange] = {}
-            for symbol in SUPPORTED_SYMBOLS:
-                self.data[exchange][symbol] = {
-                    'spot': {},
-                    'futures': {},
-                    'funding_rate': {}
-                }
+        self.last_update_time = {}  # 记录每个数据的最后更新时间
+        
+        self._initialize_data_structure()
         
         self.current_symbol = DEFAULT_SYMBOL  # 前端显示的当前币种
-        self.supported_symbols = SUPPORTED_SYMBOLS.copy()  # 同时监听的币种列表
         self.ws_connections = {}
         self.running = False
         self.reconnect_attempts = {}  # 记录每个连接的重连次数
         self.max_reconnect_attempts = 10  # 最大重连次数
         self.reconnect_delay = 5  # 重连延迟(秒)
+        
+        # 数据频率控制
+        self.data_throttle_interval = WS_UPDATE_INTERVAL  # WebSocket数据更新间隔
+        self.last_broadcast_time = {}  # 记录每个币种的上次广播时间
+        
+        # 币种列表更新控制
+        self.symbols_update_thread = None
+        self.symbols_update_interval = 3600  # 1小时更新一次币种列表
+    
+    def _load_exchange_symbols(self):
+        """加载各交易所特定的币种列表"""
+        try:
+            print("正在获取各交易所实际支持的币种列表...")
+            self.exchange_symbols = get_exchange_symbols(force_refresh=False)
+            
+            # 合并所有交易所的币种作为总的支持列表
+            all_symbols = set()
+            for exchange, symbols_data in self.exchange_symbols.items():
+                all_symbols.update(symbols_data.get('spot', []))
+                all_symbols.update(symbols_data.get('futures', []))
+            
+            # 更新总的支持币种列表
+            self.supported_symbols = sorted(list(all_symbols))
+            print(f"✅ 从各交易所获取到 {len(self.supported_symbols)} 个唯一币种")
+            
+            # 显示各交易所支持情况
+            for exchange, symbols_data in self.exchange_symbols.items():
+                spot_count = len(symbols_data.get('spot', []))
+                futures_count = len(symbols_data.get('futures', []))
+                print(f"  {exchange.upper()}: 现货 {spot_count} 个, 期货 {futures_count} 个")
+                
+        except Exception as e:
+            print(f"⚠️ 获取交易所币种列表失败，使用默认列表: {e}")
+            # 使用默认的静态列表
+            for exchange in ['binance', 'okx', 'bybit', 'bitget']:
+                self.exchange_symbols[exchange] = {
+                    'spot': self.supported_symbols.copy(),
+                    'futures': self.supported_symbols.copy()
+                }
+    
+    def _initialize_data_structure(self):
+        """初始化数据结构"""
+        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
+            self.data[exchange] = {}
+            self.last_update_time[exchange] = {}
+            
+            # 获取该交易所支持的所有币种
+            exchange_all_symbols = set()
+            if exchange in self.exchange_symbols:
+                exchange_all_symbols.update(self.exchange_symbols[exchange].get('spot', []))
+                exchange_all_symbols.update(self.exchange_symbols[exchange].get('futures', []))
+            else:
+                exchange_all_symbols = set(self.supported_symbols)
+            
+            # 为每个币种初始化数据结构
+            for symbol in exchange_all_symbols:
+                self.data[exchange][symbol] = {
+                    'spot': {},
+                    'futures': {},
+                    'funding_rate': {}
+                }
+                self.last_update_time[exchange][symbol] = {
+                    'spot': datetime.min,
+                    'futures': datetime.min
+                }
 
     def set_symbol(self, symbol):
         """切换前端显示的币种（无需重连WebSocket）"""
-        if symbol.upper() in SUPPORTED_SYMBOLS:
+        if symbol.upper() in self.supported_symbols:
             self.current_symbol = symbol.upper()
             print(f"前端切换显示币种至: {self.current_symbol}")
+    
+    def should_throttle_data(self, exchange: str, symbol: str, data_type: str) -> bool:
+        """检查是否应该节流数据更新"""
+        key = f"{exchange}_{symbol}_{data_type}"
+        current_time = datetime.now()
+        
+        if key not in self.last_broadcast_time:
+            self.last_broadcast_time[key] = current_time
+            return False
+        
+        time_diff = (current_time - self.last_broadcast_time[key]).total_seconds()
+        if time_diff >= self.data_throttle_interval:
+            self.last_broadcast_time[key] = current_time
+            return False
+        
+        return True
+    
+    def update_symbols_list(self):
+        """更新支持的币种列表"""
+        try:
+            new_symbols = update_supported_symbols_async()
+            if new_symbols and new_symbols != self.supported_symbols:
+                print(f"币种列表已更新: {len(self.supported_symbols)} -> {len(new_symbols)}")
+                old_symbols = set(self.supported_symbols)
+                new_symbols_set = set(new_symbols)
+                
+                # 添加新币种
+                added_symbols = new_symbols_set - old_symbols
+                if added_symbols:
+                    print(f"新增币种: {list(added_symbols)}")
+                
+                # 移除不再支持的币种
+                removed_symbols = old_symbols - new_symbols_set
+                if removed_symbols:
+                    print(f"移除币种: {list(removed_symbols)}")
+                
+                self.supported_symbols = new_symbols
+                self._rebuild_data_structure()
+                
+                # 如果当前显示的币种被移除，切换到默认币种
+                if self.current_symbol not in self.supported_symbols:
+                    if DEFAULT_SYMBOL in self.supported_symbols:
+                        self.current_symbol = DEFAULT_SYMBOL
+                    else:
+                        self.current_symbol = self.supported_symbols[0] if self.supported_symbols else 'BTC'
+                    print(f"当前币种已切换至: {self.current_symbol}")
+                
+        except Exception as e:
+            print(f"更新币种列表失败: {e}")
+    
+    def _rebuild_data_structure(self):
+        """重建数据结构以适应新的币种列表"""
+        new_data = {}
+        new_last_update_time = {}
+        
+        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
+            new_data[exchange] = {}
+            new_last_update_time[exchange] = {}
+            
+            for symbol in self.supported_symbols:
+                # 如果是已存在的币种，保留数据；如果是新币种，初始化空数据
+                if exchange in self.data and symbol in self.data[exchange]:
+                    new_data[exchange][symbol] = self.data[exchange][symbol]
+                else:
+                    new_data[exchange][symbol] = {
+                        'spot': {},
+                        'futures': {},
+                        'funding_rate': {}
+                    }
+                
+                # 初始化时间记录
+                if exchange in self.last_update_time and symbol in self.last_update_time[exchange]:
+                    new_last_update_time[exchange][symbol] = self.last_update_time[exchange][symbol]
+                else:
+                    new_last_update_time[exchange][symbol] = {
+                        'spot': datetime.min,
+                        'futures': datetime.min
+                    }
+        
+        self.data = new_data
+        self.last_update_time = new_last_update_time
+        print(f"数据结构已重建，当前监控 {len(self.supported_symbols)} 个币种")
+    
+    def start_symbols_update_thread(self):
+        """启动币种列表定期更新线程"""
+        def update_loop():
+            while self.running:
+                try:
+                    time.sleep(self.symbols_update_interval)
+                    if self.running:  # 再次检查，确保程序仍在运行
+                        self.update_symbols_list()
+                except Exception as e:
+                    print(f"币种更新线程异常: {e}")
+        
+        if self.symbols_update_thread is None or not self.symbols_update_thread.is_alive():
+            self.symbols_update_thread = threading.Thread(target=update_loop, daemon=True)
+            self.symbols_update_thread.start()
+            print("币种更新线程已启动")
 
     def start_all_connections(self):
         """启动所有交易所的WebSocket连接"""
         self.running = True
+        
+        # 启动币种列表定期更新线程
+        self.start_symbols_update_thread()
+        
+        print(f"开始监控 {len(self.supported_symbols)} 个币种")
+        
         # 重置重连计数器
         self.reconnect_attempts = {
             'okx': 0,
@@ -143,23 +316,25 @@ class ExchangeDataCollector:
                             for symbol in self.supported_symbols:
                                 if inst_id.startswith(f"{symbol}-USDT"):
                                     if inst_id.endswith('-SPOT') or inst_id == f"{symbol}-USDT":
-                                        # 现货数据
-                                        self.data['okx'][symbol]['spot'] = {
-                                            'price': float(item.get('last', 0)),
-                                            'timestamp': datetime.now().isoformat(),
-                                            'symbol': inst_id
-                                        }
-                                        print(f"OKX {symbol} 现货价格: {item.get('last', 0)}")
+                                        # 现货数据 - 添加节流检查
+                                        if not self.should_throttle_data('okx', symbol, 'spot'):
+                                            self.data['okx'][symbol]['spot'] = {
+                                                'price': float(item.get('last', 0)),
+                                                'timestamp': datetime.now().isoformat(),
+                                                'symbol': inst_id
+                                            }
+                                            print(f"OKX {symbol} 现货价格: {item.get('last', 0)}")
                                     elif inst_id.endswith('-SWAP'):
-                                        # 永续合约价格数据
-                                        existing_futures = self.data['okx'][symbol].get('futures', {})
-                                        self.data['okx'][symbol]['futures'] = {
-                                            **existing_futures,  # 保留已有的资金费率信息
-                                            'price': float(item.get('last', 0)),
-                                            'timestamp': datetime.now().isoformat(),
-                                            'symbol': inst_id
-                                        }
-                                        print(f"OKX {symbol} 合约价格: {item.get('last', 0)}, 资金费率: {existing_futures.get('funding_rate', 0)}")
+                                        # 永续合约价格数据 - 添加节流检查
+                                        if not self.should_throttle_data('okx', symbol, 'futures'):
+                                            existing_futures = self.data['okx'][symbol].get('futures', {})
+                                            self.data['okx'][symbol]['futures'] = {
+                                                **existing_futures,  # 保留已有的资金费率信息
+                                                'price': float(item.get('last', 0)),
+                                                'timestamp': datetime.now().isoformat(),
+                                                'symbol': inst_id
+                                            }
+                                            print(f"OKX {symbol} 合约价格: {item.get('last', 0)}, 资金费率: {existing_futures.get('funding_rate', 0)}")
                                     break
             except Exception as e:
                 print(f"OKX解析错误: {e}")
@@ -168,14 +343,23 @@ class ExchangeDataCollector:
             print(f"OKX WebSocket错误: {error}")
 
         def on_open(ws):
-            print("OKX WebSocket连接已建立 - 多币种模式")
-            # 订阅所有支持币种的现货和永续合约数据
+            print("OKX WebSocket连接已建立 - 基于实际币种订阅")
+            
+            # 获取OKX实际支持的币种
+            okx_symbols = self.exchange_symbols.get('okx', {'spot': [], 'futures': []})
+            
+            # 批量订阅OKX实际支持的币种
             args = []
-            for symbol in self.supported_symbols:
+            
+            # 订阅现货
+            for symbol in okx_symbols.get('spot', []):
                 spot_symbol = f"{symbol}-USDT"
+                args.append({"channel": "tickers", "instId": spot_symbol})
+            
+            # 订阅期货和资金费率
+            for symbol in okx_symbols.get('futures', []):
                 futures_symbol = f"{symbol}-USDT-SWAP"
                 args.extend([
-                    {"channel": "tickers", "instId": spot_symbol},
                     {"channel": "tickers", "instId": futures_symbol},
                     {"channel": "funding-rate", "instId": futures_symbol}
                 ])
@@ -184,7 +368,9 @@ class ExchangeDataCollector:
                 "op": "subscribe",
                 "args": args
             }
-            print(f"OKX 订阅币种: {[f'{s}-USDT' for s in self.supported_symbols]}")
+            
+            print(f"OKX 订阅现货: {len(okx_symbols.get('spot', []))} 个币种")
+            print(f"OKX 订阅期货: {len(okx_symbols.get('futures', []))} 个币种")
             ws.send(json.dumps(subscribe_msg))
 
         ws = websocket.WebSocketApp(EXCHANGE_WEBSOCKETS['okx']['public'],
@@ -233,14 +419,18 @@ class ExchangeDataCollector:
             print(f"Binance现货WebSocket错误: {error}")
 
         def on_open(ws):
-            print("Binance现货WebSocket连接已建立 - 多币种模式")
+            print("Binance现货WebSocket连接已建立 - 基于实际币种订阅")
 
+        # 获取Binance实际支持的现货币种
+        binance_symbols = self.exchange_symbols.get('binance', {'spot': [], 'futures': []})
+        spot_symbols = binance_symbols.get('spot', [])
+        
         # 使用多路径模式同时监听多个币种
-        streams = [f"{symbol.lower()}usdt@ticker" for symbol in self.supported_symbols]
+        streams = [f"{symbol.lower()}usdt@ticker" for symbol in spot_symbols]
         stream_path = '/'.join(streams)
         url = f"{EXCHANGE_WEBSOCKETS['binance']['spot']}{stream_path}"
         
-        print(f"Binance现货订阅币种: {[f'{s}USDT' for s in self.supported_symbols]}")
+        print(f"Binance现货订阅币种: {len(spot_symbols)} 个")
         
         ws = websocket.WebSocketApp(url,
                                     on_message=on_message,
@@ -291,14 +481,18 @@ class ExchangeDataCollector:
             print(f"Binance合约WebSocket错误: {error}")
 
         def on_open(ws):
-            print("Binance合约WebSocket连接已建立 - 多币种模式")
+            print("Binance合约WebSocket连接已建立 - 基于实际币种订阅")
 
+        # 获取Binance实际支持的期货币种
+        binance_symbols = self.exchange_symbols.get('binance', {'spot': [], 'futures': []})
+        futures_symbols = binance_symbols.get('futures', [])
+        
         # 使用多路径模式同时监听多个币种
-        streams = [f"{symbol.lower()}usdt@markPrice" for symbol in self.supported_symbols]
+        streams = [f"{symbol.lower()}usdt@markPrice" for symbol in futures_symbols]
         stream_path = '/'.join(streams)
         url = f"{EXCHANGE_WEBSOCKETS['binance']['futures']}{stream_path}"
         
-        print(f"Binance合约订阅币种: {[f'{s}USDT' for s in self.supported_symbols]}")
+        print(f"Binance合约订阅币种: {len(futures_symbols)} 个")
         
         ws = websocket.WebSocketApp(url,
                                     on_message=on_message,
@@ -358,19 +552,23 @@ class ExchangeDataCollector:
             print(f"Bybit现货WebSocket连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            print("Bybit现货WebSocket连接已建立 - 分批订阅模式")
+            print("Bybit现货WebSocket连接已建立 - 基于实际币种分批订阅")
+            
+            # 获取Bybit实际支持的现货币种
+            bybit_symbols = self.exchange_symbols.get('bybit', {'spot': [], 'futures': []})
+            spot_symbols = bybit_symbols.get('spot', [])
             
             # 分批订阅，每10个币种一组（Bybit限制）
             batch_size = 10
-            for i in range(0, len(self.supported_symbols), batch_size):
-                batch_symbols = self.supported_symbols[i:i+batch_size]
+            for i in range(0, len(spot_symbols), batch_size):
+                batch_symbols = spot_symbols[i:i+batch_size]
                 args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
                 
                 subscribe_msg = {
                     "op": "subscribe",
                     "args": args
                 }
-                print(f"Bybit现货订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                print(f"Bybit现货订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                 ws.send(json.dumps(subscribe_msg))
                 
                 # 添加延迟避免请求过快
@@ -471,19 +669,23 @@ class ExchangeDataCollector:
             print(f"Bybit合约WebSocket连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            print("Bybit合约WebSocket连接已建立 - 分批订阅模式")
+            print("Bybit合约WebSocket连接已建立 - 基于实际币种分批订阅")
+            
+            # 获取Bybit实际支持的期货币种
+            bybit_symbols = self.exchange_symbols.get('bybit', {'spot': [], 'futures': []})
+            futures_symbols = bybit_symbols.get('futures', [])
             
             # 分批订阅，每10个币种一组（Bybit限制）
             batch_size = 10
-            for i in range(0, len(self.supported_symbols), batch_size):
-                batch_symbols = self.supported_symbols[i:i+batch_size]
+            for i in range(0, len(futures_symbols), batch_size):
+                batch_symbols = futures_symbols[i:i+batch_size]
                 args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
                 
                 subscribe_msg = {
                     "op": "subscribe",
                     "args": args
                 }
-                print(f"Bybit合约订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                print(f"Bybit合约订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                 ws.send(json.dumps(subscribe_msg))
                 
                 # 添加延迟避免请求过快
@@ -727,28 +929,36 @@ class ExchangeDataCollector:
             print(f"Bitget WebSocket连接关闭: {close_status_code}, {close_msg}")
 
         def on_open(ws):
-            print("Bitget WebSocket连接已建立 - 分批订阅模式")
+            print("Bitget WebSocket连接已建立 - 基于实际币种分批订阅")
+            
+            # 获取Bitget实际支持的币种
+            bitget_symbols = self.exchange_symbols.get('bitget', {'spot': [], 'futures': []})
+            spot_symbols = bitget_symbols.get('spot', [])
+            futures_symbols = bitget_symbols.get('futures', [])
             
             # 分批订阅，每50个币种一组
             batch_size = 50
-            for i in range(0, len(self.supported_symbols), batch_size):
-                batch_symbols = self.supported_symbols[i:i+batch_size]
-                args = []
-                
-                for symbol in batch_symbols:
-                    symbol_id = f"{symbol}USDT"
-                    
-                    # 订阅现货
-                    args.append({"instType": "SPOT", "channel": "ticker", "instId": symbol_id})
-                    
-                    # 订阅所有币种的期货（如果不存在会返回错误但不会影响其他订阅）
-                    args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
+            
+            # 先处理现货
+            all_args = []
+            for symbol in spot_symbols:
+                symbol_id = f"{symbol}USDT"
+                all_args.append({"instType": "SPOT", "channel": "ticker", "instId": symbol_id})
+            
+            # 再处理期货
+            for symbol in futures_symbols:
+                symbol_id = f"{symbol}USDT"
+                all_args.append({"instType": "USDT-FUTURES", "channel": "ticker", "instId": symbol_id})
+            
+            # 分批发送订阅请求
+            for i in range(0, len(all_args), batch_size):
+                batch_args = all_args[i:i+batch_size]
                 
                 subscribe_msg = {
                     "op": "subscribe",
-                    "args": args
+                    "args": batch_args
                 }
-                print(f"Bitget 订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                print(f"Bitget重新订阅批次 {i//batch_size + 1}: {len(batch_args)}个有效币种")
                 ws.send(json.dumps(subscribe_msg))
                 
                 # 添加延迟避免请求过快

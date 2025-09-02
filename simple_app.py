@@ -4,8 +4,9 @@ import threading
 import time
 from datetime import datetime
 from exchange_connectors import ExchangeDataCollector
-from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL
+from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS
 from database import PriceDatabase
+from market_info import get_dynamic_symbols, get_market_report
 
 app = Flask(__name__)
 
@@ -15,9 +16,9 @@ data_collector = ExchangeDataCollector()
 # 数据库实例
 db = PriceDatabase()
 
-# 历史数据存储 (简单内存存储 - 保留用于实时显示)
+# 历史数据存储 (简单内存存储 - 保留用于实时显示) - 使用动态币种列表
 historical_data = {symbol: {exchange: [] for exchange in ['okx', 'binance', 'bybit', 'bitget']} 
-                  for symbol in SUPPORTED_SYMBOLS}
+                  for symbol in CURRENT_SUPPORTED_SYMBOLS}
 
 def background_data_collection():
     """后台数据收集 - 多币种模式"""
@@ -90,10 +91,22 @@ def background_data_collection():
 
 @app.route('/')
 def index():
-    """主页"""
+    """主页 - 按币种聚合展示所有可用币种"""
+    return render_template('aggregated_index.html', 
+                         symbols=data_collector.supported_symbols)
+
+@app.route('/exchanges')
+def exchanges_view():
+    """按交易所展示页面"""
     return render_template('simple_index.html', 
-                         symbols=SUPPORTED_SYMBOLS,
+                         symbols=data_collector.supported_symbols,
                          current_symbol=data_collector.current_symbol)
+
+@app.route('/aggregated')
+def aggregated_index():
+    """聚合页面 - 按币种聚合展示（重定向到主页）"""
+    return render_template('aggregated_index.html', 
+                         symbols=data_collector.supported_symbols)
 
 @app.route('/charts')
 def charts():
@@ -245,10 +258,81 @@ def get_latest_prices(symbol):
 def switch_symbol():
     """切换币种API"""
     new_symbol = request.json.get('symbol', '').upper()
-    if new_symbol in SUPPORTED_SYMBOLS:
+    if new_symbol in data_collector.supported_symbols:
         data_collector.set_symbol(new_symbol)
         return jsonify({'status': 'success', 'symbol': new_symbol})
     return jsonify({'status': 'error', 'message': 'Unsupported symbol'})
+
+@app.route('/api/aggregated_data')
+def get_aggregated_data():
+    """获取聚合数据API - 按币种聚合所有交易所数据"""
+    try:
+        all_data = data_collector.get_all_data()
+        
+        # 重组数据结构：从 交易所->币种 改为 币种->交易所
+        aggregated = {}
+        for exchange in all_data:
+            for symbol in all_data[exchange]:
+                if symbol not in aggregated:
+                    aggregated[symbol] = {}
+                aggregated[symbol][exchange] = all_data[exchange][symbol]
+        
+        return jsonify({
+            'aggregated_data': aggregated,
+            'supported_symbols': data_collector.supported_symbols,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/markets')
+def get_markets_info():
+    """获取市场信息 - 支持的币种及其交易所覆盖情况"""
+    try:
+        # 获取市场报告（如果缓存有效则使用缓存）
+        report = get_market_report(force_refresh=False)
+        
+        return jsonify({
+            'market_report': report,
+            'current_symbols': data_collector.supported_symbols,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/coverage')
+def get_coverage_stats():
+    """获取市场覆盖度统计"""
+    try:
+        all_data = data_collector.get_all_data()
+        
+        # 计算覆盖度统计
+        stats = {
+            'total_symbols': len(data_collector.supported_symbols),
+            'exchange_stats': {},
+            'symbol_stats': {},
+            'quality_metrics': {}
+        }
+        
+        # 按交易所统计
+        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
+            spot_count = sum(1 for symbol in data_collector.supported_symbols 
+                           if all_data.get(exchange, {}).get(symbol, {}).get('spot', {}).get('price', 0) > 0)
+            futures_count = sum(1 for symbol in data_collector.supported_symbols 
+                              if all_data.get(exchange, {}).get(symbol, {}).get('futures', {}).get('price', 0) > 0)
+            
+            stats['exchange_stats'][exchange] = {
+                'spot_symbols': spot_count,
+                'futures_symbols': futures_count,
+                'coverage_percent': round((spot_count + futures_count) / (len(data_collector.supported_symbols) * 2) * 100, 2)
+            }
+        
+        return jsonify({
+            'coverage_stats': stats,
+            'timestamp': datetime.now().isoformat()
+        })
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/database/stats')
 def database_stats():
