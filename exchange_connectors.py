@@ -283,6 +283,8 @@ class ExchangeDataCollector:
                         print(f"Bybit现货订阅成功: {data.get('ret_msg')}")
                     else:
                         print(f"Bybit现货订阅失败: {data}")
+                        # 检测无效币种并移除
+                        self._handle_bybit_subscription_error(data, 'spot')
                     return
                 
                 # 处理ticker数据
@@ -312,15 +314,23 @@ class ExchangeDataCollector:
             print(f"Bybit现货WebSocket连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            print("Bybit现货WebSocket连接已建立 - 多币种模式")
-            # 订阅所有支持币种的现货数据
-            args = [f"tickers.{symbol}USDT" for symbol in self.supported_symbols]
-            subscribe_msg = {
-                "op": "subscribe",
-                "args": args
-            }
-            print(f"Bybit现货订阅消息: {subscribe_msg}")
-            ws.send(json.dumps(subscribe_msg))
+            print("Bybit现货WebSocket连接已建立 - 分批订阅模式")
+            
+            # 分批订阅，每10个币种一组（Bybit限制）
+            batch_size = 10
+            for i in range(0, len(self.supported_symbols), batch_size):
+                batch_symbols = self.supported_symbols[i:i+batch_size]
+                args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": args
+                }
+                print(f"Bybit现货订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                ws.send(json.dumps(subscribe_msg))
+                
+                # 添加延迟避免请求过快
+                time.sleep(0.1)
 
         ws = websocket.WebSocketApp(EXCHANGE_WEBSOCKETS['bybit']['spot'],
                                     on_message=on_message,
@@ -350,6 +360,8 @@ class ExchangeDataCollector:
                         print(f"Bybit合约订阅成功: {data.get('ret_msg')}")
                     else:
                         print(f"Bybit合约订阅失败: {data}")
+                        # 检测无效币种并移除
+                        self._handle_bybit_subscription_error(data, 'linear')
                     return
                 
                 # 处理ticker数据
@@ -415,15 +427,23 @@ class ExchangeDataCollector:
             print(f"Bybit合约WebSocket连接关闭: {close_status_code} - {close_msg}")
 
         def on_open(ws):
-            print("Bybit合约WebSocket连接已建立 - 多币种模式")
-            # 订阅所有支持币种的永续合约数据
-            args = [f"tickers.{symbol}USDT" for symbol in self.supported_symbols]
-            subscribe_msg = {
-                "op": "subscribe",
-                "args": args
-            }
-            print(f"Bybit合约订阅消息: {subscribe_msg}")
-            ws.send(json.dumps(subscribe_msg))
+            print("Bybit合约WebSocket连接已建立 - 分批订阅模式")
+            
+            # 分批订阅，每10个币种一组（Bybit限制）
+            batch_size = 10
+            for i in range(0, len(self.supported_symbols), batch_size):
+                batch_symbols = self.supported_symbols[i:i+batch_size]
+                args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                
+                subscribe_msg = {
+                    "op": "subscribe",
+                    "args": args
+                }
+                print(f"Bybit合约订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个币种")
+                ws.send(json.dumps(subscribe_msg))
+                
+                # 添加延迟避免请求过快
+                time.sleep(0.1)
 
         ws = websocket.WebSocketApp(EXCHANGE_WEBSOCKETS['bybit']['linear'],
                                     on_message=on_message,
@@ -433,6 +453,71 @@ class ExchangeDataCollector:
         
         self.ws_connections['bybit_linear'] = ws
         ws.run_forever()
+
+    def _handle_bybit_subscription_error(self, error_data, channel_type):
+        """处理Bybit订阅错误，移除不支持的币种"""
+        try:
+            ret_msg = error_data.get('ret_msg', '')
+            
+            # 检测无效币种错误模式
+            if 'Invalid symbol' in ret_msg or 'symbol not exist' in ret_msg.lower():
+                # 从错误消息中提取币种名称
+                import re
+                
+                # 匹配模式: [tickers.LEOUSDT] 或 tickers.LEOUSDT
+                symbol_match = re.search(r'tickers\.([A-Z]+)USDT', ret_msg)
+                if symbol_match:
+                    invalid_symbol = symbol_match.group(1)
+                    
+                    # 从支持的币种列表中移除
+                    if invalid_symbol in self.supported_symbols:
+                        self.supported_symbols.remove(invalid_symbol)
+                        print(f"⚠️  检测到Bybit不支持的币种 {invalid_symbol}，已从监控列表中移除")
+                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
+                        
+                        # 重新订阅剩余的有效币种
+                        self._resubscribe_bybit(channel_type)
+                        
+        except Exception as e:
+            print(f"处理Bybit订阅错误时异常: {e}")
+
+    def _resubscribe_bybit(self, channel_type):
+        """重新订阅Bybit的有效币种"""
+        try:
+            if channel_type == 'spot' and 'bybit_spot' in self.ws_connections:
+                ws = self.ws_connections['bybit_spot']
+                # 分批订阅现货币种
+                batch_size = 10
+                for i in range(0, len(self.supported_symbols), batch_size):
+                    batch_symbols = self.supported_symbols[i:i+batch_size]
+                    args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                    
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "args": args
+                    }
+                    print(f"Bybit现货重新订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
+                    ws.send(json.dumps(subscribe_msg))
+                    time.sleep(0.1)
+                    
+            elif channel_type == 'linear' and 'bybit_linear' in self.ws_connections:
+                ws = self.ws_connections['bybit_linear']
+                # 分批订阅合约币种
+                batch_size = 10
+                for i in range(0, len(self.supported_symbols), batch_size):
+                    batch_symbols = self.supported_symbols[i:i+batch_size]
+                    args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                    
+                    subscribe_msg = {
+                        "op": "subscribe",
+                        "args": args
+                    }
+                    print(f"Bybit合约重新订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
+                    ws.send(json.dumps(subscribe_msg))
+                    time.sleep(0.1)
+                    
+        except Exception as e:
+            print(f"重新订阅Bybit时异常: {e}")
 
     def _connect_bitget(self):
         """连接Bitget WebSocket - 多币种监听"""
@@ -447,12 +532,17 @@ class ExchangeDataCollector:
                     ws.send(json.dumps(pong_msg))
                     return
                 
-                # 处理订阅确认消息
+                # 处理订阅确认消息和错误消息
                 if data.get('event') == 'subscribe':
                     if data.get('code') == '0':
                         print(f"Bitget 订阅成功: {data}")
                     else:
                         print(f"Bitget 订阅失败: {data}")
+                    return
+                
+                # 处理错误消息
+                if data.get('event') == 'error':
+                    print(f"Bitget 订阅错误: {data}")
                     return
                 
                 # 处理数据推送 - 支持 action: snapshot/update 格式
