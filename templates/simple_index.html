@@ -275,21 +275,31 @@
         let currentSymbol = '{{ current_symbol }}';
         let refreshInterval;
         
-        // 格式化资金费率显示
+        // 格式化资金费率显示 - 保持高精度，避免科学计数法
         function formatFundingRate(rate) {
-            if (!rate || rate === 0) return '0.0000';
+            if (!rate || rate === 0 || rate === '0') return '0.0000';
             
-            const percentage = rate * 100;
-            
-            // 如果是很小的数值（科学计数法），使用更多小数位并避免科学计数法显示
-            if (Math.abs(percentage) < 0.001) {
-                return percentage.toFixed(6);
-            } else if (Math.abs(percentage) < 0.01) {
-                return percentage.toFixed(5);
-            } else if (Math.abs(percentage) < 0.1) {
-                return percentage.toFixed(4);
+            // 处理字符串或数字类型的资金费率
+            let num;
+            if (typeof rate === 'string') {
+                num = parseFloat(rate);
             } else {
-                return percentage.toFixed(3);
+                num = rate;
+            }
+            
+            if (num === 0) return '0.0000';
+            
+            const percentage = num * 100;
+            
+            // 根据数值大小选择合适的小数位数，避免科学计数法
+            if (Math.abs(percentage) >= 1) {
+                return percentage.toFixed(4);
+            } else if (Math.abs(percentage) >= 0.01) {
+                return percentage.toFixed(6);
+            } else if (Math.abs(percentage) >= 0.0001) {
+                return percentage.toFixed(8);
+            } else {
+                return percentage.toFixed(10);
             }
         }
         

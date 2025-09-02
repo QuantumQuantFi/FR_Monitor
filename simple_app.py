@@ -8,7 +8,7 @@ import os
 from datetime import datetime
 from decimal import Decimal
 from exchange_connectors import ExchangeDataCollector
-from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
+from config import DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
 
@@ -153,8 +153,8 @@ def background_data_collection():
             all_data = data_collector.get_all_data()
             timestamp = datetime.now().isoformat()
             
-            # 为每个币种保存历史数据 - 优化内存和磁盘使用
-            for symbol in SUPPORTED_SYMBOLS:
+            # 为每个币种保存历史数据 - 使用动态支持列表，兼容LINEA等新币
+            for symbol in data_collector.supported_symbols:
                 premium_data = data_collector.calculate_premium(symbol)
                 
                 for exchange in all_data:
@@ -281,15 +281,17 @@ def charts():
     """图表页面"""
     # 获取URL参数中的symbol，如果有的话就切换到该symbol
     requested_symbol = request.args.get('symbol')
-    if requested_symbol and requested_symbol in SUPPORTED_SYMBOLS:
+    # 使用动态支持列表进行校验
+    if requested_symbol and requested_symbol.upper() in data_collector.supported_symbols:
         # 切换到请求的symbol
         data_collector.set_symbol(requested_symbol)
-        current_symbol = requested_symbol
+        current_symbol = requested_symbol.upper()
     else:
         current_symbol = data_collector.current_symbol
     
     return render_template('chart_index.html',
-                         symbols=SUPPORTED_SYMBOLS,
+                         # 提供动态支持的币种列表，保证前端按钮与实际支持一致
+                         symbols=data_collector.supported_symbols,
                          current_symbol=current_symbol)
 
 @app.route('/api/data')
@@ -315,7 +317,8 @@ def get_all_data():
     return precision_jsonify({
         'all_realtime_data': all_data,
         'all_premium_data': all_premiums,
-        'supported_symbols': SUPPORTED_SYMBOLS,
+        # 返回动态支持列表
+        'supported_symbols': data_collector.supported_symbols,
         'current_symbol': data_collector.current_symbol,
         'timestamp': datetime.now().isoformat()
     })
@@ -333,7 +336,8 @@ def get_historical_data(symbol):
 def get_database_historical_data(symbol):
     """获取数据库中的历史数据API"""
     symbol = symbol.upper()
-    if symbol not in SUPPORTED_SYMBOLS:
+    # 使用动态支持列表
+    if symbol not in data_collector.supported_symbols:
         return jsonify({'error': 'Unsupported symbol'}), 400
     
     # 获取查询参数
@@ -361,7 +365,8 @@ def get_database_historical_data(symbol):
 def get_chart_data(symbol):
     """获取图表数据API - 优化格式用于Chart.js"""
     symbol = symbol.upper()
-    if symbol not in SUPPORTED_SYMBOLS:
+    # 使用动态支持列表
+    if symbol not in data_collector.supported_symbols:
         return jsonify({'error': 'Unsupported symbol'}), 400
     
     # 获取查询参数
@@ -419,7 +424,8 @@ def get_chart_data(symbol):
 def get_latest_prices(symbol):
     """获取最新价格数据API"""
     symbol = symbol.upper()
-    if symbol not in SUPPORTED_SYMBOLS:
+    # 使用动态支持列表
+    if symbol not in data_collector.supported_symbols:
         return jsonify({'error': 'Unsupported symbol'}), 400
     
     try:

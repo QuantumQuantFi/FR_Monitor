@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WLFI 时序图表监控</title>
+    <title>{{ current_symbol }} - 时序图表监控</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
@@ -42,6 +42,16 @@
             align-items: center;
             flex-wrap: wrap;
         }
+        .search-input {
+            padding: 8px 12px;
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+            color: #ffffff;
+            border-radius: 8px;
+            min-width: 200px;
+        }
+        .search-input:focus { outline: none; border-color: #f0b90b; }
+        .symbol-list { display: flex; gap: 8px; max-width: 100%; overflow-x: auto; padding-bottom: 6px; }
         
         .control-group {
             display: flex;
@@ -192,12 +202,20 @@
     <div class="header">
         <div class="title">{{ current_symbol }} - 时序图表监控</div>
         <div class="controls">
-            <div class="control-group">
-                <span class="control-label">币种:</span>
-                {% for symbol in symbols %}
-                <button class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" 
-                        onclick="switchSymbol('{{ symbol }}')" data-symbol="{{ symbol }}">{{ symbol }}</button>
-                {% endfor %}
+            <div class="control-group" style="flex: 1 1 100%; align-items: flex-start; gap: 10px;">
+                <span class="control-label" style="margin-top: 6px;">币种:</span>
+                <input id="symbolSearch" class="search-input" list="symbolsList" placeholder="搜索并跳转 (如: BTC, ETH, WLFI)" />
+                <datalist id="symbolsList">
+                    {% for symbol in symbols %}
+                    <option value="{{ symbol }}"></option>
+                    {% endfor %}
+                </datalist>
+                <button class="refresh-btn" onclick="goSearch()">跳转</button>
+                <div id="symbolButtons" class="symbol-list">
+                    {% for symbol in symbols %}
+                    <a class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" href="/charts?symbol={{ symbol }}" data-symbol="{{ symbol }}">{{ symbol }}</a>
+                    {% endfor %}
+                </div>
             </div>
             <div class="control-group">
                 <span class="control-label">时间范围:</span>
@@ -264,6 +282,7 @@
 
     <script>
         let currentSymbol = '{{ current_symbol }}';
+        const allSymbols = {{ symbols|tojson }};
         let charts = {};
         let chartData = {};
         
@@ -539,34 +558,31 @@
             statsGrid.innerHTML = statsHtml;
         }
         
-        // 切换币种
-        async function switchSymbol(symbol) {
-            try {
-                const response = await fetch('/api/switch_symbol', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({symbol: symbol})
-                });
-                
-                const result = await response.json();
-                
-                if (result.status === 'success') {
-                    currentSymbol = symbol;
-                    
-                    // 更新按钮状态
-                    document.querySelectorAll('.symbol-btn').forEach(btn => {
-                        btn.classList.remove('active');
-                        if (btn.dataset.symbol === symbol) {
-                            btn.classList.add('active');
-                        }
-                    });
-                    
-                    // 更新图表
-                    updateChartData();
-                }
-            } catch (error) {
-                console.error('切换币种错误:', error);
-            }
+        // 切换币种 => 直接跳转
+        function switchSymbol(symbol) {
+            if (!symbol) return;
+            window.location.href = `/charts?symbol=${symbol.toUpperCase()}`;
+        }
+
+        // 搜索框交互：过滤按钮 + 回车跳转
+        function filterButtons(term) {
+            const t = (term || '').trim().toLowerCase();
+            const container = document.getElementById('symbolButtons');
+            const items = container.querySelectorAll('[data-symbol]');
+            items.forEach(el => {
+                const sym = el.getAttribute('data-symbol');
+                el.style.display = (!t || sym.toLowerCase().includes(t)) ? '' : 'none';
+            });
+        }
+
+        function goSearch() {
+            const input = document.getElementById('symbolSearch');
+            const v = (input.value || '').trim();
+            if (!v) return;
+            const sym = v.toUpperCase();
+            if (allSymbols.includes(sym)) { switchSymbol(sym); return; }
+            const match = allSymbols.find(s => s.toLowerCase().includes(v.toLowerCase()));
+            if (match) { switchSymbol(match); }
         }
         
         // 更新图表
@@ -585,6 +601,9 @@
         document.addEventListener('DOMContentLoaded', function() {
             initCharts();
             updateChartData();
+            const input = document.getElementById('symbolSearch');
+            input.addEventListener('input', (e) => filterButtons(e.target.value));
+            input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goSearch(); });
             
             // 设置定时刷新（每30秒）
             setInterval(updateChartData, 30000);

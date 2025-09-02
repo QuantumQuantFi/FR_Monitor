@@ -220,10 +220,281 @@ function isValidDataset(dataArray) {
 3. **用户体验优先**: 隐藏无效数据比显示警告信息更好的用户体验
 4. **动态适应能力**: 系统应能自动适应数据源的变化，无需手动配置
 
+## 资金费率精度优化 (2025-09-02 深夜)
+
+### 问题诊断
+❌ **科学计数法显示问题**
+- 用户反馈API返回的资金费率显示为科学计数法格式 (如: 1.485e-05)
+- 小数值资金费率在JSON序列化时精度损失，前端无法准确显示
+- 影响交易决策的准确性，用户体验不佳
+
+### 根本原因分析
+🔍 **数据精度损失链路**
+1. **WebSocket接收**: 交易所API返回浮点数，精度正常 (exchange_connectors.py)
+2. **数据库存储**: 使用REAL类型，精度保持 (database.py)
+3. **API序列化**: Python标准JSON编码器将小数值转为科学计数法 ❌
+4. **前端处理**: JavaScript接收到科学计数法字符串，显示效果差
+
+### 解决方案
+✅ **端到端精度保持优化**
+
+#### 1. 后端API精度优化 (simple_app.py:15-66)
+```python
+# 自定义JSON编码器以保持数值精度，避免科学计数法
+class PrecisionJSONEncoder(json.JSONEncoder):
+    def _process_value(self, key, value):
+        if key == 'funding_rate' and isinstance(value, (int, float)) and value != 0:
+            # 保持12位小数精度，去除末尾零，避免科学计数法
+            return f"{value:.12f}".rstrip('0').rstrip('.')
+        elif isinstance(value, float) and value != 0:
+            # 对其他小数也避免科学计数法
+            if abs(value) < 0.001:
+                return f"{value:.12f}".rstrip('0').rstrip('.')
+            elif abs(value) < 1:
+                return f"{value:.8f}".rstrip('0').rstrip('.')
+        return value
+```
+
+#### 2. Flask应用配置 (simple_app.py:49-66)
+- 配置自定义JSON编码器: `app.json_encoder = PrecisionJSONEncoder`
+- 创建高精度响应函数: `precision_jsonify()`
+- 更新关键API端点: `/api/data`, `/api/data/all`
+
+#### 3. 前端显示优化
+**enhanced_aggregated.html (414-445行)**:
+```javascript
+function formatFundingRate(rate) {
+    // 处理字符串或数字类型的资金费率
+    let num = typeof rate === 'string' ? parseFloat(rate) : rate;
+    const percentage = num * 100;
+    
+    // 根据数值大小选择合适的小数位数，避免科学计数法
+    if (Math.abs(percentage) >= 1) {
+        return `${percentage.toFixed(4)}%`;
+    } else if (Math.abs(percentage) >= 0.01) {
+        return `${percentage.toFixed(6)}%`;
+    } else if (Math.abs(percentage) >= 0.0001) {
+        return `${percentage.toFixed(8)}%`;
+    } else {
+        return `${percentage.toFixed(10)}%`;
+    }
+}
+```
+
+#### 4. 多模板同步优化
+- **simple_index.html**: 更新formatFundingRate函数支持字符串类型
+- **aggregated_index.html**: 同步精度处理逻辑
+- **enhanced_aggregated.html**: 最高精度处理，10位小数支持
+
+### 技术实现细节
+1. **精度等级**:
+   - 资金费率: 12位小数精度，字符串格式传输
+   - 其他小数: 根据数值大小自适应精度 (8-12位小数)
+   - 显示精度: 前端根据百分比大小选择4-10位小数
+
+2. **性能优化**:
+   - 只对funding_rate字段应用高精度处理
+   - 递归处理嵌套对象和数组
+   - 去除末尾零，减少传输数据量
+
+3. **兼容性保证**:
+   - 前端同时支持数字和字符串类型的资金费率
+   - 向后兼容现有数据格式
+   - 自动类型检测和转换
+
+### 验证结果
+- ✅ **API测试**: 资金费率以字符串形式返回 (如: "0.000071489996")
+- ✅ **精度保持**: 12位小数精度无损失
+- ✅ **无科学计数法**: JSON响应中完全消除e-格式
+- ✅ **前端显示**: 根据数值大小智能选择显示精度
+- ✅ **多交易所支持**: Binance、OKX资金费率显示正常
+
+### 用户体验提升
+- **可读性**: 资金费率显示为直观的小数格式，无科学计数法
+- **精确性**: 保持交易所原始精度，支持精确的套利计算
+- **一致性**: 所有页面和图表的资金费率显示格式统一
+- **实用性**: 小数位数根据数值大小自动调整，信息密度合理
+
+### 关键经验
+1. **数据流精度管理**: 需要在整个数据流中统一精度处理策略
+2. **JSON序列化陷阱**: Python默认JSON编码器会将小数转为科学计数法
+3. **前端类型适配**: 需要同时处理数字和字符串类型的数据
+4. **性能与精度平衡**: 只对关键字段应用高精度处理，避免性能影响
+
+## 动态币种发现功能验证 (2025-09-02 深夜)
+
+### 测试场景
+❓ **ESPORTS币种图表功能验证**
+- 用户报告ESPORTS币种的图表页面 http://47.79.144.40:4002/charts?symbol=ESPORTS
+- 需要验证动态发现的币种能否正常保存到数据库并在图表页面正确显示历史数据
+
+### 验证结果
+✅ **动态币种发现机制工作正常**
+
+#### 1. 币种支持状态验证
+```bash
+# API测试结果
+curl -s "http://47.79.144.40:4002/api/data/all" | jq '.supported_symbols' | grep -i esports
+# 结果: "ESPORTS" - 确认ESPORTS已被动态发现并支持
+```
+
+#### 2. 图表数据API验证
+```bash
+# 图表数据API测试
+curl -s "http://47.79.144.40:4002/api/chart/ESPORTS" | jq .
+# 结果: 成功返回历史数据，包含Binance、Bitget、Bybit的数据
+```
+
+#### 3. 数据质量分析
+- **Binance**: ✅ 期货价格 + 资金费率正常，❌ 现货价格为0
+- **Bitget**: ✅ 现货价格正常，❌ 期货价格为0，资金费率为null
+- **Bybit**: ✅ 期货价格 + 资金费率正常，❌ 现货价格为0
+- **OKX**: ❌ 无数据（可能不支持ESPORTS）
+
+### 技术实现验证
+✅ **数据库存储机制**
+- 数据库结构: `price_data` (实时) + `price_data_1min` (聚合)
+- 字段完整: timestamp, symbol, exchange, spot_price, futures_price, funding_rate, premium_percent
+- 索引优化: 按时间戳、币种、交易所建立索引，查询高效
+
+✅ **动态发现机制** (market_info.py)
+- `MarketInfoCollector` 定期从各交易所API获取支持的币种列表
+- 缓存机制: 1小时更新一次，避免频繁API调用
+- 多交易所支持: Binance、OKX、Bybit、Bitget
+- 过滤条件: 要求最少2个交易所支持才加入监控列表
+
+✅ **数据保存流程** (simple_app.py:141-258)
+- 实时数据收集: `ExchangeDataCollector` WebSocket连接
+- 批量保存: 缓冲区达到设定大小时批量写入数据库
+- 内存管理: `MemoryDataManager` 控制内存使用
+- 数据聚合: 定期将实时数据聚合为1分钟K线数据
+
+### 用户体验验证
+✅ **图表页面正常工作**
+- URL访问: http://47.79.144.40:4002/charts?symbol=ESPORTS 正常加载
+- 数据显示: 图表能够显示有效交易所的历史数据
+- 智能过滤: 自动过滤无效数据（全为0的交易所数据不显示）
+
+### 关键经验
+1. **动态发现优势**: 无需手动添加新币种，系统自动发现并支持
+2. **数据质量控制**: 前端智能过滤保证图表显示质量
+3. **多交易所覆盖**: 不同交易所可能支持不同市场类型（现货vs期货）
+4. **存储效率**: 批量写入和数据聚合机制保证存储效率
+
 ---
 📅 更新时间: 2025-09-02 深夜  
 👨‍💻 开发者: Claude  
 🚀 系统状态: ✅ 运行中 (http://47.79.144.40:4002)
-⚡ 最新修复: 图表显示优化 - 过滤无效数据显示
+⚡ 最新修复: 资金费率精度优化 - 消除科学计数法，保持12位小数精度
 🔄 监控状态: 976个币种实时监控，4个交易所连接正常
 📊 图表功能: ✅ 智能数据过滤，仅显示有效交易所数据
+💰 精度优化: ✅ 资金费率高精度显示，无科学计数法
+🧪 动态币种: ✅ ESPORTS等动态发现币种正常工作，数据库存储和图表显示验证通过
+
+## Bitget期货合约数据获取修复 (2025-09-02 深夜)
+
+### 问题报告
+❌ **用户反馈问题**
+- ESPORTS币种在Bitget无法获取永续合约数据
+- 用户手机端确认该币种的期货合约存在且正常交易
+- 系统仅显示现货数据，期货价格和资金费率均为0/null
+
+### 问题分析过程
+🔍 **系统性排查方法**
+
+#### 1. 日志分析验证
+```bash
+# 检查应用日志，发现只有现货数据流
+tail -500 simple_app.log | strings | grep -i bitget
+# 结果：所有Bitget数据都是 "instType":"SPOT"，没有期货数据
+```
+
+#### 2. API手动验证
+```bash
+# 验证Bitget期货API可用性
+curl -s "https://api.bitget.com/api/v2/mix/market/contracts?productType=USDT-FUTURES" | jq '.data[] | select(.baseCoin == "ESPORTS")'
+# 结果：✅ ESPORTS期货合约存在，状态为"normal"
+```
+
+#### 3. 系统配置检查
+```bash
+# 检查市场信息报告
+curl -s "http://47.79.144.40:4002/api/markets" | jq '.market_report.exchange_summary.bitget'
+# 发现关键问题：{"futures": 0, "spot": 683}
+```
+
+### 根本原因定位
+🐛 **market_info.py:207行 API字段映射错误**
+
+#### 错误代码
+```python
+# market_info.py 第207行 - 错误的字段检查
+if (symbol.endswith('USDT') and 
+    contract.get('status') == 'online'):  # ❌ 字段名错误
+```
+
+#### API实际响应格式
+```json
+{
+  "code": "00000",
+  "data": [
+    {
+      "symbol": "ESPORTSUSDT",
+      "baseCoin": "ESPORTS", 
+      "symbolStatus": "normal"  // ✅ 实际字段名
+    }
+  ]
+}
+```
+
+#### 错误对比
+- **代码期望**: `contract.get('status') == 'online'`
+- **API实际**: `contract.get('symbolStatus') == 'normal'`
+
+### 解决方案
+✅ **代码修复** (market_info.py:207)
+```python
+# 修复前
+if (symbol.endswith('USDT') and 
+    contract.get('status') == 'online'):
+
+# 修复后  
+if (symbol.endswith('USDT') and 
+    contract.get('symbolStatus') == 'normal'):
+```
+
+### 性能优化
+⚡ **内存配置调整** (config.py:85)
+```python
+# 应用户建议，提升内存缓存容量
+'max_historical_records': 1000,  # 从500提升至1000
+```
+
+### 影响范围评估
+📈 **预期修复效果**
+1. **期货合约发现**: Bitget期货合约数量从0增加到预计400+个
+2. **ESPORTS数据完整性**: 期货价格、资金费率、溢价数据将正常显示
+3. **所有Bitget期货币种**: 系统将能正确识别所有Bitget支持的USDT永续合约
+4. **WebSocket订阅**: 期货数据流将自动激活
+
+### 技术验证步骤
+🧪 **修复验证计划**
+1. 重启应用程序加载新配置
+2. 等待市场信息刷新周期(1小时)或手动触发刷新
+3. 验证 `/api/markets` 显示Bitget期货数量 > 0
+4. 测试ESPORTS币种期货数据实时更新
+5. 检查图表页面显示完整的Bitget期货数据
+
+### 关键经验总结
+💡 **开发经验**
+1. **API字段验证重要性**: 外部API字段名可能与文档不一致，需实际测试验证
+2. **系统性排查方法**: 从日志→API→配置→代码的完整排查链路
+3. **市场信息缓存机制**: 动态发现机制的缓存可能掩盖配置问题
+4. **用户反馈价值**: 用户实际使用场景能发现系统测试遗漏的问题
+
+### 预防措施
+🛡️ **未来改进方向**
+1. **API响应格式监控**: 定期验证外部API字段格式变化
+2. **自动化测试覆盖**: 增加所有交易所期货合约发现的自动化测试
+3. **实时监控告警**: 当某个交易所期货合约数量异常时自动告警
+4. **配置验证机制**: 启动时验证所有交易所市场信息获取的完整性

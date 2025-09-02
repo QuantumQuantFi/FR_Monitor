@@ -82,7 +82,7 @@ WS_CONNECTION_CONFIG = {
 
 # 内存优化配置
 MEMORY_OPTIMIZATION_CONFIG = {
-    'max_historical_records': 500,     # 内存中最大历史记录数（从1000减少到500）
+    'max_historical_records': 1000,    # 内存中最大历史记录数（用户建议增加到1000）
     'memory_cleanup_interval': 300,    # 内存清理间隔（5分钟）
     'batch_size': 50,                  # 批处理大小
     'data_compression': True,          # 启用数据压缩

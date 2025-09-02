@@ -28,6 +28,9 @@ ENV/
 # Database files
 *.db
 *.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Logs
 logs/

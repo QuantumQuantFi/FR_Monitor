@@ -204,7 +204,7 @@ class MarketInfoCollector:
                             for contract in data.get('data', []):
                                 symbol = contract.get('symbol', '')
                                 if (symbol.endswith('USDT') and 
-                                    contract.get('status') == 'online'):
+                                    contract.get('symbolStatus') == 'normal'):
                                     base_asset = symbol[:-4]  # 移除USDT后缀
                                     markets['futures'].add(base_asset)
         

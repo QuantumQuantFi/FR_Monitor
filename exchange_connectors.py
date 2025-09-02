@@ -102,14 +102,36 @@ class ExchangeDataCollector:
                 }
 
     def _get_bybit_symbol_mapping(self, symbol):
-        """获取Bybit特殊币种映射"""
+        """获取Bybit订阅用的特殊币种映射
+
+        输入为我们统一的币种名（如 NEIROETH 或 NEIRO），输出为Bybit需要订阅的基础符号名。
+        """
         special_mappings = {
+            # 历史兼容：如果统一币种名被写成 NEIRO，则在Bybit上应订阅 NEIROETH
             'NEIRO': {
-                'spot': 'NEIROETH',      # Bybit现货实际是NEIROETH
-                'futures': 'NEIROETH'    # Bybit期货实际是NEIROETHUSDT
+                'spot': 'NEIROETH',      # Bybit现货：NEIROETHUSDT
+                'futures': 'NEIROETH'    # Bybit永续：NEIROETHUSDT
+            },
+            # 标准：NEIROETH 作为统一币种名，在Bybit上也订阅 NEIROETH
+            'NEIROETH': {
+                'spot': 'NEIROETH',
+                'futures': 'NEIROETH'
             }
         }
         return special_mappings.get(symbol, {'spot': symbol, 'futures': symbol})
+
+    def _bybit_observed_to_coin(self, observed_base: str) -> str:
+        """将Bybit返回的基础符号映射为我们内部的统一币种名。
+
+        目标：确保与 NEIRO 相关的品种归并到 NEIROETH。
+        例如：NEIROETH -> NEIROETH；NEIRO -> NEIROETH。
+        其他币种保持不变。
+        """
+        alias_to_coin = {
+            'NEIRO': 'NEIROETH',
+            'NEIROETH': 'NEIROETH',
+        }
+        return alias_to_coin.get(observed_base, observed_base)
 
     def set_symbol(self, symbol):
         """切换前端显示的币种（无需重连WebSocket）"""
@@ -572,21 +594,23 @@ class ExchangeDataCollector:
                     symbol_name = item.get('symbol', '')
                     print(f"Bybit现货接收到数据: {symbol_name} - {item}")
                     
-                    # 解析币种名称 - 支持特殊映射
-                    for symbol in self.supported_symbols:
-                        # 获取Bybit特殊映射
-                        mapping = self._get_bybit_symbol_mapping(symbol)
-                        expected_symbol = mapping['spot']
-                        
-                        if symbol_name == f"{expected_symbol}USDT":
-                            self.data['bybit'][symbol]['spot'] = {
-                                'price': float(item.get('lastPrice', 0)),
-                                'volume': float(item.get('volume24h', 0)),
+                    # 解析并归并：以Bybit返回的基础符号为准（去掉USDT后缀）
+                    try:
+                        base = symbol_name[:-4] if symbol_name.endswith('USDT') else symbol_name
+                        coin = self._bybit_observed_to_coin(base)
+                        # 仅当该币种在Bybit现货支持列表中时才记录
+                        bybit_spot = self.exchange_symbols.get('bybit', {}).get('spot', [])
+                        if coin in bybit_spot:
+                            self.data['bybit'].setdefault(coin, {'spot': {}, 'futures': {}, 'funding_rate': {}})
+                            self.data['bybit'][coin]['spot'] = {
+                                'price': float(item.get('lastPrice', 0) or 0),
+                                'volume': float(item.get('volume24h', 0) or 0),
                                 'timestamp': datetime.now().isoformat(),
                                 'symbol': symbol_name
                             }
-                            print(f"Bybit {symbol} 现货价格: {item.get('lastPrice', 0)} (映射: {expected_symbol})")
-                            break
+                            print(f"Bybit {coin} 现货价格: {item.get('lastPrice', 0)} (源:{base})")
+                    except Exception as _e:
+                        print(f"Bybit现货解析基础符号失败: {_e}")
             except Exception as e:
                 print(f"Bybit现货解析错误: {e}, 消息: {message}")
 
@@ -607,18 +631,21 @@ class ExchangeDataCollector:
             batch_size = 10
             for i in range(0, len(spot_symbols), batch_size):
                 batch_symbols = spot_symbols[i:i+batch_size]
-                # 使用映射后的币种名称进行订阅
-                args = []
+                # 使用映射后的币种名称进行订阅（包含必要别名）
+                args_set = set()
                 for symbol in batch_symbols:
                     mapping = self._get_bybit_symbol_mapping(symbol)
                     mapped_symbol = mapping['spot']
-                    args.append(f"tickers.{mapped_symbol}USDT")
+                    args_set.add(f"tickers.{mapped_symbol}USDT")
                     if symbol != mapped_symbol:
                         print(f"Bybit现货订阅映射: {symbol} -> {mapped_symbol}")
+                    # 针对NEIRO系列，额外订阅可能的别名（如 NEIROUSDT）
+                    if mapped_symbol == 'NEIROETH':
+                        args_set.add("tickers.NEIROUSDT")
                 
                 subscribe_msg = {
                     "op": "subscribe",
-                    "args": args
+                    "args": sorted(list(args_set))
                 }
                 print(f"Bybit现货订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                 ws.send(json.dumps(subscribe_msg))
@@ -664,57 +691,54 @@ class ExchangeDataCollector:
                     symbol_name = item.get('symbol', '')
                     print(f"Bybit合约接收到数据: {symbol_name} - {item}")
                     
-                    # 解析币种名称 - 支持特殊映射
-                    for symbol in self.supported_symbols:
-                        # 获取Bybit特殊映射
-                        mapping = self._get_bybit_symbol_mapping(symbol)
-                        expected_symbol = mapping['futures']
-                        
-                        if symbol_name == f"{expected_symbol}USDT":
+                    # 解析并归并：以Bybit返回的基础符号为准（去掉USDT后缀）
+                    try:
+                        base = symbol_name[:-4] if symbol_name.endswith('USDT') else symbol_name
+                        coin = self._bybit_observed_to_coin(base)
+                        bybit_futures = self.exchange_symbols.get('bybit', {}).get('futures', [])
+                        if coin in bybit_futures:
+                            self.data['bybit'].setdefault(coin, {'spot': {}, 'futures': {}, 'funding_rate': {}})
                             funding_rate = item.get('fundingRate', 0)
                             if funding_rate == '':
                                 funding_rate = 0
-                            
-                            # 只有当消息包含lastPrice时才更新价格数据
                             if 'lastPrice' in item:
                                 # 完整更新包括价格
-                                # 如果有现有数据，保留现有的资金费率，除非消息中明确包含fundingRate
-                                current_funding_rate = 0
-                                if symbol in self.data['bybit'] and self.data['bybit'][symbol]['futures']:
-                                    current_funding_rate = self.data['bybit'][symbol]['futures'].get('funding_rate', 0)
-                                
-                                # 只有当消息明确包含fundingRate时才更新，否则保留现有值
+                                current_funding_rate = self.data['bybit'][coin]['futures'].get('funding_rate', 0) if self.data['bybit'][coin]['futures'] else 0
                                 final_funding_rate = current_funding_rate
                                 if 'fundingRate' in item:
-                                    final_funding_rate = float(funding_rate) if funding_rate != '' and funding_rate != 0 else current_funding_rate
-                                
-                                self.data['bybit'][symbol]['futures'] = {
-                                    'price': float(item.get('lastPrice', 0)),
+                                    try:
+                                        final_funding_rate = float(funding_rate) if funding_rate not in ('', 0) else current_funding_rate
+                                    except Exception:
+                                        final_funding_rate = current_funding_rate
+                                self.data['bybit'][coin]['futures'] = {
+                                    'price': float(item.get('lastPrice', 0) or 0),
                                     'funding_rate': final_funding_rate,
                                     'next_funding_time': item.get('nextFundingTime', ''),
-                                    'volume': float(item.get('volume24h', 0)),
+                                    'volume': float(item.get('volume24h', 0) or 0),
                                     'timestamp': datetime.now().isoformat(),
                                     'symbol': symbol_name
                                 }
-                                print(f"Bybit {symbol} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {final_funding_rate} (映射: {expected_symbol})")
+                                print(f"Bybit {coin} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {self.data['bybit'][coin]['futures'].get('funding_rate', 0)} (源:{base})")
                             else:
-                                # 保留现有价格，只更新其他可用数据
-                                if symbol in self.data['bybit'] and self.data['bybit'][symbol]['futures']:
-                                    current_data = self.data['bybit'][symbol]['futures'].copy()
-                                    # 只有消息中明确包含fundingRate时才更新资金费率
-                                    if 'fundingRate' in item and funding_rate != '' and funding_rate != 0:
-                                        current_data['funding_rate'] = float(funding_rate)
+                                # 增量更新：只更新有提供的字段
+                                if self.data['bybit'][coin]['futures']:
+                                    current_data = self.data['bybit'][coin]['futures'].copy()
+                                    if 'fundingRate' in item and funding_rate not in ('', 0):
+                                        try:
+                                            current_data['funding_rate'] = float(funding_rate)
+                                        except Exception:
+                                            pass
                                     if 'nextFundingTime' in item:
                                         current_data['next_funding_time'] = item.get('nextFundingTime', '')
                                     if 'volume24h' in item:
-                                        current_data['volume'] = float(item.get('volume24h', 0))
+                                        current_data['volume'] = float(item.get('volume24h', 0) or 0)
                                     current_data['timestamp'] = datetime.now().isoformat()
-                                    self.data['bybit'][symbol]['futures'] = current_data
-                                    print(f"Bybit {symbol} 合约增量更新 (保持价格: {current_data.get('price', 0)}, 资金费率: {current_data.get('funding_rate', 0)})")
+                                    self.data['bybit'][coin]['futures'] = current_data
+                                    print(f"Bybit {coin} 合约增量更新 (保持价格: {current_data.get('price', 0)}, 资金费率: {current_data.get('funding_rate', 0)})")
                                 else:
-                                    # 如果没有现有数据，跳过这个更新
-                                    print(f"Bybit {symbol} 合约无价格数据，跳过增量更新")
-                            break
+                                    print(f"Bybit {coin} 合约无价格数据，跳过增量更新")
+                    except Exception as _e:
+                        print(f"Bybit合约解析基础符号失败: {_e}")
             except Exception as e:
                 print(f"Bybit合约解析错误: {e}, 消息: {message}")
 
@@ -735,11 +759,20 @@ class ExchangeDataCollector:
             batch_size = 10
             for i in range(0, len(futures_symbols), batch_size):
                 batch_symbols = futures_symbols[i:i+batch_size]
-                args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                args_set = set()
+                for symbol in batch_symbols:
+                    mapping = self._get_bybit_symbol_mapping(symbol)
+                    mapped_symbol = mapping['futures']
+                    args_set.add(f"tickers.{mapped_symbol}USDT")
+                    if symbol != mapped_symbol:
+                        print(f"Bybit合约订阅映射: {symbol} -> {mapped_symbol}")
+                    # 针对NEIRO系列，额外订阅可能的别名（如 NEIROUSDT）
+                    if mapped_symbol == 'NEIROETH':
+                        args_set.add("tickers.NEIROUSDT")
                 
                 subscribe_msg = {
                     "op": "subscribe",
-                    "args": args
+                    "args": sorted(list(args_set))
                 }
                 print(f"Bybit合约订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                 ws.send(json.dumps(subscribe_msg))
@@ -790,13 +823,19 @@ class ExchangeDataCollector:
                 ws = self.ws_connections['bybit_spot']
                 # 分批订阅现货币种
                 batch_size = 10
-                for i in range(0, len(self.supported_symbols), batch_size):
-                    batch_symbols = self.supported_symbols[i:i+batch_size]
-                    args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                bybit_spot = self.exchange_symbols.get('bybit', {}).get('spot', [])
+                for i in range(0, len(bybit_spot), batch_size):
+                    batch_symbols = bybit_spot[i:i+batch_size]
+                    args_set = set()
+                    for symbol in batch_symbols:
+                        mapped = self._get_bybit_symbol_mapping(symbol)['spot']
+                        args_set.add(f"tickers.{mapped}USDT")
+                        if mapped == 'NEIROETH':
+                            args_set.add("tickers.NEIROUSDT")
                     
                     subscribe_msg = {
                         "op": "subscribe",
-                        "args": args
+                        "args": sorted(list(args_set))
                     }
                     print(f"Bybit现货重新订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                     ws.send(json.dumps(subscribe_msg))
@@ -806,13 +845,19 @@ class ExchangeDataCollector:
                 ws = self.ws_connections['bybit_linear']
                 # 分批订阅合约币种
                 batch_size = 10
-                for i in range(0, len(self.supported_symbols), batch_size):
-                    batch_symbols = self.supported_symbols[i:i+batch_size]
-                    args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                bybit_futures = self.exchange_symbols.get('bybit', {}).get('futures', [])
+                for i in range(0, len(bybit_futures), batch_size):
+                    batch_symbols = bybit_futures[i:i+batch_size]
+                    args_set = set()
+                    for symbol in batch_symbols:
+                        mapped = self._get_bybit_symbol_mapping(symbol)['futures']
+                        args_set.add(f"tickers.{mapped}USDT")
+                        if mapped == 'NEIROETH':
+                            args_set.add("tickers.NEIROUSDT")
                     
                     subscribe_msg = {
                         "op": "subscribe",
-                        "args": args
+                        "args": sorted(list(args_set))
                     }
                     print(f"Bybit合约重新订阅批次 {i//batch_size + 1}: {len(batch_symbols)}个有效币种")
                     ws.send(json.dumps(subscribe_msg))
