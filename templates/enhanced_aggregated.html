@@ -329,6 +329,7 @@
                 <input type="text" class="search-box" id="searchInput" placeholder="搜索币种 (如: BTC, ETH, WLFI...)">
                 <button class="control-btn" onclick="refreshData()">🔄 刷新</button>
                 <button class="control-btn" onclick="toggleAutoRefresh()">⏸️ 暂停</button>
+                <button class="control-btn" onclick="togglePriceDiffSort()" id="priceDiffBtn">📊 价差排序</button>
                 <button class="control-btn" onclick="window.open('/exchanges', '_blank')">📊 交易所视图</button>
             </div>
         </div>
@@ -357,6 +358,7 @@
             <div class="filter-tab" data-filter="hasData">有数据</div>
             <div class="filter-tab" data-filter="multiExchange">多交易所</div>
             <div class="filter-tab" data-filter="hasFunding">有资金费率</div>
+            <div class="filter-tab" data-filter="priceDiff">价差排序</div>
             <div class="filter-tab" data-filter="wlfi">WLFI</div>
             <div class="filter-tab" data-filter="mainstream">主流币</div>
         </div>
@@ -378,26 +380,52 @@
         let currentSearch = '';
         let isAutoRefresh = true;
         let refreshInterval;
+        let isPriceDiffSortActive = false;
 
         // 主流币种列表
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
 
-        // 格式化价格
+        // 格式化价格 - 避免科学计数法，保持原始精度
         function formatPrice(price) {
             if (!price) return '-';
-            const num = parseFloat(price);
-            if (num >= 1000) return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (num >= 1) return num.toFixed(4);
-            if (num >= 0.01) return num.toFixed(6);
-            return num.toExponential(2);
+            // 直接使用原始价格字符串，避免parseFloat造成的精度损失
+            const str = String(price);
+            const num = parseFloat(str);
+            
+            // 避免科学计数法，保持原始精度
+            if (num >= 1000) {
+                // 大于1000的价格，保留2位小数
+                return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            } else if (num >= 1) {
+                // 1-1000之间，最多显示8位小数，但移除末尾0
+                return parseFloat(num.toFixed(8)).toString();
+            } else if (num >= 0.001) {
+                // 0.001-1之间，最多显示8位小数，但移除末尾0
+                return parseFloat(num.toFixed(8)).toString();
+            } else if (num > 0) {
+                // 小于0.001的正数，保留足够精度避免科学计数法
+                const fixed = num.toFixed(12);
+                return parseFloat(fixed).toString();
+            } else {
+                return num.toString();
+            }
         }
 
-        // 格式化资金费率
+        // 格式化资金费率 - 保持原始精度
         function formatFundingRate(rate) {
             if (!rate || rate === 0) return '-';
+            // 避免不必要的精度损失
             const num = parseFloat(rate);
-            const percentage = (num * 100).toFixed(4);
-            return `${percentage}%`;
+            const percentage = num * 100;
+            
+            // 根据数值大小选择合适的小数位数
+            if (Math.abs(percentage) >= 1) {
+                return `${parseFloat(percentage.toFixed(4))}%`;
+            } else if (Math.abs(percentage) >= 0.01) {
+                return `${parseFloat(percentage.toFixed(6))}%`;
+            } else {
+                return `${parseFloat(percentage.toFixed(8))}%`;
+            }
         }
 
         // 获取资金费率样式类
@@ -406,10 +434,97 @@
             return parseFloat(rate) > 0 ? 'positive' : 'negative';
         }
 
+        // 计算价差百分比
+        function calculatePriceDifference(symbolData) {
+            const prices = [];
+            const exchanges = ['binance', 'okx', 'bybit', 'bitget'];
+            
+            // 收集所有有效价格（现货和期货）
+            exchanges.forEach(exchange => {
+                if (symbolData[exchange]) {
+                    const exData = symbolData[exchange];
+                    if (exData.spot && exData.spot.price && exData.spot.price > 0) {
+                        prices.push({
+                            exchange: exchange,
+                            type: 'spot',
+                            price: Number(exData.spot.price)  // 使用Number而不是parseFloat保持精度
+                        });
+                    }
+                    if (exData.futures && exData.futures.price && exData.futures.price > 0) {
+                        prices.push({
+                            exchange: exchange,
+                            type: 'futures',
+                            price: Number(exData.futures.price)  // 使用Number而不是parseFloat保持精度
+                        });
+                    }
+                }
+            });
+            
+            if (prices.length < 2) return null;
+            
+            // 找到最高价和最低价
+            let maxPrice = Math.max(...prices.map(p => p.price));
+            let minPrice = Math.min(...prices.map(p => p.price));
+            let maxPriceInfo = prices.find(p => p.price === maxPrice);
+            let minPriceInfo = prices.find(p => p.price === minPrice);
+            
+            // 计算价差百分比
+            let diffPercent = ((maxPrice - minPrice) / minPrice) * 100;
+            
+            return {
+                maxPrice: maxPrice,
+                minPrice: minPrice,
+                maxExchange: maxPriceInfo.exchange + '(' + maxPriceInfo.type + ')',
+                minExchange: minPriceInfo.exchange + '(' + minPriceInfo.type + ')',
+                diffPercent: diffPercent,
+                diffAmount: maxPrice - minPrice
+            };
+        }
+
+        // 切换价差排序模式
+        function togglePriceDiffSort() {
+            isPriceDiffSortActive = !isPriceDiffSortActive;
+            const btn = document.getElementById('priceDiffBtn');
+            
+            if (isPriceDiffSortActive) {
+                btn.textContent = '🔢 普通排序';
+                btn.classList.add('active');
+                currentFilter = 'priceDiff';
+                // 激活价差排序过滤标签
+                document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+                document.querySelector('[data-filter="priceDiff"]').classList.add('active');
+            } else {
+                btn.textContent = '📊 价差排序';
+                btn.classList.remove('active');
+                currentFilter = 'all';
+                // 回到全部标签
+                document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
+                document.querySelector('[data-filter="all"]').classList.add('active');
+            }
+            
+            applyFilters();
+        }
+
         // 更新币种网格
         function updateSymbolsGrid(data) {
             const grid = document.getElementById('symbolsGrid');
-            const symbols = Object.keys(data).sort();
+            let symbols = Object.keys(data);
+            
+            // 如果是价差排序模式，计算价差并排序
+            if (isPriceDiffSortActive) {
+                const symbolsWithDiff = symbols.map(symbol => {
+                    const diff = calculatePriceDifference(data[symbol]);
+                    return {
+                        symbol: symbol,
+                        priceDiff: diff
+                    };
+                }).filter(item => item.priceDiff !== null)
+                  .sort((a, b) => b.priceDiff.diffPercent - a.priceDiff.diffPercent);
+                
+                symbols = symbolsWithDiff.map(item => item.symbol);
+            } else {
+                symbols.sort();
+            }
             
             if (symbols.length === 0) {
                 grid.innerHTML = '<div class="no-data">暂无数据</div>';
@@ -423,12 +538,35 @@
                 
                 if (exchanges.length === 0) return;
 
+                // 计算价差信息 - 始终计算并显示最大价差
+                const priceDiff = calculatePriceDifference(symbolData);
+                let priceDiffDisplay = '';
+                
+                if (priceDiff && priceDiff.diffPercent >= 0.01) { // 显示价差大于0.01%的情况
+                    priceDiffDisplay = `
+                        <div style="background: rgba(240, 185, 11, 0.15); padding: 6px 8px; border-radius: 6px; margin-bottom: 8px; border: 1px solid rgba(240, 185, 11, 0.3); display: flex; justify-content: space-between; align-items: center;">
+                            <div style="display: flex; align-items: center; gap: 8px;">
+                                <span style="font-size: 10px; color: #f0b90b;">💰</span>
+                                <div>
+                                    <div style="font-size: 13px; font-weight: bold; color: #22c55e;">${parseFloat(priceDiff.diffPercent.toFixed(4))}%</div>
+                                    <div style="font-size: 9px; color: #8c8c8c;">最大价差</div>
+                                </div>
+                            </div>
+                            <div style="text-align: right; font-size: 9px; color: #8c8c8c; line-height: 1.2;">
+                                <div>高: ${priceDiff.maxExchange}</div>
+                                <div>低: ${priceDiff.minExchange}</div>
+                            </div>
+                        </div>
+                    `;
+                }
+
                 html += `
                     <div class="symbol-card">
                         <div class="symbol-header">
                             <div class="symbol-name">${symbol}</div>
                             <div class="exchange-count">${exchanges.length} 交易所</div>
                         </div>
+                        ${priceDiffDisplay}
                         <div class="exchanges-grid">
                 `;
 
@@ -538,6 +676,10 @@
                                     const exData = symbolData[ex];
                                     return exData.futures && exData.futures.funding_rate;
                                 });
+                            case 'priceDiff':
+                                // 价差筛选：需要有多个有效价格且价差大于0.1%
+                                const diff = calculatePriceDifference(symbolData);
+                                return diff && diff.diffPercent >= 0.1;
                             case 'wlfi':
                                 return symbol.toLowerCase().includes('wlfi');
                             case 'mainstream':

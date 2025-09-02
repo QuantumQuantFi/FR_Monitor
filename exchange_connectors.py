@@ -101,6 +101,16 @@ class ExchangeDataCollector:
                     'futures': datetime.min
                 }
 
+    def _get_bybit_symbol_mapping(self, symbol):
+        """获取Bybit特殊币种映射"""
+        special_mappings = {
+            'NEIRO': {
+                'spot': 'NEIROETH',      # Bybit现货实际是NEIROETH
+                'futures': 'NEIROETH'    # Bybit期货实际是NEIROETHUSDT
+            }
+        }
+        return special_mappings.get(symbol, {'spot': symbol, 'futures': symbol})
+
     def set_symbol(self, symbol):
         """切换前端显示的币种（无需重连WebSocket）"""
         if symbol.upper() in self.supported_symbols:
@@ -562,16 +572,20 @@ class ExchangeDataCollector:
                     symbol_name = item.get('symbol', '')
                     print(f"Bybit现货接收到数据: {symbol_name} - {item}")
                     
-                    # 解析币种名称
+                    # 解析币种名称 - 支持特殊映射
                     for symbol in self.supported_symbols:
-                        if symbol_name == f"{symbol}USDT":
+                        # 获取Bybit特殊映射
+                        mapping = self._get_bybit_symbol_mapping(symbol)
+                        expected_symbol = mapping['spot']
+                        
+                        if symbol_name == f"{expected_symbol}USDT":
                             self.data['bybit'][symbol]['spot'] = {
                                 'price': float(item.get('lastPrice', 0)),
                                 'volume': float(item.get('volume24h', 0)),
                                 'timestamp': datetime.now().isoformat(),
                                 'symbol': symbol_name
                             }
-                            print(f"Bybit {symbol} 现货价格: {item.get('lastPrice', 0)}")
+                            print(f"Bybit {symbol} 现货价格: {item.get('lastPrice', 0)} (映射: {expected_symbol})")
                             break
             except Exception as e:
                 print(f"Bybit现货解析错误: {e}, 消息: {message}")
@@ -593,7 +607,14 @@ class ExchangeDataCollector:
             batch_size = 10
             for i in range(0, len(spot_symbols), batch_size):
                 batch_symbols = spot_symbols[i:i+batch_size]
-                args = [f"tickers.{symbol}USDT" for symbol in batch_symbols]
+                # 使用映射后的币种名称进行订阅
+                args = []
+                for symbol in batch_symbols:
+                    mapping = self._get_bybit_symbol_mapping(symbol)
+                    mapped_symbol = mapping['spot']
+                    args.append(f"tickers.{mapped_symbol}USDT")
+                    if symbol != mapped_symbol:
+                        print(f"Bybit现货订阅映射: {symbol} -> {mapped_symbol}")
                 
                 subscribe_msg = {
                     "op": "subscribe",
@@ -643,9 +664,13 @@ class ExchangeDataCollector:
                     symbol_name = item.get('symbol', '')
                     print(f"Bybit合约接收到数据: {symbol_name} - {item}")
                     
-                    # 解析币种名称
+                    # 解析币种名称 - 支持特殊映射
                     for symbol in self.supported_symbols:
-                        if symbol_name == f"{symbol}USDT":
+                        # 获取Bybit特殊映射
+                        mapping = self._get_bybit_symbol_mapping(symbol)
+                        expected_symbol = mapping['futures']
+                        
+                        if symbol_name == f"{expected_symbol}USDT":
                             funding_rate = item.get('fundingRate', 0)
                             if funding_rate == '':
                                 funding_rate = 0
@@ -671,7 +696,7 @@ class ExchangeDataCollector:
                                     'timestamp': datetime.now().isoformat(),
                                     'symbol': symbol_name
                                 }
-                                print(f"Bybit {symbol} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {final_funding_rate}")
+                                print(f"Bybit {symbol} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {final_funding_rate} (映射: {expected_symbol})")
                             else:
                                 # 保留现有价格，只更新其他可用数据
                                 if symbol in self.data['bybit'] and self.data['bybit'][symbol]['futures']:

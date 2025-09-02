@@ -71,13 +71,13 @@ MARKET_INFO_CACHE_HOURS = 1
 
 # WebSocket连接优化配置
 WS_CONNECTION_CONFIG = {
-    'max_reconnect_attempts': 15,      # 最大重连次数（增加到15次）
-    'base_reconnect_delay': 10,        # 基础重连延迟（10秒）
-    'max_reconnect_delay': 300,        # 最大重连延迟（5分钟）
+    'max_reconnect_attempts': 50,      # 最大重连次数（增加到50次，基本不会放弃重连）
+    'base_reconnect_delay': 5,         # 基础重连延迟（5秒，更快重连）
+    'max_reconnect_delay': 120,        # 最大重连延迟（2分钟，缩短最大延迟）
     'exponential_backoff': True,       # 启用指数退避
-    'connection_timeout': 30,          # 连接超时（30秒）
-    'ping_interval': 60,               # ping间隔（60秒）
-    'ping_timeout': 30,                # ping超时（30秒）
+    'connection_timeout': 20,          # 连接超时（20秒，更快检测失败）
+    'ping_interval': 30,               # ping间隔（30秒，更频繁心跳）
+    'ping_timeout': 10,                # ping超时（10秒，更快检测断线）
 }
 
 # 内存优化配置
@@ -90,10 +90,11 @@ MEMORY_OPTIMIZATION_CONFIG = {
 
 # 动态币种筛选参数
 MARKET_FILTER_CONFIG = {
-    'min_exchanges_support': 2,        # 最少需要几个交易所支持
-    'min_completeness_score': 25,      # 最低完整性评分 (0-100)
-    'max_symbols': 200,                # 最大监控币种数量
-    'priority_symbols': ['WLFI', 'BTC', 'ETH', 'BNB'],  # 优先级币种（始终包含）
+    # 为了“全量监听USDT币种”，放宽过滤门槛并提高上限
+    'min_exchanges_support': 1,        # 至少任一交易所有现货或合约即可
+    'min_completeness_score': 0,       # 不限制覆盖度评分
+    'max_symbols': 5000,               # 提高上限，允许全量USDT币种
+    'priority_symbols': ['WLFI', 'BTC', 'ETH', 'BNB', 'PENGU'],  # 关键币种优先纳入
     'exclude_symbols': [],             # 排除币种列表
 }
 

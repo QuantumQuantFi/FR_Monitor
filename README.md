@@ -1,167 +1,256 @@
-# WLFI Funding Rate Monitor
+# WLFI 资金费率监控系统
 
-基于动态币种发现的多交易所实时监控系统，支持现货和永续合约的价格及资金费率监控。
+🚀 实时多交易所价格和资金费率监控系统，支持976+币种跨平台套利机会发现。
 
-## 🚀 项目特色
+## 📊 系统特性
 
-- **动态币种发现**：自动获取各交易所实际支持的USDT币对，避免无效订阅
-- **精准WebSocket订阅**：基于各交易所API预筛选，只订阅确实存在的币种对
-- **按币种聚合展示**：将同一币种在多个交易所的数据聚合显示，方便比较
-- **4大交易所支持**：OKX、Binance、Bybit、Bitget
-- **实时数据更新**：WebSocket实时推送，支持现货价格和合约资金费率
-- **智能频率控制**：500ms数据刷新，100ms WebSocket节流，避免数据过载
+### 🔥 核心功能
+- **实时价格监控**: 支持Binance、OKX、Bybit、Bitget四大交易所
+- **资金费率追踪**: 实时资金费率数据，发现套利机会
+- **价差分析**: 自动计算跨交易所价差，智能排序筛选
+- **多币种支持**: 动态发现并监控976+个热门币种
+- **WebSocket连接**: 低延迟实时数据更新
 
-## 🏗️ 系统架构
+### 📈 数据展示
+- **聚合视图**: 按币种聚合显示所有交易所数据
+- **价差排序**: 一键切换价差排序模式，快速发现套利机会
+- **历史数据**: 支持历史价格和资金费率查询
+- **系统状态**: 实时监控系统运行状态和连接健康度
+
+## 🛠️ 技术架构
+
+- **后端**: Python Flask + WebSocket
+- **数据库**: SQLite (本地存储)
+- **连接**: 多交易所WebSocket实时连接
+- **前端**: HTML5 + JavaScript (响应式设计)
 
 ### 核心模块
 
-1. **market_info.py** - 动态市场发现
-   - 通过REST API获取各交易所支持的币种列表
-   - 自动过滤和合并币种数据
-   - 智能缓存机制，避免频繁API调用
+1. **simple_app.py** - 主应用程序 (推荐使用)
+   - Flask Web服务 (端口4002)
+   - 完整API接口
+   - 内存优化
+   - 系统状态监控
 
-2. **exchange_connectors.py** - WebSocket连接管理
-   - 基于实际币种列表的精准订阅
-   - 自动错误检测和币种移除机制
-   - 分批订阅避免连接限制
+2. **app.py** - 旧版应用 ❌ 可删除
+   - 包含SocketIO (端口5000)
+   - 功能较少
+   - 已被simple_app.py替代
 
-3. **simple_app.py** - Web应用和API
-   - Flask后端提供数据API
-   - 聚合页面作为首页展示
-   - 支持按交易所和按币种两种视图
+3. **exchange_connectors.py** - WebSocket连接管理
+   - 多交易所WebSocket连接
+   - 自动重连机制
+   - 数据标准化处理
 
-4. **config.py** - 配置管理
-   - 动态币种列表缓存
-   - 静态备用列表
-   - 频率和过滤参数配置
+4. **market_info.py** - 动态市场发现
+   - REST API获取币种列表
+   - 智能缓存机制
+   - 976+币种自动发现
 
-## 📊 功能特性
+5. **database.py** - 数据存储
+   - SQLite数据库操作
+   - 历史数据管理
+   - 数据维护功能
 
-### 动态币种发现
-- **Binance**: 获取现货和永续合约的活跃USDT币对
-- **OKX**: 支持SPOT和SWAP类型的实时币种
-- **Bybit**: 现货和线性合约的在线币种
-- **Bitget**: 现货和USDT期货的可用币种
+## 📋 系统要求
 
-### 数据聚合显示
-- 首页默认显示按币种聚合的数据
-- 显示每个币种在各交易所的覆盖情况
-- 实时价格和资金费率对比
-- 支持搜索和筛选功能
+- Python 3.8+
+- Ubuntu/Linux (推荐)
+- 稳定的网络连接
 
-### 智能订阅机制
-```python
-# 示例：各交易所特定币种列表
-exchange_symbols = {
-    'binance': {
-        'spot': ['BTC', 'ETH', 'BNB', ...],      # 只包含Binance实际支持的现货
-        'futures': ['BTC', 'ETH', 'ADA', ...]    # 只包含Binance实际支持的期货
-    },
-    'okx': {
-        'spot': ['BTC', 'ETH', 'WLFI', ...],
-        'futures': ['BTC', 'ETH', 'SOL', ...]
-    }
-    # 每个交易所都有专门的订阅列表
-}
-```
+## 🚀 快速开始
 
-## 🔄 重要优化更新
+### 1. 环境准备
 
-### 2025年1月版本更新
-在本次更新中，我们完全重构了币种发现和WebSocket订阅机制：
-
-#### 问题解决
-- **❌ 原问题**：使用静态币种列表导致大量无效订阅和错误
-- **✅ 解决方案**：实现基于REST API的动态币种发现
-
-#### 核心改进
-1. **预筛选机制**：在建立WebSocket前先验证各交易所支持的币种
-2. **交易所特定订阅**：每个交易所只订阅其确实支持的币种对
-3. **消除盲目订阅**：不再尝试订阅可能不存在的币种
-4. **首页聚合展示**：将聚合页面设为默认首页
-
-#### 技术实现
-- 增强`market_info.py`添加`get_exchange_specific_symbols()`功能
-- 修改所有WebSocket连接使用交易所特定的币种列表
-- 优化订阅逻辑，提高连接效率和稳定性
-
-## 🚀 部署说明
-
-### 环境要求
 ```bash
-Python 3.8+
-Flask
-websocket-client
-requests
-aiohttp
+# 克隆项目
+git clone <your-repo-url>
+cd FR_Monitor
+
+# 安装系统依赖
+sudo apt update
+sudo apt install python3-venv python3-pip
 ```
 
-### 快速启动
+### 2. 安装依赖
+
 ```bash
-# 安装依赖
-pip install flask websocket-client requests aiohttp
+# 创建虚拟环境
+python3 -m venv venv
 
-# 启动应用
-python simple_app.py
+# 激活虚拟环境
+source venv/bin/activate
+
+# 安装Python依赖
+pip install -r requirements.txt
+
+# 安装额外依赖
+pip install aiohttp psutil
 ```
 
-### 访问地址
-- 主页（币种聚合）: `http://localhost:5000/`
-- 交易所视图: `http://localhost:5000/exchanges`
-- API数据: `http://localhost:5000/api/data`
+### 3. 启动系统
+
+```bash
+# 激活虚拟环境并启动
+source venv/bin/activate && python simple_app.py
+```
+
+### 4. 访问系统
+
+打开浏览器访问: `http://your-server-ip:4002`
+
+## 📂 项目结构
+
+```
+FR_Monitor/
+├── simple_app.py          # 主应用程序
+├── exchange_connectors.py # 交易所连接器
+├── config.py             # 系统配置
+├── market_info.py        # 市场信息获取
+├── database.py           # 数据库操作
+├── requirements.txt      # Python依赖
+├── templates/           # HTML模板
+│   ├── simple_index.html    # 主页
+│   ├── aggregated_index.html # 聚合页面
+│   └── enhanced_aggregated.html # 增强聚合页面
+└── venv/               # 虚拟环境 (自动生成)
+```
+
+## 🌐 页面访问
+
+### 主要页面
+```bash
+GET  /                        # 主页 (简洁视图)
+GET  /aggregated             # 聚合页面 (价差分析) - 推荐
+GET  /exchanges              # 交易所视图
+GET  /charts                 # 图表页面
+```
 
 ## 📝 API接口
 
-### 主要端点
-- `GET /` - 币种聚合主页
-- `GET /exchanges` - 按交易所展示页面  
-- `GET /api/data` - 获取实时数据
-- `GET /api/aggregated_data` - 获取聚合数据
-- `GET /api/markets` - 获取市场信息
-- `GET /api/coverage` - 获取覆盖度报告
+### 核心数据接口
+```bash
+GET  /api/data                    # 获取实时数据
+GET  /api/aggregated_data         # 获取聚合数据
+GET  /api/history/<symbol>        # 获取历史数据
+POST /api/switch_symbol          # 切换监控币种
+```
 
-### 数据格式
-```json
-{
-  "exchange": "binance",
-  "symbol": "BTC",
-  "spot": {
-    "price": 109500.00,
-    "timestamp": "2025-01-02T12:00:00"
-  },
-  "futures": {
-    "price": 109480.1,
-    "funding_rate": 0.0001,
-    "timestamp": "2025-01-02T12:00:00"
-  }
+### 市场信息接口
+```bash
+GET  /api/markets               # 获取市场信息
+GET  /api/coverage             # 获取覆盖度统计
+GET  /api/system/status        # 系统状态监控
+```
+
+## 📊 使用指南
+
+### 1. 主页面功能
+- **实时价格**: 查看所有交易所的现货和期货价格
+- **资金费率**: 监控各交易所的资金费率变化
+- **币种切换**: 快速切换要监控的币种
+
+### 2. 聚合页面 (推荐)
+- **价差分析**: 自动计算并显示跨交易所价差
+- **排序功能**: 点击"📊 价差排序"按钮切换排序模式
+- **套利机会**: 快速识别价差超过0.1%的套利机会
+
+### 3. 系统监控
+访问 `/api/system/status` 查看:
+- 系统资源使用情况
+- 连接状态
+- 数据更新频率
+- 错误统计
+
+## ⚙️ 配置说明
+
+主要配置在 `config.py` 中:
+
+```python
+# 数据更新间隔
+DATA_REFRESH_INTERVAL = 2.0  # 秒
+
+# WebSocket配置
+WS_CONNECTION_CONFIG = {
+    'max_reconnect_attempts': 50,
+    'base_delay': 5,
+    'max_delay': 120,
+    'ping_interval': 30,
+    'ping_timeout': 10,
+    'connection_timeout': 20
+}
+
+# 内存优化
+MEMORY_OPTIMIZATION_CONFIG = {
+    'max_historical_records': 500,
+    'memory_cleanup_interval': 300
 }
 ```
 
-## 🎯 使用场景
+## 🔧 维护操作
 
-1. **资金费率套利**：监控不同交易所的资金费率差异
-2. **价格比较**：实时对比各交易所的现货和期货价格
-3. **市场覆盖分析**：了解哪些币种在多个交易所都有支持
-4. **交易决策支持**：基于实时数据做出交易决策
+### 重启服务
+```bash
+# 停止当前服务 (Ctrl+C)
+# 重新启动
+source venv/bin/activate && python simple_app.py
+```
 
-## ⚠️ 注意事项
+### 清理数据库
+```bash
+# 通过API清理数据库
+curl -X POST http://localhost:4002/api/database/maintenance
+```
 
-- 请确保网络连接稳定，WebSocket连接可能因网络问题中断
-- 各交易所有不同的API限制，系统已实现适当的频率控制
-- 建议在生产环境中配置适当的错误重试和监控机制
-- 币种列表每小时自动更新一次，可手动强制刷新
+### 检查系统状态
+```bash
+# 检查服务状态
+curl http://localhost:4002/api/system/status
 
-## 🔗 相关链接
+# 检查数据库状态  
+curl http://localhost:4002/api/database/stats
+```
 
-- [OKX API文档](https://www.okx.com/docs-v5/en/)
-- [Binance API文档](https://binance-docs.github.io/apidocs/)
-- [Bybit API文档](https://bybit-exchange.github.io/docs/)
-- [Bitget API文档](https://www.bitget.com/api-doc/common/intro)
+## 🐛 常见问题
+
+### Q: 服务无法启动？
+A: 检查依赖是否完整安装，确保虚拟环境激活
+
+### Q: 连接交易所失败？
+A: 检查网络连接，某些地区可能需要代理
+
+### Q: 数据不更新？
+A: 查看控制台日志，检查WebSocket连接状态
+
+### Q: 内存占用过高？
+A: 调整 `MEMORY_OPTIMIZATION_CONFIG` 中的 `max_historical_records`
+
+## 📝 更新日志
+
+### v2.0 (2025-09-02)
+- ✅ 价差筛选和排序功能
+- ✅ WebSocket连接稳定性优化  
+- ✅ 前端数字显示精度优化
+- ✅ 服务器启动问题修复
+- ✅ 删除旧版app.py，统一使用simple_app.py
+
+### v1.0 (初始版本)
+- ✅ 多交易所实时数据收集
+- ✅ 基础Web界面
+- ✅ 资金费率监控
+
+## 🤝 贡献
+
+欢迎提交Issue和Pull Request来改进这个项目！
 
 ## 📄 许可证
 
-MIT License - 详见 LICENSE 文件
+[MIT License](LICENSE)
 
 ---
 
-*本项目专注于为加密货币交易者提供准确、实时的多交易所数据聚合服务。*
+**💡 提示**: 推荐使用聚合页面 `/aggregated` 进行价差分析和套利机会发现。
+
+**🔗 在线访问**: http://your-server-ip:4002
+
+**📧 联系**: 如有问题，请提交GitHub Issue
