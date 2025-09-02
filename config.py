@@ -60,14 +60,33 @@ SUPPORTED_SYMBOLS = [
     'WLFI'  # 项目重点关注
 ]
 
-# 数据刷新间隔（秒） - 降低频率避免数据过多
-DATA_REFRESH_INTERVAL = 0.5  # 500ms
+# 数据刷新间隔（秒） - 优化频率减少资源消耗
+DATA_REFRESH_INTERVAL = 2.0  # 2秒，减少主循环频率
 
-# WebSocket数据推送频率控制（秒） 
-WS_UPDATE_INTERVAL = 0.1  # 100ms WebSocket数据更新间隔
+# WebSocket数据推送频率控制（秒） - 同一币种数据更新间隔
+WS_UPDATE_INTERVAL = 3.0  # 3秒，同一币种数据更新间隔
 
 # 市场信息缓存时间（小时）
 MARKET_INFO_CACHE_HOURS = 1
+
+# WebSocket连接优化配置
+WS_CONNECTION_CONFIG = {
+    'max_reconnect_attempts': 15,      # 最大重连次数（增加到15次）
+    'base_reconnect_delay': 10,        # 基础重连延迟（10秒）
+    'max_reconnect_delay': 300,        # 最大重连延迟（5分钟）
+    'exponential_backoff': True,       # 启用指数退避
+    'connection_timeout': 30,          # 连接超时（30秒）
+    'ping_interval': 60,               # ping间隔（60秒）
+    'ping_timeout': 30,                # ping超时（30秒）
+}
+
+# 内存优化配置
+MEMORY_OPTIMIZATION_CONFIG = {
+    'max_historical_records': 500,     # 内存中最大历史记录数（从1000减少到500）
+    'memory_cleanup_interval': 300,    # 内存清理间隔（5分钟）
+    'batch_size': 50,                  # 批处理大小
+    'data_compression': True,          # 启用数据压缩
+}
 
 # 动态币种筛选参数
 MARKET_FILTER_CONFIG = {

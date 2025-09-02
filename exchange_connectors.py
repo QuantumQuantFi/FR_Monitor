@@ -5,8 +5,8 @@ import threading
 import time
 from datetime import datetime, timedelta
 from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
-                   CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, 
-                   update_supported_symbols_async)
+                   CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG,
+                   MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async)
 from market_info import get_exchange_symbols
 
 class ExchangeDataCollector:
@@ -28,8 +28,13 @@ class ExchangeDataCollector:
         self.ws_connections = {}
         self.running = False
         self.reconnect_attempts = {}  # 记录每个连接的重连次数
-        self.max_reconnect_attempts = 10  # 最大重连次数
-        self.reconnect_delay = 5  # 重连延迟(秒)
+        self.connection_start_times = {}  # 记录连接开始时间
+        
+        # 使用配置文件中的连接参数
+        self.max_reconnect_attempts = WS_CONNECTION_CONFIG['max_reconnect_attempts']
+        self.base_reconnect_delay = WS_CONNECTION_CONFIG['base_reconnect_delay']  
+        self.max_reconnect_delay = WS_CONNECTION_CONFIG['max_reconnect_delay']
+        self.exponential_backoff = WS_CONNECTION_CONFIG['exponential_backoff']
         
         # 数据频率控制
         self.data_throttle_interval = WS_UPDATE_INTERVAL  # WebSocket数据更新间隔
@@ -250,35 +255,61 @@ class ExchangeDataCollector:
         self.reconnect_attempts.clear()
 
     def _connect_with_retry(self, connection_name, connect_func):
-        """统一的重连机制包装器"""
+        """优化的重连机制包装器 - 避免无限循环和资源耗尽"""
+        self.connection_start_times[connection_name] = datetime.now()
+        
         while self.running:
             try:
-                print(f"{connection_name} 开始连接...")
+                print(f"[{connection_name}] 开始连接... (尝试 {self.reconnect_attempts.get(connection_name, 0) + 1}/{self.max_reconnect_attempts})")
                 connect_func()
-                # 如果连接正常结束，重置重连计数
+                # 连接成功，重置重连计数
                 self.reconnect_attempts[connection_name] = 0
+                print(f"[{connection_name}] 连接成功建立")
+                
             except Exception as e:
                 if not self.running:
+                    print(f"[{connection_name}] 程序停止，退出重连")
                     break
                     
-                self.reconnect_attempts[connection_name] += 1
-                print(f"{connection_name} 连接失败 (第{self.reconnect_attempts[connection_name]}次): {e}")
+                self.reconnect_attempts[connection_name] = self.reconnect_attempts.get(connection_name, 0) + 1
+                current_attempt = self.reconnect_attempts[connection_name]
                 
-                if self.reconnect_attempts[connection_name] >= self.max_reconnect_attempts:
-                    print(f"{connection_name} 达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
+                print(f"[{connection_name}] 连接失败 (第{current_attempt}次): {e}")
+                
+                # 检查是否达到最大重连次数
+                if current_attempt >= self.max_reconnect_attempts:
+                    print(f"[{connection_name}] 达到最大重连次数 ({self.max_reconnect_attempts})，停止重连")
                     break
                 
-                # 指数退避延迟，但不超过60秒
-                delay = min(self.reconnect_delay * (2 ** (self.reconnect_attempts[connection_name] - 1)), 60)
-                print(f"{connection_name} {delay}秒后重试...")
+                # 计算退避延迟
+                if self.exponential_backoff:
+                    delay = min(
+                        self.base_reconnect_delay * (2 ** (current_attempt - 1)), 
+                        self.max_reconnect_delay
+                    )
+                else:
+                    delay = self.base_reconnect_delay
                 
-                for _ in range(int(delay)):
+                print(f"[{connection_name}] 等待 {delay} 秒后重试...")
+                
+                # 分段睡眠，支持优雅停止
+                sleep_step = 5  # 每5秒检查一次是否需要停止
+                for _ in range(int(delay // sleep_step)):
                     if not self.running:
-                        break
-                    time.sleep(1)
+                        print(f"[{connection_name}] 等待期间程序停止，退出重连")
+                        return
+                    time.sleep(sleep_step)
+                
+                # 处理余数时间
+                remaining = delay % sleep_step
+                if remaining > 0 and self.running:
+                    time.sleep(remaining)
                     
                 if not self.running:
+                    print(f"[{connection_name}] 等待期间程序停止，退出重连")
                     break
+        
+        print(f"[{connection_name}] 重连线程已退出")
 
     def _connect_okx(self):
         """连接OKX WebSocket - 多币种监听"""

@@ -2,9 +2,12 @@ from flask import Flask, render_template, jsonify, request
 import json
 import threading
 import time
+import gc
+import psutil
+import os
 from datetime import datetime
 from exchange_connectors import ExchangeDataCollector
-from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS
+from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
 
@@ -16,14 +19,81 @@ data_collector = ExchangeDataCollector()
 # 数据库实例
 db = PriceDatabase()
 
-# 历史数据存储 (简单内存存储 - 保留用于实时显示) - 使用动态币种列表
-historical_data = {symbol: {exchange: [] for exchange in ['okx', 'binance', 'bybit', 'bitget']} 
-                  for symbol in CURRENT_SUPPORTED_SYMBOLS}
+# 优化的内存数据结构 - 减少内存占用
+class MemoryDataManager:
+    def __init__(self):
+        self.max_records = MEMORY_OPTIMIZATION_CONFIG['max_historical_records']
+        self.cleanup_interval = MEMORY_OPTIMIZATION_CONFIG['memory_cleanup_interval']
+        self.last_cleanup = datetime.now()
+        self.data = {}
+        self._init_data_structure()
+    
+    def _init_data_structure(self):
+        """初始化数据结构"""
+        for symbol in CURRENT_SUPPORTED_SYMBOLS:
+            self.data[symbol] = {
+                'okx': [],
+                'binance': [],
+                'bybit': [],
+                'bitget': []
+            }
+    
+    def add_record(self, symbol, exchange, record):
+        """添加记录并控制内存使用"""
+        if symbol not in self.data:
+            self.data[symbol] = {
+                'okx': [],
+                'binance': [],
+                'bybit': [],
+                'bitget': []
+            }
+        
+        exchange_data = self.data[symbol].get(exchange, [])
+        exchange_data.append(record)
+        
+        # 控制内存使用 - 保持记录数不超过限制
+        if len(exchange_data) > self.max_records:
+            # 移除最旧的记录
+            exchange_data.pop(0)
+        
+        self.data[symbol][exchange] = exchange_data
+    
+    def get_data(self, symbol=None):
+        """获取数据"""
+        if symbol:
+            return self.data.get(symbol, {})
+        return self.data
+    
+    def cleanup_memory(self):
+        """定期内存清理"""
+        current_time = datetime.now()
+        if (current_time - self.last_cleanup).seconds >= self.cleanup_interval:
+            print("执行内存清理...")
+            # 清理空的数据结构
+            empty_symbols = []
+            for symbol, symbol_data in self.data.items():
+                if all(len(exchange_data) == 0 for exchange_data in symbol_data.values()):
+                    empty_symbols.append(symbol)
+            
+            for symbol in empty_symbols:
+                del self.data[symbol]
+            
+            if empty_symbols:
+                print(f"清理了 {len(empty_symbols)} 个空的币种数据")
+            
+            self.last_cleanup = current_time
+
+# 使用优化的内存管理器
+memory_manager = MemoryDataManager()
 
 def background_data_collection():
-    """后台数据收集 - 多币种模式"""
+    """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
-    maintenance_interval = 60   # 1分钟执行一次维护任务
+    maintenance_interval = 300   # 5分钟执行一次维护任务（从1分钟改为5分钟）
+    
+    # 批处理缓冲区
+    batch_buffer = []
+    batch_size = MEMORY_OPTIMIZATION_CONFIG['batch_size']
     
     while True:
         try:
@@ -31,7 +101,7 @@ def background_data_collection():
             all_data = data_collector.get_all_data()
             timestamp = datetime.now().isoformat()
             
-            # 为每个币种保存历史数据
+            # 为每个币种保存历史数据 - 优化内存和磁盘使用
             for symbol in SUPPORTED_SYMBOLS:
                 premium_data = data_collector.calculate_premium(symbol)
                 
@@ -39,7 +109,7 @@ def background_data_collection():
                     if symbol in all_data[exchange]:
                         symbol_data = all_data[exchange][symbol]
                         if symbol_data['spot'] or symbol_data['futures']:
-                            # 保存到内存（用于实时显示）
+                            # 保存到优化的内存管理器
                             historical_entry = {
                                 'timestamp': timestamp,
                                 'spot_price': symbol_data['spot'].get('price', 0),
@@ -48,31 +118,77 @@ def background_data_collection():
                                 'premium': premium_data.get(exchange, {}).get('premium_percent', 0)
                             }
                             
-                            # 保持历史数据不超过1000条
-                            if len(historical_data[symbol][exchange]) >= 1000:
-                                historical_data[symbol][exchange].pop(0)
-                            historical_data[symbol][exchange].append(historical_entry)
+                            # 使用内存管理器添加记录
+                            memory_manager.add_record(symbol, exchange, historical_entry)
                             
-                            # 保存到数据库（用于持久化和图表展示）
-                            db.save_price_data(symbol, exchange, symbol_data, premium_data)
+                            # 批量保存到数据库以减少磁盘IO
+                            batch_buffer.append({
+                                'symbol': symbol,
+                                'exchange': exchange,
+                                'symbol_data': symbol_data,
+                                'premium_data': premium_data
+                            })
+                            
+                            # 当批处理缓冲区满时，批量写入数据库
+                            if len(batch_buffer) >= batch_size:
+                                try:
+                                    for batch_item in batch_buffer:
+                                        db.save_price_data(
+                                            batch_item['symbol'],
+                                            batch_item['exchange'],
+                                            batch_item['symbol_data'],
+                                            batch_item['premium_data']
+                                        )
+                                    batch_buffer.clear()
+                                    print(f"批量写入数据库完成: {batch_size} 条记录")
+                                except Exception as e:
+                                    print(f"批量写入数据库失败: {e}")
+                                    batch_buffer.clear()  # 清空缓冲区避免重复尝试
             
-            # 数据库维护任务（每1分钟执行一次）
+            # 定期维护任务（每5分钟执行一次）
             current_time = datetime.now()
             if (current_time - last_maintenance).seconds >= maintenance_interval:
                 try:
-                    print("开始数据库维护任务...")
+                    print("开始定期维护任务...")
                     
-                    # 数据聚合：将原始数据聚合为1分钟精度
+                    # 写入剩余的批处理数据
+                    if batch_buffer:
+                        print(f"写入剩余批处理数据: {len(batch_buffer)} 条记录")
+                        for batch_item in batch_buffer:
+                            db.save_price_data(
+                                batch_item['symbol'],
+                                batch_item['exchange'],
+                                batch_item['symbol_data'],
+                                batch_item['premium_data']
+                            )
+                        batch_buffer.clear()
+                    
+                    # 内存清理
+                    memory_manager.cleanup_memory()
+                    
+                    # 强制垃圾回收
+                    collected = gc.collect()
+                    if collected > 0:
+                        print(f"垃圾回收: 清理了 {collected} 个对象")
+                    
+                    # 资源监控
+                    try:
+                        process = psutil.Process(os.getpid())
+                        memory_info = process.memory_info()
+                        cpu_percent = process.cpu_percent()
+                        print(f"资源使用: 内存 {memory_info.rss / 1024 / 1024:.1f}MB, CPU {cpu_percent:.1f}%")
+                    except:
+                        pass  # 忽略监控错误
+                    
+                    # 数据库维护（降低频率）
                     db.aggregate_to_1min()
-                    
-                    # 数据清理：清理7天前的原始数据，保留30天的1分钟数据
                     db.cleanup_old_data()
                     
                     last_maintenance = current_time
-                    print("数据库维护任务完成")
+                    print("定期维护任务完成")
                     
                 except Exception as e:
-                    print(f"数据库维护错误: {e}")
+                    print(f"定期维护错误: {e}")
             
             # 仅显示当前币种的更新日志
             current_symbol = data_collector.current_symbol
@@ -91,8 +207,8 @@ def background_data_collection():
 
 @app.route('/')
 def index():
-    """主页 - 按币种聚合展示所有可用币种"""
-    return render_template('aggregated_index.html', 
+    """主页 - 增强版按币种聚合展示所有可用币种"""
+    return render_template('enhanced_aggregated.html', 
                          symbols=data_collector.supported_symbols)
 
 @app.route('/exchanges')
@@ -147,8 +263,9 @@ def get_all_data():
 def get_historical_data(symbol):
     """获取内存中的历史数据API (用于实时图表)"""
     symbol = symbol.upper()
-    if symbol in historical_data:
-        return jsonify(historical_data[symbol])
+    data = memory_manager.get_data(symbol)
+    if data:
+        return jsonify(data)
     return jsonify({})
 
 @app.route('/api/history/<symbol>/database')
@@ -420,13 +537,77 @@ def manual_maintenance():
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
+@app.route('/api/system/status')
+def get_system_status():
+    """获取系统状态监控API"""
+    try:
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        
+        # 获取内存管理器状态
+        memory_stats = {}
+        for symbol, symbol_data in memory_manager.data.items():
+            total_records = sum(len(exchange_data) for exchange_data in symbol_data.values())
+            if total_records > 0:
+                memory_stats[symbol] = total_records
+        
+        status = {
+            'system': {
+                'memory_usage_mb': round(memory_info.rss / 1024 / 1024, 1),
+                'cpu_percent': process.cpu_percent(),
+                'threads_count': process.num_threads(),
+                'connections_count': len(data_collector.ws_connections),
+            },
+            'data': {
+                'total_symbols': len(CURRENT_SUPPORTED_SYMBOLS),
+                'active_memory_symbols': len(memory_stats),
+                'memory_records_per_symbol': memory_stats,
+                'max_records_per_exchange': MEMORY_OPTIMIZATION_CONFIG['max_historical_records']
+            },
+            'connections': {
+                'websocket_status': {
+                    name: 'connected' if ws else 'disconnected'
+                    for name, ws in data_collector.ws_connections.items()
+                },
+                'reconnect_attempts': data_collector.reconnect_attempts
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        return jsonify(status)
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
 if __name__ == '__main__':
+    print("🚀 启动WLFI资金费率监控系统...")
+    
+    # 显示优化配置信息
+    print(f"📊 监控币种数量: {len(CURRENT_SUPPORTED_SYMBOLS)}")
+    print(f"⚡ 数据更新间隔: {DATA_REFRESH_INTERVAL}秒")
+    print(f"🔄 WebSocket数据间隔: {WS_UPDATE_INTERVAL}秒") 
+    print(f"💾 内存最大记录数: {MEMORY_OPTIMIZATION_CONFIG['max_historical_records']}")
+    print(f"🔧 最大重连次数: {WS_CONNECTION_CONFIG['max_reconnect_attempts']}")
+    print(f"🕒 重连基础延迟: {WS_CONNECTION_CONFIG['base_reconnect_delay']}秒")
+    
+    try:
+        # 显示系统资源
+        process = psutil.Process(os.getpid())
+        print(f"🖥️  初始内存使用: {process.memory_info().rss / 1024 / 1024:.1f}MB")
+    except:
+        pass
+    
+    print("📡 启动数据收集...")
     # 启动数据收集
     data_collector.start_all_connections()
     
+    print("🔄 启动后台数据处理...")
     # 启动后台数据收集线程
     background_thread = threading.Thread(target=background_data_collection, daemon=True)
     background_thread.start()
     
+    print("🌐 启动Web服务器...")
+    print("📊 系统状态监控: http://localhost:4002/api/system/status")
+    
     # 启动Flask应用
-    app.run(debug=False, host='0.0.0.0', port=5000, threaded=True)
+    app.run(debug=False, host='0.0.0.0', port=4002, threaded=True)

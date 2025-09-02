@@ -590,20 +590,11 @@
         // 获取聚合数据
         async function fetchAggregatedData() {
             try {
-                const response = await fetch('/api/data');
+                const response = await fetch('/api/aggregated_data');
                 const data = await response.json();
                 
-                // 重组数据结构：从 交易所->币种 改为 币种->交易所
-                const aggregatedData = {};
-                
-                Object.keys(data.realtime_data).forEach(exchange => {
-                    Object.keys(data.realtime_data[exchange]).forEach(symbol => {
-                        if (!aggregatedData[symbol]) {
-                            aggregatedData[symbol] = {};
-                        }
-                        aggregatedData[symbol][exchange] = data.realtime_data[exchange][symbol];
-                    });
-                });
+                // 数据结构已经是币种->交易所，直接使用
+                const aggregatedData = data.aggregated_data || {};
                 
                 updateSymbolsGrid(aggregatedData);
                 document.getElementById('lastUpdate').textContent = 
