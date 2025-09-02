@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多交易所实时价格监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #0d1421;
+            color: #ffffff;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        
+        .title {
+            font-size: 28px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #f0b90b 0%, #f8d12f 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .symbol-selector {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        .symbol-btn {
+            padding: 8px 16px;
+            border: 2px solid #3c4043;
+            background: #2b2f36;
+            color: #ffffff;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .symbol-btn:hover {
+            border-color: #f0b90b;
+            background: #f0b90b;
+            color: #000;
+        }
+        
+        .symbol-btn.active {
+            border-color: #f0b90b;
+            background: #f0b90b;
+            color: #000;
+            font-weight: 600;
+        }
+        
+        .exchanges-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        
+        .exchange-card {
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            border: 1px solid #3c4043;
+        }
+        
+        .exchange-name {
+            font-size: 20px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            text-transform: uppercase;
+            color: #f0b90b;
+        }
+        
+        .price-info {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 10px;
+        }
+        
+        .price-label {
+            color: #8e9297;
+            font-size: 14px;
+        }
+        
+        .price-value {
+            font-weight: 600;
+            font-size: 16px;
+        }
+        
+        .spot-price { color: #00d4aa; }
+        .futures-price { color: #f6465d; }
+        .funding-rate { color: #ffa500; }
+        .premium { color: #c99400; }
+        
+        .status {
+            text-align: center;
+            padding: 10px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+        }
+        
+        .connected { border-color: #00d4aa; color: #00d4aa; }
+        .disconnected { border-color: #f6465d; color: #f6465d; }
+        
+        .timestamp {
+            text-align: center;
+            color: #8e9297;
+            font-size: 12px;
+            margin-top: 10px;
+        }
+        
+        .loading {
+            text-align: center;
+            color: #8e9297;
+            font-style: italic;
+        }
+
+        .refresh-btn {
+            padding: 10px 20px;
+            background: #f0b90b;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            margin: 10px;
+        }
+        
+        .refresh-btn:hover {
+            background: #f8d12f;
+        }
+
+        .auto-refresh {
+            color: #00d4aa;
+            font-size: 12px;
+            text-align: center;
+            margin: 10px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">多交易所实时价格监控</div>
+        <div class="symbol-selector">
+            <span style="color: #8e9297; margin-right: 10px;">币种:</span>
+            {% for symbol in symbols %}
+            <button class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" 
+                    onclick="switchSymbol('{{ symbol }}')">{{ symbol }}</button>
+            {% endfor %}
+            <button class="refresh-btn" onclick="refreshData()">刷新</button>
+            <a href="/charts" class="refresh-btn" style="text-decoration: none; display: inline-block;">图表分析</a>
+        </div>
+    </div>
+    
+    <div id="status" class="status connected">实时监控中...</div>
+    <div class="auto-refresh">自动刷新每 1 秒</div>
+    
+    <div class="exchanges-grid" id="exchangesGrid">
+        <div class="loading">正在加载数据...</div>
+    </div>
+    
+    <div class="timestamp" id="lastUpdate">等待数据更新...</div>
+
+    <script>
+        let currentSymbol = '{{ current_symbol }}';
+        let refreshInterval;
+        
+        // 格式化资金费率显示
+        function formatFundingRate(rate) {
+            if (!rate || rate === 0) return '0.0000';
+            
+            const percentage = rate * 100;
+            
+            // 如果是很小的数值（科学计数法），使用更多小数位并避免科学计数法显示
+            if (Math.abs(percentage) < 0.001) {
+                return percentage.toFixed(6);
+            } else if (Math.abs(percentage) < 0.01) {
+                return percentage.toFixed(5);
+            } else if (Math.abs(percentage) < 0.1) {
+                return percentage.toFixed(4);
+            } else {
+                return percentage.toFixed(3);
+            }
+        }
+        
+        // 更新交易所卡片
+        function updateExchangeCards(realtimeData, premiumData) {
+            const grid = document.getElementById('exchangesGrid');
+            grid.innerHTML = '';
+            
+            for (const [exchange, data] of Object.entries(realtimeData)) {
+                const card = document.createElement('div');
+                card.className = 'exchange-card';
+                
+                const spotPrice = data.spot.price || 0;
+                const futuresPrice = data.futures.price || 0;
+                const fundingRate = data.futures.funding_rate || 0;
+                const premium = premiumData[exchange]?.premium_percent || 0;
+                
+                card.innerHTML = `
+                    <div class="exchange-name">${exchange}</div>
+                    <div class="price-info">
+                        <span class="price-label">现货价格:</span>
+                        <span class="price-value spot-price">$${spotPrice.toFixed(4)}</span>
+                    </div>
+                    <div class="price-info">
+                        <span class="price-label">期货价格:</span>
+                        <span class="price-value futures-price">$${futuresPrice.toFixed(4)}</span>
+                    </div>
+                    <div class="price-info">
+                        <span class="price-label">资金费率:</span>
+                        <span class="price-value funding-rate">${formatFundingRate(fundingRate)}%</span>
+                    </div>
+                    <div class="price-info">
+                        <span class="price-label">溢价指数:</span>
+                        <span class="price-value premium">${premium.toFixed(4)}%</span>
+                    </div>
+                `;
+                
+                grid.appendChild(card);
+            }
+        }
+        
+        // 获取数据
+        async function fetchData() {
+            try {
+                const response = await fetch('/api/data');
+                const data = await response.json();
+                
+                updateExchangeCards(data.realtime_data, data.premium_data);
+                document.getElementById('lastUpdate').textContent = 
+                    `最后更新: ${new Date(data.timestamp).toLocaleTimeString()}`;
+                    
+                document.getElementById('status').textContent = '实时监控中...';
+                document.getElementById('status').className = 'status connected';
+                
+            } catch (error) {
+                console.error('数据获取错误:', error);
+                document.getElementById('status').textContent = '连接错误';
+                document.getElementById('status').className = 'status disconnected';
+            }
+        }
+        
+        // 切换币种
+        async function switchSymbol(symbol) {
+            try {
+                const response = await fetch('/api/switch_symbol', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({symbol: symbol})
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    currentSymbol = symbol;
+                    
+                    // 更新按钮状态
+                    document.querySelectorAll('.symbol-btn').forEach(btn => {
+                        btn.classList.remove('active');
+                        if (btn.textContent === symbol) {
+                            btn.classList.add('active');
+                        }
+                    });
+                    
+                    // 立即刷新数据
+                    await fetchData();
+                }
+            } catch (error) {
+                console.error('切换币种错误:', error);
+            }
+        }
+        
+        // 手动刷新
+        function refreshData() {
+            fetchData();
+        }
+        
+        // 开始自动刷新
+        function startAutoRefresh() {
+            refreshInterval = setInterval(fetchData, 1000); // 每1秒刷新
+        }
+        
+        // 页面加载完成后开始
+        document.addEventListener('DOMContentLoaded', function() {
+            fetchData(); // 立即获取一次数据
+            startAutoRefresh(); // 开始自动刷新
+        });
+        
+        // 页面失去焦点时停止刷新，获得焦点时重新开始
+        window.addEventListener('blur', () => clearInterval(refreshInterval));
+        window.addEventListener('focus', startAutoRefresh);
+    </script>
+</body>
+</html>

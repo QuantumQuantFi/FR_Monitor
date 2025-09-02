@@ -1,0 +1,571 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WLFI 时序图表监控</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #0d1421;
+            color: #ffffff;
+        }
+        
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 30px;
+            padding: 20px;
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+        }
+        
+        .title {
+            font-size: 28px;
+            font-weight: 600;
+            background: linear-gradient(135deg, #f0b90b 0%, #f8d12f 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 15px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        
+        .control-group {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .control-label {
+            color: #8e9297;
+            font-size: 14px;
+            white-space: nowrap;
+        }
+        
+        .symbol-btn {
+            padding: 8px 16px;
+            border: 2px solid #3c4043;
+            background: #2b2f36;
+            color: #ffffff;
+            border-radius: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            font-size: 12px;
+        }
+        
+        .symbol-btn:hover {
+            border-color: #f0b90b;
+            background: #f0b90b;
+            color: #000;
+        }
+        
+        .symbol-btn.active {
+            border-color: #f0b90b;
+            background: #f0b90b;
+            color: #000;
+            font-weight: 600;
+        }
+        
+        .time-selector, .exchange-selector {
+            padding: 6px 12px;
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+            color: #ffffff;
+            border-radius: 8px;
+            cursor: pointer;
+        }
+        
+        .time-selector:focus, .exchange-selector:focus {
+            outline: none;
+            border-color: #f0b90b;
+        }
+        
+        .refresh-btn {
+            padding: 8px 16px;
+            background: #f0b90b;
+            color: #000;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        
+        .refresh-btn:hover {
+            background: #f8d12f;
+        }
+        
+        .chart-container {
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+            border: 1px solid #3c4043;
+        }
+        
+        .chart-title {
+            font-size: 18px;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #f0b90b;
+            text-align: center;
+        }
+        
+        .chart-wrapper {
+            position: relative;
+            height: 400px;
+            width: 100%;
+        }
+        
+        .status {
+            text-align: center;
+            padding: 10px;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+        }
+        
+        .connected { border-color: #00d4aa; color: #00d4aa; }
+        .loading { border-color: #ffa500; color: #ffa500; }
+        .error { border-color: #f6465d; color: #f6465d; }
+        
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .stat-card {
+            background: #2b2f36;
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #3c4043;
+            text-align: center;
+        }
+        
+        .stat-label {
+            color: #8e9297;
+            font-size: 12px;
+            margin-bottom: 5px;
+        }
+        
+        .stat-value {
+            font-size: 16px;
+            font-weight: 600;
+            color: #ffffff;
+        }
+        
+        .chart-help {
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+            font-size: 12px;
+            color: #8e9297;
+        }
+        
+        .help-title {
+            color: #f0b90b;
+            font-weight: 600;
+            margin-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="title">WLFI 时序图表监控</div>
+        <div class="controls">
+            <div class="control-group">
+                <span class="control-label">币种:</span>
+                {% for symbol in symbols %}
+                <button class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" 
+                        onclick="switchSymbol('{{ symbol }}')" data-symbol="{{ symbol }}">{{ symbol }}</button>
+                {% endfor %}
+            </div>
+            <div class="control-group">
+                <span class="control-label">时间范围:</span>
+                <select class="time-selector" id="timeRange" onchange="updateCharts()">
+                    <option value="1" selected>1小时</option>
+                    <option value="6">6小时</option>
+                    <option value="24">24小时</option>
+                    <option value="168">7天</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <span class="control-label">交易所:</span>
+                <select class="exchange-selector" id="exchangeFilter" onchange="updateCharts()">
+                    <option value="">所有交易所</option>
+                    <option value="okx">OKX</option>
+                    <option value="binance">Binance</option>
+                    <option value="bybit">Bybit</option>
+                    <option value="bitget">Bitget</option>
+                </select>
+            </div>
+            <button class="refresh-btn" onclick="updateCharts()">刷新</button>
+            <a href="/" class="refresh-btn" style="text-decoration: none; display: inline-block;">实时监控</a>
+        </div>
+    </div>
+    
+    <div id="status" class="status loading">正在加载图表数据...</div>
+    
+    <div class="chart-help">
+        <div class="help-title">图表操作说明</div>
+        <div>• 使用鼠标滚轮缩放时间轴 • 拖拽图表进行平移 • 双击重置缩放 • 点击图例隐藏/显示数据系列</div>
+    </div>
+    
+    <div class="stats-grid" id="statsGrid">
+        <!-- 统计信息将通过JavaScript动态添加 -->
+    </div>
+    
+    <div class="chart-container">
+        <div class="chart-title">现货价格走势</div>
+        <div class="chart-wrapper">
+            <canvas id="spotPriceChart"></canvas>
+        </div>
+    </div>
+    
+    <div class="chart-container">
+        <div class="chart-title">期货价格走势</div>
+        <div class="chart-wrapper">
+            <canvas id="futuresPriceChart"></canvas>
+        </div>
+    </div>
+    
+    <div class="chart-container">
+        <div class="chart-title">资金费率走势</div>
+        <div class="chart-wrapper">
+            <canvas id="fundingRateChart"></canvas>
+        </div>
+    </div>
+    
+    <div class="chart-container">
+        <div class="chart-title">溢价指数走势</div>
+        <div class="chart-wrapper">
+            <canvas id="premiumChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        let currentSymbol = '{{ current_symbol }}';
+        let charts = {};
+        let chartData = {};
+        
+        // 交易所颜色配置
+        const exchangeColors = {
+            'okx': '#1890ff',
+            'binance': '#f0b90b', 
+            'bybit': '#f6465d',
+            'bitget': '#00d4aa'
+        };
+        
+        // Chart.js默认配置
+        Chart.defaults.color = '#ffffff';
+        Chart.defaults.backgroundColor = '#2b2f36';
+        Chart.defaults.borderColor = '#3c4043';
+        
+        // 通用图表配置
+        function getChartConfig(type, datasets) {
+            return {
+                type: 'line',
+                data: {
+                    datasets: datasets
+                },
+                options: {
+                    responsive: true,
+                    maintainAspectRatio: false,
+                    plugins: {
+                        zoom: {
+                            zoom: {
+                                wheel: {
+                                    enabled: true,
+                                },
+                                drag: {
+                                    enabled: true,
+                                },
+                                pinch: {
+                                    enabled: true
+                                },
+                                mode: 'x',
+                            },
+                            pan: {
+                                enabled: true,
+                                mode: 'x',
+                            }
+                        },
+                        legend: {
+                            position: 'top',
+                            labels: {
+                                usePointStyle: true,
+                                color: '#ffffff'
+                            }
+                        }
+                    },
+                    scales: {
+                        x: {
+                            type: 'time',
+                            time: {
+                                displayFormats: {
+                                    minute: 'HH:mm',
+                                    hour: 'MM-dd HH:mm'
+                                }
+                            },
+                            grid: {
+                                color: '#3c4043'
+                            },
+                            ticks: {
+                                color: '#8e9297'
+                            }
+                        },
+                        y: {
+                            beginAtZero: false,
+                            grid: {
+                                color: '#3c4043'
+                            },
+                            ticks: {
+                                color: '#8e9297',
+                                callback: function(value) {
+                                    if (type === 'funding' || type === 'premium') {
+                                        return value.toFixed(4) + '%';
+                                    }
+                                    return '$' + value.toFixed(4);
+                                }
+                            }
+                        }
+                    },
+                    interaction: {
+                        intersect: false,
+                        mode: 'index'
+                    },
+                    elements: {
+                        point: {
+                            radius: 0,
+                            hoverRadius: 4
+                        },
+                        line: {
+                            borderWidth: 2,
+                            tension: 0.1
+                        }
+                    }
+                }
+            };
+        }
+        
+        // 初始化图表
+        function initCharts() {
+            const ctxSpot = document.getElementById('spotPriceChart').getContext('2d');
+            const ctxFutures = document.getElementById('futuresPriceChart').getContext('2d');
+            const ctxFunding = document.getElementById('fundingRateChart').getContext('2d');
+            const ctxPremium = document.getElementById('premiumChart').getContext('2d');
+            
+            charts.spot = new Chart(ctxSpot, getChartConfig('price', []));
+            charts.futures = new Chart(ctxFutures, getChartConfig('price', []));
+            charts.funding = new Chart(ctxFunding, getChartConfig('funding', []));
+            charts.premium = new Chart(ctxPremium, getChartConfig('premium', []));
+        }
+        
+        // 更新图表数据
+        function updateChartData() {
+            const timeRange = document.getElementById('timeRange').value;
+            const exchangeFilter = document.getElementById('exchangeFilter').value;
+            
+            // 构建API URL
+            let url = `/api/chart/${currentSymbol}?hours=${timeRange}&interval=1min`;
+            if (exchangeFilter) {
+                url += `&exchange=${exchangeFilter}`;
+            }
+            
+            document.getElementById('status').textContent = '正在加载数据...';
+            document.getElementById('status').className = 'status loading';
+            
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        throw new Error(data.error);
+                    }
+                    
+                    chartData = data.chart_data;
+                    updateAllCharts();
+                    updateStats(data);
+                    
+                    document.getElementById('status').textContent = '数据加载完成 • WLFI监控活跃';
+                    document.getElementById('status').className = 'status connected';
+                })
+                .catch(error => {
+                    console.error('数据加载错误:', error);
+                    document.getElementById('status').textContent = '数据加载失败: ' + error.message;
+                    document.getElementById('status').className = 'status error';
+                });
+        }
+        
+        // 更新所有图表
+        function updateAllCharts() {
+            const exchangeFilter = document.getElementById('exchangeFilter').value;
+            const exchanges = exchangeFilter ? [exchangeFilter] : Object.keys(chartData);
+            
+            // 现货价格图表
+            const spotDatasets = exchanges.map(exchange => ({
+                label: exchange.toUpperCase() + ' 现货',
+                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                    x: label,
+                    y: chartData[exchange].spot_prices[index]
+                })) : [],
+                borderColor: exchangeColors[exchange] || '#ffffff',
+                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                fill: false
+            }));
+            
+            // 期货价格图表
+            const futuresDatasets = exchanges.map(exchange => ({
+                label: exchange.toUpperCase() + ' 期货',
+                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                    x: label,
+                    y: chartData[exchange].futures_prices[index]
+                })) : [],
+                borderColor: exchangeColors[exchange] || '#ffffff',
+                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                fill: false
+            }));
+            
+            // 资金费率图表
+            const fundingDatasets = exchanges.map(exchange => ({
+                label: exchange.toUpperCase() + ' 资金费率',
+                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                    x: label,
+                    y: chartData[exchange].funding_rates[index] * 100 // 转换为百分比
+                })) : [],
+                borderColor: exchangeColors[exchange] || '#ffffff',
+                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                fill: false
+            }));
+            
+            // 溢价指数图表
+            const premiumDatasets = exchanges.map(exchange => ({
+                label: exchange.toUpperCase() + ' 溢价',
+                data: chartData[exchange] ? chartData[exchange].labels.map((label, index) => ({
+                    x: label,
+                    y: chartData[exchange].premiums[index]
+                })) : [],
+                borderColor: exchangeColors[exchange] || '#ffffff',
+                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                fill: false
+            }));
+            
+            // 更新图表
+            charts.spot.data.datasets = spotDatasets;
+            charts.futures.data.datasets = futuresDatasets;
+            charts.funding.data.datasets = fundingDatasets;
+            charts.premium.data.datasets = premiumDatasets;
+            
+            // 刷新图表
+            Object.values(charts).forEach(chart => chart.update('none'));
+        }
+        
+        // 更新统计信息
+        function updateStats(data) {
+            const statsGrid = document.getElementById('statsGrid');
+            const exchanges = Object.keys(data.chart_data);
+            
+            let statsHtml = '';
+            exchanges.forEach(exchange => {
+                const exchangeData = data.chart_data[exchange];
+                if (exchangeData && exchangeData.spot_prices.length > 0) {
+                    const latestSpot = exchangeData.spot_prices[exchangeData.spot_prices.length - 1];
+                    const latestFutures = exchangeData.futures_prices[exchangeData.futures_prices.length - 1];
+                    const latestFunding = exchangeData.funding_rates[exchangeData.funding_rates.length - 1];
+                    const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
+                    
+                    statsHtml += `
+                        <div class="stat-card">
+                            <div class="stat-label">${exchange.toUpperCase()} 最新数据</div>
+                            <div class="stat-value" style="color: ${exchangeColors[exchange]}">
+                                现货: $${latestSpot.toFixed(4)}<br>
+                                期货: $${latestFutures.toFixed(4)}<br>
+                                资金费率: ${(latestFunding * 100).toFixed(4)}%<br>
+                                溢价: ${latestPremium.toFixed(4)}%
+                            </div>
+                        </div>
+                    `;
+                }
+            });
+            
+            if (statsHtml === '') {
+                statsHtml = '<div class="stat-card"><div class="stat-value">暂无数据</div></div>';
+            }
+            
+            statsGrid.innerHTML = statsHtml;
+        }
+        
+        // 切换币种
+        async function switchSymbol(symbol) {
+            try {
+                const response = await fetch('/api/switch_symbol', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({symbol: symbol})
+                });
+                
+                const result = await response.json();
+                
+                if (result.status === 'success') {
+                    currentSymbol = symbol;
+                    
+                    // 更新按钮状态
+                    document.querySelectorAll('.symbol-btn').forEach(btn => {
+                        btn.classList.remove('active');
+                        if (btn.dataset.symbol === symbol) {
+                            btn.classList.add('active');
+                        }
+                    });
+                    
+                    // 更新图表
+                    updateChartData();
+                }
+            } catch (error) {
+                console.error('切换币种错误:', error);
+            }
+        }
+        
+        // 更新图表
+        function updateCharts() {
+            updateChartData();
+        }
+        
+        // 重置缩放
+        function resetZoom() {
+            Object.values(charts).forEach(chart => {
+                chart.resetZoom();
+            });
+        }
+        
+        // 页面加载完成后初始化
+        document.addEventListener('DOMContentLoaded', function() {
+            initCharts();
+            updateChartData();
+            
+            // 设置定时刷新（每30秒）
+            setInterval(updateChartData, 30000);
+        });
+        
+        // 双击重置缩放
+        document.addEventListener('dblclick', resetZoom);
+    </script>
+</body>
+</html>
