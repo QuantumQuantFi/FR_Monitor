@@ -296,6 +296,78 @@
             border-radius: 8px;
         }
 
+        /* 价差横幅基础样式 */
+        .price-diff-banner {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            padding: 10px 12px;
+            border-radius: 10px;
+            border: 1px solid rgba(255,255,255,0.12);
+            margin-bottom: 10px;
+        }
+        .price-diff-banner .diff-left {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .price-diff-banner .diff-percent {
+            font-size: 18px; /* 字体更大更明显 */
+            font-weight: 800;
+            line-height: 1;
+        }
+        .price-diff-banner .diff-label {
+            font-size: 11px;
+            opacity: 0.85;
+        }
+        .price-diff-banner .diff-right {
+            text-align: right;
+            line-height: 1.2;
+        }
+        .price-diff-banner .diff-meta {
+            font-size: 11px; /* 比之前更大 */
+            font-weight: 600;
+        }
+        .price-diff-banner .diff-meta .high { margin-bottom: 2px; }
+
+        /* 四种不同组合样式 */
+        /* ① 高=现货, 低=现货 */
+        .price-diff-style-1 {
+            background: rgba(34, 197, 94, 0.12);
+            border-color: rgba(34, 197, 94, 0.35);
+        }
+        .price-diff-style-1 .diff-percent { color: #22c55e; }
+        .price-diff-style-1 .diff-label { color: #16a34a; }
+        .price-diff-style-1 .diff-right { color: #86efac; }
+
+        /* ② 高=现货, 低=期货 */
+        .price-diff-style-2 {
+            background: rgba(59, 130, 246, 0.12);
+            border-color: rgba(59, 130, 246, 0.35);
+        }
+        .price-diff-style-2 .diff-percent { color: #3b82f6; }
+        .price-diff-style-2 .diff-label { color: #60a5fa; }
+        .price-diff-style-2 .diff-right { color: #bfdbfe; }
+
+        /* ③ 高=期货, 低=现货 */
+        .price-diff-style-3 {
+            background: rgba(245, 158, 11, 0.12);
+            border-color: rgba(245, 158, 11, 0.35);
+        }
+        .price-diff-style-3 .diff-percent { color: #f59e0b; }
+        .price-diff-style-3 .diff-label { color: #fbbf24; }
+        .price-diff-style-3 .diff-right { color: #fde68a; }
+
+        /* ④ 高=期货, 低=期货 */
+        .price-diff-style-4 {
+            background: rgba(244, 63, 94, 0.12);
+            border-color: rgba(244, 63, 94, 0.35);
+        }
+        .price-diff-style-4 .diff-percent { color: #f43f5e; }
+        .price-diff-style-4 .diff-label { color: #fb7185; }
+        .price-diff-style-4 .diff-right { color: #fecdd3; }
+
         @media (max-width: 768px) {
             .header-top {
                 flex-direction: column;
@@ -411,20 +483,36 @@
             }
         }
 
-        // 格式化资金费率 - 保持原始精度
+        // 格式化资金费率 - 保持原始精度，避免科学计数法
         function formatFundingRate(rate) {
-            if (!rate || rate === 0) return '-';
-            // 避免不必要的精度损失
-            const num = parseFloat(rate);
+            if (!rate || rate === 0 || rate === '0') return '-';
+            
+            // 处理字符串或数字类型的资金费率
+            let num;
+            if (typeof rate === 'string') {
+                // 如果后端传来高精度字符串，直接使用
+                num = parseFloat(rate);
+            } else {
+                num = rate;
+            }
+            
+            if (num === 0) return '-';
+            
             const percentage = num * 100;
             
-            // 根据数值大小选择合适的小数位数
+            // 根据数值大小选择合适的小数位数，避免科学计数法
             if (Math.abs(percentage) >= 1) {
-                return `${parseFloat(percentage.toFixed(4))}%`;
+                // 大于1%，保留4位小数
+                return `${percentage.toFixed(4)}%`;
             } else if (Math.abs(percentage) >= 0.01) {
-                return `${parseFloat(percentage.toFixed(6))}%`;
+                // 0.01%-1%，保留6位小数
+                return `${percentage.toFixed(6)}%`;
+            } else if (Math.abs(percentage) >= 0.0001) {
+                // 0.0001%-0.01%，保留8位小数
+                return `${percentage.toFixed(8)}%`;
             } else {
-                return `${parseFloat(percentage.toFixed(8))}%`;
+                // 非常小的值，保留10位小数避免科学计数法
+                return `${percentage.toFixed(10)}%`;
             }
         }
 
@@ -476,6 +564,8 @@
                 minPrice: minPrice,
                 maxExchange: maxPriceInfo.exchange + '(' + maxPriceInfo.type + ')',
                 minExchange: minPriceInfo.exchange + '(' + minPriceInfo.type + ')',
+                maxType: maxPriceInfo.type,
+                minType: minPriceInfo.type,
                 diffPercent: diffPercent,
                 diffAmount: maxPrice - minPrice
             };
@@ -543,18 +633,27 @@
                 let priceDiffDisplay = '';
                 
                 if (priceDiff && priceDiff.diffPercent >= 0.01) { // 显示价差大于0.01%的情况
+                    // 根据最高/最低的类型选择样式
+                    let styleClass = 'price-diff-style-1';
+                    if (priceDiff.maxType === 'spot' && priceDiff.minType === 'spot') {
+                        styleClass = 'price-diff-style-1';
+                    } else if (priceDiff.maxType === 'spot' && priceDiff.minType === 'futures') {
+                        styleClass = 'price-diff-style-2';
+                    } else if (priceDiff.maxType === 'futures' && priceDiff.minType === 'spot') {
+                        styleClass = 'price-diff-style-3';
+                    } else if (priceDiff.maxType === 'futures' && priceDiff.minType === 'futures') {
+                        styleClass = 'price-diff-style-4';
+                    }
+
                     priceDiffDisplay = `
-                        <div style="background: rgba(240, 185, 11, 0.15); padding: 6px 8px; border-radius: 6px; margin-bottom: 8px; border: 1px solid rgba(240, 185, 11, 0.3); display: flex; justify-content: space-between; align-items: center;">
-                            <div style="display: flex; align-items: center; gap: 8px;">
-                                <span style="font-size: 10px; color: #f0b90b;">💰</span>
-                                <div>
-                                    <div style="font-size: 13px; font-weight: bold; color: #22c55e;">${parseFloat(priceDiff.diffPercent.toFixed(4))}%</div>
-                                    <div style="font-size: 9px; color: #8c8c8c;">最大价差</div>
-                                </div>
+                        <div class="price-diff-banner ${styleClass}">
+                            <div class="diff-left">
+                                <span class="diff-label">最大价差</span>
+                                <span class="diff-percent">${parseFloat(priceDiff.diffPercent.toFixed(4))}%</span>
                             </div>
-                            <div style="text-align: right; font-size: 9px; color: #8c8c8c; line-height: 1.2;">
-                                <div>高: ${priceDiff.maxExchange}</div>
-                                <div>低: ${priceDiff.minExchange}</div>
+                            <div class="diff-right diff-meta">
+                                <div class="high">高: ${priceDiff.maxExchange}</div>
+                                <div class="low">低: ${priceDiff.minExchange}</div>
                             </div>
                         </div>
                     `;
