@@ -6,12 +6,64 @@ import gc
 import psutil
 import os
 from datetime import datetime
+from decimal import Decimal
 from exchange_connectors import ExchangeDataCollector
 from config import SUPPORTED_SYMBOLS, DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
 
+# 自定义JSON编码器以保持数值精度，避免科学计数法
+class PrecisionJSONEncoder(json.JSONEncoder):
+    def _process_value(self, key, value):
+        """处理单个值，特别关注资金费率字段的精度"""
+        if key == 'funding_rate' and isinstance(value, (int, float)) and value != 0:
+            # 保持12位小数精度，去除末尾零，避免科学计数法
+            return f"{value:.12f}".rstrip('0').rstrip('.')
+        elif isinstance(value, float) and value != 0:
+            # 对其他浮点数也避免科学计数法，保持合适精度
+            if abs(value) < 0.001:
+                return f"{value:.12f}".rstrip('0').rstrip('.')
+            elif abs(value) < 1:
+                return f"{value:.8f}".rstrip('0').rstrip('.')
+            else:
+                return value
+        return value
+    
+    def _process_object(self, obj):
+        """递归处理对象，保持数值精度"""
+        if isinstance(obj, dict):
+            return {key: self._process_object(self._process_value(key, value)) 
+                   for key, value in obj.items()}
+        elif isinstance(obj, list):
+            return [self._process_object(item) for item in obj]
+        return obj
+    
+    def encode(self, obj):
+        processed_obj = self._process_object(obj)
+        return super().encode(processed_obj)
+    
+    def iterencode(self, obj, _one_shot=False):
+        processed_obj = self._process_object(obj)
+        return super().iterencode(processed_obj, _one_shot)
+
 app = Flask(__name__)
+
+# 配置Flask应用使用自定义JSON编码器
+app.json_encoder = PrecisionJSONEncoder
+
+# 自定义高精度JSON响应函数
+def precision_jsonify(*args, **kwargs):
+    """使用自定义编码器的jsonify，保持数值精度"""
+    from flask import Response
+    if args and kwargs:
+        raise TypeError('jsonify() takes either *args or **kwargs, not both')
+    if args:
+        data = args[0] if len(args) == 1 else args
+    else:
+        data = kwargs
+    
+    json_string = json.dumps(data, cls=PrecisionJSONEncoder, ensure_ascii=False, separators=(',', ':'))
+    return Response(json_string, mimetype='application/json')
 
 # 全局数据收集器
 data_collector = ExchangeDataCollector()
@@ -220,8 +272,8 @@ def exchanges_view():
 
 @app.route('/aggregated')
 def aggregated_index():
-    """聚合页面 - 按币种聚合展示（重定向到主页）"""
-    return render_template('aggregated_index.html', 
+    """聚合页面（兼容路由）- 使用增强版聚合视图"""
+    return render_template('enhanced_aggregated.html', 
                          symbols=data_collector.supported_symbols)
 
 @app.route('/charts')
@@ -247,7 +299,7 @@ def get_current_data():
     symbol_data = data_collector.get_symbol_data(current_symbol)
     premium_data = data_collector.calculate_premium(current_symbol)
     
-    return jsonify({
+    return precision_jsonify({
         'realtime_data': symbol_data,
         'premium_data': premium_data,
         'symbol': current_symbol,
@@ -260,7 +312,7 @@ def get_all_data():
     all_data = data_collector.get_all_data()
     all_premiums = data_collector.calculate_all_premiums()
     
-    return jsonify({
+    return precision_jsonify({
         'all_realtime_data': all_data,
         'all_premium_data': all_premiums,
         'supported_symbols': SUPPORTED_SYMBOLS,
