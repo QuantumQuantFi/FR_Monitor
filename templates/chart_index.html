@@ -126,6 +126,49 @@
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             border: 1px solid #3c4043;
         }
+        /* 单币种信息卡片（与增强页一致风格） */
+        .symbol-card {
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border: 1px solid #3c4043;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .symbol-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #3c4043; }
+        .symbol-name { font-size: 18px; font-weight: 700; color: #f0b90b; }
+        .exchange-count { font-size: 11px; color: #8c8c8c; background: rgba(60,64,67,0.5); padding: 4px 8px; border-radius: 10px; }
+        .exchanges-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .exchange-box { background: rgba(43,47,54,0.6); border: 1px solid #3c4043; border-radius: 8px; padding: 12px; }
+        .exchange-name { font-size: 12px; font-weight: 600; color: #f0b90b; margin-bottom: 8px; text-transform: uppercase; }
+        .price-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px; }
+        .price-label { font-size: 10px; color: #8c8c8c; }
+        .price-value { font-size: 12px; font-weight: 600; color: #ffffff; }
+        .funding-rate { font-size: 10px; padding: 2px 6px; border-radius: 4px; font-weight: 500; }
+        .funding-rate.positive { background: rgba(34,197,94,0.2); color: #22c55e; }
+        .funding-rate.negative { background: rgba(239,68,68,0.2); color: #ef4444; }
+        .funding-rate.neutral { background: rgba(156,163,175,0.2); color: #9ca3af; }
+        .price-diff-banner { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.12); margin-bottom: 10px; }
+        .price-diff-banner .diff-left { display: flex; align-items: center; gap: 10px; }
+        .price-diff-banner .diff-percent { font-size: 18px; font-weight: 800; line-height: 1; }
+        .price-diff-banner .diff-label { font-size: 11px; opacity: 0.85; }
+        .price-diff-banner .diff-right { text-align: right; line-height: 1.2; }
+        .price-diff-banner .diff-meta { font-size: 11px; font-weight: 600; }
+        .price-diff-style-1 { background: rgba(34,197,94,0.12); border-color: rgba(34,197,94,0.35); }
+        .price-diff-style-1 .diff-percent { color: #22c55e; }
+        .price-diff-style-1 .diff-label { color: #16a34a; }
+        .price-diff-style-1 .diff-right { color: #86efac; }
+        .price-diff-style-2 { background: rgba(59,130,246,0.12); border-color: rgba(59,130,246,0.35); }
+        .price-diff-style-2 .diff-percent { color: #3b82f6; }
+        .price-diff-style-2 .diff-label { color: #60a5fa; }
+        .price-diff-style-2 .diff-right { color: #bfdbfe; }
+        .price-diff-style-3 { background: rgba(245,158,11,0.12); border-color: rgba(245,158,11,0.35); }
+        .price-diff-style-3 .diff-percent { color: #f59e0b; }
+        .price-diff-style-3 .diff-label { color: #fbbf24; }
+        .price-diff-style-3 .diff-right { color: #fde68a; }
+        .price-diff-style-4 { background: rgba(244,63,94,0.12); border-color: rgba(244,63,94,0.35); }
+        .price-diff-style-4 .diff-percent { color: #f43f5e; }
+        .price-diff-style-4 .diff-label { color: #fb7185; }
+        .price-diff-style-4 .diff-right { color: #fecdd3; }
         
         .chart-title {
             font-size: 18px;
@@ -242,6 +285,18 @@
     </div>
     
     <div id="status" class="status loading">正在加载图表数据...</div>
+
+    <!-- 单币种卡片（与增强页一致） -->
+    <div id="symbolCard" class="symbol-card">
+        <div class="symbol-header">
+            <div class="symbol-name">{{ current_symbol }}</div>
+            <div class="exchange-count" id="exchangeCount">- 交易所</div>
+        </div>
+        <div id="priceDiffBanner"></div>
+        <div class="exchanges-grid" id="symbolExchangesGrid">
+            <div style="color:#8c8c8c;">加载中...</div>
+        </div>
+    </div>
     
     <div class="chart-help">
         <div class="help-title">图表操作说明</div>
@@ -267,6 +322,13 @@
     </div>
     
     <div class="chart-container">
+        <div class="chart-title">现货 + 期货（合并）</div>
+        <div class="chart-wrapper">
+            <canvas id="combinedPriceChart"></canvas>
+        </div>
+    </div>
+    
+    <div class="chart-container">
         <div class="chart-title">资金费率走势</div>
         <div class="chart-wrapper">
             <canvas id="fundingRateChart"></canvas>
@@ -286,6 +348,30 @@
         let charts = {};
         let chartData = {};
         
+        // 统一解析后端时间戳：
+        // - 若无时区信息，按UTC处理（修复UTC+8 显示“晚8小时”问题）
+        // - 支持秒/毫秒时间戳
+        function parseTimestamp(ts) {
+            if (!ts && ts !== 0) return null;
+            if (typeof ts === 'number') {
+                return ts < 1e12 ? new Date(ts * 1000) : new Date(ts);
+            }
+            if (typeof ts === 'string') {
+                // 支持 "YYYY-MM-DD HH:mm:ss" 形式
+                if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ts)) {
+                    return new Date(ts.replace(' ', 'T') + 'Z');
+                }
+                // ISO且无时区偏移时，默认补Z为UTC
+                const hasOffset = /[zZ]|[\+\-]\d{2}:?\d{2}$/.test(ts);
+                if (!hasOffset && /^\d{4}-\d{2}-\d{2}T/.test(ts)) {
+                    const normalized = ts.replace(/(\.\d{3})\d+/, '$1') + 'Z';
+                    return new Date(normalized);
+                }
+                return new Date(ts);
+            }
+            return null;
+        }
+        
         // 交易所颜色配置
         const exchangeColors = {
             'okx': '#1890ff',
@@ -293,6 +379,146 @@
             'bybit': '#f6465d',
             'bitget': '#00d4aa'
         };
+
+        // 与增强页一致的工具函数
+        function formatPrice(price) {
+            if (price === null || price === undefined || price === 0) return '-';
+            const num = Number(price);
+            if (Number.isNaN(num)) return '-';
+            if (num >= 1000) return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            if (num >= 1) return parseFloat(num.toFixed(8)).toString();
+            if (num >= 0.001) return parseFloat(num.toFixed(8)).toString();
+            if (num > 0) return parseFloat(num.toFixed(12)).toString();
+            return num.toString();
+        }
+        function formatFundingRate(rate) {
+            if (!rate || rate === 0 || rate === '0') return '-';
+            const num = typeof rate === 'string' ? parseFloat(rate) : rate;
+            if (num === 0) return '-';
+            const percentage = num * 100;
+            if (Math.abs(percentage) >= 1) return `${percentage.toFixed(4)}%`;
+            if (Math.abs(percentage) >= 0.01) return `${percentage.toFixed(6)}%`;
+            if (Math.abs(percentage) >= 0.0001) return `${percentage.toFixed(8)}%`;
+            return `${percentage.toFixed(10)}%`;
+        }
+        function getFundingRateClass(rate) {
+            if (!rate || rate === 0) return 'neutral';
+            return parseFloat(rate) > 0 ? 'positive' : 'negative';
+        }
+        function formatRelTimestamp(ts) {
+            if (!ts) return '-';
+            const date = parseTimestamp(ts);
+            const now = new Date();
+            const diff = now - date;
+            if (diff < 60000) return `${Math.floor(diff/1000)}秒前`;
+            if (diff < 3600000) return `${Math.floor(diff/60000)}分钟前`;
+            if (diff < 86400000) return `${Math.floor(diff/3600000)}小时前`;
+            return date.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+        }
+        function calculatePriceDifference(symbolData) {
+            const prices = [];
+            const exchanges = ['binance','okx','bybit','bitget'];
+            exchanges.forEach(exchange => {
+                if (symbolData[exchange]) {
+                    const ex = symbolData[exchange];
+                    if (ex.spot && ex.spot.price && ex.spot.price > 0) {
+                        prices.push({ exchange, type: 'spot', price: Number(ex.spot.price), timestamp: ex.spot.timestamp });
+                    }
+                    if (ex.futures && ex.futures.price && ex.futures.price > 0) {
+                        prices.push({ exchange, type: 'futures', price: Number(ex.futures.price), timestamp: ex.futures.timestamp });
+                    }
+                }
+            });
+            if (prices.length < 2) return null;
+            const maxPrice = Math.max(...prices.map(p => p.price));
+            const minPrice = Math.min(...prices.map(p => p.price));
+            const maxInfo = prices.find(p => p.price === maxPrice);
+            const minInfo = prices.find(p => p.price === minPrice);
+            const diffPercent = ((maxPrice - minPrice) / minPrice) * 100;
+            return { maxPrice, minPrice, maxExchange: `${maxInfo.exchange}(${maxInfo.type})`, minExchange: `${minInfo.exchange}(${minInfo.type})`, maxType: maxInfo.type, minType: minInfo.type, maxTimestamp: maxInfo.timestamp, minTimestamp: minInfo.timestamp, diffPercent, diffAmount: maxPrice - minPrice };
+        }
+
+        // 渲染单币种卡片
+        function renderSymbolCard(symbolData) {
+            const grid = document.getElementById('symbolExchangesGrid');
+            const countEl = document.getElementById('exchangeCount');
+            const bannerEl = document.getElementById('priceDiffBanner');
+            if (!symbolData || Object.keys(symbolData).length === 0) {
+                countEl.textContent = '0 交易所';
+                grid.innerHTML = '<div style="color:#8c8c8c;">暂无数据</div>';
+                bannerEl.innerHTML = '';
+                return;
+            }
+            const exchanges = Object.keys(symbolData);
+            countEl.textContent = `${exchanges.length} 交易所`;
+
+            // 价差横幅
+            const diff = calculatePriceDifference(symbolData);
+            if (diff && diff.diffPercent >= 0.01) {
+                let styleClass = 'price-diff-style-1';
+                if (diff.maxType === 'spot' && diff.minType === 'futures') styleClass = 'price-diff-style-2';
+                else if (diff.maxType === 'futures' && diff.minType === 'spot') styleClass = 'price-diff-style-3';
+                else if (diff.maxType === 'futures' && diff.minType === 'futures') styleClass = 'price-diff-style-4';
+                bannerEl.innerHTML = `
+                    <div class="price-diff-banner ${styleClass}">
+                        <div class="diff-left">
+                            <span class="diff-label">最大价差</span>
+                            <span class="diff-percent">${parseFloat(diff.diffPercent.toFixed(4))}%</span>
+                        </div>
+                        <div class="diff-right diff-meta">
+                            <div class="high">高: ${diff.maxExchange} <small style="opacity:0.8">${formatRelTimestamp(diff.maxTimestamp)}</small></div>
+                            <div class="low">低: ${diff.minExchange} <small style="opacity:0.8">${formatRelTimestamp(diff.minTimestamp)}</small></div>
+                        </div>
+                    </div>`;
+            } else {
+                bannerEl.innerHTML = '';
+            }
+
+            // 交易所卡片
+            let html = '';
+            ['binance','okx','bybit','bitget'].forEach(exchange => {
+                if (symbolData[exchange]) {
+                    const ex = symbolData[exchange];
+                    const hasSpot = ex.spot && ex.spot.price;
+                    const hasFutures = ex.futures && ex.futures.price;
+                    const fundingRate = ex.futures ? ex.futures.funding_rate : null;
+                    html += `<div class="exchange-box">
+                                <div class="exchange-name">${exchange}</div>
+                                <div class="price-info">`;
+                    if (hasSpot) {
+                        html += `<div class="price-row"><span class="price-label">现货</span><span class="price-value">${formatPrice(ex.spot.price)}</span></div>
+                                 <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">现货更新</span><span class="price-value">${formatRelTimestamp(ex.spot.timestamp)}</span></div>`;
+                    }
+                    if (hasFutures) {
+                        html += `<div class="price-row"><span class="price-label">期货</span><span class="price-value">${formatPrice(ex.futures.price)}</span></div>
+                                 <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">期货更新</span><span class="price-value">${formatRelTimestamp(ex.futures.timestamp)}</span></div>`;
+                    }
+                    if (fundingRate) {
+                        html += `<div class="price-row"><span class="price-label">费率</span><span class="funding-rate ${getFundingRateClass(fundingRate)}">${formatFundingRate(fundingRate)}</span></div>`;
+                    }
+                    if (!hasSpot && !hasFutures) {
+                        html += '<div class="price-row"><span class="price-label">暂无数据</span></div>';
+                    }
+                    html += `</div></div>`;
+                } else {
+                    html += `<div class="exchange-box" style="opacity: 0.3;"><div class="exchange-name">${exchange}</div><div class="price-info"><div class="price-row"><span class="price-label">未支持</span></div></div></div>`;
+                }
+            });
+            grid.innerHTML = html;
+        }
+
+        // 获取实时聚合数据并渲染当前币种卡片
+        let cardInterval;
+        function fetchAndRenderSymbolCard() {
+            fetch('/api/aggregated_data')
+                .then(r => r.json())
+                .then(data => {
+                    const all = data.aggregated_data || {};
+                    const symbolData = all[currentSymbol] || {};
+                    renderSymbolCard(symbolData);
+                })
+                .catch(() => {});
+        }
         
         // Chart.js默认配置
         Chart.defaults.color = '#ffffff';
@@ -390,11 +616,13 @@
         function initCharts() {
             const ctxSpot = document.getElementById('spotPriceChart').getContext('2d');
             const ctxFutures = document.getElementById('futuresPriceChart').getContext('2d');
+            const ctxCombined = document.getElementById('combinedPriceChart').getContext('2d');
             const ctxFunding = document.getElementById('fundingRateChart').getContext('2d');
             const ctxPremium = document.getElementById('premiumChart').getContext('2d');
             
             charts.spot = new Chart(ctxSpot, getChartConfig('price', []));
             charts.futures = new Chart(ctxFutures, getChartConfig('price', []));
+            charts.combined = new Chart(ctxCombined, getChartConfig('price', []));
             charts.funding = new Chart(ctxFunding, getChartConfig('funding', []));
             charts.premium = new Chart(ctxPremium, getChartConfig('premium', []));
         }
@@ -451,7 +679,7 @@
             ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 现货',
                 data: chartData[exchange].labels.map((label, index) => ({
-                    x: label,
+                    x: parseTimestamp(label),
                     y: chartData[exchange].spot_prices[index]
                 })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
@@ -465,13 +693,39 @@
             ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 期货',
                 data: chartData[exchange].labels.map((label, index) => ({
-                    x: label,
+                    x: parseTimestamp(label),
                     y: chartData[exchange].futures_prices[index]
                 })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
                 backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                 fill: false
             }));
+            
+            // 合并价格图表（现货+期货）
+            const combinedDatasets = [];
+            exchanges.forEach(exchange => {
+                const dataObj = chartData[exchange];
+                if (!dataObj) return;
+                if (isValidDataset(dataObj.spot_prices)) {
+                    combinedDatasets.push({
+                        label: exchange.toUpperCase() + ' 现货',
+                        data: dataObj.labels.map((label, index) => ({ x: parseTimestamp(label), y: dataObj.spot_prices[index] })),
+                        borderColor: exchangeColors[exchange] || '#ffffff',
+                        backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                        fill: false
+                    });
+                }
+                if (isValidDataset(dataObj.futures_prices)) {
+                    combinedDatasets.push({
+                        label: exchange.toUpperCase() + ' 期货',
+                        data: dataObj.labels.map((label, index) => ({ x: parseTimestamp(label), y: dataObj.futures_prices[index] })),
+                        borderColor: exchangeColors[exchange] || '#ffffff',
+                        backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                        borderDash: [6, 3],
+                        fill: false
+                    });
+                }
+            });
             
             // 资金费率图表 - 过滤掉无效数据
             const fundingDatasets = exchanges.filter(exchange => 
@@ -481,7 +735,7 @@
                 data: chartData[exchange].labels.map((label, index) => {
                     const rate = chartData[exchange].funding_rates[index];
                     return {
-                        x: label,
+                        x: parseTimestamp(label),
                         y: rate !== null ? rate * 100 : null // 转换为百分比
                     };
                 }).filter(point => point.y !== null), // 移除null值
@@ -496,7 +750,7 @@
             ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 溢价',
                 data: chartData[exchange].labels.map((label, index) => ({
-                    x: label,
+                    x: parseTimestamp(label),
                     y: chartData[exchange].premiums[index]
                 })),
                 borderColor: exchangeColors[exchange] || '#ffffff',
@@ -507,6 +761,7 @@
             // 更新图表
             charts.spot.data.datasets = spotDatasets;
             charts.futures.data.datasets = futuresDatasets;
+            charts.combined.data.datasets = combinedDatasets;
             charts.funding.data.datasets = fundingDatasets;
             charts.premium.data.datasets = premiumDatasets;
             
@@ -607,10 +862,24 @@
             
             // 设置定时刷新（每30秒）
             setInterval(updateChartData, 30000);
+
+            // 单币种卡片每秒刷新一次
+            fetchAndRenderSymbolCard();
+            cardInterval = setInterval(fetchAndRenderSymbolCard, 1000);
         });
         
         // 双击重置缩放
         document.addEventListener('dblclick', resetZoom);
+
+        // 页面可见性变化，节省资源
+        document.addEventListener('visibilitychange', function() {
+            if (document.hidden) {
+                if (cardInterval) clearInterval(cardInterval);
+            } else {
+                fetchAndRenderSymbolCard();
+                cardInterval = setInterval(fetchAndRenderSymbolCard, 1000);
+            }
+        });
     </script>
 </body>
 </html>

@@ -3,7 +3,7 @@ import asyncio
 import websocket
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
                    CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG,
                    MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async)
@@ -367,6 +367,8 @@ class ExchangeDataCollector:
                                             self.data['okx'][symbol]['futures'].update({
                                                 'funding_rate': float(item.get('fundingRate', 0)),
                                                 'next_funding_time': item.get('nextFundingTime', ''),
+                                                # 确保资金费率单独更新也刷新时间戳，便于前端展示“最新更新时间”
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                             })
                                             print(f"OKX {symbol} 资金费率: {item.get('fundingRate', 0)}")
                                 break
@@ -383,7 +385,7 @@ class ExchangeDataCollector:
                                         if not self.should_throttle_data('okx', symbol, 'spot'):
                                             self.data['okx'][symbol]['spot'] = {
                                                 'price': float(item.get('last', 0)),
-                                                'timestamp': datetime.now().isoformat(),
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
                                             }
                                             print(f"OKX {symbol} 现货价格: {item.get('last', 0)}")
@@ -394,7 +396,7 @@ class ExchangeDataCollector:
                                             self.data['okx'][symbol]['futures'] = {
                                                 **existing_futures,  # 保留已有的资金费率信息
                                                 'price': float(item.get('last', 0)),
-                                                'timestamp': datetime.now().isoformat(),
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
                                             }
                                             print(f"OKX {symbol} 合约价格: {item.get('last', 0)}, 资金费率: {existing_futures.get('funding_rate', 0)}")
@@ -459,7 +461,7 @@ class ExchangeDataCollector:
                             if symbol_name == f"{symbol}USDT":
                                 self.data['binance'][symbol]['spot'] = {
                                     'price': float(stream_data['c']),
-                                    'timestamp': datetime.now().isoformat(),
+                                    'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
                                 print(f"Binance {symbol} 现货价格: {stream_data['c']}")
@@ -470,7 +472,7 @@ class ExchangeDataCollector:
                         if symbol_name == f"{symbol}USDT":
                             self.data['binance'][symbol]['spot'] = {
                                 'price': float(data['c']),
-                                'timestamp': datetime.now().isoformat(),
+                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
                             }
                             print(f"Binance {symbol} 现货价格: {data['c']}")
@@ -519,7 +521,7 @@ class ExchangeDataCollector:
                                     'price': float(stream_data['p']),
                                     'funding_rate': float(stream_data['r']),
                                     'next_funding_time': stream_data.get('T', ''),
-                                    'timestamp': datetime.now().isoformat(),
+                                    'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
                                 print(f"Binance {symbol} 合约价格: {stream_data['p']}, 资金费率: {stream_data['r']}")
@@ -532,7 +534,7 @@ class ExchangeDataCollector:
                                 'price': float(data['p']),
                                 'funding_rate': float(data['r']),
                                 'next_funding_time': data.get('T', ''),
-                                'timestamp': datetime.now().isoformat(),
+                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
                             }
                             print(f"Binance {symbol} 合约价格: {data['p']}, 资金费率: {data['r']}")
@@ -605,7 +607,7 @@ class ExchangeDataCollector:
                             self.data['bybit'][coin]['spot'] = {
                                 'price': float(item.get('lastPrice', 0) or 0),
                                 'volume': float(item.get('volume24h', 0) or 0),
-                                'timestamp': datetime.now().isoformat(),
+                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
                             }
                             print(f"Bybit {coin} 现货价格: {item.get('lastPrice', 0)} (源:{base})")
@@ -715,7 +717,7 @@ class ExchangeDataCollector:
                                     'funding_rate': final_funding_rate,
                                     'next_funding_time': item.get('nextFundingTime', ''),
                                     'volume': float(item.get('volume24h', 0) or 0),
-                                    'timestamp': datetime.now().isoformat(),
+                                    'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
                                 print(f"Bybit {coin} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {self.data['bybit'][coin]['futures'].get('funding_rate', 0)} (源:{base})")
@@ -732,7 +734,7 @@ class ExchangeDataCollector:
                                         current_data['next_funding_time'] = item.get('nextFundingTime', '')
                                     if 'volume24h' in item:
                                         current_data['volume'] = float(item.get('volume24h', 0) or 0)
-                                    current_data['timestamp'] = datetime.now().isoformat()
+                                    current_data['timestamp'] = datetime.now(timezone.utc).isoformat()
                                     self.data['bybit'][coin]['futures'] = current_data
                                     print(f"Bybit {coin} 合约增量更新 (保持价格: {current_data.get('price', 0)}, 资金费率: {current_data.get('funding_rate', 0)})")
                                 else:
@@ -998,7 +1000,7 @@ class ExchangeDataCollector:
                                                 'next_funding_time': item.get('nextFundingTime', ''),
                                                 'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else 0,
                                                 'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else 0,
-                                                'timestamp': datetime.now().isoformat(),
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
                                             }
                                             print(f"Bitget {symbol} 合约价格: {price}, 资金费率: {funding_rate}")
@@ -1011,7 +1013,7 @@ class ExchangeDataCollector:
                                             self.data['bitget'][symbol]['spot'] = {
                                                 'price': price,
                                                 'volume': float(item.get('baseVolume', 0)) if item.get('baseVolume') else 0,
-                                                'timestamp': datetime.now().isoformat(),
+                                                'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id,
                                                 'is_active': price > 0  # 标记是否有实际价格
                                             }

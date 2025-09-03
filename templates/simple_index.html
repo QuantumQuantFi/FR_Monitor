@@ -275,6 +275,31 @@
         let currentSymbol = '{{ current_symbol }}';
         let refreshInterval;
         
+        // 统一解析后端时间戳：
+        // - 若无时区信息，按UTC处理（修复UTC+8 显示“晚8小时”问题）
+        // - 支持秒/毫秒时间戳
+        function parseTimestamp(ts) {
+            if (!ts && ts !== 0) return null;
+            if (typeof ts === 'number') {
+                return ts < 1e12 ? new Date(ts * 1000) : new Date(ts);
+            }
+            if (typeof ts === 'string') {
+                // 支持 "YYYY-MM-DD HH:mm:ss" 形式
+                if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ts)) {
+                    return new Date(ts.replace(' ', 'T') + 'Z');
+                }
+                // ISO且无时区偏移时，默认补Z为UTC
+                const hasOffset = /[zZ]|[\+\-]\d{2}:?\d{2}$/.test(ts);
+                if (!hasOffset && /^\d{4}-\d{2}-\d{2}T/.test(ts)) {
+                    // 压到毫秒精度，避免微秒导致的解析差异
+                    const normalized = ts.replace(/(\.\d{3})\d+/, '$1') + 'Z';
+                    return new Date(normalized);
+                }
+                return new Date(ts);
+            }
+            return null;
+        }
+        
         // 格式化资金费率显示 - 保持高精度，避免科学计数法
         function formatFundingRate(rate) {
             if (!rate || rate === 0 || rate === '0') return '0.0000';
@@ -348,8 +373,9 @@
                 const data = await response.json();
                 
                 updateExchangeCards(data.realtime_data, data.premium_data);
+                const ts = parseTimestamp(data.timestamp) || new Date();
                 document.getElementById('lastUpdate').textContent = 
-                    `最后更新: ${new Date(data.timestamp).toLocaleTimeString()}`;
+                    `最后更新: ${ts.toLocaleTimeString()}`;
                     
                 document.getElementById('status').textContent = '实时监控中...';
                 document.getElementById('status').className = 'status connected';

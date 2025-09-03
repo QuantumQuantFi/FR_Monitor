@@ -5,7 +5,7 @@ import time
 import gc
 import psutil
 import os
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from exchange_connectors import ExchangeDataCollector
 from config import DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
@@ -138,6 +138,13 @@ class MemoryDataManager:
 # 使用优化的内存管理器
 memory_manager = MemoryDataManager()
 
+
+def now_utc_iso() -> str:
+    """Return current time as ISO 8601 string in UTC with timezone info.
+    Example: '2024-09-03T07:00:00.123456+00:00'
+    """
+    return datetime.now(timezone.utc).isoformat()
+
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
@@ -151,7 +158,7 @@ def background_data_collection():
         try:
             # 获取所有数据（包含所有币种）
             all_data = data_collector.get_all_data()
-            timestamp = datetime.now().isoformat()
+            timestamp = now_utc_iso()
             
             # 为每个币种保存历史数据 - 使用动态支持列表，兼容LINEA等新币
             for symbol in data_collector.supported_symbols:
@@ -305,7 +312,7 @@ def get_current_data():
         'realtime_data': symbol_data,
         'premium_data': premium_data,
         'symbol': current_symbol,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': now_utc_iso()
     })
 
 @app.route('/api/data/all')
@@ -320,7 +327,7 @@ def get_all_data():
         # 返回动态支持列表
         'supported_symbols': data_collector.supported_symbols,
         'current_symbol': data_collector.current_symbol,
-        'timestamp': datetime.now().isoformat()
+        'timestamp': now_utc_iso()
     })
 
 @app.route('/api/history/<symbol>')
@@ -379,6 +386,17 @@ def get_chart_data(symbol):
     
     try:
         raw_data = db.get_historical_data(symbol, exchange, hours, interval)
+
+        def to_utc_iso(ts: str) -> str:
+            """Ensure timestamp string is UTC ISO8601.
+            If no timezone offset is present, treat as UTC and append 'Z'.
+            Also normalize space to 'T'.
+            """
+            if not isinstance(ts, str):
+                return ts
+            has_offset = ts.endswith('Z') or ('+' in ts[-6:] or '-' in ts[-6:])
+            base = ts.replace(' ', 'T')
+            return base if has_offset else (base + 'Z')
         
         # 按交易所组织数据
         chart_data = {}
@@ -395,7 +413,7 @@ def get_chart_data(symbol):
             
             # 使用时间戳作为标签
             timestamp = row['timestamp']
-            chart_data[exchange_name]['labels'].append(timestamp)
+            chart_data[exchange_name]['labels'].append(to_utc_iso(timestamp))
             
             # 添加价格数据
             if interval == '1min':
@@ -414,7 +432,7 @@ def get_chart_data(symbol):
             'hours': hours,
             'interval': interval,
             'chart_data': chart_data,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
         
     except Exception as e:
@@ -433,7 +451,7 @@ def get_latest_prices(symbol):
         return jsonify({
             'symbol': symbol,
             'latest_data': latest_data,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -464,7 +482,7 @@ def get_aggregated_data():
         return jsonify({
             'aggregated_data': aggregated,
             'supported_symbols': data_collector.supported_symbols,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -479,7 +497,7 @@ def get_markets_info():
         return jsonify({
             'market_report': report,
             'current_symbols': data_collector.supported_symbols,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -513,7 +531,7 @@ def get_coverage_stats():
         
         return jsonify({
             'coverage_stats': stats,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -575,7 +593,7 @@ def database_stats():
         return jsonify({
             'status': 'success',
             'stats': stats,
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
         
     except Exception as e:
@@ -598,7 +616,7 @@ def manual_maintenance():
         return jsonify({
             'status': 'success', 
             'message': '数据库维护任务已完成',
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         })
         
     except Exception as e:
@@ -638,7 +656,7 @@ def get_system_status():
                 },
                 'reconnect_attempts': data_collector.reconnect_attempts
             },
-            'timestamp': datetime.now().isoformat()
+            'timestamp': now_utc_iso()
         }
         
         return jsonify(status)

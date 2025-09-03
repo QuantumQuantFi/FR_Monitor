@@ -403,6 +403,7 @@
                 <button class="control-btn" onclick="toggleAutoRefresh()">⏸️ 暂停</button>
                 <button class="control-btn" onclick="togglePriceDiffSort()" id="priceDiffBtn">📊 价差排序</button>
                 <button class="control-btn" onclick="window.open('/exchanges', '_blank')">📊 交易所视图</button>
+                <button class="control-btn" onclick="toggleAutoResort()" id="autoResortBtn">排序: 开</button>
             </div>
         </div>
         
@@ -453,6 +454,9 @@
         let isAutoRefresh = true;
         let refreshInterval;
         let isPriceDiffSortActive = false;
+        let autoResort = true;           // 是否自动重新排序
+        let cardOrder = [];              // 当前卡片顺序（冻结时使用）
+        let forceResort = false;         // 用户操作触发的一次性重排
 
         // 主流币种列表
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
@@ -522,6 +526,78 @@
             return parseFloat(rate) > 0 ? 'positive' : 'negative';
         }
 
+        // 统一解析后端时间戳
+        function parseTimestamp(ts) {
+            if (!ts && ts !== 0) return null;
+            if (typeof ts === 'number') {
+                return ts < 1e12 ? new Date(ts * 1000) : new Date(ts);
+            }
+            if (typeof ts === 'string') {
+                if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(ts)) {
+                    return new Date(ts.replace(' ', 'T') + 'Z');
+                }
+                const hasOffset = /[zZ]|[\+\-]\d{2}:?\d{2}$/.test(ts);
+                if (!hasOffset && /^\d{4}-\d{2}-\d{2}T/.test(ts)) {
+                    const normalized = ts.replace(/(\.\d{3})\d+/, '$1') + 'Z';
+                    return new Date(normalized);
+                }
+                return new Date(ts);
+            }
+            return null;
+        }
+
+        // 格式化时间戳为可读格式
+        function formatTimestamp(timestamp) {
+            if (!timestamp) return '-';
+            try {
+                // 将无时区时间戳按UTC解析，避免与本地时区产生8小时偏差
+                const date = parseTimestamp(timestamp);
+                const now = new Date();
+                
+                // 计算时间差
+                const diff = now.getTime() - date.getTime();
+                
+                if (diff < 60000) { // 小于1分钟
+                    return `${Math.floor(diff / 1000)}秒前`;
+                } else if (diff < 3600000) { // 小于1小时
+                    return `${Math.floor(diff / 60000)}分钟前`;
+                } else if (diff < 86400000) { // 小于1天
+                    return `${Math.floor(diff / 3600000)}小时前`;
+                } else {
+                    // 超过1天，显示具体时间（本地时区）
+                    return date.toLocaleString('zh-CN', {
+                        timeZone: 'Asia/Shanghai',
+                        month: 'short',
+                        day: 'numeric',
+                        hour: '2-digit',
+                        minute: '2-digit'
+                    });
+                }
+            } catch (e) {
+                return '-';
+            }
+        }
+
+        // 计算两个时间戳的差值
+        function calculateTimeDifference(time1, time2) {
+            if (!time1 || !time2) return '-';
+            try {
+                const date1 = parseTimestamp(time1);
+                const date2 = parseTimestamp(time2);
+                const diff = Math.abs(date1 - date2);
+                
+                if (diff < 60000) {
+                    return `${Math.floor(diff / 1000)}秒`;
+                } else if (diff < 3600000) {
+                    return `${Math.floor(diff / 60000)}分钟`;
+                } else {
+                    return `${Math.floor(diff / 3600000)}小时`;
+                }
+            } catch (e) {
+                return '-';
+            }
+        }
+
         // 计算价差百分比
         function calculatePriceDifference(symbolData) {
             const prices = [];
@@ -535,14 +611,16 @@
                         prices.push({
                             exchange: exchange,
                             type: 'spot',
-                            price: Number(exData.spot.price)  // 使用Number而不是parseFloat保持精度
+                            price: Number(exData.spot.price),  // 使用Number而不是parseFloat保持精度
+                            timestamp: exData.spot.timestamp
                         });
                     }
                     if (exData.futures && exData.futures.price && exData.futures.price > 0) {
                         prices.push({
                             exchange: exchange,
                             type: 'futures',
-                            price: Number(exData.futures.price)  // 使用Number而不是parseFloat保持精度
+                            price: Number(exData.futures.price),  // 使用Number而不是parseFloat保持精度
+                            timestamp: exData.futures.timestamp
                         });
                     }
                 }
@@ -566,6 +644,8 @@
                 minExchange: minPriceInfo.exchange + '(' + minPriceInfo.type + ')',
                 maxType: maxPriceInfo.type,
                 minType: minPriceInfo.type,
+                maxTimestamp: maxPriceInfo.timestamp,
+                minTimestamp: minPriceInfo.timestamp,
                 diffPercent: diffPercent,
                 diffAmount: maxPrice - minPrice
             };
@@ -583,6 +663,8 @@
                 // 激活价差排序过滤标签
                 document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
                 document.querySelector('[data-filter="priceDiff"]').classList.add('active');
+                // 用户主动切换排序模式：触发一次性重排
+                forceResort = true;
             } else {
                 btn.textContent = '📊 价差排序';
                 btn.classList.remove('active');
@@ -590,30 +672,52 @@
                 // 回到全部标签
                 document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
                 document.querySelector('[data-filter="all"]').classList.add('active');
+                // 用户主动切换排序模式：触发一次性重排
+                forceResort = true;
             }
             
             applyFilters();
+        }
+
+        // 切换自动重新排序（关：不改变卡片顺序，仅更新内容）
+        function toggleAutoResort() {
+            autoResort = !autoResort;
+            const btn = document.getElementById('autoResortBtn');
+            btn.textContent = `排序: ${autoResort ? '开' : '关'}`;
+            if (autoResort) {
+                // 开启后立即按当前模式重排一次
+                forceResort = true;
+                applyFilters();
+            }
         }
 
         // 更新币种网格
         function updateSymbolsGrid(data) {
             const grid = document.getElementById('symbolsGrid');
             let symbols = Object.keys(data);
-            
-            // 如果是价差排序模式，计算价差并排序
-            if (isPriceDiffSortActive) {
-                const symbolsWithDiff = symbols.map(symbol => {
-                    const diff = calculatePriceDifference(data[symbol]);
-                    return {
-                        symbol: symbol,
-                        priceDiff: diff
-                    };
-                }).filter(item => item.priceDiff !== null)
-                  .sort((a, b) => b.priceDiff.diffPercent - a.priceDiff.diffPercent);
-                
-                symbols = symbolsWithDiff.map(item => item.symbol);
+
+            const computeSorted = () => {
+                if (isPriceDiffSortActive) {
+                    const symbolsWithDiff = symbols.map(symbol => {
+                        const diff = calculatePriceDifference(data[symbol]);
+                        return { symbol, priceDiff: diff };
+                    }).filter(item => item.priceDiff !== null)
+                      .sort((a, b) => b.priceDiff.diffPercent - a.priceDiff.diffPercent);
+                    return symbolsWithDiff.map(item => item.symbol);
+                } else {
+                    return symbols.slice().sort();
+                }
+            };
+
+            if (autoResort || cardOrder.length === 0 || forceResort) {
+                symbols = computeSorted();
+                cardOrder = symbols.slice();
+                forceResort = false;
             } else {
-                symbols.sort();
+                const ordered = cardOrder.filter(s => symbols.includes(s));
+                const remaining = symbols.filter(s => !ordered.includes(s)).sort();
+                symbols = ordered.concat(remaining);
+                cardOrder = symbols.slice();
             }
             
             if (symbols.length === 0) {
@@ -645,6 +749,7 @@
                         styleClass = 'price-diff-style-4';
                     }
 
+                    const timeDiff = calculateTimeDifference(priceDiff.maxTimestamp, priceDiff.minTimestamp);
                     priceDiffDisplay = `
                         <div class="price-diff-banner ${styleClass}">
                             <div class="diff-left">
@@ -652,8 +757,9 @@
                                 <span class="diff-percent">${parseFloat(priceDiff.diffPercent.toFixed(4))}%</span>
                             </div>
                             <div class="diff-right diff-meta">
-                                <div class="high">高: ${priceDiff.maxExchange}</div>
-                                <div class="low">低: ${priceDiff.minExchange}</div>
+                                <div class="high">高: ${priceDiff.maxExchange} <small style="opacity:0.8">${formatTimestamp(priceDiff.maxTimestamp)}</small></div>
+                                <div class="low">低: ${priceDiff.minExchange} <small style="opacity:0.8">${formatTimestamp(priceDiff.minTimestamp)}</small></div>
+                                <div style="font-size:10px;opacity:0.7;margin-top:2px;">时间差: ${timeDiff}</div>
                             </div>
                         </div>
                     `;
@@ -688,6 +794,10 @@
                                     <span class="price-label">现货</span>
                                     <span class="price-value">${formatPrice(exData.spot.price)}</span>
                                 </div>
+                                <div class="price-row" style="font-size:10px;opacity:0.7;">
+                                    <span class="price-label">现货更新</span>
+                                    <span class="price-value">${formatTimestamp(exData.spot.timestamp)}</span>
+                                </div>
                             `;
                         }
 
@@ -696,6 +806,10 @@
                                 <div class="price-row">
                                     <span class="price-label">期货</span>
                                     <span class="price-value">${formatPrice(exData.futures.price)}</span>
+                                </div>
+                                <div class="price-row" style="font-size:10px;opacity:0.7;">
+                                    <span class="price-label">期货更新</span>
+                                    <span class="price-value">${formatTimestamp(exData.futures.timestamp)}</span>
                                 </div>
                             `;
                         }
@@ -864,6 +978,8 @@
             // 搜索框事件
             document.getElementById('searchInput').addEventListener('input', function(e) {
                 currentSearch = e.target.value;
+                // 搜索属于用户操作：触发一次性重排
+                forceResort = true;
                 applyFilters();
             });
             
@@ -873,6 +989,8 @@
                     document.querySelectorAll('.filter-tab').forEach(t => t.classList.remove('active'));
                     this.classList.add('active');
                     currentFilter = this.dataset.filter;
+                    // 过滤标签点击属于用户操作：触发一次性重排
+                    forceResort = true;
                     applyFilters();
                 });
             });
