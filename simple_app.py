@@ -656,6 +656,11 @@ def get_system_status():
                 },
                 'reconnect_attempts': data_collector.reconnect_attempts
             },
+            'rest': {
+                'enabled': getattr(data_collector, 'rest_enabled', False),
+                'update_interval': getattr(data_collector, 'rest_update_interval', None),
+                'last_sync': getattr(data_collector, 'rest_last_sync', {})
+            },
             'timestamp': now_utc_iso()
         }
         

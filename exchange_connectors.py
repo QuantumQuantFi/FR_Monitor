@@ -6,7 +6,14 @@ import time
 from datetime import datetime, timedelta, timezone
 from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
                    CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG,
-                   MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async)
+                   MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async,
+                   REST_ENABLED, REST_UPDATE_INTERVAL, REST_MERGE_POLICY)
+from rest_collectors import (
+    fetch_binance as rest_fetch_binance,
+    fetch_okx as rest_fetch_okx,
+    fetch_bybit as rest_fetch_bybit,
+    fetch_bitget as rest_fetch_bitget,
+)
 from market_info import get_exchange_symbols
 
 class ExchangeDataCollector:
@@ -43,6 +50,13 @@ class ExchangeDataCollector:
         # 币种列表更新控制
         self.symbols_update_thread = None
         self.symbols_update_interval = 3600  # 1小时更新一次币种列表
+
+        # REST补充轮询
+        self.rest_enabled = REST_ENABLED
+        self.rest_update_interval = REST_UPDATE_INTERVAL
+        self.rest_thread = None  # legacy single-thread poller (unused in Scheme A)
+        self.rest_threads = {}
+        self.rest_last_sync = { 'binance': None, 'okx': None, 'bybit': None, 'bitget': None }
     
     def _load_exchange_symbols(self):
         """加载各交易所特定的币种列表"""
@@ -269,6 +283,139 @@ class ExchangeDataCollector:
         
         # Bitget连接
         threading.Thread(target=self._connect_with_retry, args=('bitget', self._connect_bitget), daemon=True).start()
+
+        # 启动REST补充轮询（可选）
+        if self.rest_enabled:
+            self.start_rest_poller()
+
+    def start_rest_poller(self):
+        """启动每交易所独立的REST轮询线程（方案A）"""
+        def make_loop(exchange: str, fetch_func):
+            def loop():
+                while self.running:
+                    try:
+                        symbol_map = fetch_func()
+                        self._merge_rest_exchange_snapshot(exchange, symbol_map)
+                    except Exception as e:
+                        print(f"REST轮询错误[{exchange}]: {e}")
+                    time.sleep(max(0.5, float(self.rest_update_interval)))
+            return loop
+
+        plan = {
+            'binance': rest_fetch_binance,
+            'okx': rest_fetch_okx,
+            'bybit': rest_fetch_bybit,
+            'bitget': rest_fetch_bitget,
+        }
+
+        # 启动/复用线程
+        for ex, func in plan.items():
+            if ex in self.rest_threads and self.rest_threads[ex].is_alive():
+                continue
+            t = threading.Thread(target=make_loop(ex, func), daemon=True)
+            t.start()
+            self.rest_threads[ex] = t
+        print(f"REST补充轮询(并行)已启动，间隔 {self.rest_update_interval}s")
+
+    def _merge_rest_exchange_snapshot(self, exchange: str, symbol_map):
+        """合并单一交易所的REST快照；last_sync 记录为合并时刻，避免显示陈旧时间。"""
+        from datetime import datetime, timezone
+        synced_at = datetime.now(timezone.utc).isoformat()
+
+        if exchange not in self.data:
+            return
+
+        prefer_ws_secs = int(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
+
+        for symbol, parts in symbol_map.items():
+            if symbol not in self.supported_symbols:
+                continue
+            if symbol not in self.data[exchange]:
+                self.data[exchange][symbol] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
+
+            for kind in ('spot', 'futures'):
+                if kind not in parts:
+                    continue
+                new_data = parts[kind]
+                existing = self.data[exchange][symbol].get(kind, {})
+
+                # 近窗期内（默认6s）优先保留WS写入
+                try:
+                    old_ts = existing.get('timestamp')
+                    is_fresh = False
+                    if old_ts:
+                        dt = datetime.fromisoformat(old_ts.replace('Z', '+00:00'))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+                        is_fresh = age <= prefer_ws_secs
+                except Exception:
+                    is_fresh = False
+
+                if not is_fresh:
+                    merged = {k: v for k, v in existing.items() if k not in ('price', 'timestamp', 'symbol')}
+                    merged.update({
+                        'price': new_data.get('price', 0),
+                        'timestamp': new_data.get('timestamp'),  # 保留原快照时间以供诊断
+                        'symbol': new_data.get('symbol')
+                    })
+                    self.data[exchange][symbol][kind] = merged
+
+        # 标记该交易所合并时刻为最后同步时间（用于前端展示）
+        self.rest_last_sync[exchange] = synced_at
+
+    def _merge_rest_snapshots(self, snapshots):
+        """将REST快照数据合并到内存数据结构，尽量不覆盖新鲜的WS数据"""
+        prefer_ws_secs = int(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
+
+        for exchange, symbol_map in snapshots.items():
+            if exchange not in self.data:
+                continue
+            updated_ts_for_exchange = None
+            for symbol, parts in symbol_map.items():
+                # 仅合并在支持列表里的USDT币种
+                if symbol not in self.supported_symbols:
+                    continue
+                # 确保结构存在
+                if symbol not in self.data[exchange]:
+                    self.data[exchange][symbol] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
+
+                for kind in ('spot', 'futures'):
+                    if kind not in parts:
+                        continue
+                    new_data = parts[kind]
+                    if not updated_ts_for_exchange:
+                        updated_ts_for_exchange = new_data.get('timestamp')
+                    # 不覆盖资金费率；只补充价格/时间戳/标识
+                    existing = self.data[exchange][symbol].get(kind, {})
+
+                    # 如果现有数据在偏好窗口内更新，跳过覆盖以保留WS的最新数据
+                    try:
+                        old_ts = existing.get('timestamp')
+                        is_fresh = False
+                        if old_ts:
+                            dt = datetime.fromisoformat(old_ts.replace('Z', '+00:00'))
+                            # 正常化到UTC计算新鲜度
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            age = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds()
+                            is_fresh = age <= prefer_ws_secs
+                    except Exception:
+                        is_fresh = False
+
+                    if not is_fresh:
+                        merged = {k: v for k, v in existing.items() if k not in ('price', 'timestamp', 'symbol')}
+                        merged.update({
+                            'price': new_data.get('price', 0),
+                            'timestamp': new_data.get('timestamp'),
+                            'symbol': new_data.get('symbol')
+                        })
+                        self.data[exchange][symbol][kind] = merged
+
+            # 更新该交易所的REST最后同步时间
+            if updated_ts_for_exchange:
+                # 旧实现：以快照时间为last_sync；保留以兼容，但不再使用该路径
+                self.rest_last_sync[exchange] = updated_ts_for_exchange
 
     def restart_connections(self):
         """重启所有连接（通常用于网络错误恢复）"""

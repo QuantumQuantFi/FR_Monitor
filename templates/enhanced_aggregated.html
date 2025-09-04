@@ -104,6 +104,30 @@
             gap: 15px;
             margin-bottom: 20px;
         }
+
+        .rest-status {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .rest-pill {
+            background: rgba(30, 35, 41, 0.8);
+            border: 1px solid #3c4043;
+            border-radius: 999px;
+            padding: 8px 12px;
+            font-size: 12px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            color: #9ca3af;
+        }
+        .rest-pill .ex {
+            color: #f0b90b;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .rest-pill .ts { opacity: 0.9; }
         
         .stat-card {
             background: rgba(30, 35, 41, 0.8);
@@ -434,6 +458,13 @@
             <div class="filter-tab" data-filter="priceDiff">价差排序</div>
             <div class="filter-tab" data-filter="wlfi">WLFI</div>
             <div class="filter-tab" data-filter="mainstream">主流币</div>
+        </div>
+
+        <div class="rest-status" id="restStatusBar">
+            <div class="rest-pill"><span class="ex">binance</span><span class="ts" id="rest-binance">-</span></div>
+            <div class="rest-pill"><span class="ex">okx</span><span class="ts" id="rest-okx">-</span></div>
+            <div class="rest-pill"><span class="ex">bybit</span><span class="ts" id="rest-bybit">-</span></div>
+            <div class="rest-pill"><span class="ex">bitget</span><span class="ts" id="rest-bitget">-</span></div>
         </div>
     </div>
 
@@ -929,6 +960,27 @@
             document.getElementById('lastUpdate').textContent = new Date().toLocaleTimeString();
         }
 
+        // 更新REST状态
+        async function fetchSystemStatus() {
+            try {
+                const res = await fetch('/api/system/status');
+                const s = await res.json();
+                const last = (s && s.rest && s.rest.last_sync) || {};
+                const map = {
+                    binance: document.getElementById('rest-binance'),
+                    okx: document.getElementById('rest-okx'),
+                    bybit: document.getElementById('rest-bybit'),
+                    bitget: document.getElementById('rest-bitget')
+                };
+                Object.keys(map).forEach(ex => {
+                    const ts = last[ex];
+                    map[ex].textContent = ts ? formatTimestamp(ts) : '-';
+                });
+            } catch (e) {
+                // 忽略一次性错误
+            }
+        }
+
         // 获取聚合数据
         async function fetchAggregatedData() {
             try {
@@ -969,6 +1021,7 @@
             refreshInterval = setInterval(() => {
                 if (isAutoRefresh) {
                     fetchAggregatedData();
+                    fetchSystemStatus();
                 }
             }, 1000); // 1秒刷新
         }
@@ -997,6 +1050,7 @@
             
             // 初始化数据
             fetchAggregatedData();
+            fetchSystemStatus();
             startAutoRefresh();
         });
 

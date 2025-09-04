@@ -86,8 +86,14 @@ class MarketInfoCollector:
                             if (symbol_info.get('status') == 'TRADING' and 
                                 symbol_info.get('quoteAsset') == 'USDT' and
                                 symbol_info.get('contractType') == 'PERPETUAL'):
+                                # 过滤指数类合约（如 DEFI、BTCDOM、ALL 等）
+                                underlying_type = symbol_info.get('underlyingType') or symbol_info.get('underlyingSubType') or ''
+                                if isinstance(underlying_type, list):
+                                    underlying_type = ','.join(underlying_type)
+                                if isinstance(underlying_type, str) and 'INDEX' in underlying_type.upper():
+                                    continue
                                 base_asset = symbol_info.get('baseAsset')
-                                if base_asset:
+                                if base_asset and base_asset not in {'DEFI', 'BTCDOM', 'ALL', 'BLUEBIRD'}:
                                     markets['futures'].add(base_asset)
         
         except Exception as e:

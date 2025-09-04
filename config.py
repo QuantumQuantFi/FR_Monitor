@@ -80,6 +80,21 @@ WS_CONNECTION_CONFIG = {
     'ping_timeout': 10,                # ping超时（10秒，更快检测断线）
 }
 
+# REST补充轮询配置
+REST_ENABLED = True                 # 默认开启；可按需关闭
+REST_UPDATE_INTERVAL = 2.0          # REST 快照轮询间隔（秒）
+REST_CONNECTION_CONFIG = {
+    'timeout': 10,                  # 单次请求超时（秒）
+    'retry': 1,                     # 失败重试次数（轻量）
+    'stagger_ms': 200,              # 交易所之间的错峰延迟（毫秒）
+    'user_agent': 'WLFI-Monitor/1.0',
+}
+
+# REST合并策略
+REST_MERGE_POLICY = {
+    'prefer_ws_secs': 6,            # 若现有数据在N秒内更新，优先保留WS数据
+}
+
 # 内存优化配置
 MEMORY_OPTIMIZATION_CONFIG = {
     'max_historical_records': 1000,    # 内存中最大历史记录数（用户建议增加到1000）
