@@ -68,16 +68,47 @@ def test_buy_orders():
     # Test OKX
     print("\n🔸 测试 OKX...")
     try:
-        # For OKX, we need to specify size in contracts, not quote amount
-        # Assuming ETH price around $3000, 10 USDT ≈ 0.0033 ETH ≈ 3.3 contracts (if 1 contract = 0.001 ETH)
-        # Let's use a small size for testing
+        try:
+            leverage_resp = te.set_okx_swap_leverage(
+                symbol="ETH-USDT-SWAP",
+                leverage=1,
+                td_mode="cross",
+            )
+            leverage_info = leverage_resp.get("data", [{}])[0] if leverage_resp.get("data") else {}
+            print(
+                "ℹ️  OKX 杠杆设置成功: "
+                f"{leverage_info.get('lever', '1')}x / {leverage_info.get('mgnMode', 'cross')}"
+            )
+        except te.TradeExecutionError as lev_err:
+            print(f"⚠️ OKX 杠杆设置失败（继续使用现有设置）: {lev_err}")
+
+        target_notional = None
+        derived_size = None
+        last_error = None
+        for candidate in (30, 40, 50, 60, 80):
+            try:
+                derived_size = te.derive_okx_swap_size_from_usdt(
+                    symbol="ETH-USDT-SWAP",
+                    notional_usdt=candidate,
+                )
+                target_notional = candidate
+                break
+            except te.TradeExecutionError as err:
+                last_error = err
+                continue
+
+        if derived_size is None:
+            raise last_error or te.TradeExecutionError("无法计算合约数量")
+
+        print(f"ℹ️  OKX 目标名义 {target_notional} USDT -> 合约数量 {derived_size}")
+
         result = te.place_okx_swap_market_order(
             symbol="ETH-USDT-SWAP",
             side="buy",
-            size="1",  # 1 contract for testing
+            size=derived_size,
             client_order_id=f"test_buy_okx_{int(time.time())}"
         )
-        results["okx"] = {"success": True, "data": result}
+        results["okx"] = {"success": True, "data": result, "context": {"size": derived_size}}
         print(f"✅ OKX 买入成功: {format_order_result('okx', result)}")
     except te.TradeExecutionError as e:
         results["okx"] = {"success": False, "error": str(e)}
@@ -175,10 +206,13 @@ def test_sell_orders(buy_results: Dict[str, Any]):
     if buy_results.get("okx", {}).get("success"):
         print("\n🔸 测试 OKX 卖出...")
         try:
+            okx_size = "1"
+            context = buy_results.get("okx", {}).get("context") or {}
+            okx_size = context.get("size", okx_size)
             result = te.place_okx_swap_market_order(
                 symbol="ETH-USDT-SWAP",
                 side="sell",
-                size="1",  # Same size as buy order
+                size=okx_size,
                 client_order_id=f"test_sell_okx_{int(time.time())}"
             )
             results["okx"] = {"success": True, "data": result}

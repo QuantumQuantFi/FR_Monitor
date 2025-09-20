@@ -14,8 +14,8 @@ import json
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from typing import Any, Dict, List, Optional, Type
+from decimal import Decimal, ROUND_DOWN, InvalidOperation
+from typing import Any, Dict, List, Optional, Type, Union
 from urllib.parse import urlencode
 
 import requests
@@ -97,6 +97,19 @@ class _BinanceSymbolFilters:
 
 _BINANCE_FILTER_CACHE: Dict[tuple[str, str], _BinanceSymbolFilters] = {}
 _BINANCE_FILTER_CACHE_TTL = 15 * 60  # seconds
+
+
+@dataclass
+class _OKXInstrumentFilters:
+    lot_size: Decimal
+    min_size: Decimal
+    contract_value: Decimal
+    tick_size: Decimal
+    fetched_at: float
+
+
+_OKX_INSTRUMENT_CACHE: Dict[tuple[str, str], _OKXInstrumentFilters] = {}
+_OKX_INSTRUMENT_CACHE_TTL = 15 * 60  # seconds
 
 
 def _require_credentials(name: str) -> Any:
@@ -239,6 +252,26 @@ def _normalise_binance_quantity(symbol: str, quantity: float, base_url: str) -> 
 
     quantity_str = format(normalised.normalize(), "f")
     return quantity_str, normalised
+
+
+def _normalise_okx_size(symbol: str, size: Any, base_url: str, inst_type: str = "SWAP") -> tuple[str, Decimal]:
+    """Snap ``size`` to OKX lot size increments and enforce minimums."""
+    filters = _get_okx_instrument_filters(symbol, base_url, inst_type)
+    try:
+        raw_size = Decimal(str(size))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"`size` {size!r} is not a valid decimal quantity") from exc
+    lot = filters.lot_size
+    units = (raw_size / lot).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * lot
+
+    if normalised < filters.min_size:
+        raise TradeExecutionError(
+            f"`size` {raw_size} is below OKX minimum {filters.min_size} for {symbol}; increase the order size"
+        )
+
+    size_str = format(normalised.normalize(), "f")
+    return size_str, normalised
 
 
 def _binance_get_order(
@@ -498,6 +531,113 @@ def get_okx_swap_positions(
     return data.get("data", [])
 
 
+def set_okx_swap_leverage(
+    symbol: str,
+    leverage: Union[int, str],
+    *,
+    td_mode: str = "cross",
+    pos_side: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Configure OKX leverage for an instrument before placing trades."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        inst_id = f"{inst_id}-USDT-SWAP"
+
+    try:
+        leverage_value = str(int(leverage))
+    except (TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"Invalid leverage value: {leverage}") from exc
+
+    payload: Dict[str, Any] = {
+        "instId": inst_id,
+        "lever": leverage_value,
+        "mgnMode": td_mode.lower(),
+    }
+    if pos_side:
+        payload["posSide"] = pos_side.lower()
+
+    request_path = "/api/v5/account/set-leverage"
+    timestamp = _iso_timestamp()
+    body_str = _compact_json(payload)
+    message = f"{timestamp}POST{request_path}{body_str}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX leverage set reject: {data}")
+    return data
+
+
+def _get_okx_instrument_filters(
+    symbol: str,
+    base_url: str,
+    inst_type: str = "SWAP",
+) -> _OKXInstrumentFilters:
+    key_symbol = symbol.upper()
+    if inst_type.upper() == "SWAP" and not key_symbol.endswith("-USDT-SWAP"):
+        if key_symbol.endswith("USDT"):
+            key_symbol = f"{key_symbol[:-4]}-USDT-SWAP"
+        else:
+            key_symbol = f"{key_symbol}-USDT-SWAP"
+
+    cache_key = (base_url, key_symbol)
+    now = time.time()
+    cached = _OKX_INSTRUMENT_CACHE.get(cache_key)
+    if cached and now - cached.fetched_at < _OKX_INSTRUMENT_CACHE_TTL:
+        return cached
+
+    request_path = "/api/v5/public/instruments"
+    params: List[tuple[str, str]] = [("instType", inst_type.upper())]
+    params.append(("instId", key_symbol))
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX instrument metadata reject: {data}")
+
+    instruments = data.get("data") or []
+    if not instruments:
+        raise TradeExecutionError(f"OKX instruments payload empty for {key_symbol}: {data}")
+
+    instrument = instruments[0]
+
+    try:
+        lot_size = Decimal(str(instrument["lotSz"]))
+        min_size = Decimal(str(instrument["minSz"]))
+        contract_value = Decimal(str(instrument.get("ctVal", "1")))
+        tick_size = Decimal(str(instrument.get("tickSz", "0")))
+    except (KeyError, InvalidOperation) as exc:
+        raise TradeExecutionError(f"OKX instrument payload invalid: {instrument}") from exc
+
+    filters = _OKXInstrumentFilters(
+        lot_size=lot_size,
+        min_size=min_size,
+        contract_value=contract_value,
+        tick_size=tick_size,
+        fetched_at=now,
+    )
+    _OKX_INSTRUMENT_CACHE[cache_key] = filters
+    return filters
+
+
 def get_bybit_linear_positions(
     *,
     symbol: Optional[str] = None,
@@ -594,7 +734,7 @@ def get_bitget_usdt_perp_positions(
 def place_okx_swap_market_order(
     symbol: str,
     side: str,
-    size: str,
+    size: Any,
     *,
     td_mode: str = "cross",
     pos_side: Optional[str] = None,
@@ -612,12 +752,17 @@ def place_okx_swap_market_order(
     if not inst_id.endswith("-USDT-SWAP"):
         inst_id = f"{inst_id}-USDT-SWAP"
 
+    if size is None:
+        raise TradeExecutionError("`size` must be provided for OKX orders")
+
+    size_str, _ = _normalise_okx_size(inst_id, size, base_url)
+
     payload: Dict[str, Any] = {
         "instId": inst_id,
         "tdMode": td_mode,
         "side": side.lower(),
         "ordType": "market",
-        "sz": str(size),
+        "sz": size_str,
     }
     if pos_side:
         payload["posSide"] = pos_side.lower()
@@ -647,6 +792,62 @@ def place_okx_swap_market_order(
     if response.status_code != 200 or data.get("code") != "0":
         raise TradeExecutionError(f"OKX reject: {data}")
     return data
+
+
+def get_okx_swap_price(
+    symbol: str,
+    *,
+    base_url: str = "https://www.okx.com",
+) -> float:
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        if inst_id.endswith("USDT"):
+            inst_id = f"{inst_id[:-4]}-USDT-SWAP"
+        else:
+            inst_id = f"{inst_id}-USDT-SWAP"
+
+    url = f"{base_url}/api/v5/market/ticker"
+    response = _send_request("GET", url, params=[("instId", inst_id)])
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX ticker reject: {data}")
+
+    payload = data.get("data") or []
+    if not payload:
+        raise TradeExecutionError(f"OKX ticker payload empty for {inst_id}: {data}")
+
+    ticker = payload[0]
+    price_raw = ticker.get("last") or ticker.get("lastPx")
+    if price_raw is None:
+        raise TradeExecutionError(f"OKX ticker missing last price: {ticker}")
+    try:
+        return float(price_raw)
+    except (TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"OKX ticker price invalid: {ticker}") from exc
+
+
+def derive_okx_swap_size_from_usdt(
+    symbol: str,
+    notional_usdt: float,
+    *,
+    price: Optional[float] = None,
+    base_url: str = "https://www.okx.com",
+) -> str:
+    if notional_usdt is None or notional_usdt <= 0:
+        raise TradeExecutionError("`notional_usdt` must be a positive value")
+
+    if price is None:
+        price = get_okx_swap_price(symbol, base_url=base_url)
+
+    filters = _get_okx_instrument_filters(symbol, base_url)
+    if filters.contract_value <= 0:
+        raise TradeExecutionError("OKX contract value metadata invalid")
+
+    base_amount = Decimal(str(notional_usdt)) / Decimal(str(price))
+    approximate_size = base_amount / filters.contract_value
+
+    size_str, _ = _normalise_okx_size(symbol, approximate_size, base_url)
+    return size_str
 
 
 def place_bybit_linear_market_order(

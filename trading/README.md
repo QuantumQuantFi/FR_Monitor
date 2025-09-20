@@ -10,6 +10,9 @@
   - `get_binance_perp_positions()` - 查询Binance期货持仓
   - `get_binance_perp_price()` - 获取Binance期货实时价格
   - 支持OKX、Bybit、Bitget等其他交易所
+  - `get_okx_swap_price()` - 获取OKX永续实时价格
+  - `derive_okx_swap_size_from_usdt()` - 根据USDT目标金额推导OKX合约数量
+  - `set_okx_swap_leverage()` - 通过API设置OKX永续合约杠杆
 
 - **`binance_data_structures.py`** - 数据结构文档
   - 详细的Binance API响应格式说明
