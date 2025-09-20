@@ -112,6 +112,19 @@ _OKX_INSTRUMENT_CACHE: Dict[tuple[str, str], _OKXInstrumentFilters] = {}
 _OKX_INSTRUMENT_CACHE_TTL = 15 * 60  # seconds
 
 
+@dataclass
+class _BybitSymbolFilters:
+    min_qty: Decimal
+    qty_step: Decimal
+    max_qty: Optional[Decimal]
+    tick_size: Optional[Decimal]
+    fetched_at: float
+
+
+_BYBIT_SYMBOL_CACHE: Dict[tuple[str, str, str], _BybitSymbolFilters] = {}
+_BYBIT_SYMBOL_CACHE_TTL = 15 * 60  # seconds
+
+
 def _require_credentials(name: str) -> Any:
     if CONFIG_PRIVATE is None:
         raise TradeExecutionError("config_private.py not available; unable to load credentials")
@@ -638,6 +651,108 @@ def _get_okx_instrument_filters(
     return filters
 
 
+def _get_bybit_symbol_filters(
+    symbol: str,
+    base_url: str,
+    category: str = "linear",
+) -> _BybitSymbolFilters:
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    category_key = category.lower()
+    cache_key = (base_url, category_key, symbol_id)
+    now = time.time()
+    cached = _BYBIT_SYMBOL_CACHE.get(cache_key)
+    if cached and now - cached.fetched_at < _BYBIT_SYMBOL_CACHE_TTL:
+        return cached
+
+    params: List[tuple[str, str]] = [("category", category_key), ("symbol", symbol_id)]
+    url = f"{base_url}/v5/market/instruments-info"
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit instrument metadata reject: {data}")
+
+    result = data.get("result") or {}
+    instruments = result.get("list") or []
+    if not instruments:
+        raise TradeExecutionError(f"Bybit instruments payload empty for {symbol_id}: {data}")
+
+    instrument = instruments[0]
+    lot_filter = instrument.get("lotSizeFilter") or {}
+
+    try:
+        qty_step = Decimal(str(lot_filter["qtyStep"]))
+        min_qty = Decimal(str(lot_filter["minOrderQty"]))
+    except (KeyError, InvalidOperation) as exc:
+        raise TradeExecutionError(f"Bybit lot size metadata invalid: {lot_filter}") from exc
+
+    max_qty_raw = lot_filter.get("maxOrderQty")
+    max_qty: Optional[Decimal] = None
+    if max_qty_raw is not None:
+        try:
+            max_qty = Decimal(str(max_qty_raw))
+        except InvalidOperation:
+            max_qty = None
+
+    price_filter = instrument.get("priceFilter") or {}
+    tick_size_raw = price_filter.get("tickSize")
+    tick_size: Optional[Decimal] = None
+    if tick_size_raw is not None:
+        try:
+            tick_size = Decimal(str(tick_size_raw))
+        except InvalidOperation:
+            tick_size = None
+
+    filters = _BybitSymbolFilters(
+        min_qty=min_qty,
+        qty_step=qty_step,
+        max_qty=max_qty,
+        tick_size=tick_size,
+        fetched_at=now,
+    )
+    _BYBIT_SYMBOL_CACHE[cache_key] = filters
+    return filters
+
+
+def _normalise_bybit_quantity(
+    symbol: str,
+    quantity: Any,
+    base_url: str,
+    category: str = "linear",
+) -> tuple[str, Decimal]:
+    filters = _get_bybit_symbol_filters(symbol, base_url, category)
+
+    try:
+        raw_qty = Decimal(str(quantity))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"`qty` {quantity!r} is not a valid decimal quantity") from exc
+
+    if raw_qty <= 0:
+        raise TradeExecutionError("`qty` must be a positive number of contracts")
+
+    step = filters.qty_step
+    if step <= 0:
+        raise TradeExecutionError("Bybit quantity step metadata invalid")
+
+    units = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * step
+
+    if normalised < filters.min_qty:
+        raise TradeExecutionError(
+            f"`qty` {raw_qty} is below Bybit minimum {filters.min_qty} for {symbol}; increase the order size"
+        )
+
+    if filters.max_qty is not None and normalised > filters.max_qty:
+        raise TradeExecutionError(
+            f"`qty` {raw_qty} exceeds Bybit maximum {filters.max_qty} for {symbol}; reduce the order size"
+        )
+
+    qty_str = format(normalised.normalize(), "f")
+    return qty_str, normalised
+
+
 def get_bybit_linear_positions(
     *,
     symbol: Optional[str] = None,
@@ -850,36 +965,167 @@ def derive_okx_swap_size_from_usdt(
     return size_str
 
 
-def place_bybit_linear_market_order(
+def get_bybit_linear_price(
     symbol: str,
-    side: str,
-    qty: str,
     *,
-    time_in_force: str = "ImmediateOrCancel",
-    reduce_only: Optional[bool] = None,
-    client_order_id: Optional[str] = None,
+    category: str = "linear",
+    base_url: str = "https://api.bybit.com",
+) -> float:
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    params = [("category", category.lower()), ("symbol", symbol_id)]
+    url = f"{base_url}/v5/market/tickers"
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit price query failed: {data}")
+
+    result = data.get("result") or {}
+    tickers = result.get("list") or []
+    if not tickers:
+        raise TradeExecutionError(f"Bybit price payload missing ticker data: {data}")
+
+    ticker = tickers[0]
+    price_raw = ticker.get("lastPrice")
+    if price_raw is None:
+        raise TradeExecutionError(f"Bybit ticker missing last price: {ticker}")
+
+    try:
+        return float(price_raw)
+    except (TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"Bybit ticker price invalid: {ticker}") from exc
+
+
+def derive_bybit_linear_qty_from_usdt(
+    symbol: str,
+    notional_usdt: float,
+    *,
+    price: Optional[float] = None,
+    category: str = "linear",
+    base_url: str = "https://api.bybit.com",
+) -> str:
+    if notional_usdt is None or notional_usdt <= 0:
+        raise TradeExecutionError("`notional_usdt` must be a positive value")
+
+    if price is None:
+        price = get_bybit_linear_price(symbol, category=category, base_url=base_url)
+
+    if price <= 0:
+        raise TradeExecutionError("Bybit price must be positive")
+
+    base_amount = Decimal(str(notional_usdt)) / Decimal(str(price))
+    quantity_str, _ = _normalise_bybit_quantity(symbol, base_amount, base_url, category)
+    return quantity_str
+
+
+def set_bybit_linear_leverage(
+    symbol: str,
+    leverage: Union[int, float, str],
+    *,
+    buy_leverage: Optional[Union[int, float, str]] = None,
+    sell_leverage: Optional[Union[int, float, str]] = None,
+    category: str = "linear",
+    position_idx: Optional[int] = None,
     recv_window: int = 5000,
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     base_url: str = "https://api.bybit.com",
 ) -> Dict[str, Any]:
-    """Submit a market order on Bybit linear USDT perpetuals."""
+    """Configure leverage for Bybit linear perpetuals."""
     creds = _resolve_bybit_credentials(api_key, secret_key)
 
     symbol_id = symbol.upper()
     if not symbol_id.endswith("USDT"):
         symbol_id = f"{symbol_id}USDT"
 
+    def _format_leverage(value: Union[int, float, str]) -> str:
+        try:
+            dec_value = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise TradeExecutionError(f"Invalid leverage value: {value}") from exc
+        if dec_value <= 0:
+            raise TradeExecutionError("Leverage must be greater than zero")
+        return format(dec_value.normalize(), "f")
+
+    buy_value = _format_leverage(buy_leverage if buy_leverage is not None else leverage)
+    sell_value = _format_leverage(sell_leverage if sell_leverage is not None else leverage)
+
     payload: Dict[str, Any] = {
-        "category": "linear",
+        "category": category.lower(),
+        "symbol": symbol_id,
+        "buyLeverage": buy_value,
+        "sellLeverage": sell_value,
+    }
+    if position_idx is not None:
+        payload["positionIdx"] = str(int(position_idx))
+
+    body_str = _compact_json(payload)
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{body_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}/v5/position/set-leverage"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit leverage reject: {data}")
+    return data
+
+
+def place_bybit_linear_market_order(
+    symbol: str,
+    side: str,
+    qty: Union[str, float, Decimal],
+    *,
+    category: str = "linear",
+    time_in_force: str = "ImmediateOrCancel",
+    reduce_only: Optional[bool] = None,
+    position_idx: Optional[int] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Submit a market order on Bybit linear USDT perpetuals.
+
+    ``qty`` is automatically normalised to the exchange's lot-size filter so
+    callers can pass either a float or string amount.
+    """
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    category_key = category.lower()
+
+    qty_str, _ = _normalise_bybit_quantity(symbol_id, qty, base_url, category_key)
+
+    payload: Dict[str, Any] = {
+        "category": category_key,
         "symbol": symbol_id,
         "side": side.capitalize(),
         "orderType": "Market",
-        "qty": str(qty),
+        "qty": qty_str,
         "timeInForce": time_in_force,
     }
     if reduce_only is not None:
         payload["reduceOnly"] = reduce_only
+    if position_idx is not None:
+        payload["positionIdx"] = str(int(position_idx))
     if client_order_id:
         payload["orderLinkId"] = client_order_id
 
