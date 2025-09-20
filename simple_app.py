@@ -8,6 +8,7 @@ import os
 from datetime import datetime, timezone
 from decimal import Decimal
 from exchange_connectors import ExchangeDataCollector
+from arbitrage import ArbitrageMonitor
 from config import DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
@@ -70,6 +71,14 @@ data_collector = ExchangeDataCollector()
 
 # 数据库实例
 db = PriceDatabase()
+
+# 价差套利监控器
+arbitrage_monitor = ArbitrageMonitor(
+    spread_threshold=0.2,
+    sample_window=3,
+    sample_interval_seconds=3.0,
+    cooldown_seconds=30.0,
+)
 
 # 优化的内存数据结构 - 减少内存占用
 class MemoryDataManager:
@@ -158,11 +167,13 @@ def background_data_collection():
         try:
             # 获取所有数据（包含所有币种）
             all_data = data_collector.get_all_data()
-            timestamp = now_utc_iso()
+            observed_at = datetime.now(timezone.utc)
+            timestamp = observed_at.isoformat()
             
             # 为每个币种保存历史数据 - 使用动态支持列表，兼容LINEA等新币
             for symbol in data_collector.supported_symbols:
                 premium_data = data_collector.calculate_premium(symbol)
+                futures_prices = {}
                 
                 for exchange in all_data:
                     if symbol in all_data[exchange]:
@@ -180,6 +191,10 @@ def background_data_collection():
                             # 使用内存管理器添加记录
                             memory_manager.add_record(symbol, exchange, historical_entry)
                             
+                            futures_price = symbol_data['futures'].get('price') if symbol_data['futures'] else None
+                            if isinstance(futures_price, (int, float)) and futures_price > 0:
+                                futures_prices[exchange] = futures_price
+
                             # 批量保存到数据库以减少磁盘IO
                             batch_buffer.append({
                                 'symbol': symbol,
@@ -203,6 +218,17 @@ def background_data_collection():
                                 except Exception as e:
                                     print(f"批量写入数据库失败: {e}")
                                     batch_buffer.clear()  # 清空缓冲区避免重复尝试
+
+                # 更新轻量套利监控
+                if futures_prices:
+                    signals = arbitrage_monitor.update(symbol, futures_prices, observed_at=observed_at)
+                    for signal in signals:
+                        print(
+                            "套利信号:",
+                            signal.symbol,
+                            f"{signal.short_exchange}->{signal.long_exchange}",
+                            f"spread={signal.spread_percent:.2f}%",
+                        )
             
             # 定期维护任务（每5分钟执行一次）
             current_time = datetime.now()
@@ -486,6 +512,15 @@ def get_aggregated_data():
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/arbitrage/signals')
+def get_arbitrage_signals():
+    """获取最近的跨交易所套利信号"""
+    return precision_jsonify({
+        'signals': arbitrage_monitor.get_recent_signals(),
+        'timestamp': now_utc_iso()
+    })
 
 @app.route('/api/markets')
 def get_markets_info():

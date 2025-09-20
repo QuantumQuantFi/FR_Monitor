@@ -128,6 +128,69 @@
             text-transform: uppercase;
         }
         .rest-pill .ts { opacity: 0.9; }
+
+        .arbitrage-section {
+            margin-top: 18px;
+            background: rgba(30, 35, 41, 0.65);
+            border: 1px solid #3c4043;
+            border-radius: 12px;
+            padding: 16px;
+        }
+        .arbitrage-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+        .arbitrage-title {
+            font-size: 16px;
+            font-weight: 600;
+            color: #f0b90b;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .arbitrage-title span {
+            font-size: 12px;
+            color: #9ca3af;
+            font-weight: 400;
+        }
+        .signal-list {
+            display: grid;
+            gap: 10px;
+        }
+        .signal-item {
+            background: rgba(43, 47, 54, 0.7);
+            border: 1px solid rgba(240, 185, 11, 0.18);
+            border-radius: 10px;
+            padding: 10px 12px;
+            display: grid;
+            grid-template-columns: 1.2fr 1fr 1fr;
+            gap: 10px;
+            align-items: center;
+        }
+        .signal-item strong {
+            color: #f0b90b;
+            font-size: 14px;
+        }
+        .signal-meta {
+            font-size: 12px;
+            color: #9ca3af;
+            line-height: 1.4;
+        }
+        .signal-side {
+            font-size: 12px;
+            color: #22c55e;
+        }
+        .signal-side.short {
+            color: #ef4444;
+        }
+        .signal-empty {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 12px;
+            padding: 16px 0;
+        }
         
         .stat-card {
             background: rgba(30, 35, 41, 0.8);
@@ -466,6 +529,15 @@
             <div class="rest-pill"><span class="ex">bybit</span><span class="ts" id="rest-bybit">-</span></div>
             <div class="rest-pill"><span class="ex">bitget</span><span class="ts" id="rest-bitget">-</span></div>
         </div>
+
+        <div class="arbitrage-section">
+            <div class="arbitrage-header">
+                <div class="arbitrage-title">⚡ 最新套利信号 <span id="arbitrageUpdated">--</span></div>
+            </div>
+            <div class="signal-list" id="arbitrageSignals">
+                <div class="signal-empty">暂无满足条件的套利信号</div>
+            </div>
+        </div>
     </div>
 
     <div class="symbols-grid" id="symbolsGrid">
@@ -488,6 +560,7 @@
         let autoResort = true;           // 是否自动重新排序
         let cardOrder = [];              // 当前卡片顺序（冻结时使用）
         let forceResort = false;         // 用户操作触发的一次性重排
+        let latestArbitrageSignals = [];
 
         // 主流币种列表
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
@@ -997,9 +1070,56 @@
             }
         }
 
+        function renderArbitrageSignals(signals, fetchedAt) {
+            const container = document.getElementById('arbitrageSignals');
+            const updatedLabel = document.getElementById('arbitrageUpdated');
+            if (!container) return;
+
+            updatedLabel.textContent = fetchedAt ? formatTimestamp(fetchedAt) : '--';
+
+            if (!signals || !signals.length) {
+                container.innerHTML = '<div class="signal-empty">暂无满足条件的套利信号</div>';
+                return;
+            }
+
+            const limited = signals.slice(0, 5);
+            const html = limited.map(signal => {
+                const spread = (signal.spread_percent || 0).toFixed(2);
+                return `
+                    <div class="signal-item">
+                        <div>
+                            <strong>${signal.symbol}</strong>
+                            <div class="signal-meta">${formatTimestamp(signal.observed_at)}</div>
+                        </div>
+                        <div class="signal-meta">
+                            <div class="signal-side short">空: ${signal.short_exchange?.toUpperCase() || '-'} @ ${formatPrice(signal.price_short)}</div>
+                            <div class="signal-side">多: ${signal.long_exchange?.toUpperCase() || '-'} @ ${formatPrice(signal.price_long)}</div>
+                        </div>
+                        <div class="signal-meta" style="text-align:right;">
+                            <div>价差: <strong>${spread}%</strong></div>
+                        </div>
+                    </div>
+                `;
+            }).join('');
+
+            container.innerHTML = html;
+        }
+
+        async function fetchArbitrageSignals() {
+            try {
+                const res = await fetch('/api/arbitrage/signals');
+                const data = await res.json();
+                latestArbitrageSignals = data.signals || [];
+                renderArbitrageSignals(latestArbitrageSignals, data.timestamp);
+            } catch (error) {
+                console.error('套利信号获取失败:', error);
+            }
+        }
+
         // 手动刷新
         function refreshData() {
             fetchAggregatedData();
+            fetchArbitrageSignals();
         }
 
         // 切换自动刷新
@@ -1022,6 +1142,7 @@
                 if (isAutoRefresh) {
                     fetchAggregatedData();
                     fetchSystemStatus();
+                    fetchArbitrageSignals();
                 }
             }, 1000); // 1秒刷新
         }
@@ -1051,6 +1172,7 @@
             // 初始化数据
             fetchAggregatedData();
             fetchSystemStatus();
+            fetchArbitrageSignals();
             startAutoRefresh();
         });
 
