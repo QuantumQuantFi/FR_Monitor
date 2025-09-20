@@ -125,6 +125,19 @@ _BYBIT_SYMBOL_CACHE: Dict[tuple[str, str, str], _BybitSymbolFilters] = {}
 _BYBIT_SYMBOL_CACHE_TTL = 15 * 60  # seconds
 
 
+@dataclass
+class _BitgetContractFilters:
+    min_size: Decimal
+    size_step: Decimal
+    size_multiplier: Decimal
+    price_step: Decimal
+    fetched_at: float
+
+
+_BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
+_BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
+
+
 def _require_credentials(name: str) -> Any:
     if CONFIG_PRIVATE is None:
         raise TradeExecutionError("config_private.py not available; unable to load credentials")
@@ -805,21 +818,29 @@ def get_bitget_usdt_perp_positions(
     *,
     symbol: Optional[str] = None,
     product_type: str = "umcbl",
+    margin_coin: Optional[str] = "USDT",
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
     passphrase: Optional[str] = None,
     base_url: str = "https://api.bitget.com",
 ) -> List[Dict[str, Any]]:
-    """Fetch Bitget USDT-margined perpetual positions."""
+    """Fetch Bitget USDT-margined perpetual positions.
+
+    Bitget retired ``/position/list`` and now exposes consolidated snapshots via
+    ``/position/allPosition-v2``. The response contains every position for the
+    requested ``productType``, so callers can optionally filter the payload by
+    ``symbol``.
+    """
     creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
 
-    request_path = "/api/mix/v1/position/list"
-    params: List[tuple[str, str]] = [("productType", product_type)]
+    inst_filter: Optional[str] = None
     if symbol:
-        inst = symbol.upper()
-        if not inst.endswith("_UMCBL"):
-            inst = f"{inst}USDT_UMCBL" if not inst.endswith("USDT") else f"{inst}_UMCBL"
-        params.append(("symbol", inst))
+        inst_filter = _normalise_bitget_symbol(symbol)
+
+    request_path = "/api/mix/v1/position/allPosition-v2"
+    params: List[tuple[str, str]] = [("productType", product_type)]
+    if margin_coin:
+        params.append(("marginCoin", margin_coin.upper()))
 
     query_str = urlencode(params)
     timestamp = _iso_timestamp()
@@ -840,10 +861,214 @@ def get_bitget_usdt_perp_positions(
     data = _json_or_error(response)
     if response.status_code != 200 or data.get("code") != "00000":
         raise TradeExecutionError(f"Bitget positions reject: {data}")
-    payload = data.get("data", [])
-    if isinstance(payload, dict):
-        return payload.get("positions", [])
+
+    payload = data.get("data") or []
+    if not isinstance(payload, list):
+        raise TradeExecutionError(f"Bitget positions payload malformed: {data}")
+
+    if inst_filter:
+        payload = [item for item in payload if (item.get("symbol") or "").upper() == inst_filter]
     return payload
+
+
+def _normalise_bitget_symbol(symbol: str) -> str:
+    inst = symbol.upper()
+    if inst.endswith("_UMCBL"):
+        return inst
+    if inst.endswith("USDT"):
+        return f"{inst}_UMCBL"
+    return f"{inst}USDT_UMCBL"
+
+
+def _get_bitget_contract_filters(
+    symbol: str,
+    *,
+    base_url: str,
+    product_type: str = "umcbl",
+) -> _BitgetContractFilters:
+    key_symbol = _normalise_bitget_symbol(symbol)
+    cache_key = (base_url, product_type.lower(), key_symbol)
+    now = time.time()
+    cached = _BITGET_CONTRACT_CACHE.get(cache_key)
+    if cached and now - cached.fetched_at < _BITGET_CONTRACT_CACHE_TTL:
+        return cached
+
+    request_path = "/api/mix/v1/market/contracts"
+    params: List[tuple[str, str]] = [("productType", product_type)]
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget contract metadata reject: {data}")
+
+    contracts = data.get("data") or []
+    if not isinstance(contracts, list):
+        raise TradeExecutionError(f"Bitget contract metadata invalid: {data}")
+
+    contract = next((item for item in contracts if (item.get("symbol") or "").upper() == key_symbol), None)
+    if not contract:
+        raise TradeExecutionError(f"Bitget contract metadata missing {key_symbol}: {data}")
+
+    try:
+        min_trade = Decimal(str(contract["minTradeNum"]))
+        size_multiplier = Decimal(str(contract["sizeMultiplier"]))
+        volume_place = int(contract.get("volumePlace", 0))
+        price_place = int(contract.get("pricePlace", 0))
+    except (KeyError, InvalidOperation, ValueError) as exc:
+        raise TradeExecutionError(f"Bitget contract payload malformed: {contract}") from exc
+
+    size_step = Decimal("1").scaleb(-volume_place) if volume_place >= 0 else Decimal("1")
+    if size_multiplier > 0:
+        # Ensure the step honours the contract multiplier granularity.
+        size_step = max(size_step, size_multiplier)
+
+    price_step = Decimal("1").scaleb(-price_place) if price_place >= 0 else Decimal("1")
+
+    filters = _BitgetContractFilters(
+        min_size=min_trade,
+        size_step=size_step,
+        size_multiplier=size_multiplier,
+        price_step=price_step,
+        fetched_at=now,
+    )
+    _BITGET_CONTRACT_CACHE[cache_key] = filters
+    return filters
+
+
+def _normalise_bitget_size(
+    symbol: str,
+    size: Any,
+    *,
+    base_url: str,
+    product_type: str = "umcbl",
+) -> tuple[str, Decimal]:
+    filters = _get_bitget_contract_filters(symbol, base_url=base_url, product_type=product_type)
+
+    try:
+        raw_size = Decimal(str(size))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"`size` {size!r} is not a valid decimal quantity") from exc
+
+    if raw_size <= 0:
+        raise TradeExecutionError("`size` must be a positive number of contracts")
+
+    step = filters.size_step
+    if step <= 0:
+        raise TradeExecutionError("Bitget size step metadata invalid")
+
+    units = (raw_size / step).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * step
+
+    if normalised < filters.min_size:
+        raise TradeExecutionError(
+            f"`size` {raw_size} is below Bitget minimum {filters.min_size} for {symbol}; increase the order size"
+        )
+
+    size_str = format(normalised.normalize(), "f")
+    return size_str, normalised
+
+
+def get_bitget_usdt_perp_price(
+    symbol: str,
+    *,
+    base_url: str = "https://api.bitget.com",
+) -> float:
+    inst = _normalise_bitget_symbol(symbol)
+    url = f"{base_url}/api/mix/v1/market/ticker"
+    response = _send_request("GET", url, params=[("symbol", inst)])
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget price query failed: {data}")
+
+    payload = data.get("data") or {}
+    price_raw = payload.get("last")
+    if price_raw is None:
+        raise TradeExecutionError(f"Bitget ticker missing last price: {payload}")
+
+    try:
+        return float(price_raw)
+    except (TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"Bitget ticker price invalid: {payload}") from exc
+
+
+def derive_bitget_usdt_perp_size_from_usdt(
+    symbol: str,
+    notional_usdt: float,
+    *,
+    price: Optional[float] = None,
+    base_url: str = "https://api.bitget.com",
+    product_type: str = "umcbl",
+) -> str:
+    if notional_usdt is None or notional_usdt <= 0:
+        raise TradeExecutionError("`notional_usdt` must be a positive value")
+
+    if price is None:
+        price = get_bitget_usdt_perp_price(symbol, base_url=base_url)
+
+    if price <= 0:
+        raise TradeExecutionError("Bitget price must be positive")
+
+    base_amount = Decimal(str(notional_usdt)) / Decimal(str(price))
+    size_str, _ = _normalise_bitget_size(
+        symbol,
+        base_amount,
+        base_url=base_url,
+        product_type=product_type,
+    )
+    return size_str
+
+
+def set_bitget_usdt_perp_leverage(
+    symbol: str,
+    leverage: Union[int, float, str],
+    *,
+    margin_coin: str = "USDT",
+    hold_side: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+
+    inst = _normalise_bitget_symbol(symbol)
+
+    try:
+        leverage_value = Decimal(str(leverage))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"Invalid leverage value: {leverage}") from exc
+    if leverage_value <= 0:
+        raise TradeExecutionError("Leverage must be greater than zero")
+
+    payload: Dict[str, Any] = {
+        "symbol": inst,
+        "marginCoin": margin_coin.upper(),
+        "leverage": format(leverage_value.normalize(), "f"),
+    }
+    if hold_side:
+        payload["holdSide"] = hold_side
+
+    request_path = "/api/mix/v1/account/setLeverage"
+    timestamp = _iso_timestamp()
+    body_str = _compact_json(payload)
+    message = f"{timestamp}POST{request_path}{body_str}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget leverage reject: {data}")
+    return data
 
 
 def place_okx_swap_market_order(
@@ -1155,7 +1380,7 @@ def place_bybit_linear_market_order(
 def place_bitget_usdt_perp_market_order(
     symbol: str,
     side: str,
-    size: str,
+    size: Union[str, float, Decimal],
     *,
     margin_coin: str = "USDT",
     reduce_only: Optional[bool] = None,
@@ -1165,12 +1390,17 @@ def place_bitget_usdt_perp_market_order(
     passphrase: Optional[str] = None,
     base_url: str = "https://api.bitget.com",
 ) -> Dict[str, Any]:
-    """Submit a market order on Bitget USDT-margined perpetuals."""
+    """Submit a market order on Bitget USDT-margined perpetuals.
+
+    ``size`` is treated as the base asset amount (e.g. ETH) and normalised to the
+    contract's minimum trade size and step. This keeps the interface consistent
+    with Binance/OKX/Bybit helpers which accept base quantities.
+    """
     creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
 
-    inst = symbol.upper()
-    if not inst.endswith("_UMCBL"):
-        inst = f"{inst}USDT_UMCBL" if not inst.endswith("USDT") else f"{inst}_UMCBL"
+    inst = _normalise_bitget_symbol(symbol)
+
+    size_str, _ = _normalise_bitget_size(inst, size, base_url=base_url)
 
     normalized_side = side.lower()
     if normalized_side in {"buy", "sell"}:
@@ -1183,8 +1413,8 @@ def place_bitget_usdt_perp_market_order(
 
     payload: Dict[str, Any] = {
         "symbol": inst,
-        "marginCoin": margin_coin,
-        "size": str(size),
+        "marginCoin": margin_coin.upper(),
+        "size": size_str,
         "orderType": "market",
         "side": normalized_side,
     }
@@ -1213,4 +1443,11 @@ def place_bitget_usdt_perp_market_order(
     data = _json_or_error(response)
     if response.status_code != 200 or data.get("code") != "00000":
         raise TradeExecutionError(f"Bitget reject: {data}")
+    result_payload = data.get("data")
+    if isinstance(result_payload, dict):
+        result_payload.setdefault("symbol", inst)
+        result_payload.setdefault("marginCoin", margin_coin.upper())
+        result_payload.setdefault("size", size_str)
+        # Preserve the original buy/sell intent for downstream logging.
+        result_payload.setdefault("side", normalized_side)
     return data
