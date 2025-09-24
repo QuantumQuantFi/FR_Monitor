@@ -1084,7 +1084,8 @@
 
             const limited = signals.slice(0, 5);
             const html = limited.map(signal => {
-                const spread = (signal.spread_percent || 0).toFixed(2);
+                const spreadValue = Number(signal.spread_percent ?? 0);
+                const spread = Number.isFinite(spreadValue) ? spreadValue.toFixed(2) : '0.00';
                 return `
                     <div class="signal-item">
                         <div>

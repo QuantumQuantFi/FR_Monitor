@@ -413,6 +413,19 @@ class ExchangeDataCollector:
                         'timestamp': synced_at,
                         'symbol': new_data.get('symbol')
                     })
+
+                    # REST 视为权威数据来源，可覆盖旧的资金费率/结算时间
+                    rest_funding = new_data.get('funding_rate')
+                    if rest_funding not in (None, ''):
+                        try:
+                            merged['funding_rate'] = float(rest_funding)
+                        except (TypeError, ValueError):
+                            pass
+
+                    rest_next_ft = new_data.get('next_funding_time')
+                    if rest_next_ft:
+                        merged['next_funding_time'] = rest_next_ft
+
                     self.data[exchange][symbol][kind] = merged
 
         # 标记该交易所合并时刻为最后同步时间（用于前端展示）
@@ -462,6 +475,19 @@ class ExchangeDataCollector:
                             'timestamp': synced_at,
                             'symbol': new_data.get('symbol')
                         })
+
+                        # REST 视为权威数据来源，可覆盖旧的资金费率/结算时间
+                        rest_funding = new_data.get('funding_rate')
+                        if rest_funding not in (None, ''):
+                            try:
+                                merged['funding_rate'] = float(rest_funding)
+                            except (TypeError, ValueError):
+                                pass
+
+                        rest_next_ft = new_data.get('next_funding_time')
+                        if rest_next_ft:
+                            merged['next_funding_time'] = rest_next_ft
+
                         self.data[exchange][symbol][kind] = merged
 
             # 更新该交易所的REST最后同步时间

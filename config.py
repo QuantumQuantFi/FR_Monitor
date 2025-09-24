@@ -97,7 +97,7 @@ REST_CONNECTION_CONFIG = {
 
 # REST合并策略
 REST_MERGE_POLICY = {
-    'prefer_ws_secs': 6,            # 若现有数据在N秒内更新，优先保留WS数据
+    'prefer_ws_secs': 0.2,          # 若现有数据在N秒内更新，优先保留WS数据
 }
 
 # 内存优化配置
@@ -107,6 +107,9 @@ MEMORY_OPTIMIZATION_CONFIG = {
     'batch_size': 50,                  # 批处理大小
     'data_compression': True,          # 启用数据压缩
 }
+
+# 数据库存储节流间隔（秒）
+DB_WRITE_INTERVAL_SECONDS = 60
 
 # 动态币种筛选参数
 MARKET_FILTER_CONFIG = {

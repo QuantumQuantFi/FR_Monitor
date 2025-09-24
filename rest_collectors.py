@@ -170,7 +170,30 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
                     price = float(item.get('lastPrice') or 0)
                     if price:
                         out.setdefault(coin, {}).setdefault('futures', {})
-                        out[coin]['futures'] = {'price': price, 'timestamp': ts, 'symbol': sym}
+
+                        # 捕获Bybit资金费率，REST返回数据即为权威值
+                        funding_rate_value = None
+                        raw_funding = item.get('fundingRate')
+                        if raw_funding not in (None, ''):
+                            try:
+                                funding_rate_value = float(raw_funding)
+                            except (TypeError, ValueError):
+                                funding_rate_value = None
+
+                        futures_snapshot = {
+                            'price': price,
+                            'timestamp': ts,
+                            'symbol': sym
+                        }
+
+                        if funding_rate_value is not None:
+                            futures_snapshot['funding_rate'] = funding_rate_value
+
+                        next_funding_time = item.get('nextFundingTime')
+                        if next_funding_time:
+                            futures_snapshot['next_funding_time'] = next_funding_time
+
+                        out[coin]['futures'] = futures_snapshot
     except Exception:
         pass
     return out
