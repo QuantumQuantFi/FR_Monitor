@@ -21,6 +21,17 @@ class ExchangeDataCollector:
         # 使用动态币种列表作为默认值
         self.supported_symbols = CURRENT_SUPPORTED_SYMBOLS.copy()
         
+        # 针对跨交易所同名但实际不同的标的，使用本地别名避免误归并
+        # 在此维护硬编码映射：{<exchange>: {<原符号>: <本地别名>}}
+        # 维护特殊别名硬编码表：{<exchange>: {<原符号>: <本地别名>}}
+        # 如需新增/调整别名，只需在此字典补充映射，并确保 rest_collectors.py 中的 _bybit_observed_to_coin 做到对应映射。
+        # 前端聚合与 API 已通过 normalize_symbol_for_exchange() 复用该表，无需额外修改。
+        self.symbol_overrides = {
+            'bybit': {
+                'APP': 'APPbybit',  # Bybit 的 APPUSDT 独立成别名，避免与其它交易所的 APP 比价
+            }
+        }
+
         # 获取各交易所特定的币种列表
         self.exchange_symbols = {}
         self._load_exchange_symbols()
@@ -60,35 +71,70 @@ class ExchangeDataCollector:
     
     def _load_exchange_symbols(self):
         """加载各交易所特定的币种列表"""
+        used_static_fallback = False
         try:
             print("正在获取各交易所实际支持的币种列表...")
             self.exchange_symbols = get_exchange_symbols(force_refresh=False)
-            
-            # 合并所有交易所的币种作为总的支持列表
-            all_symbols = set()
-            for exchange, symbols_data in self.exchange_symbols.items():
-                all_symbols.update(symbols_data.get('spot', []))
-                all_symbols.update(symbols_data.get('futures', []))
-            
-            # 更新总的支持币种列表
-            self.supported_symbols = sorted(list(all_symbols))
-            print(f"✅ 从各交易所获取到 {len(self.supported_symbols)} 个唯一币种")
-            
-            # 显示各交易所支持情况
-            for exchange, symbols_data in self.exchange_symbols.items():
-                spot_count = len(symbols_data.get('spot', []))
-                futures_count = len(symbols_data.get('futures', []))
-                print(f"  {exchange.upper()}: 现货 {spot_count} 个, 期货 {futures_count} 个")
-                
         except Exception as e:
+            used_static_fallback = True
             print(f"⚠️ 获取交易所币种列表失败，使用默认列表: {e}")
-            # 使用默认的静态列表
+            # 使用默认的静态列表；稍后会再应用本地别名映射
             for exchange in ['binance', 'okx', 'bybit', 'bitget']:
                 self.exchange_symbols[exchange] = {
                     'spot': self.supported_symbols.copy(),
                     'futures': self.supported_symbols.copy()
                 }
-    
+
+        # 统一应用本地硬编码别名（例如 APP -> APPbybit）
+        self._apply_symbol_overrides()
+
+        # 合并所有交易所的币种作为总的支持列表
+        all_symbols = set()
+        for exchange, symbols_data in self.exchange_symbols.items():
+            all_symbols.update(symbols_data.get('spot', []))
+            all_symbols.update(symbols_data.get('futures', []))
+
+        # 更新总的支持币种列表
+        self.supported_symbols = sorted(list(all_symbols))
+        print(f"✅ 从各交易所获取到 {len(self.supported_symbols)} 个唯一币种")
+        
+        # 显示各交易所支持情况
+        for exchange, symbols_data in self.exchange_symbols.items():
+            spot_count = len(symbols_data.get('spot', []))
+            futures_count = len(symbols_data.get('futures', []))
+            print(f"  {exchange.upper()}: 现货 {spot_count} 个, 期货 {futures_count} 个")
+
+        if used_static_fallback:
+            print("⚠️ 当前使用静态回退列表，建议检查网络或稍后重试动态拉取。")
+
+    def _apply_symbol_overrides(self):
+        """应用本地特殊别名，避免跨交易所的同名币种误合并"""
+        for exchange, mapping in self.symbol_overrides.items():  # 如需扩展别名，维护 self.symbol_overrides 即可
+            if exchange not in self.exchange_symbols:
+                continue
+
+            for market_type in ['spot', 'futures']:
+                symbols = self.exchange_symbols[exchange].get(market_type)
+                if not symbols:
+                    continue
+
+                remapped = []
+                for symbol in symbols:
+                    remapped_symbol = mapping.get(symbol, symbol)
+                    if remapped_symbol not in remapped:
+                        remapped.append(remapped_symbol)
+
+                self.exchange_symbols[exchange][market_type] = remapped
+
+    def _resolve_exchange_symbol(self, exchange: str, symbol: str) -> str:
+        """将全局币种名转换为指定交易所使用的本地别名"""
+        mapping = self.symbol_overrides.get(exchange, {})
+        return mapping.get(symbol, symbol)
+
+    def normalize_symbol_for_exchange(self, exchange: str, symbol: str) -> str:
+        """对外暴露的别名映射，供API聚合等场景复用"""
+        return self._resolve_exchange_symbol(exchange, symbol)
+
     def _initialize_data_structure(self):
         """初始化数据结构"""
         for exchange in ['okx', 'binance', 'bybit', 'bitget']:
@@ -130,6 +176,11 @@ class ExchangeDataCollector:
             'NEIROETH': {
                 'spot': 'NEIROETH',
                 'futures': 'NEIROETH'
+            },
+            # Bybit 专用：APPUSDT 与其他交易所不同，映射为本地别名 APPbybit
+            'APPbybit': {
+                'spot': 'APP',
+                'futures': 'APP'
             }
         }
         return special_mappings.get(symbol, {'spot': symbol, 'futures': symbol})
@@ -144,6 +195,9 @@ class ExchangeDataCollector:
         alias_to_coin = {
             'NEIRO': 'NEIROETH',
             'NEIROETH': 'NEIROETH',
+            'APP': 'APPbybit',
+            'APPbybit': 'APPbybit',
+            'APPBYBIT': 'APPbybit',
         }
         return alias_to_coin.get(observed_base, observed_base)
 
@@ -325,7 +379,7 @@ class ExchangeDataCollector:
         if exchange not in self.data:
             return
 
-        prefer_ws_secs = int(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
+        prefer_ws_secs = float(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
 
         for symbol, parts in symbol_map.items():
             if symbol not in self.supported_symbols:
@@ -356,7 +410,7 @@ class ExchangeDataCollector:
                     merged = {k: v for k, v in existing.items() if k not in ('price', 'timestamp', 'symbol')}
                     merged.update({
                         'price': new_data.get('price', 0),
-                        'timestamp': new_data.get('timestamp'),  # 保留原快照时间以供诊断
+                        'timestamp': synced_at,
                         'symbol': new_data.get('symbol')
                     })
                     self.data[exchange][symbol][kind] = merged
@@ -366,12 +420,12 @@ class ExchangeDataCollector:
 
     def _merge_rest_snapshots(self, snapshots):
         """将REST快照数据合并到内存数据结构，尽量不覆盖新鲜的WS数据"""
-        prefer_ws_secs = int(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
+        prefer_ws_secs = float(REST_MERGE_POLICY.get('prefer_ws_secs', 6))
 
         for exchange, symbol_map in snapshots.items():
             if exchange not in self.data:
                 continue
-            updated_ts_for_exchange = None
+            synced_at = datetime.now(timezone.utc).isoformat()
             for symbol, parts in symbol_map.items():
                 # 仅合并在支持列表里的USDT币种
                 if symbol not in self.supported_symbols:
@@ -384,8 +438,6 @@ class ExchangeDataCollector:
                     if kind not in parts:
                         continue
                     new_data = parts[kind]
-                    if not updated_ts_for_exchange:
-                        updated_ts_for_exchange = new_data.get('timestamp')
                     # 不覆盖资金费率；只补充价格/时间戳/标识
                     existing = self.data[exchange][symbol].get(kind, {})
 
@@ -407,15 +459,13 @@ class ExchangeDataCollector:
                         merged = {k: v for k, v in existing.items() if k not in ('price', 'timestamp', 'symbol')}
                         merged.update({
                             'price': new_data.get('price', 0),
-                            'timestamp': new_data.get('timestamp'),
+                            'timestamp': synced_at,
                             'symbol': new_data.get('symbol')
                         })
                         self.data[exchange][symbol][kind] = merged
 
             # 更新该交易所的REST最后同步时间
-            if updated_ts_for_exchange:
-                # 旧实现：以快照时间为last_sync；保留以兼容，但不再使用该路径
-                self.rest_last_sync[exchange] = updated_ts_for_exchange
+            self.rest_last_sync[exchange] = synced_at
 
     def restart_connections(self):
         """重启所有连接（通常用于网络错误恢复）"""
@@ -1235,8 +1285,9 @@ class ExchangeDataCollector:
             
         symbol_data = {}
         for exchange in self.data:
-            if symbol in self.data[exchange]:
-                symbol_data[exchange] = self.data[exchange][symbol]
+            resolved_symbol = self._resolve_exchange_symbol(exchange, symbol)
+            if resolved_symbol in self.data[exchange]:
+                symbol_data[exchange] = self.data[exchange][resolved_symbol]
             else:
                 symbol_data[exchange] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
         
@@ -1256,10 +1307,11 @@ class ExchangeDataCollector:
         
         for exchange in self.data:
             try:
-                if symbol in self.data[exchange]:
-                    spot_price = self.data[exchange][symbol]['spot'].get('price', 0)
-                    futures_price = self.data[exchange][symbol]['futures'].get('price', 0)
-                    
+                resolved_symbol = self._resolve_exchange_symbol(exchange, symbol)
+                if resolved_symbol in self.data[exchange]:
+                    spot_price = self.data[exchange][resolved_symbol]['spot'].get('price', 0)
+                    futures_price = self.data[exchange][resolved_symbol]['futures'].get('price', 0)
+
                     exchange_data[exchange] = {
                         'spot_price': spot_price,
                         'futures_price': futures_price

@@ -44,6 +44,9 @@ def _bybit_observed_to_coin(observed_base: str) -> str:
     alias_to_coin = {
         'NEIRO': 'NEIROETH',
         'NEIROETH': 'NEIROETH',
+        'APP': 'APPbybit',
+        'APPbybit': 'APPbybit',
+        'APPBYBIT': 'APPbybit',
     }
     return alias_to_coin.get(observed_base, observed_base)
 

@@ -3,15 +3,89 @@ import json
 import threading
 import time
 import gc
+import logging
+from logging.handlers import RotatingFileHandler
 import psutil
 import os
+import builtins
+import sys
 from datetime import datetime, timezone
 from decimal import Decimal
 from exchange_connectors import ExchangeDataCollector
 from arbitrage import ArbitrageMonitor
-from config import DATA_REFRESH_INTERVAL, CURRENT_SUPPORTED_SYMBOLS, MEMORY_OPTIMIZATION_CONFIG, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG
+from config import (
+    DATA_REFRESH_INTERVAL,
+    CURRENT_SUPPORTED_SYMBOLS,
+    MEMORY_OPTIMIZATION_CONFIG,
+    WS_UPDATE_INTERVAL,
+    WS_CONNECTION_CONFIG,
+    DB_WRITE_INTERVAL_SECONDS,
+)
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
+
+LOG_DIR = "logs"
+LOG_FILE_NAME = "simple_app.log"
+LOG_MAX_BYTES = 20 * 1024 * 1024  # 20MB per file
+LOG_BACKUP_COUNT = 3
+_LOGGING_CONFIGURED = False
+
+
+def configure_logging() -> None:
+    """Configure application-wide rotating file logging and capture stdout prints."""
+    global _LOGGING_CONFIGURED
+    if _LOGGING_CONFIGURED:
+        return
+
+    os.makedirs(LOG_DIR, exist_ok=True)
+    log_path = os.path.join(LOG_DIR, LOG_FILE_NAME)
+
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    formatter = logging.Formatter(
+        "%(asctime)s %(name)s [%(levelname)s] %(message)s"
+    )
+    handler.setFormatter(formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.handlers.clear()
+    root_logger.addHandler(handler)
+
+    flask_logger = logging.getLogger("flask.app")
+    flask_logger.handlers.clear()
+    flask_logger.propagate = True
+
+    logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
+    original_print = builtins.print
+
+    def logging_print(*args, **kwargs):
+        target = kwargs.get("file", sys.stdout)
+        if target not in (sys.stdout, sys.stderr, None):
+            return original_print(*args, **kwargs)
+
+        sep = kwargs.get("sep", " ")
+        end = kwargs.get("end", "\n")
+        message = sep.join(str(arg) for arg in args)
+        if end and end != "\n":
+            message = f"{message}{end}"
+
+        logger = logging.getLogger("simple_app.stdout")
+        if message:
+            logger.info(message)
+        else:
+            logger.info("")
+
+    builtins.print = logging_print
+    _LOGGING_CONFIGURED = True
+
+
+configure_logging()
 
 # 自定义JSON编码器以保持数值精度，避免科学计数法
 class PrecisionJSONEncoder(json.JSONEncoder):
@@ -74,9 +148,9 @@ db = PriceDatabase()
 
 # 价差套利监控器
 arbitrage_monitor = ArbitrageMonitor(
-    spread_threshold=0.2,
+    spread_threshold=0.6,
     sample_window=3,
-    sample_interval_seconds=3.0,
+    sample_interval_seconds=8.0,
     cooldown_seconds=30.0,
 )
 
@@ -159,10 +233,11 @@ def background_data_collection():
     last_maintenance = datetime.now()
     maintenance_interval = 60    # 1分钟执行一次维护任务（聚合与清理）
     
-    # 批处理缓冲区
+    # 批处理缓冲区与写入节流
     batch_buffer = []
+    last_db_write = {}
     batch_size = MEMORY_OPTIMIZATION_CONFIG['batch_size']
-    
+
     while True:
         try:
             # 获取所有数据（包含所有币种）
@@ -196,13 +271,17 @@ def background_data_collection():
                                 futures_prices[exchange] = futures_price
 
                             # 批量保存到数据库以减少磁盘IO
-                            batch_buffer.append({
-                                'symbol': symbol,
-                                'exchange': exchange,
-                                'symbol_data': symbol_data,
-                                'premium_data': premium_data
-                            })
-                            
+                            key = (symbol, exchange)
+                            last_write = last_db_write.get(key)
+                            if not last_write or (observed_at - last_write).total_seconds() >= DB_WRITE_INTERVAL_SECONDS:
+                                batch_buffer.append({
+                                    'symbol': symbol,
+                                    'exchange': exchange,
+                                    'symbol_data': symbol_data,
+                                    'premium_data': premium_data
+                                })
+                                last_db_write[key] = observed_at
+
                             # 当批处理缓冲区满时，批量写入数据库
                             if len(batch_buffer) >= batch_size:
                                 try:
@@ -499,11 +578,14 @@ def get_aggregated_data():
         
         # 重组数据结构：从 交易所->币种 改为 币种->交易所
         aggregated = {}
-        for exchange in all_data:
-            for symbol in all_data[exchange]:
-                if symbol not in aggregated:
-                    aggregated[symbol] = {}
-                aggregated[symbol][exchange] = all_data[exchange][symbol]
+        for exchange, symbol_map in all_data.items():
+            for raw_symbol, exchange_data in symbol_map.items():
+                # 统一通过 normalize_symbol_for_exchange() 应用硬编码别名，避免前端比较到不同标的
+                # 如需新增别名，仅需在 exchange_connectors.ExchangeDataCollector.symbol_overrides 中维护即可。
+                normalized_symbol = data_collector.normalize_symbol_for_exchange(exchange, raw_symbol)
+                if normalized_symbol not in aggregated:
+                    aggregated[normalized_symbol] = {}
+                aggregated[normalized_symbol][exchange] = exchange_data
         
         return jsonify({
             'aggregated_data': aggregated,
