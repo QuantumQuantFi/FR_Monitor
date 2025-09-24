@@ -11,7 +11,9 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
 import time
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -20,11 +22,36 @@ from urllib.parse import urlencode
 
 import requests
 
+try:  # requests bundles urllib3, but allow user-installed urllib3 fallback
+    import urllib3.util.connection as _urllib3_connection  # type: ignore
+except Exception:  # pragma: no cover - optional dependency path
+    _urllib3_connection = None
+
 import config
 
 CONFIG_PRIVATE = getattr(config, "config_private", None)
 REQUEST_TIMEOUT = config.REST_CONNECTION_CONFIG.get("timeout", 10)
 USER_AGENT = config.REST_CONNECTION_CONFIG.get("user_agent", "WLFI-Monitor/1.0")
+LOGGER = logging.getLogger(__name__)
+
+
+def _configure_ipv4_only() -> None:
+    """Force outbound HTTP connections to resolve IPv4 addresses only."""
+    if _urllib3_connection is None:
+        return
+
+    # Avoid repeatedly patching when the module is reloaded.
+    if getattr(_configure_ipv4_only, "_patched", False):
+        return
+
+    def allowed_gai_family() -> int:
+        return socket.AF_INET
+
+    _configure_ipv4_only._patched = True  # type: ignore[attr-defined]
+    _urllib3_connection.allowed_gai_family = allowed_gai_family  # type: ignore[attr-defined]
+
+
+_configure_ipv4_only()
 
 
 class TradeExecutionError(Exception):
@@ -92,6 +119,7 @@ class _BinanceSymbolFilters:
     min_qty: Decimal
     step_size: Decimal
     min_notional: Optional[Decimal]
+    quantity_precision: Optional[int]
     fetched_at: float
 
 
@@ -136,6 +164,10 @@ class _BitgetContractFilters:
 
 _BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
 _BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
+
+
+SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget")
+SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ()  # Spot helpers not yet implemented
 
 
 def _require_credentials(name: str) -> Any:
@@ -234,14 +266,31 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
     symbols = data.get("symbols") or []
     if not symbols:
         raise TradeExecutionError(f"Binance exchange info payload missing symbol data: {data}")
-
-    filters = symbols[0].get("filters", [])
+    target_symbol = symbol.upper()
+    if len(symbols) > 1:
+        symbol_info = next((item for item in symbols if item.get("symbol") == target_symbol), None)
+        if symbol_info is None:
+            raise TradeExecutionError(
+                f"Binance exchange info did not include requested symbol {target_symbol}: {data}"
+            )
+    else:
+        symbol_info = symbols[0]
+    filters = symbol_info.get("filters", [])
     lot_filter = next((f for f in filters if f.get("filterType") == "LOT_SIZE"), None)
     if lot_filter is None:
         raise TradeExecutionError(f"Binance exchange info missing LOT_SIZE filter: {data}")
 
-    step_size = Decimal(lot_filter["stepSize"])
-    min_qty = Decimal(lot_filter["minQty"])
+    market_lot_filter = next((f for f in filters if f.get("filterType") == "MARKET_LOT_SIZE"), None)
+    step_source = lot_filter
+    min_source = lot_filter
+    if market_lot_filter is not None:
+        if market_lot_filter.get("stepSize"):
+            step_source = market_lot_filter
+        if market_lot_filter.get("minQty"):
+            min_source = market_lot_filter
+
+    step_size = Decimal(step_source["stepSize"])
+    min_qty = Decimal(min_source["minQty"])
 
     notional_filter = next((f for f in filters if f.get("filterType") == "MIN_NOTIONAL"), None)
     min_notional: Optional[Decimal] = None
@@ -250,33 +299,151 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
         if raw_min_notional is not None:
             min_notional = Decimal(str(raw_min_notional))
 
+    LOGGER.info("binance_symbol_info symbol=%s payload=%s", symbol, symbol_info)
+
+    quantity_precision_raw = symbol_info.get("quantityPrecision")
+    quantity_precision: Optional[int]
+    try:
+        quantity_precision = int(quantity_precision_raw) if quantity_precision_raw is not None else None
+    except (TypeError, ValueError):
+        quantity_precision = None
+
     cached_filters = _BinanceSymbolFilters(
         min_qty=min_qty,
         step_size=step_size,
         min_notional=min_notional,
+        quantity_precision=quantity_precision,
         fetched_at=now,
     )
     _BINANCE_FILTER_CACHE[key] = cached_filters
+    LOGGER.info(
+        "binance_filter_cache symbol=%s step=%s min_qty=%s min_notional=%s precision=%s",
+        symbol,
+        step_size,
+        min_qty,
+        min_notional,
+        quantity_precision,
+    )
     return cached_filters
 
 
-def _normalise_binance_quantity(symbol: str, quantity: float, base_url: str) -> tuple[str, Decimal]:
+def _format_decimal_for_step(value: Decimal, step: Decimal) -> str:
+    """Format ``value`` using decimal places implied by ``step``."""
+
+    step_normalized = step.normalize()
+    exponent = step_normalized.as_tuple().exponent
+    quant = Decimal(1).scaleb(exponent) if exponent < 0 else Decimal(1)
+    formatted = value.quantize(quant, rounding=ROUND_DOWN)
+    return format(formatted, "f")
+
+
+def _normalise_binance_quantity(
+    symbol: str,
+    quantity: Union[str, float, Decimal, int],
+    base_url: str,
+) -> tuple[str, Decimal]:
     """Snap ``quantity`` to Binance filter increments and enforce minimums."""
     filters = _get_binance_symbol_filters(symbol, base_url)
-    dec_qty = Decimal(str(quantity))
+    try:
+        dec_qty = Decimal(str(quantity))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"`quantity` {quantity!r} is not a valid decimal amount") from exc
+    if dec_qty <= 0:
+        raise TradeExecutionError("`quantity` must be a positive number of contracts")
     step = filters.step_size
     minimum = filters.min_qty
+    precision = filters.quantity_precision
+
+    if precision is not None:
+        precision_step = Decimal(1).scaleb(-precision) if precision > 0 else Decimal(1)
+        if precision_step > step:
+            LOGGER.info(
+                "binance_step_adjustment symbol=%s old_step=%s new_step=%s precision=%s",
+                symbol,
+                step,
+                precision_step,
+                precision,
+            )
+            step = precision_step
+        if minimum < precision_step:
+            LOGGER.info(
+                "binance_min_adjustment symbol=%s old_min=%s new_min=%s",
+                symbol,
+                minimum,
+                precision_step,
+            )
+            minimum = precision_step
 
     units = (dec_qty / step).to_integral_value(rounding=ROUND_DOWN)
     normalised = units * step
 
     if normalised < minimum:
-        raise TradeExecutionError(
-            f"`quantity` {dec_qty} is below Binance minimum {minimum} for {symbol}; "
-            "increase the order size"
+        message = (
+            f"`quantity` {dec_qty} is below Binance minimum {minimum} for {symbol}; increase the order size"
         )
+        LOGGER.info(
+            "binance_quantity_rejected symbol=%s input=%s step=%s min_qty=%s reason=%s",
+            symbol,
+            dec_qty,
+            step,
+            minimum,
+            "below_minimum",
+        )
+        raise TradeExecutionError(message)
 
-    quantity_str = format(normalised.normalize(), "f")
+    quantity_str = _format_decimal_for_step(normalised, step)
+
+    if precision is not None and "." in quantity_str:
+        whole, fractional = quantity_str.split(".", 1)
+        trimmed_fraction = fractional.rstrip("0")
+
+        if len(trimmed_fraction) > precision:
+            quant = Decimal(1).scaleb(-precision) if precision > 0 else Decimal(1)
+            adjusted = normalised.quantize(quant, rounding=ROUND_DOWN)
+            quantity_str = _format_decimal_for_step(adjusted, step)
+            normalised = adjusted
+            if "." in quantity_str:
+                whole, fractional = quantity_str.split(".", 1)
+                trimmed_fraction = fractional.rstrip("0")
+
+        if trimmed_fraction:
+            quantity_str = f"{whole}.{trimmed_fraction[:precision]}"
+        else:
+            quantity_str = whole
+
+    if "." in quantity_str:
+        quantity_str = quantity_str.rstrip("0").rstrip(".") or "0"
+
+    try:
+        normalised = Decimal(quantity_str)
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"Unable to normalise Binance quantity `{quantity_str}`") from exc
+
+    if normalised < minimum:
+        message = (
+            f"`quantity` {dec_qty} is below Binance minimum {minimum} for {symbol}; increase the order size"
+        )
+        LOGGER.info(
+            "binance_quantity_rejected symbol=%s input=%s normalized=%s step=%s min_qty=%s reason=%s",
+            symbol,
+            dec_qty,
+            quantity_str,
+            step,
+            minimum,
+            "post_adjust_below_minimum",
+        )
+        raise TradeExecutionError(message)
+
+    LOGGER.info(
+        "binance_quantity_normalised symbol=%s input=%s step=%s min_qty=%s precision=%s normalized=%s",
+        symbol,
+        dec_qty,
+        step,
+        minimum,
+        precision,
+        quantity_str,
+    )
+
     return quantity_str, normalised
 
 
@@ -356,7 +523,7 @@ def _hmac_sha256_base64(secret: str, message: str) -> str:
 def place_binance_perp_market_order(
     symbol: str,
     side: str,
-    quantity: float,
+    quantity: Union[str, float, Decimal, int],
     *,
     reduce_only: Optional[bool] = None,
     client_order_id: Optional[str] = None,
@@ -397,8 +564,6 @@ def place_binance_perp_market_order(
 
     if quantity is None:
         raise TradeExecutionError("`quantity` must be provided in base asset units")
-    if quantity <= 0:
-        raise TradeExecutionError("`quantity` must be a positive number of contracts")
 
     quantity_str, _ = _normalise_binance_quantity(pair, quantity, base_url)
     params.append(("quantity", quantity_str))
@@ -419,11 +584,27 @@ def place_binance_perp_market_order(
     }
 
     url = f"{base_url}/fapi/v1/order"
+    LOGGER.info(
+        "binance_order_submit symbol=%s side=%s quantity=%s params=%s",
+        pair,
+        side,
+        quantity_str,
+        params,
+    )
     response = _send_request("POST", url, params=params, headers=headers)
     data = _json_or_error(response)
     if response.status_code != 200:
+        LOGGER.warning(
+            "binance_order_http_error status=%s payload=%s",
+            response.status_code,
+            data,
+        )
         raise TradeExecutionError(f"Binance error {response.status_code}: {data}")
     if "code" in data and data["code"] != 0:
+        LOGGER.warning(
+            "binance_order_reject payload=%s",
+            data,
+        )
         raise TradeExecutionError(f"Binance reject: {data}")
 
     executed_qty_raw = data.get("executedQty")
@@ -1451,3 +1632,203 @@ def place_bitget_usdt_perp_market_order(
         # Preserve the original buy/sell intent for downstream logging.
         result_payload.setdefault("side", normalized_side)
     return data
+
+
+def get_supported_trading_backends() -> Dict[str, List[str]]:
+    """Return supported market types and exchanges for higher-level tooling."""
+
+    return {
+        "perpetual": list(SUPPORTED_PERPETUAL_EXCHANGES),
+        "spot": list(SUPPORTED_SPOT_EXCHANGES),
+    }
+
+
+def _coerce_positive_quantity(value: Union[str, float, Decimal, int]) -> Decimal:
+    try:
+        quantity = Decimal(str(value))
+    except (InvalidOperation, TypeError) as exc:  # pragma: no cover - input validation
+        raise TradeExecutionError("`quantity` must be a positive decimal number") from exc
+    if quantity <= 0:
+        raise TradeExecutionError("`quantity` must be a positive decimal number")
+    return quantity
+
+
+def _normalise_perp_side(side: Union[str, None]) -> str:
+    side_key = (side or "").strip().lower()
+    if side_key in {"long", "buy", "b"}:
+        return "long"
+    if side_key in {"short", "sell", "s"}:
+        return "short"
+    raise TradeExecutionError("`side` must be LONG/BUY or SHORT/SELL")
+
+
+def execute_perp_market_order(
+    exchange: str,
+    symbol: str,
+    quantity: Union[str, float, Decimal, int],
+    *,
+    side: Union[str, None],
+    order_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Submit a single directional perpetual market order.
+
+    ``quantity`` is expressed in the base asset (e.g. ETH). Higher-level callers
+    are expected to convert from USDT notionals when required.
+    """
+
+    exchange_key = (exchange or "").lower()
+    if exchange_key not in SUPPORTED_PERPETUAL_EXCHANGES:
+        raise TradeExecutionError(f"Exchange `{exchange}` is not supported for perpetual trading")
+
+    direction = _normalise_perp_side(side)
+    quantity_dec = _coerce_positive_quantity(quantity)
+    kwargs = dict(order_kwargs or {})
+    for blocked in ("side", "pos_side", "position_side", "position_idx"):
+        kwargs.pop(blocked, None)
+
+    LOGGER.info(
+        "execute_perp_market_order exchange=%s symbol=%s direction=%s quantity=%s",
+        exchange_key,
+        symbol,
+        direction,
+        quantity_dec,
+    )
+
+    if exchange_key == "binance":
+        order = place_binance_perp_market_order(
+            symbol,
+            "BUY" if direction == "long" else "SELL",
+            quantity_dec,
+            position_side="LONG" if direction == "long" else "SHORT",
+            **kwargs,
+        )
+    elif exchange_key == "okx":
+        order = place_okx_swap_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            pos_side="long" if direction == "long" else "short",
+            **kwargs,
+        )
+    elif exchange_key == "bybit":
+        order = place_bybit_linear_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            position_idx=1 if direction == "long" else 2,
+            **kwargs,
+        )
+    elif exchange_key == "bitget":
+        order = place_bitget_usdt_perp_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            **kwargs,
+        )
+    else:  # pragma: no cover - guarded above but keeps mypy happy
+        raise TradeExecutionError(f"Unhandled exchange `{exchange}`")
+
+    return order
+
+
+def execute_perp_market_batch(
+    symbol: str,
+    legs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Execute multiple perpetual market orders sequentially.
+
+    Each leg must provide ``exchange``, ``side`` and ``quantity`` (base asset).
+    Optional ``order_kwargs`` are forwarded to the exchange helper.
+    """
+
+    if not isinstance(legs, list) or not legs:
+        raise TradeExecutionError("At least one trading leg is required")
+
+    results: List[Dict[str, Any]] = []
+    for index, leg in enumerate(legs, start=1):
+        if not isinstance(leg, dict):
+            raise TradeExecutionError(f"Leg #{index} must be an object")
+        exchange = leg.get("exchange")
+        side = leg.get("side")
+        quantity = leg.get("quantity")
+        if not exchange:
+            raise TradeExecutionError(f"Leg #{index} missing `exchange`")
+        if side is None:
+            raise TradeExecutionError(f"Leg #{index} missing `side`")
+        if quantity is None:
+            raise TradeExecutionError(f"Leg #{index} missing `quantity`")
+
+        order = execute_perp_market_order(
+            exchange,
+            symbol,
+            quantity,
+            side=side,
+            order_kwargs=leg.get("order_kwargs"),
+        )
+
+        results.append(
+            {
+                "exchange": exchange,
+                "side": _normalise_perp_side(side),
+                "quantity": str(_coerce_positive_quantity(quantity)),
+                "order": order,
+            }
+        )
+
+    return results
+
+
+def execute_dual_perp_market_order(
+    exchange: str,
+    symbol: str,
+    quantity: Union[str, float, Decimal, int],
+    *,
+    order_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Open long and short positions simultaneously on a derivatives venue.
+
+    Parameters
+    ----------
+    exchange:
+        Target exchange key (e.g. ``"binance"``, ``"okx"``).
+    symbol:
+        Trading pair without leverage suffixes (``ETHUSDT`` or ``ETH``).
+    quantity:
+        Base asset quantity per side. Each side submits its own market order.
+    order_kwargs:
+        Optional dictionary forwarded to the low-level submission helpers.
+    """
+
+    exchange_key = (exchange or "").lower()
+    if exchange_key not in SUPPORTED_PERPETUAL_EXCHANGES:
+        raise TradeExecutionError(f"Exchange `{exchange}` is not supported for perpetual trading")
+
+    quantity_dec = _coerce_positive_quantity(quantity)
+    base_kwargs = dict(order_kwargs or {})
+    client_order_id = base_kwargs.pop("client_order_id", None)
+
+    long_kwargs = dict(base_kwargs)
+    short_kwargs = dict(base_kwargs)
+
+    if client_order_id:
+        base_id = str(client_order_id)
+        trimmed = base_id[-24:] if len(base_id) > 24 else base_id
+        long_kwargs["client_order_id"] = f"{trimmed}-LONG"
+        short_kwargs["client_order_id"] = f"{trimmed}-SHORT"
+
+    long_order = execute_perp_market_order(
+        exchange_key,
+        symbol,
+        quantity_dec,
+        side="long",
+        order_kwargs=long_kwargs,
+    )
+    short_order = execute_perp_market_order(
+        exchange_key,
+        symbol,
+        quantity_dec,
+        side="short",
+        order_kwargs=short_kwargs,
+    )
+
+    return {"long": long_order, "short": short_order}
