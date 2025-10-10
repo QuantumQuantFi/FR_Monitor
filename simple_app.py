@@ -9,8 +9,10 @@ import psutil
 import os
 import builtins
 import sys
+import decimal
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from typing import Any, Dict, List, Optional
 from exchange_connectors import ExchangeDataCollector
 from arbitrage import ArbitrageMonitor
 from config import (
@@ -23,6 +25,14 @@ from config import (
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
+from trading.trade_executor import (
+    TradeExecutionError,
+    execute_dual_perp_market_order,
+    execute_perp_market_batch,
+    get_supported_trading_backends,
+    get_bybit_linear_positions,
+    get_bitget_usdt_perp_positions,
+)
 
 LOG_DIR = "logs"
 LOG_FILE_NAME = "simple_app.log"
@@ -139,6 +149,489 @@ def precision_jsonify(*args, **kwargs):
     
     json_string = json.dumps(data, cls=PrecisionJSONEncoder, ensure_ascii=False, separators=(',', ':'))
     return Response(json_string, mimetype='application/json')
+
+
+PERPETUAL_MARKET_KEYS = {"perpetual", "futures"}
+DEFAULT_QUANT = Decimal("0.00000001")
+
+
+class TradeRequestValidationError(Exception):
+    """Raised when incoming trade instructions fail validation."""
+
+
+def _decimal_to_str(value: Decimal) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
+
+
+def _coerce_positive_decimal(value: Any, field: str) -> Decimal:
+    try:
+        numeric = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        raise TradeRequestValidationError(f"{field} 必须是有效的正数") from None
+    if numeric <= 0:
+        raise TradeRequestValidationError(f"{field} 必须是有效的正数")
+    return numeric
+
+
+def _resolve_market_key(market_type: str) -> str:
+    key = (market_type or "").lower()
+    if key in PERPETUAL_MARKET_KEYS:
+        return "futures"
+    if key == "spot":
+        return "spot"
+    raise TradeRequestValidationError(f"不支持的市场类型: {market_type}")
+
+
+def _lookup_recent_price(symbol: str, exchange: str, market_key: str) -> Optional[Decimal]:
+    exchange_key = (exchange or "").lower()
+    if not exchange_key:
+        return None
+
+    symbol_candidates = {symbol}
+    try:
+        normalized = data_collector.normalize_symbol_for_exchange(exchange_key, symbol)
+        symbol_candidates.add(normalized)
+    except Exception:
+        pass
+
+    data_bucket = data_collector.data.get(exchange_key, {}) if hasattr(data_collector, "data") else {}
+    for candidate in symbol_candidates:
+        entry = data_bucket.get(candidate)
+        if not entry:
+            continue
+        market_entry = entry.get(market_key, {}) if isinstance(entry, dict) else {}
+        price = market_entry.get("price")
+        try:
+            price_decimal = Decimal(str(price))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+        if price_decimal > 0:
+            return price_decimal
+
+    for candidate in symbol_candidates:
+        rows = db.get_latest_prices(candidate)
+        for row in rows:
+            row_exchange = (row.get("exchange") or "").lower()
+            if row_exchange != exchange_key:
+                continue
+            field = "futures_price" if market_key == "futures" else "spot_price"
+            price = row.get(field)
+            try:
+                price_decimal = Decimal(str(price))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            if price_decimal > 0:
+                return price_decimal
+
+    return None
+
+
+def _convert_notional_to_quantity(
+    symbol: str,
+    exchange: str,
+    market_type: str,
+    notional: Any,
+):
+    """Return the derived (quantity, reference price, notional) tuple."""
+    market_key = _resolve_market_key(market_type)
+    price = _lookup_recent_price(symbol, exchange, market_key)
+    if price is None:
+        raise TradeRequestValidationError(
+            f"无法获取 {exchange.upper()} {symbol} 最新价格，请稍后再试"
+        )
+
+    notional_dec = _coerce_positive_decimal(notional, "交易金额(USDT)")
+    with decimal.localcontext() as ctx:  # type: ignore[attr-defined]
+        ctx.prec = 28
+        quantity = (notional_dec / price).quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
+
+    if quantity <= 0:
+        raise TradeRequestValidationError("换算后的下单数量过小，请提高USDT金额")
+
+    return quantity, price, notional_dec
+
+
+# 交易动作配置字典 - 定义6种交易操作的标准行为
+# 包括：开多、开空、平多（部分）、平空（部分）、平多全部、平空全部
+TRADE_ACTION_CONFIG: Dict[str, Dict[str, Any]] = {
+    "open_long": {  # 开多仓
+        "side": "long",              # 交易方向：做多
+        "reduce_only": None,         # 不限制为只平仓
+        "requires_notional": True,   # 需要提供USDT金额
+        "close_all": False,          # 不是全部平仓操作
+        "target_position": None,     # 不针对现有持仓
+    },
+    "open_short": {  # 开空仓
+        "side": "short",             # 交易方向：做空
+        "reduce_only": None,         # 不限制为只平仓
+        "requires_notional": True,   # 需要提供USDT金额
+        "close_all": False,          # 不是全部平仓操作
+        "target_position": None,     # 不针对现有持仓
+    },
+    "close_long": {  # 平多仓（部分平仓）
+        "side": "short",             # 交易方向：做空以平多
+        "reduce_only": True,         # 只平仓，不开新仓
+        "requires_notional": True,   # 需要提供USDT金额（指定平仓数量）
+        "close_all": False,          # 部分平仓
+        "target_position": "long",   # 目标平仓的持仓类型：多仓
+    },
+    "close_short": {  # 平空仓（部分平仓）
+        "side": "long",              # 交易方向：做多以平空
+        "reduce_only": True,         # 只平仓，不开新仓
+        "requires_notional": True,   # 需要提供USDT金额（指定平仓数量）
+        "close_all": False,          # 部分平仓
+        "target_position": "short",  # 目标平仓的持仓类型：空仓
+    },
+    "close_long_all": {  # 平多全部（一键平仓）
+        "side": "short",             # 交易方向：做空以平多
+        "reduce_only": True,         # 只平仓，不开新仓
+        "requires_notional": False,  # 不需要USDT金额（自动查询持仓）
+        "close_all": True,           # 全部平仓标志
+        "target_position": "long",   # 目标平仓的持仓类型：多仓
+    },
+    "close_short_all": {  # 平空全部（一键平仓）
+        "side": "long",              # 交易方向：做多以平空
+        "reduce_only": True,         # 只平仓，不开新仓
+        "requires_notional": False,  # 不需要USDT金额（自动查询持仓）
+        "close_all": True,           # 全部平仓标志
+        "target_position": "short",  # 目标平仓的持仓类型：空仓
+    },
+}
+
+
+def _resolve_close_all_quantity(
+    symbol: str,
+    exchange_key: str,
+    target_position: str,
+    order_context: Dict[str, Any],
+    *,
+    market_type: str,
+) -> Decimal:
+    """
+    自动查询持仓数量用于全部平仓操作
+
+    功能：
+    - 支持 Bybit Linear 和 Bitget USDT Perp 自动查询持仓
+    - 根据 target_position (long/short) 确定需要平仓的持仓方向
+    - 返回精确的持仓数量，避免手动输入错误
+
+    参数：
+    - symbol: 交易标的（如 BTC）
+    - exchange_key: 交易所标识（bybit/bitget）
+    - target_position: 目标持仓类型（long=多仓, short=空仓）
+    - order_context: 订单上下文（包含API凭证等）
+    - market_type: 市场类型（perpetual/futures）
+
+    返回：
+    - Decimal: 需要平仓的精确数量
+
+    异常：
+    - TradeRequestValidationError: 持仓为空或不支持的交易所
+    """
+
+    exchange_norm = exchange_key.lower()
+    target_norm = (target_position or "").lower()
+
+    if target_norm not in {"long", "short"}:
+        raise TradeRequestValidationError("无法识别需平仓的持仓方向，请检查指令配置")
+
+    if exchange_norm == "bybit":
+        category = str(order_context.get("category") or "linear").lower()
+        recv_window = int(order_context.get("recv_window") or 5000)
+        base_url = order_context.get("base_url") or "https://api.bybit.com"
+
+        try:
+            positions = get_bybit_linear_positions(
+                symbol=symbol,
+                category=category,
+                recv_window=recv_window,
+                api_key=order_context.get("api_key"),
+                secret_key=order_context.get("secret_key"),
+                base_url=base_url,
+            )
+        except TradeExecutionError as exc:
+            raise TradeRequestValidationError(
+                f"无法查询 Bybit 持仓用于全部平仓: {exc}"
+            ) from exc
+
+        desired_side = "buy" if target_norm == "long" else "sell"
+        total = Decimal("0")
+        for position in positions:
+            side = (position.get("side") or "").lower()
+            if side != desired_side:
+                continue
+            size_raw = position.get("size") or position.get("qty")
+            if size_raw in (None, "", 0, "0"):
+                continue
+            try:
+                size_dec = Decimal(str(size_raw))
+            except (InvalidOperation, TypeError):
+                continue
+            if size_dec > 0:
+                total += size_dec
+
+        if total <= 0:
+            raise TradeRequestValidationError("当前 Bybit 持仓为空，无需执行全部平仓指令")
+
+        return total.quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
+
+    if exchange_norm == "bitget":
+        margin_coin = order_context.get("margin_coin") or "USDT"
+        base_url = order_context.get("base_url") or "https://api.bitget.com"
+        product_type = order_context.get("product_type") or "umcbl"
+
+        try:
+            positions = get_bitget_usdt_perp_positions(
+                symbol=symbol,
+                margin_coin=margin_coin,
+                product_type=product_type,
+                api_key=order_context.get("api_key"),
+                secret_key=order_context.get("secret_key"),
+                passphrase=order_context.get("passphrase"),
+                base_url=base_url,
+            )
+        except TradeExecutionError as exc:
+            raise TradeRequestValidationError(
+                f"无法查询 Bitget 持仓用于全部平仓: {exc}"
+            ) from exc
+
+        desired_side = "long" if target_norm == "long" else "short"
+        total = Decimal("0")
+        for position in positions:
+            hold_side = (
+                position.get("holdSide")
+                or position.get("hold_side")
+                or position.get("side")
+                or ""
+            ).lower()
+            if hold_side != desired_side:
+                continue
+
+            size_candidates = [
+                position.get("total"),
+                position.get("totalSize"),
+                position.get("available"),
+                position.get("availableSize"),
+                position.get("size"),
+                position.get("holdAmount"),
+            ]
+
+            for value in size_candidates:
+                if value in (None, "", 0, "0"):
+                    continue
+                try:
+                    size_dec = Decimal(str(value))
+                except (InvalidOperation, TypeError):
+                    continue
+                if size_dec > 0:
+                    total += size_dec
+                    break
+
+        if total <= 0:
+            raise TradeRequestValidationError("当前 Bitget 持仓为空，无需执行全部平仓指令")
+
+        return total.quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
+
+    raise TradeRequestValidationError(
+        f"{exchange_key.upper()} 暂未支持“全部平仓”快捷操作，请改为手动输入USDT金额"
+    )
+
+
+def _execute_multi_leg_trade(
+    symbol: str,
+    market_type: str,
+    legs_payload: Any,
+    base_order_kwargs: dict,
+    base_client_order_id: Optional[str],
+):
+    """
+    执行多腿交易（支持同时在多个交易所下单）
+
+    功能：
+    - 批量处理多条交易指令（legs）
+    - 自动识别交易动作类型（开仓/平仓/全部平仓）
+    - 支持 USDT 金额自动转换为交易数量
+    - 支持全部平仓自动查询持仓数量
+    - 统一处理 client_order_id 分配
+
+    参数：
+    - symbol: 交易标的（如 BTC）
+    - market_type: 市场类型（perpetual/futures/spot）
+    - legs_payload: 交易腿列表，每条包含 exchange、action、notional 等
+    - base_order_kwargs: 基础订单参数（如 API 凭证）
+    - base_client_order_id: 基础客户订单ID（可选）
+
+    返回：
+    - List[Dict]: 每条交易腿的执行结果，包含订单详情
+
+    异常：
+    - TradeRequestValidationError: 参数验证失败
+    - TradeExecutionError: 订单执行失败
+    """
+    if not isinstance(legs_payload, list) or not legs_payload:
+        raise TradeRequestValidationError("请至少配置一条交易腿")
+
+    sanitized_base_kwargs = {
+        key: value for key, value in (base_order_kwargs or {}).items() if key != "client_order_id"
+    }
+    prepared_legs = []
+    leg_details = []
+
+    for index, leg in enumerate(legs_payload, start=1):
+        if not isinstance(leg, dict):
+            raise TradeRequestValidationError(f"第{index}条指令格式错误")
+
+        exchange = leg.get("exchange")
+        if not exchange:
+            raise TradeRequestValidationError(f"第{index}条指令缺少交易所")
+        exchange_key = (exchange or "").lower()
+
+        leg_kwargs = dict(sanitized_base_kwargs)
+        leg_specific_kwargs = leg.get("order_kwargs")
+        if isinstance(leg_specific_kwargs, dict):
+            leg_kwargs.update(leg_specific_kwargs)
+
+        raw_action = leg.get("action")
+        action_key = str(raw_action).lower() if raw_action is not None else ""
+        action_config = TRADE_ACTION_CONFIG.get(action_key)
+        close_all_flag = bool(leg.get("close_all"))
+        requires_notional = False
+        reduce_only_flag: Optional[bool] = None
+        target_position: Optional[str] = None
+
+        if action_config:
+            side = action_config["side"]
+            reduce_only_flag = action_config.get("reduce_only")
+            requires_notional = bool(action_config.get("requires_notional"))
+            if action_config.get("close_all"):
+                close_all_flag = True
+            target_position = action_config.get("target_position")
+        else:
+            side = leg.get("side")
+
+        if side is None:
+            raise TradeRequestValidationError(f"第{index}条指令缺少方向")
+
+        side_key = str(side).lower()
+        if side_key not in {"long", "short"}:
+            raise TradeRequestValidationError(f"第{index}条指令方向不支持: {side}")
+
+        leg_market = (leg.get("market_type") or market_type or "").lower()
+        try:
+            market_key = _resolve_market_key(leg_market)
+        except TradeRequestValidationError as exc:
+            raise TradeRequestValidationError(f"第{index}条指令市场类型不支持: {leg_market}") from exc
+
+        if reduce_only_flag is True:
+            leg_kwargs["reduce_only"] = True
+        elif reduce_only_flag is False:
+            leg_kwargs["reduce_only"] = False
+
+        specific_client_id = leg.get("client_order_id")
+        if specific_client_id:
+            leg_kwargs["client_order_id"] = str(specific_client_id)
+        elif base_client_order_id:
+            base_id = str(base_client_order_id)
+            trimmed = base_id[-20:] if len(base_id) > 20 else base_id
+            leg_kwargs["client_order_id"] = f"{trimmed}-{index:02d}"
+
+        if close_all_flag and not target_position:
+            target_position = "long" if side_key == "short" else "short"
+
+        quantity_dec: Optional[Decimal] = None
+        price_dec: Optional[Decimal] = None
+        notional_dec: Optional[Decimal] = None
+
+        if close_all_flag:
+            quantity_dec = _resolve_close_all_quantity(
+                symbol,
+                exchange_key,
+                target_position or ("long" if side_key == "short" else "short"),
+                leg_kwargs,
+                market_type=leg_market,
+            )
+        elif leg.get("quantity") is not None:
+            quantity_dec = _coerce_positive_decimal(leg.get("quantity"), "下单数量").quantize(
+                DEFAULT_QUANT, rounding=ROUND_DOWN
+            )
+        else:
+            notional_value = leg.get("notional")
+            if notional_value is None or (isinstance(notional_value, str) and not notional_value.strip()):
+                notional_value = leg.get("notional_usdt")
+            if notional_value is None or (isinstance(notional_value, str) and not notional_value.strip()):
+                if requires_notional or action_config:
+                    raise TradeRequestValidationError(f"第{index}条指令缺少USDT金额")
+                raise TradeRequestValidationError(f"第{index}条指令缺少USDT金额")
+            quantity_dec, price_dec, notional_dec = _convert_notional_to_quantity(
+                symbol,
+                exchange_key,
+                leg_market,
+                notional_value,
+            )
+
+        if quantity_dec is None:
+            raise TradeRequestValidationError(f"第{index}条指令无法确定下单数量")
+        if quantity_dec <= 0:
+            raise TradeRequestValidationError(f"第{index}条指令换算后的下单数量过小，请提高USDT金额")
+
+        prepared_legs.append(
+            {
+                "exchange": exchange_key,
+                "side": side_key,
+                "quantity": quantity_dec,
+                "order_kwargs": leg_kwargs,
+                "action": action_key or None,
+                "close_all": close_all_flag,
+            }
+        )
+
+        if price_dec is None:
+            try:
+                price_dec = _lookup_recent_price(symbol, exchange_key, market_key)
+                if price_dec is not None and notional_dec is None:
+                    with decimal.localcontext() as ctx:  # type: ignore[attr-defined]
+                        ctx.prec = 28
+                        notional_dec = (quantity_dec * price_dec).quantize(
+                            DEFAULT_QUANT, rounding=ROUND_DOWN
+                        )
+            except TradeRequestValidationError:
+                price_dec = None
+            except Exception:
+                price_dec = None
+
+        leg_details.append(
+            {
+                "exchange": exchange_key,
+                "side": side_key,
+                "market_type": leg_market,
+                "notional_usdt": _decimal_to_str(notional_dec) if isinstance(notional_dec, Decimal) else None,
+                "reference_price": _decimal_to_str(price_dec) if isinstance(price_dec, Decimal) else None,
+                "base_quantity": _decimal_to_str(quantity_dec),
+                "client_order_id": leg_kwargs.get("client_order_id"),
+                "action": action_key or None,
+                "close_all": close_all_flag,
+                "reduce_only": leg_kwargs.get("reduce_only"),
+                "target_position": target_position,
+            }
+        )
+
+    execution_results = execute_perp_market_batch(symbol, prepared_legs)
+    combined = []
+    for detail, execution in zip(leg_details, execution_results):
+        combined.append(
+            {
+                **detail,
+                "exchange": execution.get("exchange", detail["exchange"]),
+                "side": execution.get("side", detail["side"]),
+                "normalized_quantity": execution.get("quantity"),
+                "order": execution.get("order"),
+            }
+        )
+
+    return combined
 
 # 全局数据收集器
 data_collector = ExchangeDataCollector()
@@ -472,6 +965,102 @@ def get_database_historical_data(symbol):
         })
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/trade/options')
+def get_trade_options():
+    """Expose supported trading exchanges for the front-end controls."""
+
+    options = get_supported_trading_backends()
+    return precision_jsonify({
+        'market_types': options,
+        'timestamp': now_utc_iso()
+    })
+
+
+@app.route('/api/trade/dual', methods=['POST'])
+def execute_dual_trade():
+    """Handle hedged market order requests from the charts page."""
+
+    payload = request.get_json(silent=True) or {}
+    symbol = (payload.get('symbol') or '').upper()
+    market_type = (payload.get('market_type') or 'perpetual').lower()
+    legs_payload = payload.get('legs')
+    order_kwargs_payload = payload.get('order_kwargs') or {}
+    client_order_id = payload.get('client_order_id')
+
+    if not symbol:
+        return precision_jsonify({'error': 'symbol is required'}), 400
+    if symbol not in data_collector.supported_symbols:
+        return precision_jsonify({'error': f'unsupported symbol: {symbol}'}), 400
+    if market_type not in PERPETUAL_MARKET_KEYS:
+        if market_type == 'spot':
+            return precision_jsonify({'error': 'spot trading is not implemented yet'}), 400
+        return precision_jsonify({'error': f'unsupported market_type: {market_type}'}), 400
+    if not isinstance(order_kwargs_payload, dict):
+        return precision_jsonify({'error': 'order_kwargs must be an object'}), 400
+
+    base_order_kwargs = dict(order_kwargs_payload)
+    base_client_order_id = client_order_id or base_order_kwargs.get('client_order_id')
+
+    if legs_payload:
+        try:
+            legs_result = _execute_multi_leg_trade(
+                symbol,
+                market_type,
+                legs_payload,
+                base_order_kwargs,
+                base_client_order_id,
+            )
+        except TradeRequestValidationError as exc:
+            return precision_jsonify({'error': str(exc)}), 400
+        except TradeExecutionError as exc:
+            logging.getLogger('trading').warning(
+                'Multi-leg order submission failed on %s (%s): %s',
+                symbol,
+                market_type,
+                exc,
+            )
+            return precision_jsonify({'error': str(exc)}), 400
+
+        return precision_jsonify({
+            'market_type': market_type,
+            'symbol': symbol,
+            'legs': legs_result,
+            'timestamp': now_utc_iso()
+        })
+
+    exchange = payload.get('exchange')
+    quantity = payload.get('quantity')
+    if not exchange:
+        return precision_jsonify({'error': 'exchange is required'}), 400
+    if quantity is None:
+        return precision_jsonify({'error': 'quantity is required'}), 400
+
+    try:
+        orders = execute_dual_perp_market_order(
+            exchange,
+            symbol,
+            quantity,
+            order_kwargs=base_order_kwargs,
+        )
+    except TradeExecutionError as exc:
+        logging.getLogger('trading').warning(
+            'Dual order submission failed on %s/%s (%s): %s',
+            exchange,
+            symbol,
+            market_type,
+            exc,
+        )
+        return precision_jsonify({'error': str(exc)}), 400
+
+    return precision_jsonify({
+        'exchange': exchange,
+        'market_type': market_type,
+        'symbol': symbol,
+        'orders': orders,
+        'timestamp': now_utc_iso()
+    })
 
 @app.route('/api/chart/<symbol>')
 def get_chart_data(symbol):

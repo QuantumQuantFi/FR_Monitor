@@ -134,6 +134,216 @@
             padding: 20px;
             margin-bottom: 20px;
         }
+        .trade-card {
+            background: linear-gradient(135deg, #1e2329 0%, #232730 100%);
+            border: 1px solid #3c4043;
+            border-radius: 12px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+        .trade-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 16px;
+            border-bottom: 1px solid #2f343b;
+            padding-bottom: 12px;
+        }
+        .trade-title {
+            font-size: 18px;
+            font-weight: 600;
+            color: #f0b90b;
+        }
+        .trade-subtitle {
+            font-size: 12px;
+            color: #8e9297;
+        }
+        .trade-form {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 12px 16px;
+        }
+        .trade-field {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .trade-legs-field {
+            grid-column: 1 / -1;
+        }
+        .trade-label-wrapper {
+            display: flex;
+            align-items: baseline;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .trade-helper {
+            font-size: 11px;
+            color: #8e9297;
+            opacity: 0.8;
+        }
+        .trade-legs {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .trade-leg {
+            display: grid;
+            grid-template-columns: 34px minmax(140px, 1fr) minmax(120px, 1fr) minmax(160px, 1fr) 36px;
+            gap: 8px;
+            align-items: center;
+            background: rgba(43,47,54,0.6);
+            border: 1px solid #3c4043;
+            border-radius: 10px;
+            padding: 10px 12px;
+        }
+        @media (max-width: 720px) {
+            .trade-leg {
+                grid-template-columns: repeat(2, minmax(140px, 1fr));
+                grid-template-rows: auto auto auto;
+                row-gap: 10px;
+            }
+            .trade-leg .trade-leg-index {
+                grid-column: span 2;
+                justify-self: flex-start;
+            }
+            .trade-leg .trade-leg-remove {
+                grid-column: span 2;
+                justify-self: flex-end;
+            }
+        }
+        .trade-leg-index {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 34px;
+            height: 34px;
+            border-radius: 8px;
+            background: rgba(240,185,11,0.12);
+            color: #f0b90b;
+            font-weight: 600;
+            font-size: 12px;
+        }
+        .trade-leg-remove {
+            border: 1px solid #3c4043;
+            background: rgba(244,63,94,0.08);
+            color: #f6465d;
+            border-radius: 8px;
+            cursor: pointer;
+            height: 34px;
+            min-width: 34px;
+            font-size: 18px;
+            line-height: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .trade-leg-remove:hover:not(:disabled) {
+            background: rgba(244,63,94,0.2);
+        }
+        .trade-leg-remove:disabled {
+            cursor: not-allowed;
+            opacity: 0.3;
+        }
+        .trade-leg-add {
+            align-self: flex-start;
+            padding: 8px 14px;
+            border-radius: 8px;
+            border: 1px dashed #3c4043;
+            background: rgba(43,47,54,0.4);
+            color: #f0b90b;
+            cursor: pointer;
+            font-size: 12px;
+            transition: all 0.2s ease;
+        }
+        .trade-leg-add:disabled {
+            cursor: not-allowed;
+            opacity: 0.4;
+        }
+        .trade-leg-add:hover:not(:disabled) {
+            background: rgba(240,185,11,0.15);
+        }
+        .trade-label {
+            font-size: 12px;
+            color: #8e9297;
+            letter-spacing: 0.04em;
+        }
+        .trade-select,
+        .trade-input {
+            padding: 10px 12px;
+            border-radius: 8px;
+            border: 1px solid #3c4043;
+            background: #2b2f36;
+            color: #ffffff;
+        }
+        .trade-select:focus,
+        .trade-input:focus {
+            outline: none;
+            border-color: #f0b90b;
+        }
+        .trade-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            margin-top: 12px;
+        }
+        .trade-btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            background: #f0b90b;
+            color: #000000;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        .trade-btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .trade-btn:hover:not(:disabled) {
+            background: #f8d12f;
+        }
+        .trade-status {
+            font-size: 12px;
+        }
+        .trade-status.pending { color: #fbbf24; }
+        .trade-status.success { color: #22c55e; }
+        .trade-status.error { color: #f6465d; }
+        .trade-status.idle { color: #8e9297; }
+        .trade-result {
+            margin-top: 16px;
+            padding: 14px;
+            border-radius: 8px;
+            border: 1px solid #2f343b;
+            background: rgba(35, 39, 48, 0.85);
+            max-height: 260px;
+            overflow-y: auto;
+            font-size: 12px;
+            color: #e5e5e5;
+        }
+        .trade-result pre {
+            margin: 0;
+            white-space: pre-wrap;
+            word-break: break-word;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+        }
+        .trade-leg-result {
+            padding: 10px 0;
+            border-top: 1px solid #2f343b;
+        }
+        .trade-leg-result:first-child {
+            border-top: none;
+            padding-top: 0;
+        }
+        .trade-leg-result summary {
+            cursor: pointer;
+            color: #f0b90b;
+        }
+        .trade-leg-result details {
+            margin-top: 6px;
+        }
         .symbol-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid #3c4043; }
         .symbol-name { font-size: 18px; font-weight: 700; color: #f0b90b; }
         .exchange-count { font-size: 11px; color: #8c8c8c; background: rgba(60,64,67,0.5); padding: 4px 8px; border-radius: 10px; }
@@ -297,7 +507,37 @@
             <div style="color:#8c8c8c;">加载中...</div>
         </div>
     </div>
-    
+
+    <div id="tradePanel" class="trade-card">
+        <div class="trade-header">
+            <div class="trade-title">对冲交易执行</div>
+            <div class="trade-subtitle">多交易所 · 多方向 · USDT金额一键提交</div>
+        </div>
+        <div class="trade-form">
+            <div class="trade-field">
+                <label class="trade-label" for="tradeMarketType">市场类型</label>
+                <select id="tradeMarketType" class="trade-select"></select>
+            </div>
+            <div class="trade-field trade-legs-field">
+                <div class="trade-label-wrapper">
+                    <label class="trade-label" for="tradeLegsContainer">交易腿配置</label>
+                    <span class="trade-helper">金额单位：USDT</span>
+                </div>
+                <div id="tradeLegsContainer" class="trade-legs"></div>
+                <button id="tradeAddLegBtn" class="trade-leg-add" type="button">+ 添加交易腿</button>
+            </div>
+            <div class="trade-field">
+                <label class="trade-label" for="tradeClientOrderId">自定义订单标识（可选）</label>
+                <input id="tradeClientOrderId" class="trade-input" type="text" maxlength="32" placeholder="用于追踪订单" />
+            </div>
+        </div>
+        <div class="trade-actions">
+            <button id="tradeExecuteBtn" class="trade-btn" type="button">执行多空同时下单</button>
+            <span id="tradeStatus" class="trade-status idle">准备就绪</span>
+        </div>
+        <div id="tradeResult" class="trade-result" style="display:none;"></div>
+    </div>
+
     <div class="chart-help">
         <div class="help-title">图表操作说明</div>
         <div>• 使用鼠标滚轮缩放时间轴 • 拖拽图表进行平移 • 双击重置缩放 • 点击图例隐藏/显示数据系列</div>
@@ -347,6 +587,21 @@
         const allSymbols = {{ symbols|tojson }};
         let charts = {};
         let chartData = {};
+        const TRADE_LEG_ACTIONS = [
+            { value: 'open_long', label: '开多', side: 'long', requiresNotional: true },
+            { value: 'open_short', label: '开空', side: 'short', requiresNotional: true },
+            { value: 'close_long', label: '平多', side: 'short', requiresNotional: true },
+            { value: 'close_short', label: '平空', side: 'long', requiresNotional: true },
+            { value: 'close_long_all', label: '平多全部', side: 'short', requiresNotional: false, closeAll: true },
+            { value: 'close_short_all', label: '平空全部', side: 'long', requiresNotional: false, closeAll: true },
+        ];
+
+        const tradeState = {
+            options: {},
+            submitting: false,
+            selectedMarket: null,
+            legs: []
+        };
         
         // 统一解析后端时间戳：
         // - 若无时区信息，按UTC处理（修复UTC+8 显示“晚8小时”问题）
@@ -436,6 +691,433 @@
             const minInfo = prices.find(p => p.price === minPrice);
             const diffPercent = ((maxPrice - minPrice) / minPrice) * 100;
             return { maxPrice, minPrice, maxExchange: `${maxInfo.exchange}(${maxInfo.type})`, minExchange: `${minInfo.exchange}(${minInfo.type})`, maxType: maxInfo.type, minType: minInfo.type, maxTimestamp: maxInfo.timestamp, minTimestamp: minInfo.timestamp, diffPercent, diffAmount: maxPrice - minPrice };
+        }
+
+        function setTradeStatus(message, status) {
+            const statusEl = document.getElementById('tradeStatus');
+            if (!statusEl) return;
+            statusEl.textContent = message;
+            statusEl.className = `trade-status ${status}`;
+        }
+
+        function resolveTradeActionLabel(action, fallbackSide) {
+            const config = TRADE_LEG_ACTIONS.find(({ value }) => value === action);
+            if (config) return config.label;
+            if (fallbackSide === 'short') return '做空';
+            if (fallbackSide === 'long') return '做多';
+            return '未知操作';
+        }
+
+        function escapeHtml(str) {
+            return (str || '').replace(/[&<>"']/g, (char) => ({
+                '&': '&amp;',
+                '<': '&lt;',
+                '>': '&gt;',
+                '"': '&quot;',
+                "'": '&#39;'
+            })[char]);
+        }
+
+        function renderTradeResult(result) {
+            const container = document.getElementById('tradeResult');
+            if (!container) return;
+            if (!result) {
+                container.style.display = 'none';
+                container.innerHTML = '';
+                return;
+            }
+
+            if (Array.isArray(result.legs) && result.legs.length > 0) {
+                const market = result.market_type || tradeState.selectedMarket || 'perpetual';
+                const timestamp = result.timestamp || '';
+                const symbol = result.symbol || currentSymbol;
+                const summaryParts = [
+                    `<div><strong>标的:</strong> ${escapeHtml(String(symbol))}</div>`,
+                    `<div><strong>市场类型:</strong> ${escapeHtml(String(market))}</div>`
+                ];
+                if (timestamp) {
+                    summaryParts.push(`<div><strong>服务器时间:</strong> ${escapeHtml(String(timestamp))}</div>`);
+                }
+                const legHtml = result.legs.map((leg, idx) => {
+                    const exchange = escapeHtml(String((leg.exchange || '').toUpperCase()));
+                    const actionLabel = resolveTradeActionLabel(leg && leg.action, leg && leg.side);
+                    const isCloseAll = leg && (leg.close_all || (typeof leg.action === 'string' && leg.action.endsWith('_all')));
+                    const notionalValue = leg && (leg.notional_usdt || leg.notional);
+                    const notional = notionalValue && !isCloseAll
+                        ? `${escapeHtml(String(notionalValue))} USDT`
+                        : (isCloseAll ? '自动（全部平仓）' : '-');
+                    const baseQty = leg && leg.base_quantity ? escapeHtml(String(leg.base_quantity)) : '-';
+                    const execQty = leg && leg.normalized_quantity ? escapeHtml(String(leg.normalized_quantity)) : baseQty;
+                    const refPrice = leg && leg.reference_price ? escapeHtml(String(leg.reference_price)) : '-';
+                    const clientId = leg && leg.client_order_id ? escapeHtml(String(leg.client_order_id)) : '';
+                    const orderJson = escapeHtml(JSON.stringify(leg && leg.order ? leg.order : {}, null, 2));
+                    const clientLine = clientId ? ` · Client ID: ${clientId}` : '';
+                    return `
+                    <div class="trade-leg-result">
+                        <div><strong>Leg ${idx + 1}:</strong> ${exchange} · ${escapeHtml(actionLabel)}</div>
+                        <div>金额: ${notional} · 基础数量: ${baseQty}</div>
+                        <div>参考价格: ${refPrice}${clientLine}</div>
+                        <div>执行数量: ${execQty}</div>
+                        <details><summary>交易响应</summary><pre>${orderJson}</pre></details>
+                    </div>`;
+                }).join('');
+                container.innerHTML = `${summaryParts.join('')}${legHtml}`;
+                container.style.display = 'block';
+                return;
+            }
+
+            if (result.orders) {
+                const exchange = (result.exchange || '').toUpperCase();
+                const market = result.market_type || tradeState.selectedMarket || 'perpetual';
+                const timestamp = result.timestamp || '';
+                const summaryParts = [
+                    `<div><strong>交易所:</strong> ${escapeHtml(exchange || '-')}</div>`,
+                    `<div><strong>市场类型:</strong> ${escapeHtml(market)}</div>`
+                ];
+                if (timestamp) {
+                    summaryParts.push(`<div><strong>服务器时间:</strong> ${escapeHtml(timestamp)}</div>`);
+                }
+                const ordersJson = escapeHtml(JSON.stringify(result.orders, null, 2));
+                container.innerHTML = `${summaryParts.join('')}<pre>${ordersJson}</pre>`;
+                container.style.display = 'block';
+                return;
+            }
+
+            container.style.display = 'none';
+            container.innerHTML = '';
+        }
+
+        function getMarketExchanges(marketType) {
+            const key = (marketType || '').toLowerCase();
+            const list = tradeState.options && tradeState.options[key];
+            return Array.isArray(list) ? list : [];
+        }
+
+        function ensureTradeLegDefaults() {
+            if (!Array.isArray(tradeState.legs)) {
+                tradeState.legs = [];
+            }
+            if (tradeState.legs.length === 0) {
+                tradeState.legs.push({ exchange: '', action: 'open_long', side: 'long', notional: '' });
+            }
+            tradeState.legs.forEach((leg) => {
+                if (!leg.action) {
+                    leg.action = 'open_long';
+                }
+                if (!leg.side) {
+                    leg.side = 'long';
+                }
+                if (typeof leg.notional !== 'string') {
+                    leg.notional = leg.notional ? String(leg.notional) : '';
+                }
+            });
+        }
+
+        function normalizeLegsForMarket(marketType) {
+            const valid = new Set(getMarketExchanges(marketType));
+            tradeState.legs.forEach((leg) => {
+                if (!valid.has(leg.exchange)) {
+                    leg.exchange = '';
+                }
+            });
+        }
+
+        function renderTradeLegs() {
+            ensureTradeLegDefaults();
+            const container = document.getElementById('tradeLegsContainer');
+            if (!container) return;
+            const exchanges = getMarketExchanges(tradeState.selectedMarket);
+            container.innerHTML = '';
+
+            tradeState.legs.forEach((leg, index) => {
+                const row = document.createElement('div');
+                row.className = 'trade-leg';
+                row.dataset.index = String(index);
+
+                const indexEl = document.createElement('span');
+                indexEl.className = 'trade-leg-index';
+                indexEl.textContent = String(index + 1);
+
+                const exchangeSelect = document.createElement('select');
+                exchangeSelect.className = 'trade-select trade-leg-exchange';
+                const placeholder = document.createElement('option');
+                placeholder.value = '';
+                placeholder.textContent = '选择交易所';
+                exchangeSelect.appendChild(placeholder);
+                exchanges.forEach((name) => {
+                    const option = document.createElement('option');
+                    option.value = name;
+                    option.textContent = name.charAt(0).toUpperCase() + name.slice(1);
+                    exchangeSelect.appendChild(option);
+                });
+                exchangeSelect.value = exchanges.includes(leg.exchange) ? leg.exchange : '';
+                exchangeSelect.addEventListener('change', (event) => {
+                    tradeState.legs[index].exchange = event.target.value;
+                });
+
+                const actionSelect = document.createElement('select');
+                actionSelect.className = 'trade-select trade-leg-action';
+                TRADE_LEG_ACTIONS.forEach(({ value, label }) => {
+                    const option = document.createElement('option');
+                    option.value = value;
+                    option.textContent = label;
+                    actionSelect.appendChild(option);
+                });
+                const currentAction = TRADE_LEG_ACTIONS.some(({ value }) => value === leg.action)
+                    ? leg.action
+                    : 'open_long';
+                actionSelect.value = currentAction;
+                const updateLegAction = (value) => {
+                    const fallback = TRADE_LEG_ACTIONS[0];
+                    const config = TRADE_LEG_ACTIONS.find(({ value: v }) => v === value) || fallback;
+                    tradeState.legs[index].action = config.value;
+                    tradeState.legs[index].side = config.side;
+                    const requiresNotional = Boolean(config.requiresNotional);
+                    notionalInput.disabled = !requiresNotional;
+                    notionalInput.placeholder = requiresNotional ? 'USDT金额' : '自动按当前仓位平仓';
+                    if (!requiresNotional) {
+                        tradeState.legs[index].notional = '';
+                        notionalInput.value = '';
+                    }
+                };
+                actionSelect.addEventListener('change', (event) => {
+                    updateLegAction(event.target.value);
+                });
+
+                const notionalInput = document.createElement('input');
+                notionalInput.type = 'number';
+                notionalInput.min = '0';
+                notionalInput.step = '0.01';
+                notionalInput.placeholder = 'USDT金额';
+                notionalInput.className = 'trade-input trade-leg-notional';
+                notionalInput.value = leg.notional || '';
+                notionalInput.addEventListener('input', (event) => {
+                    tradeState.legs[index].notional = event.target.value;
+                });
+                updateLegAction(currentAction);
+
+                const removeBtn = document.createElement('button');
+                removeBtn.type = 'button';
+                removeBtn.className = 'trade-leg-remove';
+                removeBtn.textContent = '×';
+                removeBtn.title = '移除';
+                removeBtn.disabled = tradeState.legs.length <= 1;
+                removeBtn.addEventListener('click', () => {
+                    if (tradeState.legs.length <= 1) return;
+                    tradeState.legs.splice(index, 1);
+                    renderTradeLegs();
+                });
+
+                row.appendChild(indexEl);
+                row.appendChild(exchangeSelect);
+                row.appendChild(actionSelect);
+                row.appendChild(notionalInput);
+                row.appendChild(removeBtn);
+                container.appendChild(row);
+            });
+        }
+
+        function renderTradeMarketTypes() {
+            const marketSelect = document.getElementById('tradeMarketType');
+            const executeBtn = document.getElementById('tradeExecuteBtn');
+            const addLegBtn = document.getElementById('tradeAddLegBtn');
+            if (!marketSelect || !executeBtn) return;
+
+            const entries = Object.entries(tradeState.options || {}).filter(([, arr]) => Array.isArray(arr) && arr.length > 0);
+            marketSelect.innerHTML = '';
+
+            if (entries.length === 0) {
+                marketSelect.disabled = true;
+                if (addLegBtn) addLegBtn.disabled = true;
+                executeBtn.disabled = true;
+                setTradeStatus('当前暂无可用交易所', 'error');
+                return;
+            }
+
+            entries.forEach(([market]) => {
+                const option = document.createElement('option');
+                option.value = market;
+                option.textContent = market === 'perpetual' ? '永续/期货' : market;
+                marketSelect.appendChild(option);
+            });
+
+            const defaultMarket = tradeState.selectedMarket && entries.some(([key]) => key === tradeState.selectedMarket)
+                ? tradeState.selectedMarket
+                : entries[0][0];
+            tradeState.selectedMarket = defaultMarket;
+            marketSelect.value = defaultMarket;
+            marketSelect.disabled = false;
+            if (addLegBtn) addLegBtn.disabled = false;
+            executeBtn.disabled = false;
+
+            normalizeLegsForMarket(defaultMarket);
+            renderTradeLegs();
+            setTradeStatus('准备就绪', 'idle');
+        }
+
+        async function loadTradeOptions() {
+            const marketSelect = document.getElementById('tradeMarketType');
+            const executeBtn = document.getElementById('tradeExecuteBtn');
+            const addLegBtn = document.getElementById('tradeAddLegBtn');
+            if (!marketSelect || !executeBtn) return;
+
+            try {
+                const response = await fetch('/api/trade/options');
+                if (!response.ok) throw new Error('无法获取交易配置');
+                const payload = await response.json();
+                tradeState.options = payload.market_types || {};
+                renderTradeMarketTypes();
+            } catch (error) {
+                console.error('加载交易配置失败', error);
+                tradeState.options = {};
+                marketSelect.disabled = true;
+                if (addLegBtn) addLegBtn.disabled = true;
+                executeBtn.disabled = true;
+                setTradeStatus(error.message || '无法获取交易配置', 'error');
+            }
+        }
+
+        async function submitDualTrade() {
+            const executeBtn = document.getElementById('tradeExecuteBtn');
+            const marketSelect = document.getElementById('tradeMarketType');
+            const clientInput = document.getElementById('tradeClientOrderId');
+            const legsContainer = document.getElementById('tradeLegsContainer');
+            if (!executeBtn || !marketSelect || !legsContainer) return;
+            if (tradeState.submitting) return;
+
+            const marketType = marketSelect.value || tradeState.selectedMarket || 'perpetual';
+            const exchanges = new Set(getMarketExchanges(marketType));
+            const legNodes = Array.from(legsContainer.querySelectorAll('.trade-leg'));
+            if (legNodes.length === 0) {
+                setTradeStatus('请至少配置一条交易腿', 'error');
+                return;
+            }
+
+            const legs = [];
+            for (let i = 0; i < legNodes.length; i += 1) {
+                const row = legNodes[i];
+                const index = i + 1;
+                const exchangeSelect = row.querySelector('.trade-leg-exchange');
+                const actionSelect = row.querySelector('.trade-leg-action');
+                const notionalInput = row.querySelector('.trade-leg-notional');
+                if (!exchangeSelect || !actionSelect || !notionalInput) {
+                    continue;
+                }
+
+                const exchange = exchangeSelect.value;
+                const action = actionSelect.value;
+                const actionConfig = TRADE_LEG_ACTIONS.find(({ value }) => value === action);
+
+                const notionalRaw = notionalInput.value.trim();
+
+                tradeState.legs[i].exchange = exchange;
+                if (actionConfig) {
+                    tradeState.legs[i].action = actionConfig.value;
+                    tradeState.legs[i].side = actionConfig.side;
+                }
+                tradeState.legs[i].notional = notionalRaw;
+
+                if (!exchange || !exchanges.has(exchange)) {
+                    setTradeStatus(`第${index}条指令请选择有效的交易所`, 'error');
+                    return;
+                }
+
+                if (!actionConfig) {
+                    setTradeStatus(`第${index}条指令请选择有效的操作`, 'error');
+                    return;
+                }
+
+                if (actionConfig.requiresNotional) {
+                    const notionalValue = parseFloat(notionalRaw);
+                    if (!Number.isFinite(notionalValue) || notionalValue <= 0) {
+                        setTradeStatus(`第${index}条指令请输入有效的USDT金额`, 'error');
+                        return;
+                    }
+                }
+
+                legs.push({
+                    exchange,
+                    action: actionConfig.value,
+                    side: actionConfig.side,
+                    notional: actionConfig.requiresNotional ? notionalRaw : null,
+                    close_all: Boolean(actionConfig.closeAll),
+                });
+            }
+
+            if (legs.length === 0) {
+                setTradeStatus('请完善交易腿配置', 'error');
+                return;
+            }
+
+            const payload = {
+                symbol: currentSymbol,
+                market_type: marketType,
+                legs,
+                order_kwargs: {}
+            };
+            const clientOrderId = clientInput ? clientInput.value.trim() : '';
+            if (clientOrderId) {
+                payload.client_order_id = clientOrderId;
+            }
+
+            tradeState.submitting = true;
+            executeBtn.disabled = true;
+            setTradeStatus('正在提交订单...', 'pending');
+            renderTradeResult(null);
+
+            try {
+                const response = await fetch('/api/trade/dual', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                let result;
+                try {
+                    result = await response.json();
+                } catch (jsonError) {
+                    throw new Error('服务器响应无法解析');
+                }
+                if (!response.ok || (result && result.error)) {
+                    throw new Error(result && result.error ? result.error : '下单失败');
+                }
+                setTradeStatus('下单成功', 'success');
+                renderTradeResult(result);
+            } catch (error) {
+                console.error('执行交易失败', error);
+                setTradeStatus(error.message || '下单失败', 'error');
+                renderTradeResult(null);
+            } finally {
+                tradeState.submitting = false;
+                executeBtn.disabled = false;
+            }
+        }
+
+        function initTradePanel() {
+            const executeBtn = document.getElementById('tradeExecuteBtn');
+            if (!executeBtn) return;
+            const marketSelect = document.getElementById('tradeMarketType');
+            const addLegBtn = document.getElementById('tradeAddLegBtn');
+
+            executeBtn.addEventListener('click', submitDualTrade);
+            if (marketSelect) {
+                marketSelect.addEventListener('change', (event) => {
+                    const value = event.target.value;
+                    tradeState.selectedMarket = value;
+                    normalizeLegsForMarket(value);
+                    renderTradeLegs();
+                });
+            }
+            if (addLegBtn) {
+                addLegBtn.addEventListener('click', () => {
+                tradeState.legs.push({ exchange: '', action: 'open_long', side: 'long', notional: '' });
+                    renderTradeLegs();
+                });
+            }
+
+            ensureTradeLegDefaults();
+            renderTradeLegs();
+            setTradeStatus('正在加载交易配置...', 'pending');
+            loadTradeOptions();
         }
 
         // 渲染单币种卡片
@@ -856,6 +1538,7 @@
         document.addEventListener('DOMContentLoaded', function() {
             initCharts();
             updateChartData();
+            initTradePanel();
             const input = document.getElementById('symbolSearch');
             input.addEventListener('input', (e) => filterButtons(e.target.value));
             input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goSearch(); });
