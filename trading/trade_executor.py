@@ -1802,7 +1802,8 @@ def execute_perp_market_order(
         bybit_category = kwargs.get("category", "linear")
         receiver_window = kwargs.get("recv_window", 5000)
         # 为了兼容默认的单向持仓策略，下单前强制校准杠杆至1倍；
-        # 若杠杆已满足或受账户设置限制，会在辅助函数中给出明确反馈。
+        # 若 Bybit 返回 110043（leverage not modified，通常表示已是目标杠杆或受限），
+        # 会在辅助函数中进一步确认并给出明确反馈。
         _ensure_bybit_leverage_target(
             symbol,
             target_leverage=1,
