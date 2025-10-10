@@ -1490,6 +1490,92 @@ def set_bybit_linear_leverage(
     return data
 
 
+def _ensure_bybit_leverage_target(
+    symbol: str,
+    target_leverage: Union[int, float, str],
+    *,
+    category: str,
+    position_idx: int,
+    recv_window: int,
+    api_key: Optional[str],
+    secret_key: Optional[str],
+    base_url: str,
+) -> None:
+    """Ensure Bybit symbol leverage equals the requested value before trading."""
+    try:
+        set_bybit_linear_leverage(
+            symbol,
+            leverage=target_leverage,
+            category=category,
+            position_idx=position_idx,
+            recv_window=recv_window,
+            api_key=api_key,
+            secret_key=secret_key,
+            base_url=base_url,
+        )
+        return
+    except TradeExecutionError as exc:
+        message = str(exc)
+        if "110043" not in message and "leverage not modified" not in message:
+            raise
+
+        target_decimal = Decimal(str(target_leverage))
+        try:
+            positions = get_bybit_linear_positions(
+                symbol=symbol,
+                category=category,
+                recv_window=recv_window,
+                api_key=api_key,
+                secret_key=secret_key,
+                base_url=base_url,
+            )
+        except TradeExecutionError:
+            raise TradeExecutionError(
+                "Bybit返回 retCode=110043（leverage not modified），且无法确认当前杠杆设置。"
+                "请在 Bybit 后台手动检查并调整杠杆。"
+            ) from exc
+
+        leverage_matches = False
+        for position in positions:
+            leverage_raw = position.get("leverage")
+            if leverage_raw is None:
+                continue
+            try:
+                leverage_dec = Decimal(str(leverage_raw))
+            except (InvalidOperation, TypeError):
+                continue
+            if leverage_dec == target_decimal:
+                leverage_matches = True
+                continue
+
+            size_raw = position.get("size")
+            has_position = False
+            try:
+                has_position = Decimal(str(size_raw)) != 0
+            except (InvalidOperation, TypeError):
+                has_position = bool(size_raw)
+
+            if has_position:
+                raise TradeExecutionError(
+                    "Bybit返回 retCode=110043（leverage not modified），且当前持仓杠杆"
+                    f" 为 {leverage_raw}，无法自动调整至 {target_decimal}。"
+                    "请检查保证金模式或手动调整杠杆。"
+                ) from exc
+
+        if leverage_matches:
+            LOGGER.info(
+                "Bybit leverage already configured at target=%s for %s; skipping update.",
+                target_decimal,
+                symbol,
+            )
+            return
+
+        LOGGER.info(
+            "Bybit leverage request returned 110043 without conflicting positions; assuming leverage=%s.",
+            target_decimal,
+        )
+
+
 def place_bybit_linear_market_order(
     symbol: str,
     side: str,
@@ -1683,8 +1769,9 @@ def execute_perp_market_order(
     direction = _normalise_perp_side(side)
     quantity_dec = _coerce_positive_quantity(quantity)
     kwargs = dict(order_kwargs or {})
-    for blocked in ("side", "pos_side", "position_side", "position_idx"):
+    for blocked in ("side", "pos_side", "position_side"):
         kwargs.pop(blocked, None)
+    bybit_position_idx = kwargs.pop("position_idx", None)
 
     LOGGER.info(
         "execute_perp_market_order exchange=%s symbol=%s direction=%s quantity=%s",
@@ -1711,11 +1798,26 @@ def execute_perp_market_order(
             **kwargs,
         )
     elif exchange_key == "bybit":
+        bybit_position_idx_resolved = bybit_position_idx if bybit_position_idx is not None else 0
+        bybit_category = kwargs.get("category", "linear")
+        receiver_window = kwargs.get("recv_window", 5000)
+        # 为了兼容默认的单向持仓策略，下单前强制校准杠杆至1倍；
+        # 若杠杆已满足或受账户设置限制，会在辅助函数中给出明确反馈。
+        _ensure_bybit_leverage_target(
+            symbol,
+            target_leverage=1,
+            category=bybit_category,
+            position_idx=bybit_position_idx_resolved,
+            recv_window=receiver_window,
+            api_key=kwargs.get("api_key"),
+            secret_key=kwargs.get("secret_key"),
+            base_url=kwargs.get("base_url", "https://api.bybit.com"),
+        )
         order = place_bybit_linear_market_order(
             symbol,
             "buy" if direction == "long" else "sell",
             str(quantity_dec),
-            position_idx=1 if direction == "long" else 2,
+            position_idx=bybit_position_idx_resolved,
             **kwargs,
         )
     elif exchange_key == "bitget":
