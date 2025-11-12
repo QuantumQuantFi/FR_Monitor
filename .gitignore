@@ -35,6 +35,10 @@ ENV/
 # Logs
 logs/
 *.log
+*.out
+*.tsv
+*.pid
+binance_contract_cache.json
 
 # IDE
 .vscode/
