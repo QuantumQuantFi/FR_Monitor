@@ -118,7 +118,7 @@ echo $! > runtime/simple_app/simple_app.pid
 ```
 - `nohup` 可保证即便 code-server/SSH 会话被关闭，进程仍持续运行
 - 所有应用日志自动写入 `logs/simple_app/simple_app.log`（含轮转文件）
-- 停止时 `kill "$(cat runtime/simple_app/simple_app.pid)"`，再清理 `.pid` 文件，避免僵尸 PID
+- 停止时运行 `source venv/bin/activate && scripts/stop_simple_app.sh`（或手动 `kill "$(cat runtime/simple_app/simple_app.pid)"`），再清理 `.pid` 文件
 
 ### 4. 日志与运行目录
 
@@ -127,7 +127,17 @@ echo $! > runtime/simple_app/simple_app.pid
 - `scripts/run_simple_app.sh` 会自动创建上述目录并设置所需环境变量
 - `simple_app.py` 额外把日志输出到 `stdout`，方便在容器或 `nohup` 环境中实时查看
 
-### 5. 访问系统
+### 5. 停止与重启
+
+```bash
+# 停止（会尝试通过 PID 文件与 pgrep 终止 simple_app.py）
+source venv/bin/activate && scripts/stop_simple_app.sh
+
+# 重启 = 停止 + 启动（内部复用 run_simple_app.sh）
+source venv/bin/activate && scripts/restart_simple_app.sh
+```
+
+### 6. 访问系统
 
 打开浏览器访问: `http://your-server-ip:4002`
 
