@@ -34,7 +34,7 @@ from trading.trade_executor import (
     get_bitget_usdt_perp_positions,
 )
 
-LOG_DIR = "logs"
+LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
 LOG_MAX_BYTES = 20 * 1024 * 1024  # 20MB per file
 LOG_BACKUP_COUNT = 3
@@ -61,10 +61,14 @@ def configure_logging() -> None:
     )
     handler.setFormatter(formatter)
 
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(formatter)
+
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.INFO)
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
+    root_logger.addHandler(stream_handler)
 
     flask_logger = logging.getLogger("flask.app")
     flask_logger.handlers.clear()

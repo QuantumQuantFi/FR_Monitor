@@ -105,21 +105,29 @@ pip install aiohttp psutil
 
 ```bash
 # 激活虚拟环境并启动
-source venv/bin/activate && python simple_app.py
+source venv/bin/activate && scripts/run_simple_app.sh
 ```
 
 #### 后台守护运行（不依赖 code-server/终端会话）
 
 ```bash
-nohup bash -c 'source venv/bin/activate && python simple_app.py' \
-  > simple_app.out 2>&1 &
-echo $! > simple_app.pid
+mkdir -p runtime/simple_app
+nohup bash -c 'source venv/bin/activate && scripts/run_simple_app.sh' \
+  >/dev/null 2>&1 &
+echo $! > runtime/simple_app/simple_app.pid
 ```
 - `nohup` 可保证即便 code-server/SSH 会话被关闭，进程仍持续运行
-- 可通过 `lsof -i :4002` 或 `curl http://127.0.0.1:4002/api/system/status` 验证服务存活
-- 停止时 `kill "$(cat simple_app.pid)"`，再清理 `.pid` 文件，避免僵尸 PID
+- 所有应用日志自动写入 `logs/simple_app/simple_app.log`（含轮转文件）
+- 停止时 `kill "$(cat runtime/simple_app/simple_app.pid)"`，再清理 `.pid` 文件，避免僵尸 PID
 
-### 4. 访问系统
+### 4. 日志与运行目录
+
+- Flask 服务日志默认写入 `logs/simple_app/`，可通过 `SIMPLE_APP_LOG_DIR=/custom/path scripts/run_simple_app.sh` 自定义位置
+- 运行期文件（PID 等）建议放在 `runtime/simple_app/`，可通过 `SIMPLE_APP_RUNTIME_DIR` 覆盖
+- `scripts/run_simple_app.sh` 会自动创建上述目录并设置所需环境变量
+- `simple_app.py` 额外把日志输出到 `stdout`，方便在容器或 `nohup` 环境中实时查看
+
+### 5. 访问系统
 
 打开浏览器访问: `http://your-server-ip:4002`
 
