@@ -108,6 +108,17 @@ pip install aiohttp psutil
 source venv/bin/activate && python simple_app.py
 ```
 
+#### 后台守护运行（不依赖 code-server/终端会话）
+
+```bash
+nohup bash -c 'source venv/bin/activate && python simple_app.py' \
+  > simple_app.out 2>&1 &
+echo $! > simple_app.pid
+```
+- `nohup` 可保证即便 code-server/SSH 会话被关闭，进程仍持续运行
+- 可通过 `lsof -i :4002` 或 `curl http://127.0.0.1:4002/api/system/status` 验证服务存活
+- 停止时 `kill "$(cat simple_app.pid)"`，再清理 `.pid` 文件，避免僵尸 PID
+
 ### 4. 访问系统
 
 打开浏览器访问: `http://your-server-ip:4002`
