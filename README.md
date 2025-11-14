@@ -153,6 +153,7 @@ FR_Monitor/
 ├── arbitrage/            # ArbitrageMonitor 与套利信号封装
 ├── bitget_symbol_filter.py # Bitget符号过滤器
 ├── requirements.txt      # Python依赖
+├── dex/                  # `perp-dex-tools` 多交易所做市/刷量机器人
 ├── templates/           # HTML模板
 │   ├── simple_index.html    # 主页
 │   ├── aggregated_index.html # 聚合页面
@@ -160,6 +161,66 @@ FR_Monitor/
 ├── test_rest_apis.py     # REST快照覆盖度测试脚本
 └── venv/               # 虚拟环境 (自动生成)
 ```
+
+## 🔁 `dex/`（perp-dex-tools）联动指引
+
+`dex/` 目录内置 [your-quantguy/perp-dex-tools](https://github.com/your-quantguy/perp-dex-tools) 源码，可用于 EdgeX、Backpack、Paradex、Aster、Lighter、GRVT、Extended、ApeX 等多家新兴永续交易所的刷量、对冲与 Boost 交易。结合本项目的实时价差/资金费率监控，可实现「发现套利 → 立即下单」的闭环。
+
+### 1. 初始化依赖
+
+```bash
+cd dex
+python3 -m venv env
+source env/bin/activate
+pip install -r requirements.txt
+
+# Paradex 独立依赖
+python3 -m venv para_env
+source para_env/bin/activate
+pip install -r para_requirements.txt
+
+# ApeX / EdgeX 扩展
+source env/bin/activate
+pip install -r apex_requirements.txt
+```
+
+### 2. 配置密钥
+
+```bash
+cd dex
+cp env_example.txt .env
+```
+
+根据 `env_example.txt` 填写交易所 API Key、私钥、代理、Telegram/Lark Token，可与 `FR_Monitor` 根目录同名变量复用，便于统一管理密钥。
+
+### 3. 启动多交易所机器人
+
+`runbot.py` 接受所有策略参数，适合直接写入 `systemd` 或 `screen`：
+
+```bash
+cd dex
+source env/bin/activate
+python runbot.py \
+  --exchange backpack \
+  --ticker ETH \
+  --direction buy \
+  --quantity 50 \
+  --take-profit 0.02 \
+  --max-orders 40 \
+  --wait-time 600 \
+  --grid-step 0.5 \
+  --env-file .env
+```
+
+- `--grid-step` 控制平仓价间距，避免过度密集
+- `--stop-price` / `--pause-price` 可配合本仓库监控到的极端价差做风控
+- `--boost` 仅在 Backpack/Aster 交易所生效，用于冲积分/交易量
+
+### 4. 与资金费率监控联动技巧
+
+- 在 `/aggregated` 页面根据价差、`/api/arbitrage/signals` 中的方向，决定 `--ticker` 与 `--direction`
+- `dex/helpers/logger.py` 默认输出 `logs/trading_bot_<exchange>_<ticker>.log`，可纳入 `list_logs.tsv` 统一巡检
+- 需要自动化联动时，可在 `scripts/` 添加任务，拉取 `FR_Monitor` 识别的套利机会后调用 `runbot.py`
 
 ## 🌐 页面访问
 
