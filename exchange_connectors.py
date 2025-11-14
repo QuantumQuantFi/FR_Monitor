@@ -1230,9 +1230,8 @@ class ExchangeDataCollector:
                                     elif inst_type == 'SPOT':  # 现货
                                         price = float(item.get('lastPr', 0)) if item.get('lastPr') and str(item.get('lastPr')) != '0' else 0
                                         
-                                        # 对于WLFI特殊处理：即使价格为0也要更新（确保上线第一时间获取数据）
-                                        # 对于其他币种：只在有有效价格时更新
-                                        if price > 0 or symbol == 'WLFI':
+                                        # 只在有有效价格时更新，避免把占位数据写入面板
+                                        if price > 0:
                                             self.data['bitget'][symbol]['spot'] = {
                                                 'price': price,
                                                 'volume': float(item.get('baseVolume', 0)) if item.get('baseVolume') else 0,
@@ -1240,10 +1239,7 @@ class ExchangeDataCollector:
                                                 'symbol': inst_id,
                                                 'is_active': price > 0  # 标记是否有实际价格
                                             }
-                                            if price > 0:
-                                                print(f"Bitget {symbol} 现货价格: {price}")
-                                            elif symbol == 'WLFI':
-                                                print(f"Bitget {symbol} 现货监控中 (等待上线): {price}")
+                                            print(f"Bitget {symbol} 现货价格: {price}")
                                     break
             except Exception as e:
                 print(f"Bitget解析错误: {e}, 原始数据: {message}")

@@ -180,7 +180,7 @@
         <div class="title">多交易所实时价格监控</div>
         <div class="symbol-selector">
             <span style="color: #8e9297; margin-right: 10px;">快速选择:</span>
-            {% for symbol in ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL', 'WLFI'] %}
+            {% for symbol in ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'SOL', 'LINK'] %}
             <button class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" 
                     onclick="switchSymbol('{{ symbol }}')">{{ symbol }}</button>
             {% endfor %}

@@ -54,7 +54,7 @@ async def test_market_integration():
     
     # 5. 显示特定币种详情
     print("\n=== 特定币种分析 ===")
-    test_symbols = ['BTC', 'ETH', 'WLFI', 'LINK']
+    test_symbols = ['BTC', 'ETH', 'LINK', 'SOL', 'WLFI']
     for symbol in test_symbols:
         if symbol in symbol_stats:
             stats = symbol_stats[symbol]

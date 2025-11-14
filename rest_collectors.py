@@ -20,7 +20,7 @@ def _now_iso() -> str:
 
 def _req_json(url: str) -> Any:
     timeout = REST_CONNECTION_CONFIG.get('timeout', 10)
-    headers = {'User-Agent': REST_CONNECTION_CONFIG.get('user_agent', 'WLFI-Monitor/1.0')}
+    headers = {'User-Agent': REST_CONNECTION_CONFIG.get('user_agent', 'CrossExchange-Arb/1.0')}
     retry = max(0, int(REST_CONNECTION_CONFIG.get('retry', 0)))
 
     for attempt in range(retry + 1):

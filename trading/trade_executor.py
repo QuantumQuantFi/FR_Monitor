@@ -31,7 +31,7 @@ import config
 
 CONFIG_PRIVATE = getattr(config, "config_private", None)
 REQUEST_TIMEOUT = config.REST_CONNECTION_CONFIG.get("timeout", 10)
-USER_AGENT = config.REST_CONNECTION_CONFIG.get("user_agent", "WLFI-Monitor/1.0")
+USER_AGENT = config.REST_CONNECTION_CONFIG.get("user_agent", "CrossExchange-Arb/1.0")
 LOGGER = logging.getLogger(__name__)
 
 

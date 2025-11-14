@@ -1380,7 +1380,7 @@ def get_system_status():
         return jsonify({'error': str(e)}), 500
 
 if __name__ == '__main__':
-    print("🚀 启动WLFI资金费率监控系统...")
+    print("🚀 启动跨交易所期现套利监控系统...")
     
     # 显示优化配置信息
     print(f"📊 监控币种数量: {len(CURRENT_SUPPORTED_SYMBOLS)}")

@@ -485,7 +485,7 @@
         <div class="header-top">
             <h1 class="title">🚀 多交易所实时监控</h1>
             <div class="controls">
-                <input type="text" class="search-box" id="searchInput" placeholder="搜索币种 (如: BTC, ETH, WLFI...)">
+                <input type="text" class="search-box" id="searchInput" placeholder="搜索币种 (如: BTC, ETH, ARB...)">
                 <button class="control-btn" onclick="refreshData()">🔄 刷新</button>
                 <button class="control-btn" onclick="toggleAutoRefresh()">⏸️ 暂停</button>
                 <button class="control-btn" onclick="togglePriceDiffSort()" id="priceDiffBtn">📊 价差排序</button>
@@ -519,7 +519,7 @@
             <div class="filter-tab" data-filter="multiExchange">多交易所</div>
             <div class="filter-tab" data-filter="hasFunding">有资金费率</div>
             <div class="filter-tab" data-filter="priceDiff">价差排序</div>
-            <div class="filter-tab" data-filter="wlfi">WLFI</div>
+            <div class="filter-tab" data-filter="watchlist">重点关注</div>
             <div class="filter-tab" data-filter="mainstream">主流币</div>
         </div>
 
@@ -562,8 +562,9 @@
         let forceResort = false;         // 用户操作触发的一次性重排
         let latestArbitrageSignals = [];
 
-        // 主流币种列表
+        // 主流与重点关注币种列表
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
+        const watchlistSymbols = ['BTC', 'ETH', 'ARB', 'OP', 'GMX', 'ONDO', 'PENDLE', 'PYTH', 'TIA', 'SUI'];
 
         // 格式化价格 - 避免科学计数法，保持原始精度
         function formatPrice(price) {
@@ -997,8 +998,8 @@
                                 // 价差筛选：需要有多个有效价格且价差大于0.1%
                                 const diff = calculatePriceDifference(symbolData);
                                 return diff && diff.diffPercent >= 0.1;
-                            case 'wlfi':
-                                return symbol.toLowerCase().includes('wlfi');
+                            case 'watchlist':
+                                return watchlistSymbols.includes(symbol);
                             case 'mainstream':
                                 return mainstreamSymbols.includes(symbol);
                             default:

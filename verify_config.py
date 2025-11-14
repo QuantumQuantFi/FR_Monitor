@@ -28,9 +28,9 @@ def verify_config():
         'DeFi热门': 25, 
         'Layer1/Layer2': 25,
         'GameFi/NFT': 20,
-        '基础设施': 20,
-        '新兴热门': 30,
-        '特殊关注': 10
+        '基础设施': 19,
+        '新兴热门': 31,
+        '策略重点': 10
     }
     
     expected_total = sum(categories.values())
@@ -40,7 +40,7 @@ def verify_config():
         print(f"❌ 币种数量不匹配: 预期 {expected_total}, 实际 {total_symbols}")
     
     # 检查特定币种是否存在
-    important_symbols = ['BTC', 'ETH', 'WLFI', 'LINK']
+    important_symbols = ['BTC', 'ETH', 'SOL', 'LINK', 'WLFI']
     missing = []
     for symbol in important_symbols:
         if symbol not in SUPPORTED_SYMBOLS:

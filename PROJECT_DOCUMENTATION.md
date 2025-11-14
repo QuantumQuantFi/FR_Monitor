@@ -14,7 +14,7 @@
 ## 项目结构
 
 ```
-wlfi/
+FR_Monitor/
 ├── simple_app.py              # 主应用程序 - Flask Web服务
 ├── exchange_connectors.py     # 交易所WebSocket连接器
 ├── config.py                  # 系统配置文件
@@ -110,7 +110,7 @@ EXCHANGE_WEBSOCKETS = {
 }
 
 # 支持的币种
-SUPPORTED_SYMBOLS = ['LINK', 'WLFI', 'BTC', 'ETH']
+SUPPORTED_SYMBOLS = ['LINK', 'BTC', 'ETH', 'ARB']
 ```
 
 ### 4. `simple_index.html` - Web界面
@@ -119,7 +119,7 @@ SUPPORTED_SYMBOLS = ['LINK', 'WLFI', 'BTC', 'ETH']
 
 **核心特性**:
 - **实时数据展示**: 每3秒自动刷新
-- **币种切换**: 支持LINK、WLFI、BTC、ETH切换
+- **币种切换**: 支持LINK、BTC、ETH、ARB切换
 - **价格对比**: 现货vs期货价格对比
 - **资金费率**: 实时资金费率显示
 - **溢价指数**: 自动计算并显示溢价百分比
@@ -222,7 +222,7 @@ premium = ((futures_price - spot_price) / spot_price) * 100
 - **数据结构**: 时间序列数据，包含价格、费率、溢价
 
 ### 4. 币种动态切换
-- **支持币种**: LINK, WLFI, BTC, ETH
+- **支持币种**: LINK, BTC, ETH, ARB
 - **切换方式**: Web界面按钮或API调用
 - **实时生效**: 切换后立即重新连接WebSocket
 
@@ -252,10 +252,10 @@ premium = ((futures_price - spot_price) / spot_price) * 100
 
 ```json
 // Request
-{"symbol": "WLFI"}
+{"symbol": "BTC"}
 
 // Response
-{"status": "success", "symbol": "WLFI"}
+{"status": "success", "symbol": "BTC"}
 ```
 
 ## 运维监控
@@ -360,5 +360,5 @@ http://localhost:5000
 ---
 
 **开发者**: Claude Code Assistant  
-**项目地址**: `/root/dev_jerry/wlfi/`  
+**项目地址**: `~/FR_Monitor/`  
 **访问地址**: `http://quantumtech.tech:5000`

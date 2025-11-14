@@ -56,13 +56,13 @@ SUPPORTED_SYMBOLS = [
     'GRT', 'LPT', 'BAT', 'STORJ', 'OCEAN', 'ANKR', 'FET', 'AGIX', 'NKN', 'HOT',
     'DENT', 'KEY', 'DATA', 'BLZ', 'REQ', 'POWR', 'SUB', 'MTL', 'SALT',
     
-    # 新兴热门 (30个)
+    # 新兴热门 (31个)
     'AR', 'RUNE', 'KSM', 'DYDX', 'PERP', 'ENS', 'LDO', 'FXS', 'CVX', 'BICO',
     'JASMY', 'C98', 'GTC', 'BTRST', 'RAD', 'API3', 'CTSI', 'AUCTION', 'BADGER', 'BOND',
-    'DPX', 'FIDA', 'GOG', 'HFT', 'IQ', 'JUP', 'LCX', 'LOKA', 'METIS', 'MNGO',
+    'DPX', 'FIDA', 'GOG', 'HFT', 'IQ', 'JUP', 'LCX', 'LOKA', 'METIS', 'MNGO', 'WLFI',
     
-    # 特殊关注 (2个)
-    'WLFI'  # 项目重点关注
+    # 策略重点 (10个)
+    'ARB', 'OP', 'GMX', 'PYTH', 'TIA', 'SUI', 'ONDO', 'PENDLE', 'JTO', 'NTRN'
 ]
 
 # 数据刷新间隔（秒） - 优化频率减少资源消耗
@@ -92,7 +92,7 @@ REST_CONNECTION_CONFIG = {
     'timeout': 10,                  # 单次请求超时（秒）
     'retry': 1,                     # 失败重试次数（轻量）
     'stagger_ms': 200,              # 交易所之间的错峰延迟（毫秒）
-    'user_agent': 'WLFI-Monitor/1.0',
+    'user_agent': 'CrossExchange-Arb/1.0',
 }
 
 # REST合并策略
@@ -117,7 +117,7 @@ MARKET_FILTER_CONFIG = {
     'min_exchanges_support': 1,        # 至少任一交易所有现货或合约即可
     'min_completeness_score': 0,       # 不限制覆盖度评分
     'max_symbols': 5000,               # 提高上限，允许全量USDT币种
-    'priority_symbols': ['WLFI', 'BTC', 'ETH', 'BNB', 'PENGU'],  # 关键币种优先纳入
+    'priority_symbols': ['BTC', 'ETH', 'BNB', 'ARB', 'SOL'],  # 关键币种优先纳入
     'exclude_symbols': [],             # 排除币种列表
 }
 

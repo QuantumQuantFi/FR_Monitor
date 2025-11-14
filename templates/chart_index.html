@@ -457,7 +457,7 @@
         <div class="controls">
             <div class="control-group" style="flex: 1 1 100%; align-items: flex-start; gap: 10px;">
                 <span class="control-label" style="margin-top: 6px;">币种:</span>
-                <input id="symbolSearch" class="search-input" list="symbolsList" placeholder="搜索并跳转 (如: BTC, ETH, WLFI)" />
+                <input id="symbolSearch" class="search-input" list="symbolsList" placeholder="搜索并跳转 (如: BTC, ETH, ARB)" />
                 <datalist id="symbolsList">
                     {% for symbol in symbols %}
                     <option value="{{ symbol }}"></option>
@@ -1334,7 +1334,7 @@
                     updateAllCharts();
                     updateStats(data);
                     
-                    document.getElementById('status').textContent = '数据加载完成 • WLFI监控活跃';
+                    document.getElementById('status').textContent = '数据加载完成 • 套利监控活跃';
                     document.getElementById('status').className = 'status connected';
                 })
                 .catch(error => {
