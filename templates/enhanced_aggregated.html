@@ -501,7 +501,7 @@
             </div>
             <div class="stat-card">
                 <div class="stat-label">活跃交易所</div>
-                <div class="stat-value" id="activeExchanges">4</div>
+                <div class="stat-value" id="activeExchanges">{{ exchange_order|length }}</div>
             </div>
             <div class="stat-card">
                 <div class="stat-label">有数据币种</div>
@@ -524,10 +524,9 @@
         </div>
 
         <div class="rest-status" id="restStatusBar">
-            <div class="rest-pill"><span class="ex">binance</span><span class="ts" id="rest-binance">-</span></div>
-            <div class="rest-pill"><span class="ex">okx</span><span class="ts" id="rest-okx">-</span></div>
-            <div class="rest-pill"><span class="ex">bybit</span><span class="ts" id="rest-bybit">-</span></div>
-            <div class="rest-pill"><span class="ex">bitget</span><span class="ts" id="rest-bitget">-</span></div>
+            {% for exchange in exchange_order %}
+            <div class="rest-pill"><span class="ex">{{ exchange }}</span><span class="ts" id="rest-{{ exchange }}">-</span></div>
+            {% endfor %}
         </div>
 
         <div class="arbitrage-section">
@@ -546,7 +545,7 @@
 
     <div class="footer-info">
         💡 支持搜索币种名称 | 🔄 每秒自动刷新 | 📊 实时价格和资金费率监控<br>
-        支持的交易所: Binance、OKX、Bybit、Bitget
+        支持的交易所: {{ exchange_order | map('upper') | join('、') }}
     </div>
 
     <script>
@@ -561,6 +560,8 @@
         let cardOrder = [];              // 当前卡片顺序（冻结时使用）
         let forceResort = false;         // 用户操作触发的一次性重排
         let latestArbitrageSignals = [];
+        const EXCHANGE_ORDER = {{ exchange_order|tojson }};
+        const trackedExchanges = Array.isArray(EXCHANGE_ORDER) ? EXCHANGE_ORDER.slice() : [];
 
         // 主流与重点关注币种列表
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
@@ -706,7 +707,7 @@
         // 计算价差百分比
         function calculatePriceDifference(symbolData) {
             const prices = [];
-            const exchanges = ['binance', 'okx', 'bybit', 'bitget'];
+            const exchanges = trackedExchanges.length ? trackedExchanges : Object.keys(symbolData || {});
             
             // 收集所有有效价格（现货和期货）
             exchanges.forEach(exchange => {
@@ -880,7 +881,7 @@
                         <div class="exchanges-grid">
                 `;
 
-                ['binance', 'okx', 'bybit', 'bitget'].forEach(exchange => {
+                (trackedExchanges.length ? trackedExchanges : Object.keys(symbolData)).forEach(exchange => {
                     if (symbolData[exchange]) {
                         const exData = symbolData[exchange];
                         const hasSpot = exData.spot && exData.spot.price;
@@ -889,7 +890,7 @@
 
                         html += `
                             <div class="exchange-box">
-                                <div class="exchange-name">${exchange}</div>
+                                <div class="exchange-name">${exchange.toUpperCase()}</div>
                                 <div class="price-info">
                         `;
 
@@ -929,21 +930,10 @@
                         }
 
                         if (!hasSpot && !hasFutures) {
-                            html += '<div class="price-row"><span class="price-label">暂无数据</span></div>';
+                            html += `<div class="price-row"><span class="price-label">暂无数据</span></div>`;
                         }
 
                         html += `
-                                </div>
-                            </div>
-                        `;
-                    } else {
-                        html += `
-                            <div class="exchange-box" style="opacity: 0.3;">
-                                <div class="exchange-name">${exchange}</div>
-                                <div class="price-info">
-                                    <div class="price-row">
-                                        <span class="price-label">未支持</span>
-                                    </div>
                                 </div>
                             </div>
                         `;
@@ -1040,15 +1030,13 @@
                 const res = await fetch('/api/system/status');
                 const s = await res.json();
                 const last = (s && s.rest && s.rest.last_sync) || {};
-                const map = {
-                    binance: document.getElementById('rest-binance'),
-                    okx: document.getElementById('rest-okx'),
-                    bybit: document.getElementById('rest-bybit'),
-                    bitget: document.getElementById('rest-bitget')
-                };
-                Object.keys(map).forEach(ex => {
+                const map = {};
+                (trackedExchanges.length ? trackedExchanges : Object.keys(last)).forEach(ex => {
+                    const el = document.getElementById(`rest-${ex}`);
+                    if (!el) return;
                     const ts = last[ex];
-                    map[ex].textContent = ts ? formatTimestamp(ts) : '-';
+                    el.textContent = ts ? formatTimestamp(ts) : '-';
+                    map[ex] = el;
                 });
             } catch (e) {
                 // 忽略一次性错误

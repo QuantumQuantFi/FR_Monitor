@@ -5,7 +5,7 @@
 ## 📊 系统特性
 
 ### 🔥 核心功能
-- **实时价格监控**: 支持Binance、OKX、Bybit、Bitget四大交易所
+- **实时价格监控**: 支持 Binance、OKX、Bybit、Bitget、GRVT 五大交易所
 - **资金费率追踪**: 实时资金费率数据，发现套利机会
 - **价差分析**: 自动计算跨交易所价差，智能排序筛选
 - **套利信号**: 内置 `ArbitrageMonitor`，基于0.6%阈值与3次连续采样输出可执行套利提示
@@ -41,7 +41,7 @@
    - 已被simple_app.py替代
 
 3. **exchange_connectors.py** - WebSocket连接管理
-   - 多交易所WebSocket连接
+   - 多交易所WebSocket连接（含 GRVT）
    - 自动重连机制
    - 数据标准化处理
 
@@ -120,14 +120,29 @@ echo $! > runtime/simple_app/simple_app.pid
 - 所有应用日志自动写入 `logs/simple_app/simple_app.log`（含轮转文件）
 - 停止时运行 `source venv/bin/activate && scripts/stop_simple_app.sh`（或手动 `kill "$(cat runtime/simple_app/simple_app.pid)"`），再清理 `.pid` 文件
 
-### 4. 日志与运行目录
+### 4. GRVT 配置 & 环境变量
+
+若需开启 GRVT 市场数据，需在 `config_private.py` 或环境变量中写入以下字段：
+
+| 变量名 | 说明 |
+| --- | --- |
+| `GRVT_API_KEY` | API Key，用于 `edge.grvt.io` 登录 |
+| `GRVT_SECRET_KEY` | 私钥（与 SDK `private_key` 兼容） |
+| `GRVT_TRADING_ACCOUNT_ID` | 交易账户 ID，用于私有订阅 |
+| `GRVT_ENVIRONMENT` | `prod` / `testnet` / `staging` 等，默认 `prod` |
+| `GRVT_WS_PUBLIC_URL` | 可选：覆盖默认 `wss://market-data.<env>.grvt.io/ws` |
+| `GRVT_REST_BASE_URL` | 可选：覆盖 REST 域名 |
+
+> ✅ 建议先将运行机器的公网 IPv4/IPv6 加入 GRVT 白名单；`config.py` 默认启用了 IPv4 优先策略，确保登录请求命中已授权地址。
+
+### 5. 日志与运行目录
 
 - Flask 服务日志默认写入 `logs/simple_app/`，可通过 `SIMPLE_APP_LOG_DIR=/custom/path scripts/run_simple_app.sh` 自定义位置
 - 运行期文件（PID 等）建议放在 `runtime/simple_app/`，可通过 `SIMPLE_APP_RUNTIME_DIR` 覆盖
 - `scripts/run_simple_app.sh` 会自动创建上述目录并设置所需环境变量
 - `simple_app.py` 额外把日志输出到 `stdout`，方便在容器或 `nohup` 环境中实时查看
 
-### 5. 停止与重启
+### 6. 停止与重启
 
 ```bash
 # 停止（会尝试通过 PID 文件与 pgrep 终止 simple_app.py）
@@ -137,7 +152,7 @@ source venv/bin/activate && scripts/stop_simple_app.sh
 source venv/bin/activate && scripts/restart_simple_app.sh
 ```
 
-### 6. 访问系统
+### 7. 访问系统
 
 打开浏览器访问: `http://your-server-ip:4002`
 
@@ -155,12 +170,21 @@ FR_Monitor/
 ├── requirements.txt      # Python依赖
 ├── dex/                  # `perp-dex-tools` 多交易所做市/刷量机器人
 ├── templates/           # HTML模板
-│   ├── simple_index.html    # 主页
-│   ├── aggregated_index.html # 聚合页面
-│   └── enhanced_aggregated.html # 增强聚合页面
+│   ├── simple_index.html      # 交易所视图
+│   ├── enhanced_aggregated.html # 聚合页/套利看板
+│   └── chart_index.html       # 图表&下单页面
 ├── test_rest_apis.py     # REST快照覆盖度测试脚本
 └── venv/               # 虚拟环境 (自动生成)
 ```
+
+### 🔍 内置测试脚本
+
+| 命令 | 作用 |
+| --- | --- |
+| `python verify_config.py` | 校验币种配置与容量设置 |
+| `python test_rest_apis.py` | 同时测试 Binance/OKX/Bybit/Bitget/GRVT 的 REST 快照覆盖度 |
+| `python test_websocket_limits.py grvt` | 触发 GRVT WS 登录 + 全量订阅并打印行情样本 |
+| `python test_market_integration.py` | 打印动态支持币种、REST/WS 覆盖率 |
 
 ## 🔁 `dex/`（perp-dex-tools）联动指引
 

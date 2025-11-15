@@ -627,12 +627,30 @@
             return null;
         }
         
+        const EXCHANGE_ORDER = {{ exchange_order|tojson }};
+        function getOrderedExchangeList(input) {
+            const keys = Array.isArray(input)
+                ? Array.from(new Set(input))
+                : Object.keys(input || {});
+            if (!Array.isArray(EXCHANGE_ORDER) || EXCHANGE_ORDER.length === 0) {
+                return keys;
+            }
+            const ordered = [...EXCHANGE_ORDER];
+            keys.forEach((key) => {
+                if (!ordered.includes(key)) {
+                    ordered.push(key);
+                }
+            });
+            return ordered.filter((key) => keys.includes(key));
+        }
+        
         // 交易所颜色配置
         const exchangeColors = {
             'okx': '#1890ff',
             'binance': '#f0b90b', 
             'bybit': '#f6465d',
-            'bitget': '#00d4aa'
+            'bitget': '#00d4aa',
+            'grvt': '#8c6bff'
         };
 
         // 与增强页一致的工具函数
@@ -672,16 +690,15 @@
         }
         function calculatePriceDifference(symbolData) {
             const prices = [];
-            const exchanges = ['binance','okx','bybit','bitget'];
+            const exchanges = getOrderedExchangeList(symbolData);
             exchanges.forEach(exchange => {
-                if (symbolData[exchange]) {
-                    const ex = symbolData[exchange];
-                    if (ex.spot && ex.spot.price && ex.spot.price > 0) {
-                        prices.push({ exchange, type: 'spot', price: Number(ex.spot.price), timestamp: ex.spot.timestamp });
-                    }
-                    if (ex.futures && ex.futures.price && ex.futures.price > 0) {
-                        prices.push({ exchange, type: 'futures', price: Number(ex.futures.price), timestamp: ex.futures.timestamp });
-                    }
+                const ex = symbolData[exchange];
+                if (!ex) return;
+                if (ex.spot && ex.spot.price && ex.spot.price > 0) {
+                    prices.push({ exchange, type: 'spot', price: Number(ex.spot.price), timestamp: ex.spot.timestamp });
+                }
+                if (ex.futures && ex.futures.price && ex.futures.price > 0) {
+                    prices.push({ exchange, type: 'futures', price: Number(ex.futures.price), timestamp: ex.futures.timestamp });
                 }
             });
             if (prices.length < 2) return null;
@@ -1158,35 +1175,33 @@
 
             // 交易所卡片
             let html = '';
-            ['binance','okx','bybit','bitget'].forEach(exchange => {
-                if (symbolData[exchange]) {
-                    const ex = symbolData[exchange];
-                    const hasSpot = ex.spot && ex.spot.price;
-                    const hasFutures = ex.futures && ex.futures.price;
-                    const fundingRate = ex.futures ? ex.futures.funding_rate : null;
-                    html += `<div class="exchange-box">
-                                <div class="exchange-name">${exchange}</div>
-                                <div class="price-info">`;
-                    if (hasSpot) {
-                        html += `<div class="price-row"><span class="price-label">现货</span><span class="price-value">${formatPrice(ex.spot.price)}</span></div>
-                                 <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">现货更新</span><span class="price-value">${formatRelTimestamp(ex.spot.timestamp)}</span></div>`;
-                    }
-                    if (hasFutures) {
-                        html += `<div class="price-row"><span class="price-label">期货</span><span class="price-value">${formatPrice(ex.futures.price)}</span></div>
-                                 <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">期货更新</span><span class="price-value">${formatRelTimestamp(ex.futures.timestamp)}</span></div>`;
-                    }
-                    if (fundingRate) {
-                        html += `<div class="price-row"><span class="price-label">费率</span><span class="funding-rate ${getFundingRateClass(fundingRate)}">${formatFundingRate(fundingRate)}</span></div>`;
-                    }
-                    if (!hasSpot && !hasFutures) {
-                        html += '<div class="price-row"><span class="price-label">暂无数据</span></div>';
-                    }
-                    html += `</div></div>`;
-                } else {
-                    html += `<div class="exchange-box" style="opacity: 0.3;"><div class="exchange-name">${exchange}</div><div class="price-info"><div class="price-row"><span class="price-label">未支持</span></div></div></div>`;
+            const orderedExchanges = getOrderedExchangeList(symbolData);
+            orderedExchanges.forEach(exchange => {
+                const ex = symbolData[exchange];
+                if (!ex) return;
+                const hasSpot = ex.spot && ex.spot.price;
+                const hasFutures = ex.futures && ex.futures.price;
+                const fundingRate = ex.futures ? ex.futures.funding_rate : null;
+                html += `<div class="exchange-box">
+                            <div class="exchange-name">${exchange.toUpperCase()}</div>
+                            <div class="price-info">`;
+                if (hasSpot) {
+                    html += `<div class="price-row"><span class="price-label">现货</span><span class="price-value">${formatPrice(ex.spot.price)}</span></div>
+                             <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">现货更新</span><span class="price-value">${formatRelTimestamp(ex.spot.timestamp)}</span></div>`;
                 }
+                if (hasFutures) {
+                    html += `<div class="price-row"><span class="price-label">期货</span><span class="price-value">${formatPrice(ex.futures.price)}</span></div>
+                             <div class="price-row" style="font-size:10px;opacity:0.7;"><span class="price-label">期货更新</span><span class="price-value">${formatRelTimestamp(ex.futures.timestamp)}</span></div>`;
+                }
+                if (fundingRate) {
+                    html += `<div class="price-row"><span class="price-label">费率</span><span class="funding-rate ${getFundingRateClass(fundingRate)}">${formatFundingRate(fundingRate)}</span></div>`;
+                }
+                if (!hasSpot && !hasFutures) {
+                    html += `<div class="price-row"><span class="price-label">状态</span><span class="price-value">暂无数据</span></div>`;
+                }
+                html += `</div></div>`;
             });
-            grid.innerHTML = html;
+            grid.innerHTML = html || '<div style="color:#8c8c8c;">暂无数据</div>';
         }
 
         // 获取实时聚合数据并渲染当前币种卡片

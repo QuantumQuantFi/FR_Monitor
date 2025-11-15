@@ -274,6 +274,22 @@
     <script>
         let currentSymbol = '{{ current_symbol }}';
         let refreshInterval;
+        const EXCHANGE_ORDER = {{ exchange_order|tojson }};
+        
+        function getOrderedExchangeKeys(data) {
+            if (!data) return [];
+            const keys = Object.keys(data);
+            if (!Array.isArray(EXCHANGE_ORDER) || EXCHANGE_ORDER.length === 0) {
+                return keys;
+            }
+            const ordered = [...EXCHANGE_ORDER];
+            keys.forEach(key => {
+                if (!ordered.includes(key)) {
+                    ordered.push(key);
+                }
+            });
+            return ordered.filter(key => data[key]);
+        }
         
         // 统一解析后端时间戳：
         // - 若无时区信息，按UTC处理（修复UTC+8 显示“晚8小时”问题）
@@ -332,18 +348,22 @@
         function updateExchangeCards(realtimeData, premiumData) {
             const grid = document.getElementById('exchangesGrid');
             grid.innerHTML = '';
+            const exchanges = getOrderedExchangeKeys(realtimeData);
             
-            for (const [exchange, data] of Object.entries(realtimeData)) {
+            exchanges.forEach(exchange => {
+                const data = realtimeData[exchange] || {};
+                const spot = data.spot || {};
+                const futures = data.futures || {};
                 const card = document.createElement('div');
                 card.className = 'exchange-card';
                 
-                const spotPrice = data.spot.price || 0;
-                const futuresPrice = data.futures.price || 0;
-                const fundingRate = data.futures.funding_rate || 0;
+                const spotPrice = spot.price || 0;
+                const futuresPrice = futures.price || 0;
+                const fundingRate = futures.funding_rate || 0;
                 const premium = premiumData[exchange]?.premium_percent || 0;
                 
                 card.innerHTML = `
-                    <div class="exchange-name">${exchange}</div>
+                    <div class="exchange-name">${exchange.toUpperCase()}</div>
                     <div class="price-info">
                         <span class="price-label">现货价格:</span>
                         <span class="price-value spot-price">$${spotPrice.toFixed(4)}</span>
@@ -363,7 +383,7 @@
                 `;
                 
                 grid.appendChild(card);
-            }
+            });
         }
         
         // 获取数据

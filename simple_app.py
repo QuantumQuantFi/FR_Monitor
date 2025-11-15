@@ -39,6 +39,7 @@ LOG_FILE_NAME = "simple_app.log"
 LOG_MAX_BYTES = 20 * 1024 * 1024  # 20MB per file
 LOG_BACKUP_COUNT = 3
 _LOGGING_CONFIGURED = False
+EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt']
 
 
 def configure_logging() -> None:
@@ -870,20 +871,23 @@ def background_data_collection():
 def index():
     """主页 - 增强版按币种聚合展示所有可用币种"""
     return render_template('enhanced_aggregated.html', 
-                         symbols=data_collector.supported_symbols)
+                         symbols=data_collector.supported_symbols,
+                         exchange_order=EXCHANGE_DISPLAY_ORDER)
 
 @app.route('/exchanges')
 def exchanges_view():
     """按交易所展示页面"""
     return render_template('simple_index.html', 
                          symbols=data_collector.supported_symbols,
-                         current_symbol=data_collector.current_symbol)
+                         current_symbol=data_collector.current_symbol,
+                         exchange_order=EXCHANGE_DISPLAY_ORDER)
 
 @app.route('/aggregated')
 def aggregated_index():
     """聚合页面（兼容路由）- 使用增强版聚合视图"""
     return render_template('enhanced_aggregated.html', 
-                         symbols=data_collector.supported_symbols)
+                         symbols=data_collector.supported_symbols,
+                         exchange_order=EXCHANGE_DISPLAY_ORDER)
 
 @app.route('/charts')
 def charts():
@@ -901,7 +905,8 @@ def charts():
     return render_template('chart_index.html',
                          # 提供动态支持的币种列表，保证前端按钮与实际支持一致
                          symbols=data_collector.supported_symbols,
-                         current_symbol=current_symbol)
+                         current_symbol=current_symbol,
+                         exchange_order=EXCHANGE_DISPLAY_ORDER)
 
 @app.route('/api/data')
 def get_current_data():
@@ -914,6 +919,7 @@ def get_current_data():
         'realtime_data': symbol_data,
         'premium_data': premium_data,
         'symbol': current_symbol,
+        'exchange_order': EXCHANGE_DISPLAY_ORDER,
         'timestamp': now_utc_iso()
     })
 
@@ -929,6 +935,7 @@ def get_all_data():
         # 返回动态支持列表
         'supported_symbols': data_collector.supported_symbols,
         'current_symbol': data_collector.current_symbol,
+        'exchange_order': EXCHANGE_DISPLAY_ORDER,
         'timestamp': now_utc_iso()
     })
 
