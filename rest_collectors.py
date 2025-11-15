@@ -85,6 +85,9 @@ def _ms_to_iso(value: Optional[Any]) -> Optional[str]:
 
 # -------------------------------
 # Hyperliquid helpers
+# 说明：Hyperliquid 的公共 REST API 通过 POST `/info`
+# （type=allMids/meta/metaAndAssetCtxs）返回 JSON，
+# 这里封装了常用调用与缓存逻辑，供 fetch_hyperliquid 使用。
 # -------------------------------
 _HYPERLIQUID_BASES: List[str] = []
 _HYPERLIQUID_BASES_LOCK = threading.Lock()
@@ -421,6 +424,8 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
     return out
 
 
+# GRVT helper：通过官方 grvt-pysdk 访问 REST/WS
+# SDK 会负责签名与 IP 白名单校验，我们在这里缓存 client 并轮询 ticker。
 _GRVT_CLIENT_LOCK = threading.Lock()
 _GRVT_CLIENT: Optional["GrvtCcxt"] = None
 _GRVT_SYMBOL_QUEUE: deque[str] = deque()
@@ -556,7 +561,8 @@ def _decode_grvt_funding(value) -> Optional[float]:
 def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
     Fetch GRVT tickers via authenticated REST calls using the official SDK.
-    Rotates through supported symbols to avoid rate limits.
+    SDK 会向 `market-data.<env>.grvt.io` 发起 `full/v1/ticker` 请求，
+    因此必须提前配置 API Key/白名单；这里按批次轮询避免触发限频。
     """
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     client = _get_grvt_client()
@@ -605,7 +611,7 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
 
 
 def fetch_hyperliquid() -> Dict[str, Dict[str, Dict[str, Any]]]:
-    """Fetch Hyperliquid perp mid prices and funding data."""
+    """Fetch Hyperliquid perp mid prices and funding data via /info."""
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     payload = _hyperliquid_post({'type': 'allMids'})
     if not isinstance(payload, dict):

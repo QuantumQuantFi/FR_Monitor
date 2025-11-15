@@ -135,6 +135,8 @@ class ExchangeDataCollector:
         self.exchange_symbols['lighter']['spot'] = self.exchange_symbols['lighter'].get('spot') or []
 
         # Hyperliquid markets
+        # 说明：Hyperliquid 没有现货，`get_hyperliquid_supported_bases`
+        # 通过 REST /info(meta) 拉取支持列表，供 WS/REST 同步使用。
         if 'hyperliquid' not in self.exchange_symbols:
             self.exchange_symbols['hyperliquid'] = {'spot': [], 'futures': []}
 

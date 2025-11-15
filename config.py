@@ -89,6 +89,8 @@ LIGHTER_MARKET_REFRESH_SECONDS = int(
 )
 
 # Hyperliquid configuration
+# 说明：Hyperliquid 公共行情通过 REST `/info` 与 WebSocket `allMids` 提供，
+# 下面的配置用来描述 REST 与 WS 端点，方便在不同环境（主网/测试网）之间切换。
 HYPERLIQUID_API_BASE_URL = _get_private(
     'HYPERLIQUID_API_BASE_URL',
     'HYPERLIQUID_API_BASE_URL',

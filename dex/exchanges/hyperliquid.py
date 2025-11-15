@@ -16,6 +16,10 @@ class HyperliquidMarketWebSocket:
     """
     Lightweight manager that mirrors websocket.WebSocketApp usage so it can
     be driven by ExchangeDataCollector._connect_with_retry.
+
+    使用方式：官方 WebSocket `wss://api.hyperliquid.xyz/ws` 只需订阅
+    `{"method":"subscribe","subscription":{"type":"allMids"}}`，即可得到所有
+    永续 mid 价格，本类只做解包并回调核心 collector。
     """
 
     def __init__(

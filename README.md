@@ -180,6 +180,20 @@ source venv/bin/activate && scripts/restart_simple_app.sh
 
 打开浏览器访问: `http://your-server-ip:4002`
 
+### 10. 如何接入新的交易所（Checklist）
+
+> 以下步骤适用于 CEX/DEX 统一行情接入，确保 REST/WS 与前端展示一致。
+
+1. **整理官方文档**：确认 WebSocket/REST 端点、鉴权方式、订阅 payload、节流/白名单要求。
+2. **新增配置**（`config.py`）：为新交易所暴露 REST/WS URL、刷新周期、API Key/私钥等变量，便于在服务器和开发机切换环境。
+3. **实现 REST 补齐**（`rest_collectors.py`）：按交易所格式编写 `fetch_xxx()`，并在 `fetch_all_exchanges()` 里注入；必要时提供缓存或元数据拉取函数（类似 `get_lighter_market_info`、`get_hyperliquid_supported_bases`）。
+4. **实现 WebSocket 客户端**（`dex/exchanges/`）：封装对应的订阅/心跳/重连逻辑，只需输出标准化 payload，便于 collector 统一处理。
+5. **注册 Collector**（`exchange_connectors.py`）：在 `_load_exchange_symbols`、`_initialize_data_structure`、`start_all_connections`、`start_rest_poller` 以及具体 `_connect_xxx` 中接入新的 REST/WS 客户端。
+6. **前端与 API**：`simple_app.py` 中更新 `EXCHANGE_DISPLAY_ORDER`，Templates/REST API 会自动带上新交易所；若有特定 UI 需求可在模板内追加卡片描述。
+7. **文档与测试**：在 `README.md` 记录新增交易所的环境变量与验证命令；扩展 `test_rest_apis.py` / `test_websocket_limits.py` 以提供最小自检脚本，方便他人快速确认访问是否成功。
+
+完成上述修改后，通过 `python verify_config.py` 与若干 REST/WS 测试脚本确认整体链路，再提交 PR。
+
 ## 📂 项目结构
 
 ```
