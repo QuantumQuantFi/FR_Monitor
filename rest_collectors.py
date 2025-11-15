@@ -26,6 +26,8 @@ from config import (
     GRVT_ENVIRONMENT,
     GRVT_REST_SYMBOLS_PER_CALL,
     GRVT_TRADING_ACCOUNT_ID,
+    HYPERLIQUID_API_BASE_URL,
+    HYPERLIQUID_FUNDING_REFRESH_SECONDS,
     LIGHTER_MARKET_REFRESH_SECONDS,
     LIGHTER_REST_BASE_URL,
     REST_CONNECTION_CONFIG,
@@ -79,6 +81,104 @@ def _ms_to_iso(value: Optional[Any]) -> Optional[str]:
         return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
     except Exception:
         return None
+
+
+# -------------------------------
+# Hyperliquid helpers
+# -------------------------------
+_HYPERLIQUID_BASES: List[str] = []
+_HYPERLIQUID_BASES_LOCK = threading.Lock()
+_HYPERLIQUID_FUNDING_CACHE: Dict[str, Dict[str, Any]] = {}
+_HYPERLIQUID_FUNDING_LOCK = threading.Lock()
+_HYPERLIQUID_LAST_FUNDING_REFRESH = 0.0
+
+
+def _hyperliquid_base_url() -> str:
+    return HYPERLIQUID_API_BASE_URL.rstrip('/')
+
+
+def _hyperliquid_post(payload: Dict[str, Any]) -> Optional[Any]:
+    url = f"{_hyperliquid_base_url()}/info"
+    headers = _rest_headers()
+    headers['Content-Type'] = 'application/json'
+    timeout = REST_CONNECTION_CONFIG.get('timeout', 10)
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"Hyperliquid API {payload.get('type')} 调用失败: {resp.status_code} {resp.text[:120]}")
+    except Exception as exc:
+        print(f"Hyperliquid API请求异常({payload.get('type')}): {exc}")
+    return None
+
+
+def get_hyperliquid_supported_bases(force_refresh: bool = False) -> List[str]:
+    """返回Hyperliquid当前支持的永续标的，缓存以减少频繁请求。"""
+    global _HYPERLIQUID_BASES
+    with _HYPERLIQUID_BASES_LOCK:
+        if _HYPERLIQUID_BASES and not force_refresh:
+            return _HYPERLIQUID_BASES.copy()
+
+    payload = _hyperliquid_post({'type': 'meta'})
+    bases: List[str] = []
+    if isinstance(payload, dict):
+        for entry in payload.get('universe', []):
+            base = (entry.get('name') or '').upper()
+            if not base or entry.get('isDelisted'):
+                continue
+            bases.append(base)
+
+    with _HYPERLIQUID_BASES_LOCK:
+        if bases:
+            _HYPERLIQUID_BASES = sorted(set(bases))
+        return _HYPERLIQUID_BASES.copy()
+
+
+def _refresh_hyperliquid_funding(force: bool = False):
+    global _HYPERLIQUID_LAST_FUNDING_REFRESH, _HYPERLIQUID_FUNDING_CACHE
+    now = time.time()
+    if not force and _HYPERLIQUID_FUNDING_CACHE:
+        if (now - _HYPERLIQUID_LAST_FUNDING_REFRESH) < HYPERLIQUID_FUNDING_REFRESH_SECONDS:
+            return
+
+    payload = _hyperliquid_post({'type': 'metaAndAssetCtxs'})
+    if not isinstance(payload, list) or len(payload) < 2:
+        return
+
+    universe = payload[0].get('universe', []) if isinstance(payload[0], dict) else []
+    ctxs = payload[1] if isinstance(payload[1], list) else []
+    if not universe or not ctxs:
+        return
+
+    ctx_map: Dict[str, Dict[str, Any]] = {}
+    timestamp = _now_iso()
+    for meta_entry, ctx in zip(universe, ctxs):
+        base = (meta_entry.get('name') or '').upper()
+        if not base or meta_entry.get('isDelisted'):
+            continue
+        info: Dict[str, Any] = {'timestamp': timestamp}
+        funding = _safe_float(ctx.get('funding'))
+        if funding is not None:
+            info['funding'] = funding
+        mark_px = _safe_float(ctx.get('midPx') or ctx.get('markPx') or ctx.get('oraclePx'))
+        if mark_px is not None:
+            info['markPx'] = mark_px
+        ctx_map[base] = info
+
+    if ctx_map:
+        with _HYPERLIQUID_FUNDING_LOCK:
+            _HYPERLIQUID_FUNDING_CACHE = ctx_map
+            _HYPERLIQUID_LAST_FUNDING_REFRESH = now
+
+
+def get_hyperliquid_funding_map(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    """返回最近一次 funding/markPx 快照。"""
+    with _HYPERLIQUID_FUNDING_LOCK:
+        has_cache = bool(_HYPERLIQUID_FUNDING_CACHE)
+    if force_refresh or not has_cache:
+        _refresh_hyperliquid_funding(force_refresh)
+    with _HYPERLIQUID_FUNDING_LOCK:
+        return dict(_HYPERLIQUID_FUNDING_CACHE)
 
 
 # -------------------------------
@@ -504,6 +604,51 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
     return out
 
 
+def fetch_hyperliquid() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Fetch Hyperliquid perp mid prices and funding data."""
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    payload = _hyperliquid_post({'type': 'allMids'})
+    if not isinstance(payload, dict):
+        return out
+
+    allowed = set(get_hyperliquid_supported_bases()) or set(CURRENT_SUPPORTED_SYMBOLS or [])
+    funding_map = get_hyperliquid_funding_map()
+    ts = _now_iso()
+
+    for base, raw_price in payload.items():
+        base_upper = (base or '').upper()
+        if not base_upper or '/' in base_upper or base_upper.startswith('@'):
+            continue
+        if allowed and base_upper not in allowed:
+            continue
+
+        price = _safe_float(raw_price)
+        if price is None:
+            continue
+
+        snapshot: Dict[str, Any] = {
+            'price': price,
+            'timestamp': ts,
+            'symbol': f"{base_upper}-PERP"
+        }
+
+        ctx = funding_map.get(base_upper)
+        if ctx:
+            funding = ctx.get('funding')
+            if funding is not None:
+                snapshot['funding_rate'] = funding
+            mark_px = ctx.get('markPx')
+            if mark_px is not None:
+                snapshot['mark_price'] = mark_px
+            ctx_ts = ctx.get('timestamp')
+            if ctx_ts:
+                snapshot['context_timestamp'] = ctx_ts
+
+        out.setdefault(base_upper, {})['futures'] = snapshot
+
+    return out
+
+
 def fetch_lighter() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """Fetch Lighter exchange statistics (futures only)."""
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -622,5 +767,11 @@ def fetch_all_exchanges() -> Dict[str, Dict[str, Dict[str, Dict[str, Any]]]]:
     results['bybit'] = fetch_bybit()
     time.sleep(REST_CONNECTION_CONFIG.get('stagger_ms', 200) / 1000.0)
     results['bitget'] = fetch_bitget()
+    time.sleep(REST_CONNECTION_CONFIG.get('stagger_ms', 200) / 1000.0)
+    results['grvt'] = fetch_grvt()
+    time.sleep(REST_CONNECTION_CONFIG.get('stagger_ms', 200) / 1000.0)
+    results['lighter'] = fetch_lighter()
+    time.sleep(REST_CONNECTION_CONFIG.get('stagger_ms', 200) / 1000.0)
+    results['hyperliquid'] = fetch_hyperliquid()
 
     return results

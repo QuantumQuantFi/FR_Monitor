@@ -17,14 +17,17 @@ from rest_collectors import (
     fetch_bybit as rest_fetch_bybit,
     fetch_bitget as rest_fetch_bitget,
     fetch_grvt as rest_fetch_grvt,
+    fetch_hyperliquid as rest_fetch_hyperliquid,
     get_grvt_supported_bases,
     fetch_lighter as rest_fetch_lighter,
     get_lighter_supported_bases,
     get_lighter_market_lookup,
+    get_hyperliquid_supported_bases,
 )
 from market_info import get_exchange_symbols
 from dex.exchanges.grvt import GrvtMarketWebSocket
 from dex.exchanges.lighter import LighterMarketWebSocket
+from dex.exchanges.hyperliquid import HyperliquidMarketWebSocket
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -84,6 +87,7 @@ class ExchangeDataCollector:
             'bitget': None,
             'grvt': None,
             'lighter': None,
+            'hyperliquid': None,
         }
     
     def _load_exchange_symbols(self):
@@ -129,6 +133,18 @@ class ExchangeDataCollector:
                 self.exchange_symbols['lighter']['futures'] = self.supported_symbols.copy()
         # Lighter 暂无现货
         self.exchange_symbols['lighter']['spot'] = self.exchange_symbols['lighter'].get('spot') or []
+
+        # Hyperliquid markets
+        if 'hyperliquid' not in self.exchange_symbols:
+            self.exchange_symbols['hyperliquid'] = {'spot': [], 'futures': []}
+
+        hyperliquid_bases = get_hyperliquid_supported_bases()
+        if hyperliquid_bases:
+            self.exchange_symbols['hyperliquid']['futures'] = hyperliquid_bases
+        else:
+            if not self.exchange_symbols['hyperliquid'].get('futures'):
+                self.exchange_symbols['hyperliquid']['futures'] = self.supported_symbols.copy()
+        self.exchange_symbols['hyperliquid']['spot'] = self.exchange_symbols['hyperliquid'].get('spot') or []
 
         # 统一应用本地硬编码别名（例如 APP -> APPbybit）
         self._apply_symbol_overrides()
@@ -182,7 +198,7 @@ class ExchangeDataCollector:
 
     def _initialize_data_structure(self):
         """初始化数据结构"""
-        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter']:
+        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']:
             self.data[exchange] = {}
             self.last_update_time[exchange] = {}
             
@@ -306,7 +322,7 @@ class ExchangeDataCollector:
         new_data = {}
         new_last_update_time = {}
         
-        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter']:
+        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']:
             new_data[exchange] = {}
             new_last_update_time[exchange] = {}
             
@@ -369,6 +385,7 @@ class ExchangeDataCollector:
             'bitget': 0,
             'grvt': 0,
             'lighter': 0,
+            'hyperliquid': 0,
         }
         
         # OKX连接
@@ -390,6 +407,9 @@ class ExchangeDataCollector:
 
         # Lighter连接
         threading.Thread(target=self._connect_with_retry, args=('lighter', self._connect_lighter), daemon=True).start()
+
+        # Hyperliquid连接
+        threading.Thread(target=self._connect_with_retry, args=('hyperliquid', self._connect_hyperliquid), daemon=True).start()
 
         # 启动REST补充轮询（可选）
         if self.rest_enabled:
@@ -415,6 +435,7 @@ class ExchangeDataCollector:
             'bitget': rest_fetch_bitget,
             'grvt': rest_fetch_grvt,
             'lighter': rest_fetch_lighter,
+            'hyperliquid': rest_fetch_hyperliquid,
         }
 
         # 启动/复用线程
@@ -1452,6 +1473,47 @@ class ExchangeDataCollector:
             lookup_refresher=get_lighter_market_lookup,
         )
         self.ws_connections['lighter'] = ws_client
+        ws_client.run_forever()
+
+    def _connect_hyperliquid(self):
+        ws_url = EXCHANGE_WEBSOCKETS.get('hyperliquid', {}).get('public')
+        if not ws_url:
+            print("Hyperliquid WebSocket地址未配置")
+            return
+
+        hyper_symbols = self.exchange_symbols.get('hyperliquid', {}).get('futures', [])
+        if not hyper_symbols:
+            hyper_symbols = self.supported_symbols.copy()
+
+        def handle_payload(payload: Dict[str, Any]):
+            symbol = payload.get('symbol')
+            if not symbol:
+                return
+            if symbol not in self.data['hyperliquid']:
+                self.data['hyperliquid'][symbol] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
+
+            try:
+                price_value = float(payload.get('price', 0) or 0)
+            except (TypeError, ValueError):
+                price_value = 0.0
+
+            if price_value <= 0:
+                return
+
+            snapshot = {
+                'price': price_value,
+                'timestamp': payload.get('timestamp') or datetime.now(timezone.utc).isoformat(),
+                'symbol': payload.get('instrument', f"{symbol}-PERP"),
+            }
+            self.data['hyperliquid'][symbol]['futures'] = snapshot
+            print(f"Hyperliquid {symbol} 永续价格: {snapshot['price']}")
+
+        ws_client = HyperliquidMarketWebSocket(
+            url=ws_url,
+            symbols=hyper_symbols,
+            on_ticker=handle_payload,
+        )
+        self.ws_connections['hyperliquid'] = ws_client
         ws_client.run_forever()
 
     def get_all_data(self):

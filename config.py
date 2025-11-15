@@ -88,6 +88,21 @@ LIGHTER_MARKET_REFRESH_SECONDS = int(
     float(_get_private('LIGHTER_MARKET_REFRESH_SECONDS', 'LIGHTER_MARKET_REFRESH_SECONDS', '900'))
 )
 
+# Hyperliquid configuration
+HYPERLIQUID_API_BASE_URL = _get_private(
+    'HYPERLIQUID_API_BASE_URL',
+    'HYPERLIQUID_API_BASE_URL',
+    'https://api.hyperliquid.xyz'
+)
+HYPERLIQUID_WS_PUBLIC_URL = _get_private(
+    'HYPERLIQUID_WS_PUBLIC_URL',
+    'HYPERLIQUID_WS_PUBLIC_URL',
+    'wss://api.hyperliquid.xyz/ws'
+)
+HYPERLIQUID_FUNDING_REFRESH_SECONDS = int(
+    float(_get_private('HYPERLIQUID_FUNDING_REFRESH_SECONDS', 'HYPERLIQUID_FUNDING_REFRESH_SECONDS', '60'))
+)
+
 # WebSocket连接URLs
 EXCHANGE_WEBSOCKETS = {
     'okx': {
@@ -109,6 +124,9 @@ EXCHANGE_WEBSOCKETS = {
     },
     'lighter': {
         'public': LIGHTER_WS_PUBLIC_URL
+    },
+    'hyperliquid': {
+        'public': HYPERLIQUID_WS_PUBLIC_URL
     }
 }
 

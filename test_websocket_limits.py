@@ -20,7 +20,11 @@ from config import (
     GRVT_TRADING_ACCOUNT_ID,
     GRVT_WS_RATE_MS,
 )
-from rest_collectors import get_grvt_supported_bases, get_lighter_supported_bases
+from rest_collectors import (
+    get_grvt_supported_bases,
+    get_lighter_supported_bases,
+    get_hyperliquid_supported_bases,
+)
 
 # 获取所有主要交易对（前100个市值最大的币种）
 def get_major_symbols():
@@ -510,6 +514,47 @@ class WebSocketLimitTester:
                     print("⚠️ 未能在预期时间内收到 Lighter 行情推送")
         except Exception as exc:
             print(f"❌ Lighter 连接异常: {exc}")
+
+    async def test_hyperliquid_limits(self):
+        """测试 Hyperliquid allMids 广播"""
+        print(f"\n{'='*60}")
+        print("测试 Hyperliquid WebSocket 订阅能力")
+        print(f"{'='*60}")
+
+        ws_url = EXCHANGE_WEBSOCKETS.get('hyperliquid', {}).get('public')
+        if not ws_url:
+            print("Hyperliquid WebSocket地址未配置")
+            return
+
+        bases = get_hyperliquid_supported_bases()
+        print(f"Hyperliquid 当前预计支持 {len(bases)} 个永续标的（allMids 单路广播）")
+
+        try:
+            async with websockets.connect(ws_url) as websocket:
+                await websocket.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
+                success = False
+
+                for _ in range(5):
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=10)
+                    except asyncio.TimeoutError:
+                        print("⚠️ Hyperliquid 等待行情超时，重试...")
+                        continue
+
+                    data = json.loads(message)
+                    if data.get('channel') == 'allMids':
+                        count = len(data.get('data', {}))
+                        self.results['hyperliquid_markets'] = count
+                        print(f"✅ Hyperliquid 推送 {count} 个标的 mid 价格")
+                        success = True
+                        break
+                    elif data.get('channel') == 'pong':
+                        continue
+
+                if not success:
+                    print("⚠️ Hyperliquid 未在预期时间内返回 allMids 数据")
+        except Exception as exc:
+            print(f"❌ Hyperliquid 连接异常: {exc}")
     
     def print_summary(self):
         """打印测试结果汇总"""
@@ -526,6 +571,7 @@ class WebSocketLimitTester:
             'Bitget': self.results.get('bitget_max', 'N/A'),
             'GRVT': self.results.get('grvt_max', 'N/A'),
             'Lighter(市场)': self.results.get('lighter_markets', 'N/A'),
+            'Hyperliquid(市场)': self.results.get('hyperliquid_markets', 'N/A'),
         }
         
         for exchange, max_symbols in exchanges.items():
@@ -572,8 +618,10 @@ async def main():
             await tester.test_grvt_limits()
         elif exchange == 'lighter':
             await tester.test_lighter_limits()
+        elif exchange == 'hyperliquid':
+            await tester.test_hyperliquid_limits()
         else:
-            print("支持的交易所: binance, okx, bybit, bitget, grvt, lighter")
+            print("支持的交易所: binance, okx, bybit, bitget, grvt, lighter, hyperliquid")
             return
     else:
         # 测试所有交易所
@@ -600,6 +648,9 @@ async def main():
             await asyncio.sleep(5)
 
             await tester.test_lighter_limits()
+            await asyncio.sleep(5)
+
+            await tester.test_hyperliquid_limits()
             
         except KeyboardInterrupt:
             print("\n测试被用户中断")
