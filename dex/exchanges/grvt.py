@@ -4,15 +4,50 @@ GRVT exchange client implementation.
 
 import os
 import asyncio
+import json
+import threading
 import time
+import hmac
+import hashlib
+import logging
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Any, List, Optional, Tuple
-from pysdk.grvt_ccxt import GrvtCcxt
-from pysdk.grvt_ccxt_ws import GrvtCcxtWS
-from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+from typing import Dict, Any, List, Optional, Tuple, Callable
+
+import websocket
+
+try:  # Optional dependency – only required for trading bot workflows
+    from pysdk.grvt_ccxt import GrvtCcxt
+    from pysdk.grvt_ccxt_ws import GrvtCcxtWS
+    from pysdk.grvt_ccxt_env import GrvtEnv, GrvtWSEndpointType
+except ImportError:  # pragma: no cover - SDK installed only when trading on GRVT
+    GrvtCcxt = None
+    GrvtCcxtWS = None
+    GrvtEnv = None
+    GrvtWSEndpointType = None
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
-from helpers.logger import TradingLogger
+try:
+    from helpers.logger import TradingLogger
+except ImportError:  # pragma: no cover - trading helpers optional in monitor runtime
+    class TradingLogger:
+        """Fallback logger used when helpers.logger is unavailable."""
+
+        def __init__(self, exchange: str = "grvt", ticker: str = "", log_to_console: bool = True):
+            name = f"{exchange}.{ticker}".strip(".")
+            self._logger = logging.getLogger(name or "grvt")
+
+        def log(self, message: str, level: str = "INFO"):
+            level = level.upper()
+            if level == "ERROR":
+                self._logger.error(message)
+            elif level == "WARNING":
+                self._logger.warning(message)
+            else:
+                self._logger.info(message)
+
+        def error(self, message: str):
+            self._logger.error(message)
 
 
 class GrvtClient(BaseExchangeClient):
@@ -21,6 +56,11 @@ class GrvtClient(BaseExchangeClient):
     def __init__(self, config: Dict[str, Any]):
         """Initialize GRVT client."""
         super().__init__(config)
+
+        if GrvtCcxt is None or GrvtEnv is None:
+            raise ImportError(
+                "grvt-pysdk is required for GrvtClient. Install via `pip install grvt-pysdk`."
+            )
 
         # GRVT credentials from environment
         self.trading_account_id = os.getenv('GRVT_TRADING_ACCOUNT_ID')
@@ -80,6 +120,10 @@ class GrvtClient(BaseExchangeClient):
 
     async def connect(self) -> None:
         """Connect to GRVT WebSocket."""
+        if GrvtCcxtWS is None or GrvtWSEndpointType is None:
+            raise ImportError(
+                "grvt-pysdk is required for WebSocket trading support. Install via `pip install grvt-pysdk`."
+            )
         try:
             # Initialize WebSocket client - match the working test implementation
             loop = asyncio.get_running_loop()
@@ -537,3 +581,248 @@ class GrvtClient(BaseExchangeClient):
                 return self.config.contract_id, self.config.tick_size
 
         raise ValueError(f"Contract not found for ticker: {ticker}")
+
+
+class GrvtMarketWebSocket:
+    """
+    Lightweight WebSocket manager used by FR Monitor to stream GRVT prices.
+
+    The class intentionally mirrors the `websocket.WebSocketApp` life-cycle so it
+    can plug into ExchangeDataCollector's `_connect_with_retry` helper.
+    """
+
+    def __init__(
+        self,
+        url: str,
+        symbols: List[str],
+        on_ticker: Callable[[Dict[str, Any]], None],
+        market_types: Optional[List[str]] = None,
+        api_key: Optional[str] = None,
+        api_secret: Optional[str] = None,
+        trading_account_id: Optional[str] = None,
+        batch_size: int = 20,
+        rate_ms: float = 500.0,
+        api_version: str = "v1",
+        stream: str = "ticker.s",
+    ):
+        self.url = url
+        self.symbols = sorted(set(symbols or []))
+        self.market_types = market_types or ['futures']
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.trading_account_id = trading_account_id
+        self.batch_size = batch_size
+        self.rate_ms = max(50, int(rate_ms))
+        self.api_version = api_version
+        self.stream = stream
+        self._on_ticker = on_ticker
+
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._closing = threading.Event()
+        self._request_id = 0
+        self.logger = logging.getLogger("GrvtMarketWebSocket")
+
+    def run_forever(self):
+        """Start the underlying websocket loop and block until it terminates."""
+        self._closing.clear()
+        self._ws = websocket.WebSocketApp(
+            self.url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+        self.logger.info("Connecting to GRVT market stream: %s", self.url)
+        self._ws.run_forever()
+
+    def close(self):
+        """Gracefully close the socket."""
+        self._closing.set()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------ #
+    # Internal helpers
+    # ------------------------------------------------------------------ #
+
+    def _on_open(self, ws):
+        self.logger.info("GRVT WebSocket connected")
+        if self.api_key and self.api_secret:
+            self._send_auth(ws)
+        self._subscribe(ws)
+
+    def _on_message(self, ws, message: str):
+        try:
+            data = json.loads(message)
+        except Exception:
+            self.logger.debug("Received non-JSON message: %s", message)
+            return
+
+        if isinstance(data, dict):
+            if data.get('op') == 'ping' or data.get('type') == 'ping':
+                ws.send(json.dumps({'op': 'pong'}))
+                return
+            if data.get('op') == 'pong' or data.get('type') == 'pong':
+                return
+            if 'subs' in data or 'unsubs' in data:
+                self.logger.debug("GRVT订阅响应: %s", data)
+                return
+            if data.get('event') == 'login':
+                self.logger.info("GRVT auth result: %s", data.get('success'))
+                return
+            if 'feed' in data and 'stream' in data:
+                normalized = self._normalize_entry(data)
+                if normalized and self._on_ticker:
+                    try:
+                        self._on_ticker(normalized)
+                    except Exception as exc:
+                        self.logger.error("Error dispatching GRVT ticker: %s", exc)
+                return
+            if data.get('code'):
+                self.logger.warning("GRVT消息错误: %s", data)
+                return
+
+    def _on_error(self, ws, error):
+        if not self._closing.is_set():
+            self.logger.error("GRVT WebSocket错误: %s", error)
+
+    def _on_close(self, ws, status_code, msg):
+        self.logger.warning("GRVT WebSocket关闭: %s %s", status_code, msg)
+
+    def _next_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _versioned_stream(self) -> str:
+        return f"{self.api_version}.{self.stream}"
+
+    def _send_auth(self, ws):
+        # Trading feeds require cookie/login; public market data does not.
+        # Placeholder for future expansion if private endpoints are required.
+        if not (self.api_key and self.api_secret):
+            return
+        timestamp = str(int(time.time() * 1000))
+        message = f"{timestamp}GET/realtime"
+        signature = hmac.new(
+            self.api_secret.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+
+        auth_payload = {
+            "op": "login",
+            "args": [self.api_key, timestamp, signature],
+        }
+        if self.trading_account_id:
+            auth_payload["accountId"] = self.trading_account_id
+
+        ws.send(json.dumps(auth_payload))
+        self.logger.info("Sent GRVT auth payload")
+
+    def _subscribe(self, ws):
+        if not self.symbols:
+            self.logger.warning("No symbols configured for GRVT stream")
+            return
+
+        selectors: List[str] = []
+        for symbol in self.symbols:
+            for market in self.market_types:
+                instrument = self._build_instrument(symbol, market)
+                selectors.append(f"{instrument}@{self.rate_ms}")
+
+        versioned_stream = self._versioned_stream()
+        for chunk in self._chunk_list(selectors, self.batch_size):
+            payload = {
+                "request_id": self._next_id(),
+                "stream": versioned_stream,
+                "feed": chunk,
+                "method": "subscribe",
+                "is_full": True,
+            }
+            ws.send(json.dumps(payload))
+            time.sleep(0.05)  # avoid rate limits
+            self.logger.debug("GRVT订阅批次 %d，大小=%d", self._request_id, len(chunk))
+
+    @staticmethod
+    def _chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+        return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+    def _build_instrument(self, symbol: str, market_type: str) -> str:
+        base = symbol.upper()
+        if market_type == 'spot':
+            return f"{base}_USDT"
+        return f"{base}_USDT_Perp"
+
+    def _normalize_entry(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        feed = payload.get('feed') or {}
+        instrument = feed.get('instrument')
+        if not instrument:
+            return None
+        symbol = instrument.split('_')[0]
+        price = (
+            self._decode_price(feed.get('mark_price'))
+            or self._decode_price(feed.get('last_price'))
+        )
+        if not price:
+            return None
+
+        timestamp = feed.get('event_time')
+        if timestamp and isinstance(timestamp, str) and timestamp.isdigit():
+            try:
+                timestamp = datetime.fromtimestamp(
+                    int(timestamp) / 1_000_000_000, tz=timezone.utc
+                ).isoformat()
+            except Exception:
+                timestamp = None
+        if not timestamp:
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+        market_type = 'futures'
+        if 'spot' in instrument.lower():
+            market_type = 'spot'
+
+        snapshot: Dict[str, Any] = {
+            'symbol': symbol,
+            'instrument': instrument,
+            'market_type': market_type,
+            'price': price,
+            'timestamp': timestamp,
+        }
+
+        funding = self._decode_funding(feed.get('funding_rate_8h_curr'))
+        if funding is None:
+            funding = self._decode_funding(feed.get('funding_rate_curr'))
+        if funding is not None:
+            snapshot['funding_rate'] = funding
+
+        next_fund = feed.get('next_funding_time') or feed.get('nextFundingTime')
+        if next_fund:
+            snapshot['next_funding_time'] = next_fund
+
+        return snapshot
+
+    @staticmethod
+    def _decode_price(value) -> Optional[float]:
+        if value in (None, ''):
+            return None
+        try:
+            if isinstance(value, str) and '.' in value:
+                return float(value)
+            return float(value) / 1e9
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _decode_funding(value) -> Optional[float]:
+        if value in (None, ''):
+            return None
+        try:
+            funding = float(value)
+        except (TypeError, ValueError):
+            return None
+        if abs(funding) > 1:
+            funding = funding / 1e8
+        return funding

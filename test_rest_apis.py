@@ -10,6 +10,8 @@ import json
 import time
 from typing import Dict, List, Optional
 
+from rest_collectors import fetch_grvt, get_grvt_supported_bases
+
 
 class ExchangeAPITester:
     def __init__(self):
@@ -195,9 +197,30 @@ class ExchangeAPITester:
             
         return results
 
+    async def test_grvt(self) -> Dict:
+        """测试 GRVT REST API（通过官方SDK封装）"""
+        results = {
+            'exchange': 'GRVT',
+            'spot': {'success': False, 'count': 0, 'api': '', 'sample': None},
+            'futures': {'success': False, 'count': 0, 'api': 'fetch_grvt()', 'sample': None}
+        }
+
+        bases = get_grvt_supported_bases()
+        snapshot = fetch_grvt()
+        if snapshot:
+            results['futures'] = {
+                'success': True,
+                'count': len(snapshot),
+                'api': f"SDK full/v1/ticker ({len(bases)} 支持品种)",
+                'sample': next(iter(snapshot.values())) if snapshot else None
+            }
+        else:
+            results['futures']['api'] = "fetch_grvt() (无返回)"
+        return results
+
     async def run_all_tests(self):
         """运行所有交易所的API测试"""
-        print("🚀 开始测试四个交易所的 REST API 快照功能\n")
+        print("🚀 开始测试五个交易所的 REST API 快照功能\n")
         print("=" * 80)
         
         # 并发测试所有交易所
@@ -205,7 +228,8 @@ class ExchangeAPITester:
             self.test_binance(),
             self.test_okx(),
             self.test_bybit(),
-            self.test_bitget()
+            self.test_bitget(),
+            self.test_grvt()
         ]
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -215,7 +239,7 @@ class ExchangeAPITester:
         print("-" * 80)
         
         summary = {
-            'total_tested': 4,
+            'total_tested': len(tasks),
             'exchanges_with_spot_api': 0,
             'exchanges_with_futures_api': 0,
             'total_spot_symbols': 0,
@@ -245,8 +269,8 @@ class ExchangeAPITester:
                 
         print("-" * 80)
         print(f"📊 测试总结:")
-        print(f"   支持现货快照API的交易所: {summary['exchanges_with_spot_api']}/4")
-        print(f"   支持期货快照API的交易所: {summary['exchanges_with_futures_api']}/4")
+        print(f"   支持现货快照API的交易所: {summary['exchanges_with_spot_api']}/{summary['total_tested']}")
+        print(f"   支持期货快照API的交易所: {summary['exchanges_with_futures_api']}/{summary['total_tested']}")
         print(f"   现货币种总数: {summary['total_spot_symbols']}")
         print(f"   期货币种总数: {summary['total_futures_symbols']}")
         

@@ -3,18 +3,24 @@ import asyncio
 import websocket
 import threading
 import time
+from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
 from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
                    CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG,
                    MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async,
-                   REST_ENABLED, REST_UPDATE_INTERVAL, REST_MERGE_POLICY)
+                   REST_ENABLED, REST_UPDATE_INTERVAL, REST_MERGE_POLICY,
+                   GRVT_API_KEY, GRVT_API_SECRET, GRVT_TRADING_ACCOUNT_ID,
+                   GRVT_WS_RATE_MS)
 from rest_collectors import (
     fetch_binance as rest_fetch_binance,
     fetch_okx as rest_fetch_okx,
     fetch_bybit as rest_fetch_bybit,
     fetch_bitget as rest_fetch_bitget,
+    fetch_grvt as rest_fetch_grvt,
+    get_grvt_supported_bases,
 )
 from market_info import get_exchange_symbols
+from dex.exchanges.grvt import GrvtMarketWebSocket
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -67,7 +73,13 @@ class ExchangeDataCollector:
         self.rest_update_interval = REST_UPDATE_INTERVAL
         self.rest_thread = None  # legacy single-thread poller (unused in Scheme A)
         self.rest_threads = {}
-        self.rest_last_sync = { 'binance': None, 'okx': None, 'bybit': None, 'bitget': None }
+        self.rest_last_sync = {
+            'binance': None,
+            'okx': None,
+            'bybit': None,
+            'bitget': None,
+            'grvt': None
+        }
     
     def _load_exchange_symbols(self):
         """加载各交易所特定的币种列表"""
@@ -84,6 +96,21 @@ class ExchangeDataCollector:
                     'spot': self.supported_symbols.copy(),
                     'futures': self.supported_symbols.copy()
                 }
+
+        # 默认将GRVT纳入列表（若动态发现未覆盖），并用API返回的真实交易对覆盖
+        if 'grvt' not in self.exchange_symbols:
+            self.exchange_symbols['grvt'] = {'spot': [], 'futures': []}
+
+        grvt_bases = get_grvt_supported_bases()
+        if grvt_bases:
+            self.exchange_symbols['grvt']['futures'] = grvt_bases
+            self.exchange_symbols['grvt']['spot'] = self.exchange_symbols['grvt'].get('spot') or []
+        else:
+            # fallback to全量，以免完全没有订阅
+            if not self.exchange_symbols['grvt'].get('futures'):
+                self.exchange_symbols['grvt']['futures'] = self.supported_symbols.copy()
+            if not self.exchange_symbols['grvt'].get('spot'):
+                self.exchange_symbols['grvt']['spot'] = self.supported_symbols.copy()
 
         # 统一应用本地硬编码别名（例如 APP -> APPbybit）
         self._apply_symbol_overrides()
@@ -137,7 +164,7 @@ class ExchangeDataCollector:
 
     def _initialize_data_structure(self):
         """初始化数据结构"""
-        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
+        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt']:
             self.data[exchange] = {}
             self.last_update_time[exchange] = {}
             
@@ -321,7 +348,8 @@ class ExchangeDataCollector:
             'binance_futures': 0,
             'bybit_spot': 0,
             'bybit_linear': 0,
-            'bitget': 0
+            'bitget': 0,
+            'grvt': 0
         }
         
         # OKX连接
@@ -337,6 +365,9 @@ class ExchangeDataCollector:
         
         # Bitget连接
         threading.Thread(target=self._connect_with_retry, args=('bitget', self._connect_bitget), daemon=True).start()
+
+        # GRVT连接
+        threading.Thread(target=self._connect_with_retry, args=('grvt', self._connect_grvt), daemon=True).start()
 
         # 启动REST补充轮询（可选）
         if self.rest_enabled:
@@ -360,6 +391,7 @@ class ExchangeDataCollector:
             'okx': rest_fetch_okx,
             'bybit': rest_fetch_bybit,
             'bitget': rest_fetch_bitget,
+            'grvt': rest_fetch_grvt,
         }
 
         # 启动/复用线程
@@ -1295,6 +1327,62 @@ class ExchangeDataCollector:
         self.ws_connections['bitget'] = ws
         print(f"Bitget 尝试连接: {EXCHANGE_WEBSOCKETS['bitget']['public']}")
         ws.run_forever()
+
+    def _connect_grvt(self):
+        """连接GRVT市场数据WebSocket"""
+        ws_url = EXCHANGE_WEBSOCKETS.get('grvt', {}).get('public')
+        if not ws_url:
+            print("GRVT WebSocket地址未配置，等待5秒后重试")
+            time.sleep(5)
+            return
+
+        grvt_symbols = self.exchange_symbols.get('grvt', {})
+        spot_symbols = grvt_symbols.get('spot', [])
+        futures_symbols = grvt_symbols.get('futures', [])
+        combined = sorted(set(spot_symbols + futures_symbols))
+        if not combined:
+            combined = self.supported_symbols.copy()
+
+        def handle_payload(payload: Dict[str, Any]):
+            symbol = payload.get('symbol')
+            if not symbol:
+                return
+            if symbol not in self.data['grvt']:
+                self.data['grvt'][symbol] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
+
+            market_type = payload.get('market_type', 'futures')
+            target_kind = 'spot' if market_type == 'spot' else 'futures'
+
+            snapshot = {
+                'price': float(payload.get('price', 0) or 0),
+                'timestamp': payload.get('timestamp') or datetime.now(timezone.utc).isoformat(),
+                'symbol': payload.get('instrument', f"{symbol}USDT")
+            }
+
+            funding_rate = payload.get('funding_rate')
+            if funding_rate not in (None, ''):
+                snapshot['funding_rate'] = funding_rate
+            next_ft = payload.get('next_funding_time')
+            if next_ft:
+                snapshot['next_funding_time'] = next_ft
+
+            if snapshot['price'] > 0:
+                self.data['grvt'][symbol][target_kind] = snapshot
+                print(f"GRVT {symbol} {target_kind} 价格: {snapshot['price']}")
+
+        ws_client = GrvtMarketWebSocket(
+            url=ws_url,
+            symbols=combined,
+            on_ticker=handle_payload,
+            market_types=['futures'],
+            api_key=GRVT_API_KEY or None,
+            api_secret=GRVT_API_SECRET or None,
+            trading_account_id=GRVT_TRADING_ACCOUNT_ID or None,
+            rate_ms=GRVT_WS_RATE_MS,
+        )
+
+        self.ws_connections['grvt'] = ws_client
+        ws_client.run_forever()
 
     def get_all_data(self):
         """获取所有交易所的实时数据"""

@@ -2,6 +2,7 @@
 
 import os
 import json
+import socket
 from datetime import datetime
 from typing import List, Optional
 
@@ -9,6 +10,68 @@ try:
     import config_private  # local secrets; attributes managed per account
 except ImportError:  # pragma: no cover - secrets file optional
     config_private = None
+
+
+def _get_private(attr_name: str, env_name: Optional[str] = None, default: Optional[str] = None):
+    """Fetch secrets from config_private first, then environment variables."""
+    if config_private and hasattr(config_private, attr_name):
+        return getattr(config_private, attr_name)
+    return os.getenv(env_name or attr_name, default)
+
+
+def _is_truthy(value: Optional[str]) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+# Global IPv4 enforcement (helps exchanges that whitelist IPv4 only)
+FORCE_IPV4_CONNECTIONS = _is_truthy(
+    _get_private('FORCE_IPV4', 'FORCE_IPV4', _get_private('GRVT_FORCE_IPV4', 'GRVT_FORCE_IPV4', '1'))
+)
+if FORCE_IPV4_CONNECTIONS:
+    _ORIGINAL_GETADDRINFO = socket.getaddrinfo
+
+    def _ipv4_only_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+        if family == 0:
+            family = socket.AF_INET
+        return _ORIGINAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+    socket.getaddrinfo = _ipv4_only_getaddrinfo
+
+
+# GRVT-specific configuration (optional)
+def _build_grvt_domain(prefix: str, env_name: str, scheme: str = 'https') -> str:
+    env_name = (env_name or 'prod').lower()
+    if env_name == 'prod':
+        host = f"{prefix}.grvt.io"
+    elif env_name == 'testnet':
+        host = f"{prefix}.testnet.grvt.io"
+    elif env_name in ('staging', 'dev'):
+        host = f"{prefix}.{env_name}.gravitymarkets.io"
+    else:  # fallback to prod
+        host = f"{prefix}.grvt.io"
+    return f"{scheme}://{host}"
+
+
+GRVT_ENVIRONMENT = _get_private('GRVT_ENVIRONMENT', 'GRVT_ENVIRONMENT', 'prod').lower()
+_GRVT_MD_HTTP = _build_grvt_domain('market-data', GRVT_ENVIRONMENT, 'https')
+_GRVT_MD_WS = _build_grvt_domain('market-data', GRVT_ENVIRONMENT, 'wss') + '/ws'
+
+GRVT_WS_PUBLIC_URL = _get_private('GRVT_WS_PUBLIC_URL', 'GRVT_WS_PUBLIC_URL', _GRVT_MD_WS)
+GRVT_REST_BASE_URL = _get_private('GRVT_REST_BASE_URL', 'GRVT_REST_BASE_URL', _GRVT_MD_HTTP)
+GRVT_API_KEY = _get_private('GRVT_API_KEY', 'GRVT_API_KEY', '')
+GRVT_API_SECRET = (
+    _get_private('GRVT_SECRET_KEY', 'GRVT_SECRET_KEY', '')
+    or _get_private('GRVT_PRIVATE_KEY', 'GRVT_PRIVATE_KEY', '')
+)
+GRVT_TRADING_ACCOUNT_ID = _get_private('GRVT_TRADING_ACCOUNT_ID', 'GRVT_TRADING_ACCOUNT_ID', '')
+GRVT_WS_RATE_MS = float(_get_private('GRVT_WS_RATE_MS', 'GRVT_WS_RATE_MS', '500'))
+GRVT_REST_SYMBOLS_PER_CALL = int(
+    float(_get_private('GRVT_REST_SYMBOLS_PER_CALL', 'GRVT_REST_SYMBOLS_PER_CALL', '25'))
+)
 
 # WebSocket连接URLs
 EXCHANGE_WEBSOCKETS = {
@@ -25,6 +88,9 @@ EXCHANGE_WEBSOCKETS = {
     },
     'bitget': {
         'public': 'wss://ws.bitget.com/v2/ws/public'
+    },
+    'grvt': {
+        'public': GRVT_WS_PUBLIC_URL
     }
 }
 

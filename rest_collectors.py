@@ -4,12 +4,30 @@ Fetches spot/futures tickers in bulk and returns normalized maps.
 Uses lightweight requests with timeouts; avoids asyncio for simplicity.
 """
 
-from typing import Dict, Any, List
+from collections import deque
 from datetime import datetime, timezone
+import threading
+from typing import Any, Dict, List, Optional
 import time
+
 import requests
 
-from config import REST_CONNECTION_CONFIG
+try:  # Optional dependency for GRVT REST integration
+    from pysdk.grvt_ccxt import GrvtCcxt
+    from pysdk.grvt_ccxt_env import GrvtEnv
+except Exception:  # pragma: no cover - dependency optional
+    GrvtCcxt = None
+    GrvtEnv = None
+
+from config import (
+    CURRENT_SUPPORTED_SYMBOLS,
+    GRVT_API_KEY,
+    GRVT_API_SECRET,
+    GRVT_ENVIRONMENT,
+    GRVT_REST_SYMBOLS_PER_CALL,
+    GRVT_TRADING_ACCOUNT_ID,
+    REST_CONNECTION_CONFIG,
+)
 from binance_contract_filter import binance_filter
 from bitget_symbol_filter import bitget_filter
 
@@ -196,6 +214,189 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         out[coin]['futures'] = futures_snapshot
     except Exception:
         pass
+    return out
+
+
+_GRVT_CLIENT_LOCK = threading.Lock()
+_GRVT_CLIENT: Optional["GrvtCcxt"] = None
+_GRVT_SYMBOL_QUEUE: deque[str] = deque()
+_GRVT_BASE_SYMBOLS: List[str] = []
+
+
+def _get_grvt_env_enum():
+    if GrvtEnv is None:
+        return None
+    env = (GRVT_ENVIRONMENT or 'prod').lower()
+    mapping = {
+        'prod': GrvtEnv.PROD,
+        'testnet': GrvtEnv.TESTNET,
+        'staging': GrvtEnv.STAGING,
+        'dev': GrvtEnv.DEV,
+    }
+    return mapping.get(env, GrvtEnv.PROD)
+
+
+def _get_grvt_client():
+    global _GRVT_CLIENT
+    if GrvtCcxt is None:
+        return None
+    if not GRVT_API_KEY:
+        return None
+    env_enum = _get_grvt_env_enum()
+    if env_enum is None:
+        return None
+    with _GRVT_CLIENT_LOCK:
+        if _GRVT_CLIENT is None:
+            params = {'api_key': GRVT_API_KEY}
+            if GRVT_TRADING_ACCOUNT_ID:
+                params['trading_account_id'] = GRVT_TRADING_ACCOUNT_ID
+            if GRVT_API_SECRET:
+                params['private_key'] = GRVT_API_SECRET
+            try:
+                _GRVT_CLIENT = GrvtCcxt(env=env_enum, parameters=params)
+            except Exception as exc:
+                print(f"GRVT REST客户端初始化失败: {exc}")
+                return None
+    return _GRVT_CLIENT
+
+
+def get_grvt_supported_bases(refresh: bool = False) -> List[str]:
+    """
+    Retrieve active GRVT USDT perpetual bases via the official SDK.
+    Results are cached in-memory unless refresh=True.
+    """
+    global _GRVT_BASE_SYMBOLS
+    if _GRVT_BASE_SYMBOLS and not refresh:
+        return _GRVT_BASE_SYMBOLS.copy()
+
+    client = _get_grvt_client()
+    if client is None:
+        return []
+
+    try:
+        markets = client.fetch_markets()
+    except Exception as exc:
+        print(f"获取GRVT市场列表失败: {exc}")
+        return _GRVT_BASE_SYMBOLS.copy()
+
+    bases: List[str] = []
+    for market in markets or []:
+        quote = (market.get('quote') or '').upper()
+        kind = (market.get('kind') or '').upper()
+        base = (market.get('base') or '').upper()
+        if not base or quote != 'USDT':
+            continue
+        if kind not in ('PERPETUAL', 'SWAP'):
+            continue
+        if base not in bases:
+            bases.append(base)
+
+    if bases:
+        _GRVT_BASE_SYMBOLS = bases
+    return _GRVT_BASE_SYMBOLS.copy()
+
+
+def _ensure_grvt_symbol_queue():
+    if _GRVT_SYMBOL_QUEUE:
+        return
+    symbols = get_grvt_supported_bases() or CURRENT_SUPPORTED_SYMBOLS or []
+    if not symbols:
+        return
+    for symbol in symbols:
+        _GRVT_SYMBOL_QUEUE.append(symbol)
+
+
+def _next_grvt_batch(limit: int) -> List[str]:
+    if not _GRVT_SYMBOL_QUEUE:
+        return []
+    limit = max(1, limit)
+    batch: List[str] = []
+    for _ in range(min(limit, len(_GRVT_SYMBOL_QUEUE))):
+        sym = _GRVT_SYMBOL_QUEUE.popleft()
+        batch.append(sym)
+        _GRVT_SYMBOL_QUEUE.append(sym)
+    return batch
+
+
+def _build_grvt_instrument(symbol: str, market_type: str = 'futures') -> str:
+    base = symbol.upper()
+    if market_type == 'spot':
+        return f"{base}_USDT"
+    return f"{base}_USDT_Perp"
+
+
+def _decode_grvt_price(value) -> Optional[float]:
+    if value in (None, ''):
+        return None
+    try:
+        # textual float already scaled (e.g., "0.0123")
+        if isinstance(value, str) and '.' in value:
+            return float(value)
+        return float(value) / 1e9
+    except (TypeError, ValueError):
+        return None
+
+
+def _decode_grvt_funding(value) -> Optional[float]:
+    if value in (None, ''):
+        return None
+    try:
+        funding = float(value)
+    except (TypeError, ValueError):
+        return None
+    if abs(funding) > 1:
+        funding = funding / 1e8
+    return funding
+
+
+def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """
+    Fetch GRVT tickers via authenticated REST calls using the official SDK.
+    Rotates through supported symbols to avoid rate limits.
+    """
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    client = _get_grvt_client()
+    if client is None:
+        return out
+
+    _ensure_grvt_symbol_queue()
+    if not _GRVT_SYMBOL_QUEUE:
+        return out
+
+    ts = _now_iso()
+    symbols = _next_grvt_batch(GRVT_REST_SYMBOLS_PER_CALL)
+    for symbol in symbols:
+        instrument = _build_grvt_instrument(symbol)
+        try:
+            ticker = client.fetch_ticker(instrument)
+        except Exception as exc:
+            print(f"GRVT REST获取 {instrument} 失败: {exc}")
+            continue
+        if not ticker:
+            continue
+
+        price = (
+            _decode_grvt_price(ticker.get('mark_price'))
+            or _decode_grvt_price(ticker.get('last_price'))
+        )
+        if not price:
+            continue
+
+        snapshot: Dict[str, Any] = {
+            'price': price,
+            'timestamp': ts,
+            'symbol': instrument
+        }
+        funding = _decode_grvt_funding(
+            ticker.get('funding_rate_8h_curr')
+            or ticker.get('funding_rate_curr')
+            or ticker.get('funding_rate')
+        )
+        if funding is not None:
+            snapshot['funding_rate'] = funding
+
+        out.setdefault(symbol, {})['futures'] = snapshot
+
     return out
 
 

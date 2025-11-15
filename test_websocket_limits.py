@@ -9,7 +9,18 @@ import websockets
 import json
 import time
 import sys
+import hmac
+import hashlib
 from datetime import datetime
+
+from config import (
+    EXCHANGE_WEBSOCKETS,
+    GRVT_API_KEY,
+    GRVT_API_SECRET,
+    GRVT_TRADING_ACCOUNT_ID,
+    GRVT_WS_RATE_MS,
+)
+from rest_collectors import get_grvt_supported_bases
 
 # 获取所有主要交易对（前100个市值最大的币种）
 def get_major_symbols():
@@ -378,6 +389,86 @@ class WebSocketLimitTester:
                 break
                 
             await asyncio.sleep(3)
+
+    async def _send_grvt_auth(self, websocket):
+        """向GRVT发送登录请求"""
+        if not (GRVT_API_KEY and GRVT_API_SECRET):
+            print("⚠️ 未配置GRVT API密钥，跳过登录")
+            return
+        timestamp = str(int(time.time() * 1000))
+        message = f"{timestamp}GET/realtime"
+        signature = hmac.new(
+            GRVT_API_SECRET.encode('utf-8'),
+            message.encode('utf-8'),
+            hashlib.sha256,
+        ).hexdigest()
+        payload = {
+            "op": "login",
+            "args": [GRVT_API_KEY, timestamp, signature],
+        }
+        if GRVT_TRADING_ACCOUNT_ID:
+            payload["accountId"] = GRVT_TRADING_ACCOUNT_ID
+        await websocket.send(json.dumps(payload))
+        print("   已发送GRVT登录请求")
+
+    async def test_grvt_limits(self):
+        """测试GRVT WebSocket订阅能力"""
+        print(f"\n{'='*60}")
+        print("测试 GRVT WebSocket 订阅能力")
+        print(f"{'='*60}")
+
+        ws_url = EXCHANGE_WEBSOCKETS.get('grvt', {}).get('public')
+        if not ws_url:
+            print("❌ 未配置GRVT WebSocket地址")
+            return
+
+        bases = get_grvt_supported_bases()
+        if not bases:
+            print("❌ 无法获取GRVT支持的交易对")
+            return
+
+        selectors = [f"{base}_USDT_Perp@{int(GRVT_WS_RATE_MS)}" for base in bases]
+        payload = {
+            "request_id": 1,
+            "stream": "v1.ticker.s",
+            "feed": selectors,
+            "method": "subscribe",
+            "is_full": True,
+        }
+
+        try:
+            async with websockets.connect(ws_url) as websocket:
+                await asyncio.sleep(0.5)
+                await self._send_grvt_auth(websocket)
+                await asyncio.sleep(0.5)
+
+                print(f"   订阅 {len(selectors)} 个GRVT永续交易对...")
+                await websocket.send(json.dumps(payload))
+
+                success = False
+                start = time.time()
+                while time.time() - start < 10:
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=5)
+                    except asyncio.TimeoutError:
+                        break
+                    data = json.loads(message)
+                    if data.get('event') == 'login':
+                        print(f"   登录响应: {data}")
+                    elif data.get('feed') and data.get('stream'):
+                        instrument = data.get('feed', {}).get('instrument')
+                        price = data.get('feed', {}).get('last_price') or data.get('feed', {}).get('mark_price')
+                        print(f"✅ GRVT 收到行情: {instrument} -> {price}")
+                        success = True
+                        break
+                    elif data.get('code'):
+                        print(f"⚠️ GRVT返回: {data}")
+                if success:
+                    self.results['grvt_max'] = len(selectors)
+                else:
+                    print("⚠️ GRVT 在限定时间内未收到行情")
+        except Exception as exc:
+            print(f"❌ GRVT 连接异常: {exc}")
     
     def print_summary(self):
         """打印测试结果汇总"""
@@ -391,7 +482,8 @@ class WebSocketLimitTester:
             'OKX': self.results.get('okx_max', 'N/A'),
             'Bybit现货': self.results.get('bybit_spot_max', 'N/A'),
             'Bybit永续': self.results.get('bybit_linear_max', 'N/A'),
-            'Bitget': self.results.get('bitget_max', 'N/A')
+            'Bitget': self.results.get('bitget_max', 'N/A'),
+            'GRVT': self.results.get('grvt_max', 'N/A'),
         }
         
         for exchange, max_symbols in exchanges.items():
@@ -434,8 +526,10 @@ async def main():
             await tester.test_bybit_limits()
         elif exchange == 'bitget':
             await tester.test_bitget_limits()
+        elif exchange == 'grvt':
+            await tester.test_grvt_limits()
         else:
-            print("支持的交易所: binance, okx, bybit, bitget")
+            print("支持的交易所: binance, okx, bybit, bitget, grvt")
             return
     else:
         # 测试所有交易所
@@ -456,6 +550,9 @@ async def main():
             await asyncio.sleep(5)
             
             await tester.test_bitget_limits()
+            await asyncio.sleep(5)
+
+            await tester.test_grvt_limits()
             
         except KeyboardInterrupt:
             print("\n测试被用户中断")
