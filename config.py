@@ -73,6 +73,21 @@ GRVT_REST_SYMBOLS_PER_CALL = int(
     float(_get_private('GRVT_REST_SYMBOLS_PER_CALL', 'GRVT_REST_SYMBOLS_PER_CALL', '25'))
 )
 
+# Lighter (DEX) configuration
+LIGHTER_WS_PUBLIC_URL = _get_private(
+    'LIGHTER_WS_PUBLIC_URL',
+    'LIGHTER_WS_PUBLIC_URL',
+    'wss://mainnet.zklighter.elliot.ai/stream'
+)
+LIGHTER_REST_BASE_URL = _get_private(
+    'LIGHTER_REST_BASE_URL',
+    'LIGHTER_REST_BASE_URL',
+    'https://mainnet.zklighter.elliot.ai/api/v1'
+)
+LIGHTER_MARKET_REFRESH_SECONDS = int(
+    float(_get_private('LIGHTER_MARKET_REFRESH_SECONDS', 'LIGHTER_MARKET_REFRESH_SECONDS', '900'))
+)
+
 # WebSocket连接URLs
 EXCHANGE_WEBSOCKETS = {
     'okx': {
@@ -91,6 +106,9 @@ EXCHANGE_WEBSOCKETS = {
     },
     'grvt': {
         'public': GRVT_WS_PUBLIC_URL
+    },
+    'lighter': {
+        'public': LIGHTER_WS_PUBLIC_URL
     }
 }
 

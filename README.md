@@ -5,7 +5,7 @@
 ## 📊 系统特性
 
 ### 🔥 核心功能
-- **实时价格监控**: 支持 Binance、OKX、Bybit、Bitget、GRVT 五大交易所
+- **实时价格监控**: 支持 Binance、OKX、Bybit、Bitget、GRVT、Lighter 六大交易所
 - **资金费率追踪**: 实时资金费率数据，发现套利机会
 - **价差分析**: 自动计算跨交易所价差，智能排序筛选
 - **套利信号**: 内置 `ArbitrageMonitor`，基于0.6%阈值与3次连续采样输出可执行套利提示
@@ -135,14 +135,26 @@ echo $! > runtime/simple_app/simple_app.pid
 
 > ✅ 建议先将运行机器的公网 IPv4/IPv6 加入 GRVT 白名单；`config.py` 默认启用了 IPv4 优先策略，确保登录请求命中已授权地址。
 
-### 5. 日志与运行目录
+### 5. Lighter 配置 & 环境变量
+
+Lighter 默认提供公开的行情广播，如需自定义网关或降低刷新频次，可通过以下配置覆盖：
+
+| 变量名 | 说明 |
+| --- | --- |
+| `LIGHTER_WS_PUBLIC_URL` | 可选：覆盖默认 `wss://mainnet.zklighter.elliot.ai/stream` |
+| `LIGHTER_REST_BASE_URL` | 可选：覆盖 `https://mainnet.zklighter.elliot.ai/api/v1` |
+| `LIGHTER_MARKET_REFRESH_SECONDS` | 市场列表缓存时长（秒），默认 900 |
+
+> ⚠️ 若需在 `dex/` 子模块内做市/交易，请参考官方 `lighter` SDK 文档配置 API Key、Account Index 等参数。
+
+### 6. 日志与运行目录
 
 - Flask 服务日志默认写入 `logs/simple_app/`，可通过 `SIMPLE_APP_LOG_DIR=/custom/path scripts/run_simple_app.sh` 自定义位置
 - 运行期文件（PID 等）建议放在 `runtime/simple_app/`，可通过 `SIMPLE_APP_RUNTIME_DIR` 覆盖
 - `scripts/run_simple_app.sh` 会自动创建上述目录并设置所需环境变量
 - `simple_app.py` 额外把日志输出到 `stdout`，方便在容器或 `nohup` 环境中实时查看
 
-### 6. 停止与重启
+### 7. 停止与重启
 
 ```bash
 # 停止（会尝试通过 PID 文件与 pgrep 终止 simple_app.py）
@@ -152,7 +164,7 @@ source venv/bin/activate && scripts/stop_simple_app.sh
 source venv/bin/activate && scripts/restart_simple_app.sh
 ```
 
-### 7. 访问系统
+### 8. 访问系统
 
 打开浏览器访问: `http://your-server-ip:4002`
 
@@ -182,8 +194,9 @@ FR_Monitor/
 | 命令 | 作用 |
 | --- | --- |
 | `python verify_config.py` | 校验币种配置与容量设置 |
-| `python test_rest_apis.py` | 同时测试 Binance/OKX/Bybit/Bitget/GRVT 的 REST 快照覆盖度 |
+| `python test_rest_apis.py` | 同时测试 Binance/OKX/Bybit/Bitget/GRVT/Lighter 的 REST 快照覆盖度 |
 | `python test_websocket_limits.py grvt` | 触发 GRVT WS 登录 + 全量订阅并打印行情样本 |
+| `python test_websocket_limits.py lighter` | 检查 Lighter `market_stats/all` 通道推送与市场覆盖 |
 | `python test_market_integration.py` | 打印动态支持币种、REST/WS 覆盖率 |
 
 ## 🔁 `dex/`（perp-dex-tools）联动指引

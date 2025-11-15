@@ -26,6 +26,8 @@ from config import (
     GRVT_ENVIRONMENT,
     GRVT_REST_SYMBOLS_PER_CALL,
     GRVT_TRADING_ACCOUNT_ID,
+    LIGHTER_MARKET_REFRESH_SECONDS,
+    LIGHTER_REST_BASE_URL,
     REST_CONNECTION_CONFIG,
 )
 from binance_contract_filter import binance_filter
@@ -52,6 +54,108 @@ def _req_json(url: str) -> Any:
         # small backoff
         time.sleep(0.2)
     return None
+
+
+def _rest_headers() -> Dict[str, str]:
+    return {
+        'User-Agent': REST_CONNECTION_CONFIG.get('user_agent', 'CrossExchange-Arb/1.0'),
+        'Accept': 'application/json'
+    }
+
+
+def _safe_float(value) -> Optional[float]:
+    if value in (None, ''):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _ms_to_iso(value: Optional[Any]) -> Optional[str]:
+    try:
+        if value in (None, '', 0):
+            return None
+        return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
+    except Exception:
+        return None
+
+
+# -------------------------------
+# Lighter market metadata cache
+# -------------------------------
+_LIGHTER_MARKET_CACHE: Dict[str, Dict[str, Any]] = {}
+_LIGHTER_MARKET_LOOKUP: Dict[int, str] = {}
+_LIGHTER_MARKET_LOCK = threading.Lock()
+_LIGHTER_LAST_REFRESH = 0.0
+
+
+def _lighter_base_url() -> str:
+    return LIGHTER_REST_BASE_URL.rstrip('/')
+
+
+def _lighter_api(path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    url = f"{_lighter_base_url()}/{path.lstrip('/')}"
+    try:
+        resp = requests.get(
+            url,
+            params=params,
+            headers=_rest_headers(),
+            timeout=REST_CONNECTION_CONFIG.get('timeout', 10),
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        print(f"Lighter API调用失败 {resp.status_code}: {resp.text[:120]}")
+    except Exception as exc:
+        print(f"Lighter API请求错误: {exc}")
+    return None
+
+
+def _refresh_lighter_markets(force: bool = False):
+    global _LIGHTER_LAST_REFRESH, _LIGHTER_MARKET_CACHE, _LIGHTER_MARKET_LOOKUP
+    now = time.time()
+    if not force and _LIGHTER_MARKET_CACHE and (now - _LIGHTER_LAST_REFRESH) < LIGHTER_MARKET_REFRESH_SECONDS:
+        return
+
+    payload = _lighter_api('orderBooks')
+    if not payload or 'order_books' not in payload:
+        return
+
+    markets_by_symbol: Dict[str, Dict[str, Any]] = {}
+    lookup: Dict[int, str] = {}
+    for entry in payload.get('order_books', []):
+        symbol = (entry.get('symbol') or '').upper()
+        market_id = entry.get('market_id')
+        status = entry.get('status', '').lower()
+        if not symbol or market_id is None or status not in ('active', ''):
+            continue
+        markets_by_symbol[symbol] = entry
+        try:
+            lookup[int(market_id)] = symbol
+        except (TypeError, ValueError):
+            continue
+
+    if markets_by_symbol:
+        _LIGHTER_MARKET_CACHE = markets_by_symbol
+        _LIGHTER_MARKET_LOOKUP = lookup
+        _LIGHTER_LAST_REFRESH = now
+
+
+def get_lighter_market_info(force_refresh: bool = False) -> Dict[str, Dict[str, Any]]:
+    with _LIGHTER_MARKET_LOCK:
+        _refresh_lighter_markets(force_refresh)
+        return dict(_LIGHTER_MARKET_CACHE)
+
+
+def get_lighter_market_lookup(force_refresh: bool = False) -> Dict[int, str]:
+    with _LIGHTER_MARKET_LOCK:
+        _refresh_lighter_markets(force_refresh)
+        return dict(_LIGHTER_MARKET_LOOKUP)
+
+
+def get_lighter_supported_bases(force_refresh: bool = False) -> List[str]:
+    info = get_lighter_market_info(force_refresh)
+    return sorted(info.keys())
 
 
 def _bybit_observed_to_coin(observed_base: str) -> str:
@@ -396,6 +500,54 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
             snapshot['funding_rate'] = funding
 
         out.setdefault(symbol, {})['futures'] = snapshot
+
+    return out
+
+
+def fetch_lighter() -> Dict[str, Dict[str, Dict[str, Any]]]:
+    """Fetch Lighter exchange statistics (futures only)."""
+    out: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    payload = _lighter_api('exchangeStats')
+    if not payload or payload.get('code') != 200:
+        return out
+
+    ts = _now_iso()
+    market_info = get_lighter_market_info()
+    for entry in payload.get('order_book_stats', []):
+        symbol = (entry.get('symbol') or '').upper()
+        if not symbol:
+            continue
+        price = _safe_float(entry.get('last_trade_price') or entry.get('mark_price'))
+        if price is None:
+            continue
+
+        snapshot: Dict[str, Any] = {
+            'price': price,
+            'timestamp': ts,
+            'symbol': f"{symbol}-PERP"
+        }
+
+        mark_price = _safe_float(entry.get('mark_price'))
+        if mark_price is not None:
+            snapshot['mark_price'] = mark_price
+
+        index_price = _safe_float(entry.get('index_price'))
+        if index_price is not None:
+            snapshot['index_price'] = index_price
+
+        funding = _safe_float(entry.get('current_funding_rate') or entry.get('funding_rate'))
+        if funding is not None:
+            snapshot['funding_rate'] = funding
+
+        funding_ts = _ms_to_iso(entry.get('funding_timestamp'))
+        if funding_ts:
+            snapshot['next_funding_time'] = funding_ts
+
+        market_meta = market_info.get(symbol)
+        if market_meta:
+            snapshot['market_id'] = market_meta.get('market_id')
+
+        out.setdefault(symbol, {}).setdefault('futures', snapshot)
 
     return out
 

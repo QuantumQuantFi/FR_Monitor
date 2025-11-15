@@ -10,7 +10,12 @@ import json
 import time
 from typing import Dict, List, Optional
 
-from rest_collectors import fetch_grvt, get_grvt_supported_bases
+from rest_collectors import (
+    fetch_grvt,
+    fetch_lighter,
+    get_grvt_supported_bases,
+    get_lighter_supported_bases,
+)
 
 
 class ExchangeAPITester:
@@ -218,9 +223,30 @@ class ExchangeAPITester:
             results['futures']['api'] = "fetch_grvt() (无返回)"
         return results
 
+    async def test_lighter(self) -> Dict:
+        """测试 Lighter 市场快照（REST + WebSocket 统一结构）"""
+        results = {
+            'exchange': 'Lighter',
+            'spot': {'success': False, 'count': 0, 'api': '(无现货)', 'sample': None},
+            'futures': {'success': False, 'count': 0, 'api': 'fetch_lighter()', 'sample': None}
+        }
+
+        snapshot = fetch_lighter()
+        bases = get_lighter_supported_bases()
+        if snapshot:
+            results['futures'] = {
+                'success': True,
+                'count': len(snapshot),
+                'api': f"exchangeStats ({len(bases)} 支持品种)",
+                'sample': next(iter(snapshot.values())) if snapshot else None
+            }
+        else:
+            results['futures']['api'] = "fetch_lighter() (无返回)"
+        return results
+
     async def run_all_tests(self):
         """运行所有交易所的API测试"""
-        print("🚀 开始测试五个交易所的 REST API 快照功能\n")
+        print("🚀 开始测试六个交易所的 REST API 快照功能\n")
         print("=" * 80)
         
         # 并发测试所有交易所
@@ -229,7 +255,8 @@ class ExchangeAPITester:
             self.test_okx(),
             self.test_bybit(),
             self.test_bitget(),
-            self.test_grvt()
+            self.test_grvt(),
+            self.test_lighter(),
         ]
         
         results = await asyncio.gather(*tasks, return_exceptions=True)

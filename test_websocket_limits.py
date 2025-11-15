@@ -20,7 +20,7 @@ from config import (
     GRVT_TRADING_ACCOUNT_ID,
     GRVT_WS_RATE_MS,
 )
-from rest_collectors import get_grvt_supported_bases
+from rest_collectors import get_grvt_supported_bases, get_lighter_supported_bases
 
 # 获取所有主要交易对（前100个市值最大的币种）
 def get_major_symbols():
@@ -470,6 +470,47 @@ class WebSocketLimitTester:
         except Exception as exc:
             print(f"❌ GRVT 连接异常: {exc}")
     
+    async def test_lighter_limits(self):
+        """测试 Lighter WebSocket 市场广播"""
+        print(f"\n{'='*60}")
+        print("测试 Lighter WebSocket 订阅能力")
+        print(f"{'='*60}")
+
+        ws_url = EXCHANGE_WEBSOCKETS.get('lighter', {}).get('public')
+        if not ws_url:
+            print("Lighter WebSocket地址未配置")
+            return
+
+        symbols = get_lighter_supported_bases()
+        print(f"Lighter 当前支持 {len(symbols)} 个永续市场（market_stats/all 单通道）")
+
+        try:
+            async with websockets.connect(ws_url) as websocket:
+                await websocket.send(json.dumps({'type': 'subscribe', 'channel': 'market_stats/all'}))
+                success = False
+
+                for _ in range(5):
+                    try:
+                        message = await asyncio.wait_for(websocket.recv(), timeout=15)
+                    except asyncio.TimeoutError:
+                        print("⚠️ Lighter 订阅等待超时，重试...")
+                        continue
+
+                    data = json.loads(message)
+                    if 'market_stats' in data:
+                        count = len(data['market_stats'])
+                        self.results['lighter_markets'] = count
+                        print(f"✅ Lighter 推送 {count} 个市场行情")
+                        success = True
+                        break
+                    elif data.get('type') == 'connected':
+                        print("   Lighter 已建立会话，继续等待数据...")
+
+                if not success:
+                    print("⚠️ 未能在预期时间内收到 Lighter 行情推送")
+        except Exception as exc:
+            print(f"❌ Lighter 连接异常: {exc}")
+    
     def print_summary(self):
         """打印测试结果汇总"""
         print(f"\n{'='*60}")
@@ -484,6 +525,7 @@ class WebSocketLimitTester:
             'Bybit永续': self.results.get('bybit_linear_max', 'N/A'),
             'Bitget': self.results.get('bitget_max', 'N/A'),
             'GRVT': self.results.get('grvt_max', 'N/A'),
+            'Lighter(市场)': self.results.get('lighter_markets', 'N/A'),
         }
         
         for exchange, max_symbols in exchanges.items():
@@ -528,8 +570,10 @@ async def main():
             await tester.test_bitget_limits()
         elif exchange == 'grvt':
             await tester.test_grvt_limits()
+        elif exchange == 'lighter':
+            await tester.test_lighter_limits()
         else:
-            print("支持的交易所: binance, okx, bybit, bitget, grvt")
+            print("支持的交易所: binance, okx, bybit, bitget, grvt, lighter")
             return
     else:
         # 测试所有交易所
@@ -553,6 +597,9 @@ async def main():
             await asyncio.sleep(5)
 
             await tester.test_grvt_limits()
+            await asyncio.sleep(5)
+
+            await tester.test_lighter_limits()
             
         except KeyboardInterrupt:
             print("\n测试被用户中断")

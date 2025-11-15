@@ -39,7 +39,7 @@ LOG_FILE_NAME = "simple_app.log"
 LOG_MAX_BYTES = 20 * 1024 * 1024  # 20MB per file
 LOG_BACKUP_COUNT = 3
 _LOGGING_CONFIGURED = False
-EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt']
+EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter']
 
 
 def configure_logging() -> None:

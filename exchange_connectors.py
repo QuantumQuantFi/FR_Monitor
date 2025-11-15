@@ -18,9 +18,13 @@ from rest_collectors import (
     fetch_bitget as rest_fetch_bitget,
     fetch_grvt as rest_fetch_grvt,
     get_grvt_supported_bases,
+    fetch_lighter as rest_fetch_lighter,
+    get_lighter_supported_bases,
+    get_lighter_market_lookup,
 )
 from market_info import get_exchange_symbols
 from dex.exchanges.grvt import GrvtMarketWebSocket
+from dex.exchanges.lighter import LighterMarketWebSocket
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -78,7 +82,8 @@ class ExchangeDataCollector:
             'okx': None,
             'bybit': None,
             'bitget': None,
-            'grvt': None
+            'grvt': None,
+            'lighter': None,
         }
     
     def _load_exchange_symbols(self):
@@ -111,6 +116,19 @@ class ExchangeDataCollector:
                 self.exchange_symbols['grvt']['futures'] = self.supported_symbols.copy()
             if not self.exchange_symbols['grvt'].get('spot'):
                 self.exchange_symbols['grvt']['spot'] = self.supported_symbols.copy()
+
+        # 默认添加 Lighter 市场
+        if 'lighter' not in self.exchange_symbols:
+            self.exchange_symbols['lighter'] = {'spot': [], 'futures': []}
+
+        lighter_bases = get_lighter_supported_bases()
+        if lighter_bases:
+            self.exchange_symbols['lighter']['futures'] = lighter_bases
+        else:
+            if not self.exchange_symbols['lighter'].get('futures'):
+                self.exchange_symbols['lighter']['futures'] = self.supported_symbols.copy()
+        # Lighter 暂无现货
+        self.exchange_symbols['lighter']['spot'] = self.exchange_symbols['lighter'].get('spot') or []
 
         # 统一应用本地硬编码别名（例如 APP -> APPbybit）
         self._apply_symbol_overrides()
@@ -164,7 +182,7 @@ class ExchangeDataCollector:
 
     def _initialize_data_structure(self):
         """初始化数据结构"""
-        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt']:
+        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter']:
             self.data[exchange] = {}
             self.last_update_time[exchange] = {}
             
@@ -288,7 +306,7 @@ class ExchangeDataCollector:
         new_data = {}
         new_last_update_time = {}
         
-        for exchange in ['okx', 'binance', 'bybit', 'bitget']:
+        for exchange in ['okx', 'binance', 'bybit', 'bitget', 'grvt', 'lighter']:
             new_data[exchange] = {}
             new_last_update_time[exchange] = {}
             
@@ -349,7 +367,8 @@ class ExchangeDataCollector:
             'bybit_spot': 0,
             'bybit_linear': 0,
             'bitget': 0,
-            'grvt': 0
+            'grvt': 0,
+            'lighter': 0,
         }
         
         # OKX连接
@@ -368,6 +387,9 @@ class ExchangeDataCollector:
 
         # GRVT连接
         threading.Thread(target=self._connect_with_retry, args=('grvt', self._connect_grvt), daemon=True).start()
+
+        # Lighter连接
+        threading.Thread(target=self._connect_with_retry, args=('lighter', self._connect_lighter), daemon=True).start()
 
         # 启动REST补充轮询（可选）
         if self.rest_enabled:
@@ -392,6 +414,7 @@ class ExchangeDataCollector:
             'bybit': rest_fetch_bybit,
             'bitget': rest_fetch_bitget,
             'grvt': rest_fetch_grvt,
+            'lighter': rest_fetch_lighter,
         }
 
         # 启动/复用线程
@@ -1382,6 +1405,53 @@ class ExchangeDataCollector:
         )
 
         self.ws_connections['grvt'] = ws_client
+        ws_client.run_forever()
+
+    def _connect_lighter(self):
+        """连接Lighter市场数据WebSocket"""
+        ws_url = EXCHANGE_WEBSOCKETS.get('lighter', {}).get('public')
+        if not ws_url:
+            print("Lighter WebSocket地址未配置，等待5秒后重试")
+            time.sleep(5)
+            return
+
+        lighter_symbols = self.exchange_symbols.get('lighter', {})
+
+        def handle_payload(payload: Dict[str, Any]):
+            symbol = payload.get('symbol')
+            price = payload.get('price')
+            if not symbol or price in (None, 0):
+                return
+            if symbol not in self.data['lighter']:
+                self.data['lighter'][symbol] = {'spot': {}, 'futures': {}, 'funding_rate': {}}
+
+            snapshot: Dict[str, Any] = {
+                'price': float(price),
+                'timestamp': payload.get('timestamp') or datetime.now(timezone.utc).isoformat(),
+                'symbol': payload.get('instrument', f"{symbol}-PERP")
+            }
+            if payload.get('mark_price') is not None:
+                snapshot['mark_price'] = payload['mark_price']
+            if payload.get('index_price') is not None:
+                snapshot['index_price'] = payload['index_price']
+            if payload.get('market_id') is not None:
+                snapshot['market_id'] = payload['market_id']
+            funding_rate = payload.get('funding_rate')
+            if funding_rate is not None:
+                snapshot['funding_rate'] = funding_rate
+            if payload.get('next_funding_time'):
+                snapshot['next_funding_time'] = payload['next_funding_time']
+
+            self.data['lighter'][symbol]['futures'] = snapshot
+            print(f"Lighter {symbol} 永续价格: {snapshot['price']}")
+
+        ws_client = LighterMarketWebSocket(
+            url=ws_url,
+            market_lookup=get_lighter_market_lookup(),
+            on_stats=handle_payload,
+            lookup_refresher=get_lighter_market_lookup,
+        )
+        self.ws_connections['lighter'] = ws_client
         ws_client.run_forever()
 
     def get_all_data(self):

@@ -4,17 +4,46 @@ Lighter exchange client implementation.
 
 import os
 import asyncio
+import json
 import time
 import logging
+import threading
+from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, Callable, List, Optional, Tuple
+
+import websocket
 
 from .base import BaseExchangeClient, OrderResult, OrderInfo, query_retry
-from helpers.logger import TradingLogger
+try:
+    from helpers.logger import TradingLogger
+except ImportError:  # pragma: no cover - helpers optional in monitor runtime
+    class TradingLogger:
+        """Fallback logger when helpers.logger is unavailable."""
 
-# Import official Lighter SDK for API client
-import lighter
-from lighter import SignerClient, ApiClient, Configuration
+        def __init__(self, exchange: str = "lighter", ticker: str = "", log_to_console: bool = True):
+            name = f"{exchange}.{ticker}".strip(".")
+            self._logger = logging.getLogger(name or "lighter")
+
+        def log(self, message: str, level: str = "INFO"):
+            level = level.upper()
+            if level == "ERROR":
+                self._logger.error(message)
+            elif level == "WARNING":
+                self._logger.warning(message)
+            else:
+                self._logger.info(message)
+
+        def error(self, message: str):
+            self._logger.error(message)
+
+# Import official Lighter SDK for API client (optional for monitor runtime)
+try:
+    import lighter
+    from lighter import SignerClient, ApiClient, Configuration
+except ImportError:  # pragma: no cover - heavy dependency, optional for monitoring
+    lighter = None
+    SignerClient = ApiClient = Configuration = None
 
 # Import custom WebSocket implementation
 from .lighter_custom_websocket import LighterCustomWebSocketManager
@@ -33,6 +62,9 @@ class LighterClient(BaseExchangeClient):
     def __init__(self, config: Dict[str, Any]):
         """Initialize Lighter client."""
         super().__init__(config)
+
+        if lighter is None or SignerClient is None:
+            raise ImportError("lighter SDK is required for trading client. Install via `pip install lighter`.")
 
         # Lighter credentials from environment
         self.api_key_private_key = os.getenv('API_KEY_PRIVATE_KEY')
@@ -549,3 +581,193 @@ class LighterClient(BaseExchangeClient):
             raise ValueError("Failed to get tick size")
 
         return self.config.contract_id, self.config.tick_size
+
+
+class LighterMarketWebSocket:
+    """Lightweight WS client streaming public Lighter market data."""
+
+    def __init__(
+        self,
+        url: str,
+        market_lookup: Optional[Dict[int, str]],
+        on_stats: Optional[Callable[[Dict[str, Any]], None]] = None,
+        lookup_refresher: Optional[Callable[[], Dict[int, str]]] = None,
+        ping_interval: int = 30,
+    ):
+        self.url = url
+        self.market_lookup = self._normalize_lookup(market_lookup or {})
+        self._lookup_refresher = lookup_refresher
+        self._on_stats = on_stats
+        self.ping_interval = max(10, int(ping_interval or 30))
+        self._ws: Optional[websocket.WebSocketApp] = None
+        self._closing = threading.Event()
+        self.logger = logging.getLogger("LighterMarketWebSocket")
+
+    def run_forever(self):
+        self._closing.clear()
+        self._ws = websocket.WebSocketApp(
+            self.url,
+            on_open=self._on_open,
+            on_message=self._on_message,
+            on_error=self._on_error,
+            on_close=self._on_close,
+        )
+        self.logger.info("Connecting to Lighter market stats: %s", self.url)
+        self._ws.run_forever(
+            ping_interval=self.ping_interval,
+            ping_timeout=max(5, self.ping_interval // 2),
+        )
+
+    def close(self):
+        self._closing.set()
+        if self._ws:
+            try:
+                self._ws.close()
+            except Exception:
+                pass
+
+    def update_market_lookup(self, entries: Dict[int, str]):
+        self.market_lookup = self._normalize_lookup(entries or {})
+
+    # ------------------------------------------------------------------ #
+    # Internal callbacks
+    # ------------------------------------------------------------------ #
+    def _on_open(self, ws):
+        self.logger.info("Lighter市场数据已连接")
+        self._subscribe(ws)
+
+    def _on_message(self, ws, message: str):
+        try:
+            payload = json.loads(message)
+        except Exception:
+            self.logger.debug("Lighter未知消息: %s", message)
+            return
+
+        if 'channel' in payload and payload['channel'].startswith('market_stats'):
+            stats = payload.get('market_stats')
+            if isinstance(stats, dict):
+                self._handle_market_stats(stats)
+            return
+
+        if payload.get('type') in ('connected', 'subscribed', 'pong'):
+            self.logger.debug("Lighter WS事件: %s", payload)
+            return
+
+        if payload.get('error'):
+            self.logger.warning("Lighter WS错误: %s", payload)
+
+    def _on_error(self, ws, error):
+        if not self._closing.is_set():
+            self.logger.error("Lighter WebSocket错误: %s", error)
+
+    def _on_close(self, ws, status_code, msg):
+        self.logger.warning("Lighter WebSocket关闭: %s %s", status_code, msg)
+
+    def _subscribe(self, ws):
+        try:
+            ws.send(json.dumps({'type': 'subscribe', 'channel': 'market_stats/all'}))
+            self.logger.info("已订阅 Lighter market_stats/all")
+        except Exception as exc:
+            self.logger.error("订阅 Lighter 市场失败: %s", exc)
+
+    def _handle_market_stats(self, stats: Dict[str, Any]):
+        for entry in stats.values():
+            normalized = self._normalize_entry(entry)
+            if normalized and self._on_stats:
+                try:
+                    self._on_stats(normalized)
+                except Exception as exc:
+                    self.logger.error("分发Lighter行情失败: %s", exc)
+
+    # ------------------------------------------------------------------ #
+    # Helpers
+    # ------------------------------------------------------------------ #
+    def _normalize_entry(self, entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not isinstance(entry, dict):
+            return None
+
+        market_id = entry.get('market_id')
+        symbol = self._resolve_symbol(market_id)
+        if not symbol:
+            return None
+
+        price = self._safe_float(entry.get('last_trade_price') or entry.get('mark_price'))
+        if price is None:
+            return None
+
+        snapshot: Dict[str, Any] = {
+            'symbol': symbol,
+            'market_id': market_id,
+            'price': price,
+            'market_type': 'futures',
+            'instrument': f"{symbol}-PERP",
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+        }
+
+        mark_price = self._safe_float(entry.get('mark_price'))
+        if mark_price is not None:
+            snapshot['mark_price'] = mark_price
+
+        index_price = self._safe_float(entry.get('index_price'))
+        if index_price is not None:
+            snapshot['index_price'] = index_price
+
+        funding = self._safe_float(entry.get('current_funding_rate') or entry.get('funding_rate'))
+        if funding is not None:
+            snapshot['funding_rate'] = funding
+
+        funding_ts = entry.get('funding_timestamp')
+        funding_iso = self._ms_to_iso(funding_ts)
+        if funding_iso:
+            snapshot['next_funding_time'] = funding_iso
+
+        return snapshot
+
+    def _resolve_symbol(self, market_id: Any) -> Optional[str]:
+        try:
+            market_id = int(market_id)
+        except (TypeError, ValueError):
+            return None
+
+        symbol = self.market_lookup.get(market_id)
+        if symbol or not self._lookup_refresher:
+            return symbol
+
+        try:
+            refreshed = self._lookup_refresher()
+        except Exception as exc:
+            self.logger.warning("刷新Lighter市场映射失败: %s", exc)
+            return symbol
+
+        if refreshed:
+            self.market_lookup = self._normalize_lookup(refreshed)
+            symbol = self.market_lookup.get(market_id)
+        return symbol
+
+    @staticmethod
+    def _safe_float(value) -> Optional[float]:
+        if value in (None, '', 0):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _ms_to_iso(value: Any) -> Optional[str]:
+        try:
+            if value in (None, '', 0):
+                return None
+            return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _normalize_lookup(entries: Dict[Any, str]) -> Dict[int, str]:
+        normalized: Dict[int, str] = {}
+        for key, value in entries.items():
+            try:
+                normalized[int(key)] = value
+            except (TypeError, ValueError):
+                continue
+        return normalized
