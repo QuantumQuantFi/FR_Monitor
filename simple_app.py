@@ -36,8 +36,8 @@ from trading.trade_executor import (
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
-LOG_MAX_BYTES = 20 * 1024 * 1024  # 20MB per file
-LOG_BACKUP_COUNT = 3
+LOG_MAX_BYTES = 25 * 1024 * 1024  # 25MB per file, 4 files total <=100MB
+LOG_BACKUP_COUNT = 3  # plus the active file -> 4*25MB = 100MB cap
 _LOGGING_CONFIGURED = False
 EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']
 
@@ -63,6 +63,7 @@ def configure_logging() -> None:
     handler.setFormatter(formatter)
 
     stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setLevel(logging.WARNING)  # keep stdout noise low to avoid huge service logs
     stream_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
