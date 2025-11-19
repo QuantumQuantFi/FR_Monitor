@@ -35,6 +35,7 @@ from config import (
 from binance_contract_filter import binance_filter
 from bitget_symbol_filter import bitget_filter
 from precision_utils import normalize_funding_rate
+from funding_utils import normalize_next_funding_time, derive_funding_interval_hours
 
 
 def _now_iso() -> str:
@@ -282,6 +283,30 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
     过滤指数合约和清算中合约，避免污染币种价格比较."""
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     ts = _now_iso()
+    premium_meta: Dict[str, Dict[str, Any]] = {}
+
+    try:
+        premium_payload = _req_json('https://fapi.binance.com/fapi/v1/premiumIndex')
+        if isinstance(premium_payload, list):
+            for item in premium_payload:
+                sym = item.get('symbol', '')
+                if not sym.endswith('USDT'):
+                    continue
+                base = sym[:-4]
+                extras: Dict[str, Any] = {}
+                funding = normalize_funding_rate(item.get('lastFundingRate'))
+                if funding is not None:
+                    extras['funding_rate'] = funding
+                next_ft = normalize_next_funding_time(item.get('nextFundingTime'))
+                if next_ft:
+                    extras['next_funding_time'] = next_ft
+                interval = derive_funding_interval_hours('binance')
+                if interval:
+                    extras['funding_interval_hours'] = interval
+                if extras:
+                    premium_meta[base] = extras
+    except Exception as exc:
+        print(f"Binance资金费率REST获取失败: {exc}")
     
     # 获取有效的符号列表（失败或为空则退化为不过滤）
     valid_symbols = binance_filter.get_valid_symbols()
@@ -315,12 +340,19 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         price = float(item.get('lastPrice') or item.get('c') or 0)
                         if price:
                             out.setdefault(base, {}).setdefault('futures', {})
-                            # funding not present here; keep if already set by WS
-                            out[base]['futures'] = {
+                            futures_snapshot = {
                                 'price': price,
                                 'timestamp': ts,
                                 'symbol': sym
                             }
+                            extras = premium_meta.get(base)
+                            if extras:
+                                futures_snapshot.update(extras)
+                            else:
+                                interval = derive_funding_interval_hours('binance')
+                                if interval:
+                                    futures_snapshot['funding_interval_hours'] = interval
+                            out[base]['futures'] = futures_snapshot
                     elif has_fut_filter and sym in valid_symbols['futures_invalid']:
                         # 过滤的无效合约（指数/清算中）
                         filtered_count += 1
@@ -330,6 +362,13 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                 
     except Exception as e:
         print(f"Binance期货REST获取失败: {e}")
+
+    # 补充仅有资金费率数据但暂未获取到价格的标的
+    for base, extras in premium_meta.items():
+        entry = out.setdefault(base, {}).setdefault('futures', {})
+        if 'timestamp' not in entry:
+            entry['timestamp'] = ts
+        entry.update(extras)
         
     return out
 
@@ -361,7 +400,11 @@ def fetch_okx() -> Dict[str, Dict[str, Dict[str, Any]]]:
                     price = float(item.get('last') or 0)
                     if price:
                         out.setdefault(base, {}).setdefault('futures', {})
-                        out[base]['futures'] = {'price': price, 'timestamp': ts, 'symbol': inst_id}
+                        snapshot = {'price': price, 'timestamp': ts, 'symbol': inst_id}
+                        interval = derive_funding_interval_hours('okx')
+                        if interval:
+                            snapshot['funding_interval_hours'] = interval
+                        out[base]['futures'] = snapshot
     except Exception:
         pass
     return out
@@ -410,9 +453,13 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         if funding_rate_value is not None:
                             futures_snapshot['funding_rate'] = funding_rate_value
 
-                        next_funding_time = item.get('nextFundingTime')
+                        next_funding_time = normalize_next_funding_time(item.get('nextFundingTime'))
                         if next_funding_time:
                             futures_snapshot['next_funding_time'] = next_funding_time
+
+                        interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'))
+                        if interval:
+                            futures_snapshot['funding_interval_hours'] = interval
 
                         out[coin]['futures'] = futures_snapshot
     except Exception:
@@ -593,6 +640,9 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
             'timestamp': ts,
             'symbol': instrument
         }
+        interval = derive_funding_interval_hours('grvt')
+        if interval:
+            snapshot['funding_interval_hours'] = interval
         funding = _decode_grvt_funding(
             ticker.get('funding_rate_8h_curr')
             or ticker.get('funding_rate_curr')
@@ -601,6 +651,12 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
         normalized_funding = normalize_funding_rate(funding, assume_percent=True)
         if normalized_funding is not None:
             snapshot['funding_rate'] = normalized_funding
+
+        next_ft = normalize_next_funding_time(
+            ticker.get('next_funding_time') or ticker.get('nextFundingTime')
+        )
+        if next_ft:
+            snapshot['next_funding_time'] = next_ft
 
         out.setdefault(symbol, {})['futures'] = snapshot
 
@@ -634,6 +690,9 @@ def fetch_hyperliquid() -> Dict[str, Dict[str, Dict[str, Any]]]:
             'timestamp': ts,
             'symbol': f"{base_upper}-PERP"
         }
+        interval = derive_funding_interval_hours('hyperliquid')
+        if interval:
+            snapshot['funding_interval_hours'] = interval
 
         ctx = funding_map.get(base_upper)
         if ctx:
@@ -689,9 +748,15 @@ def fetch_lighter() -> Dict[str, Dict[str, Dict[str, Any]]]:
         if normalized_funding is not None:
             snapshot['funding_rate'] = normalized_funding
 
-        funding_ts = _ms_to_iso(entry.get('funding_timestamp'))
+        funding_ts = normalize_next_funding_time(
+            entry.get('funding_timestamp') or entry.get('next_funding_time')
+        )
         if funding_ts:
             snapshot['next_funding_time'] = funding_ts
+
+        interval = derive_funding_interval_hours('lighter')
+        if interval:
+            snapshot['funding_interval_hours'] = interval
 
         market_meta = market_info.get(symbol)
         if market_meta:
@@ -746,7 +811,11 @@ def fetch_bitget() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         price = float(item.get('lastPr') or 0)
                         if price:
                             out.setdefault(base, {}).setdefault('futures', {})
-                            out[base]['futures'] = {'price': price, 'timestamp': ts, 'symbol': sym}
+                            snapshot = {'price': price, 'timestamp': ts, 'symbol': sym}
+                            interval = derive_funding_interval_hours('bitget')
+                            if interval:
+                                snapshot['funding_interval_hours'] = interval
+                            out[base]['futures'] = snapshot
                     elif has_fut_filter:
                         filtered_count += 1
             

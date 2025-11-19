@@ -315,6 +315,41 @@
             }
             return null;
         }
+
+        function formatFundingInterval(hours) {
+            const numeric = Number(hours);
+            if (!Number.isFinite(numeric) || numeric <= 0) return null;
+            if (Math.abs(numeric - Math.round(numeric)) < 1e-3) {
+                return `${Math.round(numeric)}小时`;
+            }
+            return `${numeric.toFixed(2)}小时`;
+        }
+
+        function formatFundingCountdown(ts) {
+            if (!ts) return null;
+            const target = parseTimestamp(ts);
+            if (!target) return null;
+            const diffMs = target.getTime() - Date.now();
+            if (diffMs <= 0) return '即将结算';
+            const totalMinutes = Math.floor(diffMs / 60000);
+            const hours = Math.floor(totalMinutes / 60);
+            const minutes = totalMinutes % 60;
+            if (hours <= 0) {
+                return `${minutes}分钟`;
+            }
+            return `${hours}小时${minutes.toString().padStart(2, '0')}分`;
+        }
+
+        function formatFundingSchedule(futures) {
+            if (!futures) return null;
+            const intervalText = formatFundingInterval(futures.funding_interval_hours);
+            const countdownText = formatFundingCountdown(futures.next_funding_time);
+            if (!intervalText && !countdownText) return null;
+            if (intervalText && countdownText) {
+                return `${intervalText} · 距下次 ${countdownText}`;
+            }
+            return intervalText || `距下次 ${countdownText}`;
+        }
         
         function normalizeFundingRate(rate) {
             if (rate === null || rate === undefined) return null;
@@ -368,6 +403,7 @@
                 const spotPrice = spot.price || 0;
                 const futuresPrice = futures.price || 0;
                 const fundingRate = futures.funding_rate || 0;
+                const fundingSchedule = formatFundingSchedule(futures);
                 const premium = premiumData[exchange]?.premium_percent || 0;
                 
                 card.innerHTML = `
@@ -384,6 +420,11 @@
                         <span class="price-label">资金费率:</span>
                         <span class="price-value funding-rate">${formatFundingRate(fundingRate)}%</span>
                     </div>
+                    ${fundingSchedule ? `
+                    <div class="price-info">
+                        <span class="price-label">资金节奏:</span>
+                        <span class="price-value">${fundingSchedule}</span>
+                    </div>` : ''}
                     <div class="price-info">
                         <span class="price-label">溢价指数:</span>
                         <span class="price-value premium">${premium.toFixed(4)}%</span>

@@ -5,12 +5,19 @@ import threading
 import os
 
 from precision_utils import funding_rate_to_float
+from funding_utils import normalize_next_funding_time
 
 class PriceDatabase:
     def __init__(self, db_path='market_data.db'):
         self.db_path = db_path
         self.lock = threading.Lock()
         self.init_database()
+
+    def _ensure_column(self, cursor, table: str, column: str, definition: str):
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        if column not in existing:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
     
     def init_database(self):
         """初始化数据库表结构"""
@@ -27,6 +34,8 @@ class PriceDatabase:
                     spot_price REAL DEFAULT 0.0,
                     futures_price REAL DEFAULT 0.0,
                     funding_rate REAL DEFAULT 0.0,
+                    funding_interval_hours REAL DEFAULT 0.0,
+                    next_funding_time TEXT,
                     mark_price REAL DEFAULT 0.0,
                     index_price REAL DEFAULT 0.0,
                     premium_percent REAL DEFAULT 0.0,
@@ -51,6 +60,8 @@ class PriceDatabase:
                     futures_price_low REAL DEFAULT 0.0,
                     futures_price_close REAL DEFAULT 0.0,
                     funding_rate_avg REAL DEFAULT 0.0,
+                    funding_interval_hours REAL DEFAULT 0.0,
+                    next_funding_time TEXT,
                     premium_percent_avg REAL DEFAULT 0.0,
                     volume_24h_avg REAL DEFAULT 0.0,
                     data_points INTEGER DEFAULT 0,
@@ -58,6 +69,12 @@ class PriceDatabase:
                     UNIQUE(timestamp, symbol, exchange)
                 )
             ''')
+
+            # 迁移旧表缺失的列
+            self._ensure_column(cursor, 'price_data', 'funding_interval_hours', 'REAL DEFAULT 0.0')
+            self._ensure_column(cursor, 'price_data', 'next_funding_time', 'TEXT')
+            self._ensure_column(cursor, 'price_data_1min', 'funding_interval_hours', 'REAL DEFAULT 0.0')
+            self._ensure_column(cursor, 'price_data_1min', 'next_funding_time', 'TEXT')
             
             # 创建索引
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_data_timestamp ON price_data (timestamp)')
@@ -75,9 +92,16 @@ class PriceDatabase:
                 timestamp = datetime.now()
                 
                 spot_price = data.get('spot', {}).get('price', 0.0) if data.get('spot') else 0.0
-                futures_price = data.get('futures', {}).get('price', 0.0) if data.get('futures') else 0.0
-                funding_rate_raw = data.get('futures', {}).get('funding_rate') if data.get('futures') else None
+                futures_payload = data.get('futures') or {}
+                futures_price = futures_payload.get('price', 0.0)
+                funding_rate_raw = futures_payload.get('funding_rate')
                 funding_rate = funding_rate_to_float(funding_rate_raw)
+                interval_raw = futures_payload.get('funding_interval_hours')
+                try:
+                    funding_interval = float(interval_raw) if interval_raw not in (None, '') else None
+                except (TypeError, ValueError):
+                    funding_interval = None
+                next_funding_time = normalize_next_funding_time(futures_payload.get('next_funding_time'))
                 mark_price = data.get('futures', {}).get('mark_price', 0.0) if data.get('futures') else 0.0
                 index_price = data.get('futures', {}).get('index_price', 0.0) if data.get('futures') else 0.0
                 volume_24h = data.get('spot', {}).get('volume', 0.0) if data.get('spot') else 0.0
@@ -91,12 +115,14 @@ class PriceDatabase:
                     cursor = conn.cursor()
                     cursor.execute('''
                         INSERT INTO price_data 
-                        (timestamp, symbol, exchange, spot_price, futures_price, funding_rate, 
-                         mark_price, index_price, premium_percent, volume_24h)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        (timestamp, symbol, exchange, spot_price, futures_price, funding_rate,
+                         funding_interval_hours, next_funding_time, mark_price, index_price,
+                         premium_percent, volume_24h)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        timestamp, symbol, exchange, spot_price, futures_price, 
-                        funding_rate, mark_price, index_price, premium_percent, volume_24h
+                        timestamp, symbol, exchange, spot_price, futures_price,
+                        funding_rate, funding_interval, next_funding_time,
+                        mark_price, index_price, premium_percent, volume_24h
                     ))
                     conn.commit()
                     
@@ -176,7 +202,8 @@ class PriceDatabase:
                     INSERT OR REPLACE INTO price_data_1min 
                     (timestamp, symbol, exchange, spot_price_open, spot_price_high, spot_price_low, spot_price_close,
                      futures_price_open, futures_price_high, futures_price_low, futures_price_close,
-                     funding_rate_avg, premium_percent_avg, volume_24h_avg, data_points)
+                     funding_rate_avg, funding_interval_hours, next_funding_time,
+                     premium_percent_avg, volume_24h_avg, data_points)
                     SELECT 
                         datetime(strftime('%Y-%m-%d %H:%M:00', timestamp)) as timestamp,
                         symbol,
@@ -190,6 +217,8 @@ class PriceDatabase:
                         MIN(CASE WHEN futures_price > 0 THEN futures_price ELSE NULL END) as futures_price_low,
                         LAST_VALUE(futures_price) OVER (PARTITION BY symbol, exchange, datetime(strftime('%Y-%m-%d %H:%M:00', timestamp)) ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as futures_price_close,
                         AVG(CASE WHEN funding_rate != 0 THEN funding_rate ELSE NULL END) as funding_rate_avg,
+                        AVG(CASE WHEN funding_interval_hours > 0 THEN funding_interval_hours ELSE NULL END) as funding_interval_hours,
+                        MAX(next_funding_time) as next_funding_time,
                         AVG(premium_percent) as premium_percent_avg,
                         AVG(volume_24h) as volume_24h_avg,
                         COUNT(*) as data_points
@@ -232,8 +261,8 @@ class PriceDatabase:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
-                    SELECT exchange, spot_price, futures_price, funding_rate, premium_percent,
-                           timestamp
+                    SELECT exchange, spot_price, futures_price, funding_rate, funding_interval_hours,
+                           next_funding_time, premium_percent, timestamp
                     FROM price_data 
                     WHERE symbol = ? 
                     AND timestamp >= datetime('now', '-5 minutes')

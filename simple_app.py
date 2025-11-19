@@ -937,6 +937,8 @@ def background_data_collection():
                                 'spot_price': symbol_data['spot'].get('price', 0),
                                 'futures_price': symbol_data['futures'].get('price', 0),
                                 'funding_rate': symbol_data['futures'].get('funding_rate', 0),
+                                'funding_interval_hours': symbol_data['futures'].get('funding_interval_hours'),
+                                'next_funding_time': symbol_data['futures'].get('next_funding_time'),
                                 'premium': premium_data.get(exchange, {}).get('premium_percent', 0)
                             }
                             

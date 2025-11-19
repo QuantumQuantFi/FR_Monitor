@@ -29,6 +29,7 @@ from dex.exchanges.grvt import GrvtMarketWebSocket
 from dex.exchanges.lighter import LighterMarketWebSocket
 from dex.exchanges.hyperliquid import HyperliquidMarketWebSocket
 from precision_utils import normalize_funding_rate
+from funding_utils import normalize_next_funding_time, derive_funding_interval_hours
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -499,9 +500,15 @@ class ExchangeDataCollector:
                     if normalized_funding is not None:
                         merged['funding_rate'] = normalized_funding
 
-                    rest_next_ft = new_data.get('next_funding_time')
+                    rest_next_ft = normalize_next_funding_time(new_data.get('next_funding_time'))
                     if rest_next_ft:
                         merged['next_funding_time'] = rest_next_ft
+
+                    rest_interval = derive_funding_interval_hours(
+                        exchange, new_data.get('funding_interval_hours'), fallback=False
+                    )
+                    if rest_interval:
+                        merged['funding_interval_hours'] = rest_interval
 
                     self.data[exchange][symbol][kind] = merged
 
@@ -559,9 +566,15 @@ class ExchangeDataCollector:
                         if normalized_funding is not None:
                             merged['funding_rate'] = normalized_funding
 
-                        rest_next_ft = new_data.get('next_funding_time')
+                        rest_next_ft = normalize_next_funding_time(new_data.get('next_funding_time'))
                         if rest_next_ft:
                             merged['next_funding_time'] = rest_next_ft
+
+                        rest_interval = derive_funding_interval_hours(
+                            exchange, new_data.get('funding_interval_hours'), fallback=False
+                        )
+                        if rest_interval:
+                            merged['funding_interval_hours'] = rest_interval
 
                         self.data[exchange][symbol][kind] = merged
 
@@ -663,11 +676,15 @@ class ExchangeDataCollector:
                                             if 'futures' not in self.data['okx'][symbol]:
                                                 self.data['okx'][symbol]['futures'] = {}
                                             funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
+                                            next_time = normalize_next_funding_time(item.get('nextFundingTime'))
                                             updates = {
-                                                'next_funding_time': item.get('nextFundingTime', ''),
-                                                # 确保资金费率单独更新也刷新时间戳，便于前端展示“最新更新时间”
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                             }
+                                            if next_time:
+                                                updates['next_funding_time'] = next_time
+                                            interval = derive_funding_interval_hours('okx')
+                                            if interval:
+                                                updates['funding_interval_hours'] = interval
                                             if funding_rate_value is not None:
                                                 updates['funding_rate'] = funding_rate_value
                                             self.data['okx'][symbol]['futures'].update(updates)
@@ -821,10 +838,15 @@ class ExchangeDataCollector:
                                 funding_rate_value = normalize_funding_rate(stream_data.get('r'))
                                 futures_entry = {
                                     'price': float(stream_data['p']),
-                                    'next_funding_time': stream_data.get('T', ''),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
+                                next_time = normalize_next_funding_time(stream_data.get('T'))
+                                if next_time:
+                                    futures_entry['next_funding_time'] = next_time
+                                interval = derive_funding_interval_hours('binance')
+                                if interval:
+                                    futures_entry['funding_interval_hours'] = interval
                                 if funding_rate_value is not None:
                                     futures_entry['funding_rate'] = funding_rate_value
                                 self.data['binance'][symbol]['futures'] = futures_entry
@@ -837,10 +859,15 @@ class ExchangeDataCollector:
                             funding_rate_value = normalize_funding_rate(data.get('r'))
                             futures_entry = {
                                 'price': float(data['p']),
-                                'next_funding_time': data.get('T', ''),
                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
                             }
+                            next_time = normalize_next_funding_time(data.get('T'))
+                            if next_time:
+                                futures_entry['next_funding_time'] = next_time
+                            interval = derive_funding_interval_hours('binance')
+                            if interval:
+                                futures_entry['funding_interval_hours'] = interval
                             if funding_rate_value is not None:
                                 futures_entry['funding_rate'] = funding_rate_value
                             self.data['binance'][symbol]['futures'] = futures_entry
@@ -1017,11 +1044,16 @@ class ExchangeDataCollector:
                                 final_funding_rate = funding_rate_value if funding_rate_value is not None else current_funding_rate
                                 futures_snapshot = {
                                     'price': float(item.get('lastPrice', 0) or 0),
-                                    'next_funding_time': item.get('nextFundingTime', ''),
                                     'volume': float(item.get('volume24h', 0) or 0),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
+                                next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                if next_time:
+                                    futures_snapshot['next_funding_time'] = next_time
+                                interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'))
+                                if interval:
+                                    futures_snapshot['funding_interval_hours'] = interval
                                 if final_funding_rate is not None:
                                     futures_snapshot['funding_rate'] = final_funding_rate
                                 self.data['bybit'][coin]['futures'] = futures_snapshot
@@ -1033,7 +1065,12 @@ class ExchangeDataCollector:
                                     if funding_rate_value is not None:
                                         current_data['funding_rate'] = funding_rate_value
                                     if 'nextFundingTime' in item:
-                                        current_data['next_funding_time'] = item.get('nextFundingTime', '')
+                                        next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                        if next_time:
+                                            current_data['next_funding_time'] = next_time
+                                        interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'))
+                                        if interval:
+                                            current_data['funding_interval_hours'] = interval
                                     if 'volume24h' in item:
                                         current_data['volume'] = float(item.get('volume24h', 0) or 0)
                                     current_data['timestamp'] = datetime.now(timezone.utc).isoformat()
@@ -1298,12 +1335,17 @@ class ExchangeDataCollector:
                                         if price > 0:  # 只在有有效价格时更新
                                             futures_snapshot = {
                                                 'price': price,
-                                                'next_funding_time': item.get('nextFundingTime', ''),
                                                 'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else 0,
                                                 'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else 0,
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
                                             }
+                                            next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                            if next_time:
+                                                futures_snapshot['next_funding_time'] = next_time
+                                            interval = derive_funding_interval_hours('bitget')
+                                            if interval:
+                                                futures_snapshot['funding_interval_hours'] = interval
                                             if funding_rate_value is not None:
                                                 futures_snapshot['funding_rate'] = funding_rate_value
                                             self.data['bitget'][symbol]['futures'] = futures_snapshot
@@ -1411,9 +1453,12 @@ class ExchangeDataCollector:
             funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
             if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
-            next_ft = payload.get('next_funding_time')
+            next_ft = normalize_next_funding_time(payload.get('next_funding_time'))
             if next_ft:
                 snapshot['next_funding_time'] = next_ft
+            interval = derive_funding_interval_hours('grvt')
+            if interval:
+                snapshot['funding_interval_hours'] = interval
 
             if snapshot['price'] > 0:
                 self.data['grvt'][symbol][target_kind] = snapshot
@@ -1465,8 +1510,12 @@ class ExchangeDataCollector:
             funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
             if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
-            if payload.get('next_funding_time'):
-                snapshot['next_funding_time'] = payload['next_funding_time']
+            next_time = normalize_next_funding_time(payload.get('next_funding_time') or payload.get('funding_timestamp'))
+            if next_time:
+                snapshot['next_funding_time'] = next_time
+            interval = derive_funding_interval_hours('lighter')
+            if interval:
+                snapshot['funding_interval_hours'] = interval
 
             self.data['lighter'][symbol]['futures'] = snapshot
             print(f"Lighter {symbol} 永续价格: {snapshot['price']}")
