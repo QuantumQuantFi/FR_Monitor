@@ -107,13 +107,18 @@ class PriceDatabase:
                 cursor = conn.cursor()
                 
                 # 根据间隔选择表
-                if interval == '1min':
+                interval_key = (interval or '').lower()
+                if interval_key.endswith('min') or interval_key.endswith('h') or interval_key.endswith('day'):
                     table = 'price_data_1min'
                     timestamp_col = 'timestamp'
                 else:
                     table = 'price_data'
                     timestamp_col = 'timestamp'
                 
+                # 不同粒度设置不同的行数上限，分钟级允许返回完整30天 (~43k行)
+                max_rows = 50000 if table == 'price_data_1min' else 1000
+                limit_clause = f"LIMIT {max_rows}" if max_rows else ""
+
                 # 构建查询
                 if exchange:
                     query = f'''
@@ -121,7 +126,7 @@ class PriceDatabase:
                         WHERE symbol = ? AND exchange = ? 
                         AND {timestamp_col} >= datetime('now', '-{hours} hours')
                         ORDER BY {timestamp_col} DESC
-                        LIMIT 1000
+                        {limit_clause}
                     '''
                     params = (symbol, exchange)
                 else:
@@ -130,7 +135,7 @@ class PriceDatabase:
                         WHERE symbol = ? 
                         AND {timestamp_col} >= datetime('now', '-{hours} hours')
                         ORDER BY {timestamp_col} DESC
-                        LIMIT 1000
+                        {limit_clause}
                     '''
                     params = (symbol,)
                 

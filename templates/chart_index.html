@@ -473,10 +473,19 @@
             <div class="control-group">
                 <span class="control-label">时间范围:</span>
                 <select class="time-selector" id="timeRange" onchange="updateCharts()">
-                    <option value="1" selected>1小时</option>
+                    <option value="1">1小时</option>
                     <option value="6">6小时</option>
                     <option value="24">24小时</option>
                     <option value="168">7天</option>
+                    <option value="720" selected>30天</option>
+                </select>
+            </div>
+            <div class="control-group">
+                <span class="control-label">数据精度:</span>
+                <select class="time-selector" id="intervalSelect" onchange="updateCharts()">
+                    {% for value, label in chart_intervals %}
+                    <option value="{{ value }}" {% if value == default_chart_interval %}selected{% endif %}>{{ label }}</option>
+                    {% endfor %}
                 </select>
             </div>
             <div class="control-group">
@@ -595,6 +604,8 @@
             { value: 'close_long_all', label: '平多全部', side: 'short', requiresNotional: false, closeAll: true },
             { value: 'close_short_all', label: '平空全部', side: 'long', requiresNotional: false, closeAll: true },
         ];
+        const intervalLabelMap = {{ chart_interval_label_map|tojson }};
+        const DEFAULT_INTERVAL = "{{ default_chart_interval }}";
 
         const tradeState = {
             options: {},
@@ -1328,14 +1339,17 @@
         function updateChartData() {
             const timeRange = document.getElementById('timeRange').value;
             const exchangeFilter = document.getElementById('exchangeFilter').value;
+            const intervalSelect = document.getElementById('intervalSelect');
+            const selectedInterval = intervalSelect ? intervalSelect.value : DEFAULT_INTERVAL;
             
             // 构建API URL
-            let url = `/api/chart/${currentSymbol}?hours=${timeRange}&interval=1min`;
+            let url = `/api/chart/${currentSymbol}?hours=${timeRange}&interval=${selectedInterval}`;
             if (exchangeFilter) {
                 url += `&exchange=${exchangeFilter}`;
             }
             
-            document.getElementById('status').textContent = '正在加载数据...';
+            const pendingLabel = intervalLabelMap[selectedInterval] || selectedInterval;
+            document.getElementById('status').textContent = `正在加载数据 (${pendingLabel})...`;
             document.getElementById('status').className = 'status loading';
             
             fetch(url)
@@ -1349,7 +1363,9 @@
                     updateAllCharts();
                     updateStats(data);
                     
-                    document.getElementById('status').textContent = '数据加载完成 • 套利监控活跃';
+                    const resolvedInterval = data.interval || selectedInterval;
+                    const resolvedLabel = intervalLabelMap[resolvedInterval] || resolvedInterval;
+                    document.getElementById('status').textContent = `数据加载完成 • 精度 ${resolvedLabel}`;
                     document.getElementById('status').className = 'status connected';
                 })
                 .catch(error => {

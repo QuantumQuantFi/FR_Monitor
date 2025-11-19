@@ -10,7 +10,7 @@ import os
 import builtins
 import sys
 import decimal
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 from exchange_connectors import ExchangeDataCollector
@@ -40,6 +40,27 @@ LOG_MAX_BYTES = 25 * 1024 * 1024  # 25MB per file, 4 files total <=100MB
 LOG_BACKUP_COUNT = 3  # plus the active file -> 4*25MB = 100MB cap
 _LOGGING_CONFIGURED = False
 EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']
+
+CHART_INTERVAL_OPTIONS = [
+    ('1min', '1分钟'),
+    ('5min', '5分钟'),
+    ('15min', '15分钟'),
+    ('30min', '30分钟'),
+    ('1h', '1小时'),
+    ('4h', '4小时'),
+    ('1day', '1天'),
+]
+CHART_INTERVAL_MINUTES = {
+    '1min': 1,
+    '5min': 5,
+    '15min': 15,
+    '30min': 30,
+    '1h': 60,
+    '4h': 240,
+    '1day': 1440,
+}
+DEFAULT_CHART_INTERVAL = '5min'
+CHART_INTERVAL_LABEL_MAP = {value: label for value, label in CHART_INTERVAL_OPTIONS}
 
 
 def configure_logging() -> None:
@@ -159,6 +180,143 @@ def precision_jsonify(*args, **kwargs):
 
 PERPETUAL_MARKET_KEYS = {"perpetual", "futures"}
 DEFAULT_QUANT = Decimal("0.00000001")
+
+
+def _safe_number(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError, decimal.InvalidOperation):
+        return 0.0
+
+
+def _parse_db_timestamp(value):
+    """将数据库中的时间字符串转换为 datetime 对象"""
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    text = text.replace('T', ' ')
+    if text.endswith('Z'):
+        text = text[:-1]
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        try:
+            base = text.split('.')[0]
+            return datetime.strptime(base, '%Y-%m-%d %H:%M:%S')
+        except ValueError:
+            return None
+
+
+def _floor_timestamp(dt, interval_minutes):
+    """将时间戳向下取整到指定分钟粒度"""
+    if not interval_minutes:
+        return dt.replace(second=0, microsecond=0)
+    day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    minutes_since_day_start = dt.hour * 60 + dt.minute
+    bucket_minutes = (minutes_since_day_start // interval_minutes) * interval_minutes
+    return day_start + timedelta(minutes=bucket_minutes)
+
+
+def resample_price_rows(rows, interval):
+    """将1分钟K线数据聚合为更高粒度"""
+    if interval == '1min':
+        return rows
+    interval_minutes = CHART_INTERVAL_MINUTES.get(interval)
+    if not interval_minutes:
+        return rows
+    buckets = {}
+    for row in rows:
+        ts = _parse_db_timestamp(row.get('timestamp'))
+        if not ts:
+            continue
+        exchange = row.get('exchange')
+        symbol = row.get('symbol')
+        bucket_start = _floor_timestamp(ts, interval_minutes)
+        key = (exchange, bucket_start)
+        data_points = row.get('data_points') or 1
+        spot_high = _safe_number(row.get('spot_price_high'))
+        spot_low = _safe_number(row.get('spot_price_low'))
+        futures_high = _safe_number(row.get('futures_price_high'))
+        futures_low = _safe_number(row.get('futures_price_low'))
+        entry = buckets.get(key)
+        if not entry:
+            entry = {
+                'symbol': symbol,
+                'exchange': exchange,
+                'timestamp': bucket_start,
+                'first_ts': ts,
+                'last_ts': ts,
+                'spot_price_open': _safe_number(row.get('spot_price_open')),
+                'spot_price_close': _safe_number(row.get('spot_price_close')),
+                'spot_price_high': spot_high,
+                'spot_price_low': spot_low if spot_low > 0 else 0.0,
+                'futures_price_open': _safe_number(row.get('futures_price_open')),
+                'futures_price_close': _safe_number(row.get('futures_price_close')),
+                'futures_price_high': futures_high,
+                'futures_price_low': futures_low if futures_low > 0 else 0.0,
+                'funding_weighted_sum': _safe_number(row.get('funding_rate_avg')) * data_points,
+                'premium_weighted_sum': _safe_number(row.get('premium_percent_avg')) * data_points,
+                'volume_weighted_sum': _safe_number(row.get('volume_24h_avg')) * data_points,
+                'total_points': data_points,
+            }
+            buckets[key] = entry
+        else:
+            entry['total_points'] += data_points
+            entry['funding_weighted_sum'] += _safe_number(row.get('funding_rate_avg')) * data_points
+            entry['premium_weighted_sum'] += _safe_number(row.get('premium_percent_avg')) * data_points
+            entry['volume_weighted_sum'] += _safe_number(row.get('volume_24h_avg')) * data_points
+            entry['spot_price_high'] = max(entry['spot_price_high'], spot_high)
+            entry['futures_price_high'] = max(entry['futures_price_high'], futures_high)
+            if spot_low > 0:
+                if entry['spot_price_low'] <= 0:
+                    entry['spot_price_low'] = spot_low
+                else:
+                    entry['spot_price_low'] = min(entry['spot_price_low'], spot_low)
+            if futures_low > 0:
+                if entry['futures_price_low'] <= 0:
+                    entry['futures_price_low'] = futures_low
+                else:
+                    entry['futures_price_low'] = min(entry['futures_price_low'], futures_low)
+            if ts < entry['first_ts']:
+                entry['first_ts'] = ts
+                entry['spot_price_open'] = _safe_number(row.get('spot_price_open'))
+                entry['futures_price_open'] = _safe_number(row.get('futures_price_open'))
+            if ts > entry['last_ts']:
+                entry['last_ts'] = ts
+                entry['spot_price_close'] = _safe_number(row.get('spot_price_close'))
+                entry['futures_price_close'] = _safe_number(row.get('futures_price_close'))
+
+    result = []
+    for entry in buckets.values():
+        total_points = entry['total_points'] or 1
+        timestamp_dt = entry['timestamp']
+        timestamp_str = timestamp_dt.strftime('%Y-%m-%d %H:%M:%S')
+        result.append({
+            'timestamp': timestamp_str,
+            'symbol': entry['symbol'],
+            'exchange': entry['exchange'],
+            'spot_price_open': entry['spot_price_open'],
+            'spot_price_high': entry['spot_price_high'],
+            'spot_price_low': entry['spot_price_low'],
+            'spot_price_close': entry['spot_price_close'],
+            'futures_price_open': entry['futures_price_open'],
+            'futures_price_high': entry['futures_price_high'],
+            'futures_price_low': entry['futures_price_low'],
+            'futures_price_close': entry['futures_price_close'],
+            'funding_rate_avg': entry['funding_weighted_sum'] / total_points if total_points else 0.0,
+            'premium_percent_avg': entry['premium_weighted_sum'] / total_points if total_points else 0.0,
+            'volume_24h_avg': entry['volume_weighted_sum'] / total_points if total_points else 0.0,
+            'data_points': total_points,
+            '_timestamp_dt': timestamp_dt,
+        })
+    result.sort(key=lambda item: item['_timestamp_dt'], reverse=True)
+    for entry in result:
+        entry.pop('_timestamp_dt', None)
+    return result
 
 
 class TradeRequestValidationError(Exception):
@@ -907,7 +1065,10 @@ def charts():
                          # 提供动态支持的币种列表，保证前端按钮与实际支持一致
                          symbols=data_collector.supported_symbols,
                          current_symbol=current_symbol,
-                         exchange_order=EXCHANGE_DISPLAY_ORDER)
+                         exchange_order=EXCHANGE_DISPLAY_ORDER,
+                         chart_intervals=CHART_INTERVAL_OPTIONS,
+                         default_chart_interval=DEFAULT_CHART_INTERVAL,
+                         chart_interval_label_map=CHART_INTERVAL_LABEL_MAP)
 
 @app.route('/api/data')
 def get_current_data():
@@ -960,13 +1121,22 @@ def get_database_historical_data(symbol):
     # 获取查询参数
     hours = request.args.get('hours', 24, type=int)  # 默认24小时
     exchange = request.args.get('exchange', None)    # 特定交易所，默认所有
-    interval = request.args.get('interval', '1min')  # 数据间隔，默认1分钟
+    interval = request.args.get('interval', DEFAULT_CHART_INTERVAL)
+    interval = (interval or DEFAULT_CHART_INTERVAL).lower()
     
     # 限制查询范围以提高性能
-    hours = min(hours, 168)  # 最多7天
+    hours = min(hours, 720)  # 最多30天
+    
+    supported_intervals = set(CHART_INTERVAL_MINUTES.keys()) | {'raw'}
+    if interval not in supported_intervals:
+        return jsonify({'error': 'Unsupported interval'}), 400
+    
+    db_interval = '1min' if interval in CHART_INTERVAL_MINUTES else interval
     
     try:
-        data = db.get_historical_data(symbol, exchange, hours, interval)
+        data = db.get_historical_data(symbol, exchange, hours, db_interval)
+        if interval in CHART_INTERVAL_MINUTES and interval != '1min':
+            data = resample_price_rows(data, interval)
         return jsonify({
             'symbol': symbol,
             'exchange': exchange,
@@ -1085,13 +1255,22 @@ def get_chart_data(symbol):
     # 获取查询参数
     hours = request.args.get('hours', 6, type=int)  # 默认6小时用于图表
     exchange = request.args.get('exchange', None)
-    interval = request.args.get('interval', '1min')
+    interval = request.args.get('interval', DEFAULT_CHART_INTERVAL)
+    interval = (interval or DEFAULT_CHART_INTERVAL).lower()
     
     # 限制查询范围
-    hours = min(hours, 168)  # 最多7天
+    hours = min(hours, 720)  # 最多30天
+    
+    supported_intervals = set(CHART_INTERVAL_MINUTES.keys()) | {'raw'}
+    if interval not in supported_intervals:
+        return jsonify({'error': 'Unsupported interval'}), 400
+    
+    db_interval = '1min' if interval in CHART_INTERVAL_MINUTES else interval
     
     try:
-        raw_data = db.get_historical_data(symbol, exchange, hours, interval)
+        raw_data = db.get_historical_data(symbol, exchange, hours, db_interval)
+        if interval in CHART_INTERVAL_MINUTES and interval != '1min':
+            raw_data = resample_price_rows(raw_data, interval)
 
         def to_utc_iso(ts: str) -> str:
             """Ensure timestamp string is UTC ISO8601.
@@ -1121,17 +1300,24 @@ def get_chart_data(symbol):
             timestamp = row['timestamp']
             chart_data[exchange_name]['labels'].append(to_utc_iso(timestamp))
             
-            # 添加价格数据
-            if interval == '1min':
-                chart_data[exchange_name]['spot_prices'].append(row.get('spot_price_close', 0))
-                chart_data[exchange_name]['futures_prices'].append(row.get('futures_price_close', 0))
-                chart_data[exchange_name]['funding_rates'].append(row.get('funding_rate_avg', 0))
-                chart_data[exchange_name]['premiums'].append(row.get('premium_percent_avg', 0))
-            else:
-                chart_data[exchange_name]['spot_prices'].append(row.get('spot_price', 0))
-                chart_data[exchange_name]['futures_prices'].append(row.get('futures_price', 0))
-                chart_data[exchange_name]['funding_rates'].append(row.get('funding_rate', 0))
-                chart_data[exchange_name]['premiums'].append(row.get('premium_percent', 0))
+            # 添加价格数据，优先使用聚合字段，缺失时回退到原始字段
+            spot_close = row.get('spot_price_close')
+            if spot_close is None:
+                spot_close = row.get('spot_price')
+            futures_close = row.get('futures_price_close')
+            if futures_close is None:
+                futures_close = row.get('futures_price')
+            funding_value = row.get('funding_rate_avg')
+            if funding_value is None:
+                funding_value = row.get('funding_rate')
+            premium_value = row.get('premium_percent_avg')
+            if premium_value is None:
+                premium_value = row.get('premium_percent')
+
+            chart_data[exchange_name]['spot_prices'].append(spot_close or 0)
+            chart_data[exchange_name]['futures_prices'].append(futures_close or 0)
+            chart_data[exchange_name]['funding_rates'].append(funding_value or 0)
+            chart_data[exchange_name]['premiums'].append(premium_value or 0)
         
         return jsonify({
             'symbol': symbol,
