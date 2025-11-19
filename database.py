@@ -4,6 +4,8 @@ from datetime import datetime
 import threading
 import os
 
+from precision_utils import funding_rate_to_float
+
 class PriceDatabase:
     def __init__(self, db_path='market_data.db'):
         self.db_path = db_path
@@ -74,7 +76,8 @@ class PriceDatabase:
                 
                 spot_price = data.get('spot', {}).get('price', 0.0) if data.get('spot') else 0.0
                 futures_price = data.get('futures', {}).get('price', 0.0) if data.get('futures') else 0.0
-                funding_rate = data.get('futures', {}).get('funding_rate', 0.0) if data.get('futures') else 0.0
+                funding_rate_raw = data.get('futures', {}).get('funding_rate') if data.get('futures') else None
+                funding_rate = funding_rate_to_float(funding_rate_raw)
                 mark_price = data.get('futures', {}).get('mark_price', 0.0) if data.get('futures') else 0.0
                 index_price = data.get('futures', {}).get('index_price', 0.0) if data.get('futures') else 0.0
                 volume_24h = data.get('spot', {}).get('volume', 0.0) if data.get('spot') else 0.0

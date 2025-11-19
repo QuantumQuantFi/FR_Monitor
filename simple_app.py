@@ -126,19 +126,37 @@ configure_logging()
 
 # 自定义JSON编码器以保持数值精度，避免科学计数法
 class PrecisionJSONEncoder(json.JSONEncoder):
+    def _format_float(self, value: float):
+        if value == 0:
+            return 0
+        if abs(value) < 0.001:
+            return f"{value:.12f}".rstrip('0').rstrip('.')
+        if abs(value) < 1:
+            return f"{value:.8f}".rstrip('0').rstrip('.')
+        return value
+
+    def _format_funding_value(self, value):
+        if value in (None, ''):
+            return value
+        if value in (0, '0'):
+            return '0'
+        if isinstance(value, str):
+            return value
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return value
+        formatted = f"{numeric:.12f}".rstrip('0').rstrip('.')
+        return formatted or '0'
+
     def _process_value(self, key, value):
         """处理单个值，特别关注资金费率字段的精度"""
-        if key == 'funding_rate' and isinstance(value, (int, float)) and value != 0:
-            # 保持12位小数精度，去除末尾零，避免科学计数法
-            return f"{value:.12f}".rstrip('0').rstrip('.')
-        elif isinstance(value, float) and value != 0:
-            # 对其他浮点数也避免科学计数法，保持合适精度
-            if abs(value) < 0.001:
-                return f"{value:.12f}".rstrip('0').rstrip('.')
-            elif abs(value) < 1:
-                return f"{value:.8f}".rstrip('0').rstrip('.')
-            else:
-                return value
+        if key == 'funding_rate':
+            return self._format_funding_value(value)
+        if key == 'funding_rates' and isinstance(value, list):
+            return [self._format_funding_value(item) for item in value]
+        if isinstance(value, float) and value != 0:
+            return self._format_float(value)
         return value
     
     def _process_object(self, obj):
@@ -148,6 +166,8 @@ class PrecisionJSONEncoder(json.JSONEncoder):
                    for key, value in obj.items()}
         elif isinstance(obj, list):
             return [self._process_object(item) for item in obj]
+        elif isinstance(obj, float):
+            return self._format_float(obj)
         return obj
     
     def encode(self, obj):

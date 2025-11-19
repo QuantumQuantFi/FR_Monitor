@@ -34,6 +34,7 @@ from config import (
 )
 from binance_contract_filter import binance_filter
 from bitget_symbol_filter import bitget_filter
+from precision_utils import normalize_funding_rate
 
 
 def _now_iso() -> str:
@@ -397,13 +398,8 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         out.setdefault(coin, {}).setdefault('futures', {})
 
                         # 捕获Bybit资金费率，REST返回数据即为权威值
-                        funding_rate_value = None
                         raw_funding = item.get('fundingRate')
-                        if raw_funding not in (None, ''):
-                            try:
-                                funding_rate_value = float(raw_funding)
-                            except (TypeError, ValueError):
-                                funding_rate_value = None
+                        funding_rate_value = normalize_funding_rate(raw_funding)
 
                         futures_snapshot = {
                             'price': price,
@@ -602,8 +598,9 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
             or ticker.get('funding_rate_curr')
             or ticker.get('funding_rate')
         )
-        if funding is not None:
-            snapshot['funding_rate'] = funding
+        normalized_funding = normalize_funding_rate(funding, assume_percent=True)
+        if normalized_funding is not None:
+            snapshot['funding_rate'] = normalized_funding
 
         out.setdefault(symbol, {})['futures'] = snapshot
 
@@ -641,8 +638,9 @@ def fetch_hyperliquid() -> Dict[str, Dict[str, Dict[str, Any]]]:
         ctx = funding_map.get(base_upper)
         if ctx:
             funding = ctx.get('funding')
-            if funding is not None:
-                snapshot['funding_rate'] = funding
+            normalized_funding = normalize_funding_rate(funding)
+            if normalized_funding is not None:
+                snapshot['funding_rate'] = normalized_funding
             mark_px = ctx.get('markPx')
             if mark_px is not None:
                 snapshot['mark_price'] = mark_px
@@ -687,8 +685,9 @@ def fetch_lighter() -> Dict[str, Dict[str, Dict[str, Any]]]:
             snapshot['index_price'] = index_price
 
         funding = _safe_float(entry.get('current_funding_rate') or entry.get('funding_rate'))
-        if funding is not None:
-            snapshot['funding_rate'] = funding
+        normalized_funding = normalize_funding_rate(funding, assume_percent=True)
+        if normalized_funding is not None:
+            snapshot['funding_rate'] = normalized_funding
 
         funding_ts = _ms_to_iso(entry.get('funding_timestamp'))
         if funding_ts:

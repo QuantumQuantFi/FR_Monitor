@@ -675,19 +675,35 @@
             if (num > 0) return parseFloat(num.toFixed(12)).toString();
             return num.toString();
         }
+        function normalizeFundingRate(rate) {
+            if (rate === null || rate === undefined) return null;
+            if (typeof rate === 'number') {
+                return isFinite(rate) ? rate : null;
+            }
+            if (typeof rate === 'string') {
+                const trimmed = rate.trim();
+                if (!trimmed) return null;
+                const hasPercent = trimmed.endsWith('%');
+                const numericPart = hasPercent ? trimmed.slice(0, -1).trim() : trimmed;
+                const parsed = parseFloat(numericPart);
+                if (Number.isNaN(parsed)) return null;
+                return hasPercent ? parsed / 100 : parsed;
+            }
+            return null;
+        }
         function formatFundingRate(rate) {
-            if (!rate || rate === 0 || rate === '0') return '-';
-            const num = typeof rate === 'string' ? parseFloat(rate) : rate;
-            if (num === 0) return '-';
-            const percentage = num * 100;
+            const decimalRate = normalizeFundingRate(rate);
+            if (decimalRate === null || decimalRate === 0) return '-';
+            const percentage = decimalRate * 100;
             if (Math.abs(percentage) >= 1) return `${percentage.toFixed(4)}%`;
             if (Math.abs(percentage) >= 0.01) return `${percentage.toFixed(6)}%`;
             if (Math.abs(percentage) >= 0.0001) return `${percentage.toFixed(8)}%`;
             return `${percentage.toFixed(10)}%`;
         }
         function getFundingRateClass(rate) {
-            if (!rate || rate === 0) return 'neutral';
-            return parseFloat(rate) > 0 ? 'positive' : 'negative';
+            const decimalRate = normalizeFundingRate(rate);
+            if (decimalRate === null || decimalRate === 0) return 'neutral';
+            return decimalRate > 0 ? 'positive' : 'negative';
         }
         function formatRelTimestamp(ts) {
             if (!ts) return '-';
@@ -1376,9 +1392,21 @@
         }
         
         // 检查数据是否有效（不全为0或null）
-        function isValidDataset(dataArray) {
+        function isValidDataset(dataArray, parser) {
             if (!dataArray || dataArray.length === 0) return false;
-            return dataArray.some(value => value !== null && value !== 0 && !isNaN(value));
+            return dataArray.some(value => {
+                let parsed;
+                if (parser) {
+                    parsed = parser(value);
+                } else if (typeof value === 'number') {
+                    parsed = value;
+                } else if (typeof value === 'string') {
+                    parsed = value.trim() ? parseFloat(value) : null;
+                } else {
+                    parsed = null;
+                }
+                return parsed !== null && !Number.isNaN(parsed) && parsed !== 0;
+            });
         }
         
         // 更新所有图表
@@ -1442,14 +1470,15 @@
             
             // 资金费率图表 - 过滤掉无效数据
             const fundingDatasets = exchanges.filter(exchange => 
-                chartData[exchange] && isValidDataset(chartData[exchange].funding_rates)
+                chartData[exchange] && isValidDataset(chartData[exchange].funding_rates, normalizeFundingRate)
             ).map(exchange => ({
                 label: exchange.toUpperCase() + ' 资金费率',
                 data: chartData[exchange].labels.map((label, index) => {
                     const rate = chartData[exchange].funding_rates[index];
+                    const decimalRate = normalizeFundingRate(rate);
                     return {
                         x: parseTimestamp(label),
-                        y: rate !== null ? rate * 100 : null // 转换为百分比
+                        y: decimalRate !== null ? decimalRate * 100 : null // 转换为百分比
                     };
                 }).filter(point => point.y !== null), // 移除null值
                 borderColor: exchangeColors[exchange] || '#ffffff',
@@ -1494,7 +1523,7 @@
                     // 检查是否有有效的现货数据
                     const hasValidSpot = isValidDataset(exchangeData.spot_prices);
                     const hasValidFutures = isValidDataset(exchangeData.futures_prices);
-                    const hasValidFunding = isValidDataset(exchangeData.funding_rates);
+                    const hasValidFunding = isValidDataset(exchangeData.funding_rates, normalizeFundingRate);
                     const hasValidPremium = isValidDataset(exchangeData.premiums);
                     
                     // 只显示有至少一种有效数据的交易所
@@ -1502,6 +1531,7 @@
                         const latestSpot = exchangeData.spot_prices[exchangeData.spot_prices.length - 1];
                         const latestFutures = exchangeData.futures_prices[exchangeData.futures_prices.length - 1];
                         const latestFunding = exchangeData.funding_rates[exchangeData.funding_rates.length - 1];
+                        const normalizedFunding = normalizeFundingRate(latestFunding);
                         const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
                         
                         statsHtml += `
@@ -1510,7 +1540,7 @@
                                 <div class="stat-value" style="color: ${exchangeColors[exchange]}">
                                     ${hasValidSpot ? `现货: $${latestSpot.toFixed(4)}<br>` : ''}
                                     ${hasValidFutures ? `期货: $${latestFutures.toFixed(4)}<br>` : ''}
-                                    ${hasValidFunding && latestFunding !== null ? `资金费率: ${(latestFunding * 100).toFixed(4)}%<br>` : ''}
+                                    ${hasValidFunding && normalizedFunding !== null ? `资金费率: ${(normalizedFunding * 100).toFixed(4)}%<br>` : ''}
                                     ${hasValidPremium ? `溢价: ${latestPremium.toFixed(4)}%` : ''}
                                 </div>
                             </div>

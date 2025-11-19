@@ -593,22 +593,29 @@
             }
         }
 
+        function normalizeFundingRate(rate) {
+            if (rate === null || rate === undefined) return null;
+            if (typeof rate === 'number') {
+                return isFinite(rate) ? rate : null;
+            }
+            if (typeof rate === 'string') {
+                const trimmed = rate.trim();
+                if (!trimmed) return null;
+                const hasPercent = trimmed.endsWith('%');
+                const numericPart = hasPercent ? trimmed.slice(0, -1).trim() : trimmed;
+                const parsed = parseFloat(numericPart);
+                if (Number.isNaN(parsed)) return null;
+                return hasPercent ? parsed / 100 : parsed;
+            }
+            return null;
+        }
+        
         // 格式化资金费率 - 保持原始精度，避免科学计数法
         function formatFundingRate(rate) {
-            if (!rate || rate === 0 || rate === '0') return '-';
+            const decimalRate = normalizeFundingRate(rate);
+            if (decimalRate === null || decimalRate === 0) return '-';
             
-            // 处理字符串或数字类型的资金费率
-            let num;
-            if (typeof rate === 'string') {
-                // 如果后端传来高精度字符串，直接使用
-                num = parseFloat(rate);
-            } else {
-                num = rate;
-            }
-            
-            if (num === 0) return '-';
-            
-            const percentage = num * 100;
+            const percentage = decimalRate * 100;
             
             // 根据数值大小选择合适的小数位数，避免科学计数法
             if (Math.abs(percentage) >= 1) {
@@ -628,8 +635,9 @@
 
         // 获取资金费率样式类
         function getFundingRateClass(rate) {
-            if (!rate || rate === 0) return 'neutral';
-            return parseFloat(rate) > 0 ? 'positive' : 'negative';
+            const decimalRate = normalizeFundingRate(rate);
+            if (decimalRate === null || decimalRate === 0) return 'neutral';
+            return decimalRate > 0 ? 'positive' : 'negative';
         }
 
         // 统一解析后端时间戳

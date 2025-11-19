@@ -28,6 +28,7 @@ from market_info import get_exchange_symbols
 from dex.exchanges.grvt import GrvtMarketWebSocket
 from dex.exchanges.lighter import LighterMarketWebSocket
 from dex.exchanges.hyperliquid import HyperliquidMarketWebSocket
+from precision_utils import normalize_funding_rate
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -494,11 +495,9 @@ class ExchangeDataCollector:
 
                     # REST 视为权威数据来源，可覆盖旧的资金费率/结算时间
                     rest_funding = new_data.get('funding_rate')
-                    if rest_funding not in (None, ''):
-                        try:
-                            merged['funding_rate'] = float(rest_funding)
-                        except (TypeError, ValueError):
-                            pass
+                    normalized_funding = normalize_funding_rate(rest_funding)
+                    if normalized_funding is not None:
+                        merged['funding_rate'] = normalized_funding
 
                     rest_next_ft = new_data.get('next_funding_time')
                     if rest_next_ft:
@@ -556,11 +555,9 @@ class ExchangeDataCollector:
 
                         # REST 视为权威数据来源，可覆盖旧的资金费率/结算时间
                         rest_funding = new_data.get('funding_rate')
-                        if rest_funding not in (None, ''):
-                            try:
-                                merged['funding_rate'] = float(rest_funding)
-                            except (TypeError, ValueError):
-                                pass
+                        normalized_funding = normalize_funding_rate(rest_funding)
+                        if normalized_funding is not None:
+                            merged['funding_rate'] = normalized_funding
 
                         rest_next_ft = new_data.get('next_funding_time')
                         if rest_next_ft:
@@ -665,13 +662,16 @@ class ExchangeDataCollector:
                                             # 更新现有的合约数据，只修改资金费率部分
                                             if 'futures' not in self.data['okx'][symbol]:
                                                 self.data['okx'][symbol]['futures'] = {}
-                                            self.data['okx'][symbol]['futures'].update({
-                                                'funding_rate': float(item.get('fundingRate', 0)),
+                                            funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
+                                            updates = {
                                                 'next_funding_time': item.get('nextFundingTime', ''),
                                                 # 确保资金费率单独更新也刷新时间戳，便于前端展示“最新更新时间”
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                                            })
-                                            print(f"OKX {symbol} 资金费率: {item.get('fundingRate', 0)}")
+                                            }
+                                            if funding_rate_value is not None:
+                                                updates['funding_rate'] = funding_rate_value
+                                            self.data['okx'][symbol]['futures'].update(updates)
+                                            print(f"OKX {symbol} 资金费率: {funding_rate_value}")
                                 break
                     
                     # 处理 tickers 数据（现货和合约价格）
@@ -818,27 +818,33 @@ class ExchangeDataCollector:
                         symbol_name = stream_data['s']
                         for symbol in self.supported_symbols:
                             if symbol_name == f"{symbol}USDT":
-                                self.data['binance'][symbol]['futures'] = {
+                                funding_rate_value = normalize_funding_rate(stream_data.get('r'))
+                                futures_entry = {
                                     'price': float(stream_data['p']),
-                                    'funding_rate': float(stream_data['r']),
                                     'next_funding_time': stream_data.get('T', ''),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
-                                print(f"Binance {symbol} 合约价格: {stream_data['p']}, 资金费率: {stream_data['r']}")
+                                if funding_rate_value is not None:
+                                    futures_entry['funding_rate'] = funding_rate_value
+                                self.data['binance'][symbol]['futures'] = futures_entry
+                                print(f"Binance {symbol} 合约价格: {stream_data['p']}, 资金费率: {funding_rate_value}")
                                 break
                 elif 'r' in data:  # 单一流数据格式
                     symbol_name = data['s']
                     for symbol in self.supported_symbols:
                         if symbol_name == f"{symbol}USDT":
-                            self.data['binance'][symbol]['futures'] = {
+                            funding_rate_value = normalize_funding_rate(data.get('r'))
+                            futures_entry = {
                                 'price': float(data['p']),
-                                'funding_rate': float(data['r']),
                                 'next_funding_time': data.get('T', ''),
                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
                             }
-                            print(f"Binance {symbol} 合约价格: {data['p']}, 资金费率: {data['r']}")
+                            if funding_rate_value is not None:
+                                futures_entry['funding_rate'] = funding_rate_value
+                            self.data['binance'][symbol]['futures'] = futures_entry
+                            print(f"Binance {symbol} 合约价格: {data['p']}, 资金费率: {funding_rate_value}")
                             break
             except Exception as e:
                 print(f"Binance合约解析错误: {e}")
@@ -1001,36 +1007,31 @@ class ExchangeDataCollector:
                         bybit_futures = self.exchange_symbols.get('bybit', {}).get('futures', [])
                         if coin in bybit_futures:
                             self.data['bybit'].setdefault(coin, {'spot': {}, 'futures': {}, 'funding_rate': {}})
-                            funding_rate = item.get('fundingRate', 0)
-                            if funding_rate == '':
-                                funding_rate = 0
+                            raw_funding = item.get('fundingRate')
+                            funding_rate_value = normalize_funding_rate(raw_funding)
                             if 'lastPrice' in item:
                                 # 完整更新包括价格
-                                current_funding_rate = self.data['bybit'][coin]['futures'].get('funding_rate', 0) if self.data['bybit'][coin]['futures'] else 0
-                                final_funding_rate = current_funding_rate
-                                if 'fundingRate' in item:
-                                    try:
-                                        final_funding_rate = float(funding_rate) if funding_rate not in ('', 0) else current_funding_rate
-                                    except Exception:
-                                        final_funding_rate = current_funding_rate
-                                self.data['bybit'][coin]['futures'] = {
+                                current_funding_rate = None
+                                if self.data['bybit'][coin]['futures']:
+                                    current_funding_rate = self.data['bybit'][coin]['futures'].get('funding_rate')
+                                final_funding_rate = funding_rate_value if funding_rate_value is not None else current_funding_rate
+                                futures_snapshot = {
                                     'price': float(item.get('lastPrice', 0) or 0),
-                                    'funding_rate': final_funding_rate,
                                     'next_funding_time': item.get('nextFundingTime', ''),
                                     'volume': float(item.get('volume24h', 0) or 0),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
                                 }
+                                if final_funding_rate is not None:
+                                    futures_snapshot['funding_rate'] = final_funding_rate
+                                self.data['bybit'][coin]['futures'] = futures_snapshot
                                 print(f"Bybit {coin} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {self.data['bybit'][coin]['futures'].get('funding_rate', 0)} (源:{base})")
                             else:
                                 # 增量更新：只更新有提供的字段
                                 if self.data['bybit'][coin]['futures']:
                                     current_data = self.data['bybit'][coin]['futures'].copy()
-                                    if 'fundingRate' in item and funding_rate not in ('', 0):
-                                        try:
-                                            current_data['funding_rate'] = float(funding_rate)
-                                        except Exception:
-                                            pass
+                                    if funding_rate_value is not None:
+                                        current_data['funding_rate'] = funding_rate_value
                                     if 'nextFundingTime' in item:
                                         current_data['next_funding_time'] = item.get('nextFundingTime', '')
                                     if 'volume24h' in item:
@@ -1292,19 +1293,21 @@ class ExchangeDataCollector:
                                 if inst_id == f"{symbol}USDT":
                                     if inst_type == 'USDT-FUTURES':  # 期货合约
                                         price = float(item.get('lastPr', 0)) if item.get('lastPr') and str(item.get('lastPr')) != '0' else 0
-                                        funding_rate = float(item.get('fundingRate', 0)) if item.get('fundingRate') and str(item.get('fundingRate')) != '0' else 0
-                                        
+                                        funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
+
                                         if price > 0:  # 只在有有效价格时更新
-                                            self.data['bitget'][symbol]['futures'] = {
+                                            futures_snapshot = {
                                                 'price': price,
-                                                'funding_rate': funding_rate,
                                                 'next_funding_time': item.get('nextFundingTime', ''),
                                                 'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else 0,
                                                 'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else 0,
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
                                             }
-                                            print(f"Bitget {symbol} 合约价格: {price}, 资金费率: {funding_rate}")
+                                            if funding_rate_value is not None:
+                                                futures_snapshot['funding_rate'] = funding_rate_value
+                                            self.data['bitget'][symbol]['futures'] = futures_snapshot
+                                            print(f"Bitget {symbol} 合约价格: {price}, 资金费率: {funding_rate_value}")
                                     elif inst_type == 'SPOT':  # 现货
                                         price = float(item.get('lastPr', 0)) if item.get('lastPr') and str(item.get('lastPr')) != '0' else 0
                                         
@@ -1405,8 +1408,8 @@ class ExchangeDataCollector:
                 'symbol': payload.get('instrument', f"{symbol}USDT")
             }
 
-            funding_rate = payload.get('funding_rate')
-            if funding_rate not in (None, ''):
+            funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
+            if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
             next_ft = payload.get('next_funding_time')
             if next_ft:
@@ -1459,7 +1462,7 @@ class ExchangeDataCollector:
                 snapshot['index_price'] = payload['index_price']
             if payload.get('market_id') is not None:
                 snapshot['market_id'] = payload['market_id']
-            funding_rate = payload.get('funding_rate')
+            funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
             if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
             if payload.get('next_funding_time'):
