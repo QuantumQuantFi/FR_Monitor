@@ -567,30 +567,22 @@
         const mainstreamSymbols = ['BTC', 'ETH', 'BNB', 'XRP', 'ADA', 'DOGE', 'SOL', 'DOT', 'MATIC', 'AVAX', 'LTC', 'LINK', 'UNI', 'ATOM'];
         const watchlistSymbols = ['BTC', 'ETH', 'ARB', 'OP', 'GMX', 'ONDO', 'PENDLE', 'PYTH', 'TIA', 'SUI'];
 
-        // 格式化价格 - 避免科学计数法，保持原始精度
+        // 格式化价格 - 避免科学计数法，尽量保留原始精度
         function formatPrice(price) {
-            if (!price) return '-';
-            // 直接使用原始价格字符串，避免parseFloat造成的精度损失
-            const str = String(price);
-            const num = parseFloat(str);
-            
-            // 避免科学计数法，保持原始精度
-            if (num >= 1000) {
-                // 大于1000的价格，保留2位小数
-                return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            } else if (num >= 1) {
-                // 1-1000之间，最多显示8位小数，但移除末尾0
-                return parseFloat(num.toFixed(8)).toString();
-            } else if (num >= 0.001) {
-                // 0.001-1之间，最多显示8位小数，但移除末尾0
-                return parseFloat(num.toFixed(8)).toString();
-            } else if (num > 0) {
-                // 小于0.001的正数，保留足够精度避免科学计数法
-                const fixed = num.toFixed(12);
-                return parseFloat(fixed).toString();
-            } else {
-                return num.toString();
+            if (price === null || price === undefined || price === 0 || price === '0') return '-';
+            if (typeof price === 'string') {
+                const trimmed = price.trim();
+                if (trimmed && trimmed !== '0') return trimmed;
             }
+            const num = Number(price);
+            if (!Number.isFinite(num) || num === 0) return '-';
+            const absNum = Math.abs(num);
+            if (absNum >= 1000) {
+                return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            }
+            if (absNum >= 1) return num.toFixed(8);
+            if (absNum >= 0.001) return num.toFixed(8);
+            return num.toFixed(12);
         }
 
         function normalizeFundingRate(rate) {

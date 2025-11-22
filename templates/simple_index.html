@@ -367,6 +367,23 @@
             }
             return null;
         }
+
+        function formatPriceValue(price) {
+            if (price === null || price === undefined || price === 0 || price === '0') return '-';
+            if (typeof price === 'string') {
+                const trimmed = price.trim();
+                if (trimmed && trimmed !== '0') return trimmed;
+            }
+            const num = Number(price);
+            if (!Number.isFinite(num) || num === 0) return '-';
+            const absNum = Math.abs(num);
+            if (absNum >= 1000) {
+                return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            }
+            if (absNum >= 1) return num.toFixed(8);
+            if (absNum >= 0.001) return num.toFixed(8);
+            return num.toFixed(12);
+        }
         
         // 格式化资金费率显示 - 保持高精度，避免科学计数法
         function formatFundingRate(rate) {
@@ -405,16 +422,18 @@
                 const fundingRate = futures.funding_rate || 0;
                 const fundingSchedule = formatFundingSchedule(futures);
                 const premium = premiumData[exchange]?.premium_percent || 0;
+                const displaySpot = formatPriceValue(spotPrice);
+                const displayFutures = formatPriceValue(futuresPrice);
                 
                 card.innerHTML = `
                     <div class="exchange-name">${exchange.toUpperCase()}</div>
                     <div class="price-info">
                         <span class="price-label">现货价格:</span>
-                        <span class="price-value spot-price">$${spotPrice.toFixed(4)}</span>
+                        <span class="price-value spot-price">${displaySpot === '-' ? '-' : `$${displaySpot}`}</span>
                     </div>
                     <div class="price-info">
                         <span class="price-label">期货价格:</span>
-                        <span class="price-value futures-price">$${futuresPrice.toFixed(4)}</span>
+                        <span class="price-value futures-price">${displayFutures === '-' ? '-' : `$${displayFutures}`}</span>
                     </div>
                     <div class="price-info">
                         <span class="price-label">资金费率:</span>

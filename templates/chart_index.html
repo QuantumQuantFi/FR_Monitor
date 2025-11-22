@@ -701,14 +701,22 @@
 
         // 与增强页一致的工具函数
         function formatPrice(price) {
-            if (price === null || price === undefined || price === 0) return '-';
+            if (price === null || price === undefined || price === 0 || price === '0') return '-';
+            if (typeof price === 'string') {
+                const trimmed = price.trim();
+                if (trimmed && trimmed !== '0') {
+                    return trimmed;
+                }
+            }
             const num = Number(price);
-            if (Number.isNaN(num)) return '-';
-            if (num >= 1000) return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
-            if (num >= 1) return parseFloat(num.toFixed(8)).toString();
-            if (num >= 0.001) return parseFloat(num.toFixed(8)).toString();
-            if (num > 0) return parseFloat(num.toFixed(12)).toString();
-            return num.toString();
+            if (!Number.isFinite(num) || num === 0) return '-';
+            const absNum = Math.abs(num);
+            if (absNum >= 1000) {
+                return num.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+            }
+            if (absNum >= 1) return num.toFixed(8);
+            if (absNum >= 0.001) return num.toFixed(8);
+            return num.toFixed(12);
         }
         function normalizeFundingRate(rate) {
             if (rate === null || rate === undefined) return null;
@@ -1572,13 +1580,15 @@
                         const latestFunding = exchangeData.funding_rates[exchangeData.funding_rates.length - 1];
                         const normalizedFunding = normalizeFundingRate(latestFunding);
                         const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
+                        const displaySpot = formatPrice(latestSpot);
+                        const displayFutures = formatPrice(latestFutures);
                         
                         statsHtml += `
                             <div class="stat-card">
                                 <div class="stat-label">${exchange.toUpperCase()} 最新数据</div>
                                 <div class="stat-value" style="color: ${exchangeColors[exchange]}">
-                                    ${hasValidSpot ? `现货: $${latestSpot.toFixed(4)}<br>` : ''}
-                                    ${hasValidFutures ? `期货: $${latestFutures.toFixed(4)}<br>` : ''}
+                                    ${hasValidSpot && displaySpot !== '-' ? `现货: $${displaySpot}<br>` : ''}
+                                    ${hasValidFutures && displayFutures !== '-' ? `期货: $${displayFutures}<br>` : ''}
                                     ${hasValidFunding && normalizedFunding !== null ? `资金费率: ${(normalizedFunding * 100).toFixed(4)}%<br>` : ''}
                                     ${hasValidPremium ? `溢价: ${latestPremium.toFixed(4)}%` : ''}
                                 </div>

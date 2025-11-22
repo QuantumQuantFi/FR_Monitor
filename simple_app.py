@@ -154,13 +154,27 @@ configure_logging()
 
 # 自定义JSON编码器以保持数值精度，避免科学计数法
 class PrecisionJSONEncoder(json.JSONEncoder):
+    @staticmethod
+    def _format_fraction(value_str: str, minimum_fraction: int) -> str:
+        """Ensure fraction part keeps at least minimum_fraction digits."""
+        if '.' not in value_str:
+            return value_str
+        integer, fraction = value_str.split('.')
+        trimmed = fraction.rstrip('0')
+        if len(trimmed) < minimum_fraction:
+            trimmed = (fraction[:minimum_fraction]).ljust(minimum_fraction, '0')
+        return f"{integer}.{trimmed}"
+
     def _format_float(self, value: float):
         if value == 0:
             return 0
-        if abs(value) < 0.001:
-            return f"{value:.12f}".rstrip('0').rstrip('.')
-        if abs(value) < 1:
-            return f"{value:.8f}".rstrip('0').rstrip('.')
+        abs_value = abs(value)
+        if abs_value < 0.001:
+            formatted = f"{value:.12f}"
+            return self._format_fraction(formatted, 6)
+        if abs_value < 1:
+            formatted = f"{value:.8f}"
+            return self._format_fraction(formatted, 4)
         return value
 
     def _format_funding_value(self, value):
@@ -1345,7 +1359,7 @@ def get_chart_data(symbol):
             payload = dict(cached_entry['payload'])
             payload['from_cache'] = True
             payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
-            return jsonify(payload)
+            return precision_jsonify(payload)
         if last_error:
             return jsonify({'error': 'database temporarily unavailable', 'details': str(last_error)}), 503
         return jsonify({'error': 'no chart data available'}), 404
@@ -1406,7 +1420,7 @@ def get_chart_data(symbol):
             'timestamp': now_utc_iso()
         }
         _set_chart_cache_entry(cache_key, response_payload)
-        return jsonify(response_payload)
+        return precision_jsonify(response_payload)
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
