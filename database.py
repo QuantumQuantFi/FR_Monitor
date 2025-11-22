@@ -8,10 +8,27 @@ from precision_utils import funding_rate_to_float
 from funding_utils import normalize_next_funding_time
 
 class PriceDatabase:
+    DEFAULT_TIMEOUT = 30.0  # seconds
+    CLEANUP_BATCH_SIZE = 2000
+    LOW_TRAFFIC_UTC_HOURS = {1, 2, 3, 4, 5}
+
     def __init__(self, db_path='market_data.db'):
         self.db_path = db_path
         self.lock = threading.Lock()
+        self.connection_timeout = self.DEFAULT_TIMEOUT
+        self._wal_configured = False
         self.init_database()
+
+    def _get_connection(self):
+        conn = sqlite3.connect(self.db_path, timeout=self.connection_timeout)
+        if not self._wal_configured:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+                conn.execute("PRAGMA synchronous=NORMAL")
+                self._wal_configured = True
+            except sqlite3.DatabaseError:
+                pass
+        return conn
 
     def _ensure_column(self, cursor, table: str, column: str, definition: str):
         cursor.execute(f"PRAGMA table_info({table})")
@@ -21,7 +38,7 @@ class PriceDatabase:
     
     def init_database(self):
         """初始化数据库表结构"""
-        with sqlite3.connect(self.db_path) as conn:
+        with self._get_connection() as conn:
             cursor = conn.cursor()
             
             # 创建价格数据表 - 每秒精度
@@ -111,7 +128,7 @@ class PriceDatabase:
                 if premium_data and exchange in premium_data:
                     premium_percent = premium_data[exchange].get('premium_percent', 0.0)
                 
-                with sqlite3.connect(self.db_path) as conn:
+                with self._get_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute('''
                         INSERT INTO price_data 
@@ -129,10 +146,10 @@ class PriceDatabase:
         except Exception as e:
             print(f"数据库保存错误: {e}")
     
-    def get_historical_data(self, symbol, exchange=None, hours=24, interval='1min'):
+    def get_historical_data(self, symbol, exchange=None, hours=24, interval='1min', raise_on_error=False):
         """获取历史数据"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 
                 # 根据间隔选择表
@@ -176,12 +193,14 @@ class PriceDatabase:
                 
         except Exception as e:
             print(f"获取历史数据错误: {e}")
+            if raise_on_error:
+                raise
             return []
     
     def aggregate_to_1min(self):
         """聚合数据到1分钟精度"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 
                 # 获取最新的1分钟聚合时间戳
@@ -232,25 +251,44 @@ class PriceDatabase:
         except Exception as e:
             print(f"数据聚合错误: {e}")
     
-    def cleanup_old_data(self, days=7):
+    def _batched_delete(self, conn, table, threshold_expression, batch_size):
+        cursor = conn.cursor()
+        total_deleted = 0
+        while True:
+            cursor.execute(
+                f'''
+                DELETE FROM {table}
+                WHERE rowid IN (
+                    SELECT rowid FROM {table}
+                    WHERE timestamp < {threshold_expression}
+                    LIMIT ?
+                )
+                ''',
+                (batch_size,)
+            )
+            deleted = cursor.rowcount or 0
+            if deleted == 0:
+                break
+            total_deleted += deleted
+            conn.commit()
+        if total_deleted:
+            print(f"{table} 清理完成: 删除 {total_deleted} 条历史数据")
+        return total_deleted
+
+    def cleanup_old_data(self, days=7, force=False):
         """清理旧数据，保留指定天数"""
+        current_utc_hour = datetime.utcnow().hour
+        if not force and current_utc_hour not in self.LOW_TRAFFIC_UTC_HOURS:
+            print(f"跳过数据库清理: 当前UTC小时 {current_utc_hour} 不在低峰期 {sorted(self.LOW_TRAFFIC_UTC_HOURS)}")
+            return
+
         try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.cursor()
-                
-                # 清理原始数据（保留7天）
-                cursor.execute('''
-                    DELETE FROM price_data 
-                    WHERE timestamp < datetime('now', '-{} days')
-                '''.format(days))
-                
-                # 清理1分钟数据（保留30天）
-                cursor.execute('''
-                    DELETE FROM price_data_1min 
-                    WHERE timestamp < datetime('now', '-30 days')
-                ''')
-                
-                conn.commit()
+            with self._get_connection() as conn:
+                raw_threshold = f"datetime('now', '-{days} days')"
+                agg_threshold = "datetime('now', '-30 days')"
+
+                self._batched_delete(conn, 'price_data', raw_threshold, self.CLEANUP_BATCH_SIZE)
+                self._batched_delete(conn, 'price_data_1min', agg_threshold, self.CLEANUP_BATCH_SIZE)
                 
         except Exception as e:
             print(f"数据清理错误: {e}")
@@ -258,7 +296,7 @@ class PriceDatabase:
     def get_latest_prices(self, symbol):
         """获取最新价格数据"""
         try:
-            with sqlite3.connect(self.db_path) as conn:
+            with self._get_connection() as conn:
                 cursor = conn.cursor()
                 cursor.execute('''
                     SELECT exchange, spot_price, futures_price, funding_rate, funding_interval_hours,

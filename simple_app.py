@@ -3,6 +3,7 @@ import json
 import threading
 import time
 import gc
+import sqlite3
 import logging
 from logging.handlers import RotatingFileHandler
 import psutil
@@ -61,6 +62,33 @@ CHART_INTERVAL_MINUTES = {
 }
 DEFAULT_CHART_INTERVAL = '5min'
 CHART_INTERVAL_LABEL_MAP = {value: label for value, label in CHART_INTERVAL_OPTIONS}
+CHART_CACHE_TTL_SECONDS = 60
+CHART_CACHE_MAX_ENTRIES = 64
+_chart_cache = {}
+_chart_cache_lock = threading.Lock()
+
+
+def _get_chart_cache_entry(cache_key):
+    """Fetch cached chart payload if it is still fresh."""
+    now = time.time()
+    with _chart_cache_lock:
+        entry = _chart_cache.get(cache_key)
+        if not entry:
+            return None
+        if now - entry['timestamp'] > CHART_CACHE_TTL_SECONDS:
+            _chart_cache.pop(cache_key, None)
+            return None
+        return {'timestamp': entry['timestamp'], 'payload': entry['payload']}
+
+
+def _set_chart_cache_entry(cache_key, payload):
+    """Store chart payload with eviction of the oldest item if needed."""
+    now = time.time()
+    with _chart_cache_lock:
+        if len(_chart_cache) >= CHART_CACHE_MAX_ENTRIES:
+            oldest_key = min(_chart_cache.items(), key=lambda item: item[1]['timestamp'])[0]
+            _chart_cache.pop(oldest_key, None)
+        _chart_cache[cache_key] = {'timestamp': now, 'payload': payload}
 
 
 def configure_logging() -> None:
@@ -1289,11 +1317,40 @@ def get_chart_data(symbol):
     
     db_interval = '1min' if interval in CHART_INTERVAL_MINUTES else interval
     
-    try:
-        raw_data = db.get_historical_data(symbol, exchange, hours, db_interval)
-        if interval in CHART_INTERVAL_MINUTES and interval != '1min':
-            raw_data = resample_price_rows(raw_data, interval)
+    cache_key = (symbol, exchange or '', interval, hours)
+    cached_entry = _get_chart_cache_entry(cache_key)
+    raw_data = None
+    last_error = None
+    retry_attempts = 3
+    backoff_seconds = 0.4
+    
+    for attempt in range(retry_attempts):
+        try:
+            raw_data = db.get_historical_data(symbol, exchange, hours, db_interval, raise_on_error=True)
+            if interval in CHART_INTERVAL_MINUTES and interval != '1min':
+                raw_data = resample_price_rows(raw_data, interval)
+            break
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if 'locked' in str(exc).lower():
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
 
+    if raw_data is None:
+        if cached_entry:
+            payload = dict(cached_entry['payload'])
+            payload['from_cache'] = True
+            payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
+            return jsonify(payload)
+        if last_error:
+            return jsonify({'error': 'database temporarily unavailable', 'details': str(last_error)}), 503
+        return jsonify({'error': 'no chart data available'}), 404
+
+    try:
         def to_utc_iso(ts: str) -> str:
             """Ensure timestamp string is UTC ISO8601.
             If no timezone offset is present, treat as UTC and append 'Z'.
@@ -1341,13 +1398,15 @@ def get_chart_data(symbol):
             chart_data[exchange_name]['funding_rates'].append(funding_value or 0)
             chart_data[exchange_name]['premiums'].append(premium_value or 0)
         
-        return jsonify({
+        response_payload = {
             'symbol': symbol,
             'hours': hours,
             'interval': interval,
             'chart_data': chart_data,
             'timestamp': now_utc_iso()
-        })
+        }
+        _set_chart_cache_entry(cache_key, response_payload)
+        return jsonify(response_payload)
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -1535,7 +1594,7 @@ def manual_maintenance():
         db.aggregate_to_1min()
         
         # 数据清理
-        db.cleanup_old_data()
+        db.cleanup_old_data(force=True)
         
         print("手动数据库维护完成")
         
