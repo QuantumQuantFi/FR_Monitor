@@ -126,6 +126,26 @@
             box-shadow: 0 4px 20px rgba(0,0,0,0.3);
             border: 1px solid #3c4043;
         }
+        .chart-title-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+        .chart-helper-text {
+            margin-top: 10px;
+            font-size: 12px;
+            color: #8e9297;
+            line-height: 1.5;
+        }
+        .chart-inline-control {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            color: #8e9297;
+        }
         /* 单币种信息卡片（与增强页一致风格） */
         .symbol-card {
             background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
@@ -576,6 +596,23 @@
             <canvas id="combinedPriceChart"></canvas>
         </div>
     </div>
+
+    <div class="chart-container">
+        <div class="chart-title-row">
+            <div class="chart-title">价差参考对比</div>
+            <div class="chart-inline-control">
+                <span class="control-label">参考系列</span>
+                <select id="relativeReferenceSelect" class="time-selector">
+                    <option value="">加载中...</option>
+                </select>
+            </div>
+        </div>
+        <div class="chart-helper-text">该图会复制合并图的所有系列，可选择任意系列作为基准，其他曲线实时展示与基准价格的差值。</div>
+        <div class="chart-wrapper">
+            <canvas id="relativeComparisonChart"></canvas>
+        </div>
+        <div class="chart-helper-text">提示：与图例联动显示/隐藏，差值轴以参考系列为零点，便于观察各交易所的价差波动。</div>
+    </div>
     
     <div class="chart-container">
         <div class="chart-title">资金费率走势</div>
@@ -606,6 +643,12 @@
         ];
         const intervalLabelMap = {{ chart_interval_label_map|tojson }};
         const DEFAULT_INTERVAL = "{{ default_chart_interval }}";
+        let relativeComparisonSources = [];
+        let relativeReferenceKey = null;
+        const chartVisibilityStore = {};
+        const defaultLegendClickHandler = (typeof Chart !== 'undefined' && Chart.defaults && Chart.defaults.plugins && Chart.defaults.plugins.legend)
+            ? Chart.defaults.plugins.legend.onClick
+            : null;
 
         const tradeState = {
             options: {},
@@ -785,6 +828,19 @@
             return formatPercentageNumber(base) + '%';
         }
 
+        function formatRelativePercent(value) {
+            if (!Number.isFinite(value)) return '-';
+            return formatPercentageNumber(value * 100) + '%';
+        }
+
+        function formatAxisRelativePercent(value) {
+            if (!Number.isFinite(value)) return '-';
+            const percent = value * 100;
+            const formatted = formatPercentageNumber(percent);
+            const sign = percent > 0 ? '+' : '';
+            return `${sign}${formatted}%`;
+        }
+
         function coerceNumeric(value) {
             if (typeof value === 'number') {
                 return Number.isFinite(value) ? value : null;
@@ -823,6 +879,161 @@
             }).filter(point => point.x && point.y !== null);
         }
 
+        function getPointTimestamp(point) {
+            if (!point) return null;
+            if (point.x instanceof Date) return point.x.getTime();
+            const parsed = parseTimestamp(point.x);
+            return parsed ? parsed.getTime() : null;
+        }
+
+        function buildReferenceLookup(referenceSource) {
+            const lookup = new Map();
+            if (!referenceSource || !Array.isArray(referenceSource.data)) {
+                return lookup;
+            }
+            referenceSource.data.forEach(point => {
+                const ts = getPointTimestamp(point);
+                if (ts === null) return;
+                const value = typeof point.y === 'number' ? point.y : coerceNumeric(point.y);
+                if (!Number.isFinite(value)) return;
+                lookup.set(ts, {
+                    value,
+                    rawValue: point.rawValue !== undefined ? point.rawValue : value
+                });
+            });
+            return lookup;
+        }
+
+        function buildRelativeDataset(source, referenceSource, referenceLookup) {
+            const baseData = Array.isArray(source.data) ? source.data : [];
+            const isReference = source.key === referenceSource.key;
+            const data = baseData.map(point => {
+                const ts = getPointTimestamp(point);
+                if (ts === null) return null;
+                const refEntry = referenceLookup.get(ts);
+                if (!refEntry) return null;
+                const value = typeof point.y === 'number' ? point.y : coerceNumeric(point.y);
+                if (!Number.isFinite(value) || !Number.isFinite(refEntry.value)) return null;
+                const priceDiff = value - refEntry.value;
+                const relativeDiff = isReference ? 0 : (refEntry.value !== 0 ? priceDiff / refEntry.value : 0);
+                return {
+                    x: point.x,
+                    y: relativeDiff,
+                    rawValue: relativeDiff,
+                    priceDiff,
+                    originalValue: value,
+                    referenceValue: refEntry.value,
+                    originalRawValue: point.rawValue !== undefined ? point.rawValue : value,
+                    referenceRawValue: refEntry.rawValue !== undefined ? refEntry.rawValue : refEntry.value,
+                    referenceLabel: referenceSource.label
+                };
+            }).filter(Boolean);
+            return {
+                label: isReference ? `${source.label}（参考）` : `${source.label} 相对%`,
+                data,
+                borderColor: source.color,
+                backgroundColor: (source.color || '#ffffff') + '20',
+                borderDash: isReference ? [4, 4] : source.borderDash || undefined,
+                fill: false,
+                relativeKey: source.key,
+                referenceKey: referenceSource.key,
+                metaKey: source.key
+            };
+        }
+
+        function getDatasetKey(dataset, index) {
+            if (!dataset) return index !== undefined ? `idx_${index}` : null;
+            return dataset.metaKey || dataset.label || dataset.id || (index !== undefined ? `idx_${index}` : null);
+        }
+
+        function getStoredDatasetHidden(chartKey, datasetKey) {
+            if (!chartKey || !datasetKey) return null;
+            const store = chartVisibilityStore[chartKey];
+            if (!store) return null;
+            return store.hasOwnProperty(datasetKey) ? store[datasetKey] : null;
+        }
+
+        function applyStoredVisibility(chartKey, dataset, index) {
+            const key = getDatasetKey(dataset, index);
+            const hidden = getStoredDatasetHidden(chartKey, key);
+            if (hidden === null) return;
+            dataset.hidden = hidden ? true : false;
+        }
+
+        function rememberChartVisibility(chartKey) {
+            if (!chartKey || !charts[chartKey]) return;
+            const chart = charts[chartKey];
+            const store = chartVisibilityStore[chartKey] || {};
+            chart.data.datasets.forEach((dataset, index) => {
+                const key = getDatasetKey(dataset, index);
+                if (!key) return;
+                const meta = chart.getDatasetMeta(index);
+                const hidden = meta ? meta.hidden === true : dataset.hidden === true;
+                store[key] = hidden;
+            });
+            chartVisibilityStore[chartKey] = store;
+        }
+
+        function updateRelativeReferenceSelect() {
+            const select = document.getElementById('relativeReferenceSelect');
+            if (!select) return;
+            select.innerHTML = '';
+            if (!relativeComparisonSources.length) {
+                const option = document.createElement('option');
+                option.value = '';
+                option.textContent = '暂无可用系列';
+                select.appendChild(option);
+                select.disabled = true;
+                relativeReferenceKey = null;
+                return;
+            }
+            select.disabled = false;
+            relativeComparisonSources.forEach(source => {
+                const option = document.createElement('option');
+                option.value = source.key;
+                option.textContent = source.label;
+                select.appendChild(option);
+            });
+            if (!relativeReferenceKey || !relativeComparisonSources.some(s => s.key === relativeReferenceKey)) {
+                relativeReferenceKey = relativeComparisonSources[0].key;
+            }
+            select.value = relativeReferenceKey;
+        }
+
+        function refreshRelativeComparisonChart() {
+            if (!charts.relative) return;
+            rememberChartVisibility('relative');
+            if (!relativeComparisonSources.length || !relativeReferenceKey) {
+                charts.relative.data.datasets = [];
+                charts.relative.update('none');
+                rememberChartVisibility('relative');
+                return;
+            }
+            const reference = relativeComparisonSources.find(s => s.key === relativeReferenceKey) || relativeComparisonSources[0];
+            if (!reference) {
+                charts.relative.data.datasets = [];
+                charts.relative.update('none');
+                rememberChartVisibility('relative');
+                return;
+            }
+            const referenceLookup = buildReferenceLookup(reference);
+            const datasets = relativeComparisonSources.map(source => 
+                buildRelativeDataset(source, reference, referenceLookup)
+            ).filter(dataset => dataset.data.length > 0).map((dataset, index) => {
+                applyStoredVisibility('relative', dataset, index);
+                return dataset;
+            });
+            charts.relative.data.datasets = datasets;
+            charts.relative.update('none');
+            rememberChartVisibility('relative');
+        }
+
+        function setRelativeComparisonSources(sources) {
+            relativeComparisonSources = Array.isArray(sources) ? sources : [];
+            updateRelativeReferenceSelect();
+            refreshRelativeComparisonChart();
+        }
+
         function formatTooltipValue(type, rawValue, fallbackNumeric) {
             if (type === 'funding') {
                 const normalized = normalizeFundingRate(rawValue);
@@ -846,6 +1057,35 @@
             const formatted = formatPrice(rawValue !== undefined ? rawValue : fallbackNumeric);
             return formatted === '-' ? '-' : `$${formatted}`;
         }
+
+        function formatSignedPriceDiff(value) {
+            if (!Number.isFinite(value)) return '-';
+            const absValue = Math.abs(value);
+            const formatted = formatAxisPrice(absValue);
+            if (formatted === '-') return '-';
+            const sign = value > 0 ? '+' : value < 0 ? '-' : '';
+            return `${sign}$${formatted}`;
+        }
+
+        function formatRelativeTooltip(context) {
+            const datasetLabel = context.dataset.label || '';
+            const delta = context.parsed ? context.parsed.y : undefined;
+            const displayDelta = Number.isFinite(delta) ? formatAxisRelativePercent(delta) : '-';
+            const lines = [datasetLabel ? `${datasetLabel}: ${displayDelta}` : displayDelta];
+            const priceDiff = context.raw && Number.isFinite(context.raw.priceDiff) ? context.raw.priceDiff : null;
+            const original = context.raw && Number.isFinite(context.raw.originalValue) ? context.raw.originalValue : null;
+            const referenceValue = context.raw && Number.isFinite(context.raw.referenceValue) ? context.raw.referenceValue : null;
+            if (priceDiff !== null) {
+                lines.push(`价差: ${formatSignedPriceDiff(priceDiff)}`);
+            }
+            if (original !== null && referenceValue !== null) {
+                lines.push(`实际: $${formatPrice(original)} | 参考: $${formatPrice(referenceValue)}`);
+            } else if (original !== null) {
+                lines.push(`实际: $${formatPrice(original)}`);
+            }
+            return lines;
+        }
+
         function formatFundingDistanceForPoint(nextFundingTime, baseTime) {
             if (!nextFundingTime || !baseTime) return null;
             const target = parseTimestamp(nextFundingTime);
@@ -1577,7 +1817,7 @@
         Chart.register(fundingMarkerPlugin);
         
         // 通用图表配置
-        function getChartConfig(type, datasets) {
+        function getChartConfig(type, datasets, chartKey) {
             return {
                 type: 'line',
                 data: {
@@ -1590,6 +1830,9 @@
                         tooltip: {
                             callbacks: {
                                 label: function(context) {
+                                    if (type === 'relative') {
+                                        return formatRelativeTooltip(context);
+                                    }
                                     const datasetLabel = context.dataset.label || '';
                                     const rawValue = context.raw ? context.raw.rawValue : undefined;
                                     const fallbackNumeric = context.parsed ? context.parsed.y : undefined;
@@ -1635,6 +1878,17 @@
                             labels: {
                                 usePointStyle: true,
                                 color: '#ffffff'
+                            },
+                            onClick: function(event, legendItem, legend) {
+                                if (typeof defaultLegendClickHandler === 'function') {
+                                    defaultLegendClickHandler.call(this, event, legendItem, legend);
+                                } else {
+                                    const ci = legend.chart;
+                                    const index = legendItem.datasetIndex;
+                                    const visible = ci.isDatasetVisible(index);
+                                    ci.setDatasetVisibility(index, !visible);
+                                }
+                                rememberChartVisibility(chartKey);
                             }
                         }
                         ,
@@ -1666,6 +1920,9 @@
                             ticks: {
                                 color: '#8e9297',
                                 callback: function(value) {
+                                    if (type === 'relative') {
+                                        return formatAxisRelativePercent(value);
+                                    }
                                     if (type === 'funding') {
                                         return formatAxisPercentage(value, true);
                                     }
@@ -1701,14 +1958,16 @@
             const ctxSpot = document.getElementById('spotPriceChart').getContext('2d');
             const ctxFutures = document.getElementById('futuresPriceChart').getContext('2d');
             const ctxCombined = document.getElementById('combinedPriceChart').getContext('2d');
+            const ctxRelative = document.getElementById('relativeComparisonChart').getContext('2d');
             const ctxFunding = document.getElementById('fundingRateChart').getContext('2d');
             const ctxPremium = document.getElementById('premiumChart').getContext('2d');
             
-            charts.spot = new Chart(ctxSpot, getChartConfig('price', []));
-            charts.futures = new Chart(ctxFutures, getChartConfig('price', []));
-            charts.combined = new Chart(ctxCombined, getChartConfig('price', []));
-            charts.funding = new Chart(ctxFunding, getChartConfig('funding', []));
-            charts.premium = new Chart(ctxPremium, getChartConfig('premium', []));
+            charts.spot = new Chart(ctxSpot, getChartConfig('price', [], 'spot'));
+            charts.futures = new Chart(ctxFutures, getChartConfig('price', [], 'futures'));
+            charts.combined = new Chart(ctxCombined, getChartConfig('price', [], 'combined'));
+            charts.relative = new Chart(ctxRelative, getChartConfig('relative', [], 'relative'));
+            charts.funding = new Chart(ctxFunding, getChartConfig('funding', [], 'funding'));
+            charts.premium = new Chart(ctxPremium, getChartConfig('premium', [], 'premium'));
         }
         
         // 更新图表数据
@@ -1780,19 +2039,24 @@
                 }
             });
             const chartTimeRange = getChartTimeRange(filteredChartData);
+            ['spot','futures','combined','relative','funding','premium'].forEach(rememberChartVisibility);
             
             // 现货价格图表 - 过滤掉无效数据
             const spotDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].spot_prices)
             ).map(exchange => {
                 const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].spot_prices);
-                return {
+                const datasetKey = `${exchange}_spot_chart`;
+                const dataset = {
                     label: exchange.toUpperCase() + ' 现货',
                     data: points,
                     borderColor: exchangeColors[exchange] || '#ffffff',
                     backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                    fill: false
+                    fill: false,
+                    metaKey: datasetKey
                 };
+                applyStoredVisibility('spot', dataset);
+                return dataset;
             });
             
             // 期货价格图表 - 过滤掉无效数据
@@ -1800,38 +2064,67 @@
                 chartData[exchange] && isValidDataset(chartData[exchange].futures_prices)
             ).map(exchange => {
                 const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].futures_prices);
-                return {
+                const datasetKey = `${exchange}_futures_chart`;
+                const dataset = {
                     label: exchange.toUpperCase() + ' 期货',
                     data: points,
                     borderColor: exchangeColors[exchange] || '#ffffff',
                     backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                    fill: false
+                    fill: false,
+                    metaKey: datasetKey
                 };
+                applyStoredVisibility('futures', dataset);
+                return dataset;
             });
             
             // 合并价格图表（现货+期货）
             const combinedDatasets = [];
+            const relativeSourceDatasets = [];
             exchanges.forEach(exchange => {
                 const dataObj = chartData[exchange];
                 if (!dataObj) return;
                 if (isValidDataset(dataObj.spot_prices)) {
-                    combinedDatasets.push({
+                    const datasetKey = `${exchange}_spot`;
+                    const datasetColor = exchangeColors[exchange] || '#ffffff';
+                    const dataset = {
                         label: exchange.toUpperCase() + ' 现货',
                         data: buildChartPoints(dataObj.labels, dataObj.spot_prices),
-                        borderColor: exchangeColors[exchange] || '#ffffff',
-                        backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                        fill: false
-                    });
+                        borderColor: datasetColor,
+                        backgroundColor: datasetColor + '20',
+                        fill: false,
+                        metaKey: datasetKey
+                    };
+                    combinedDatasets.push(dataset);
+                    const relativeSource = {
+                        key: datasetKey,
+                        label: dataset.label,
+                        data: dataset.data,
+                        color: datasetColor
+                    };
+                    relativeSourceDatasets.push(relativeSource);
                 }
                 if (isValidDataset(dataObj.futures_prices)) {
-                    combinedDatasets.push({
+                    const datasetKey = `${exchange}_futures`;
+                    const datasetColor = exchangeColors[exchange] || '#ffffff';
+                    const dataset = {
                         label: exchange.toUpperCase() + ' 期货',
                         data: buildChartPoints(dataObj.labels, dataObj.futures_prices),
-                        borderColor: exchangeColors[exchange] || '#ffffff',
-                        backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                        borderColor: datasetColor,
+                        backgroundColor: datasetColor + '20',
                         borderDash: [6, 3],
-                        fill: false
-                    });
+                        fill: false,
+                        metaKey: datasetKey
+                    };
+                    applyStoredVisibility('combined', dataset);
+                    combinedDatasets.push(dataset);
+                    const relativeSource = {
+                        key: datasetKey,
+                        label: dataset.label,
+                        data: dataset.data,
+                        color: datasetColor,
+                        borderDash: [6, 3]
+                    };
+                    relativeSourceDatasets.push(relativeSource);
                 }
             });
             
@@ -1847,14 +2140,17 @@
                         fundingIntervalHours: chartData[exchange].funding_intervals
                     }
                 );
-                return {
+                const dataset = {
                     label: exchange.toUpperCase() + ' 资金费率',
                     data: points,
                     borderColor: exchangeColors[exchange] || '#ffffff',
                     backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                     fill: false,
-                    fundingMarkers: buildFundingMarkersForExchange(exchange, chartData[exchange], chartTimeRange)
+                    fundingMarkers: buildFundingMarkersForExchange(exchange, chartData[exchange], chartTimeRange),
+                    metaKey: `${exchange}_funding`
                 };
+                applyStoredVisibility('funding', dataset);
+                return dataset;
             });
             
             // 溢价指数图表 - 过滤掉无效数据
@@ -1862,26 +2158,34 @@
                 chartData[exchange] && isValidDataset(chartData[exchange].premiums)
             ).map(exchange => {
                 const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].premiums);
-                return {
+                const dataset = {
                     label: exchange.toUpperCase() + ' 溢价',
                     data: points,
                     borderColor: exchangeColors[exchange] || '#ffffff',
                     backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                    fill: false
+                    fill: false,
+                    metaKey: `${exchange}_premium`
                 };
+                applyStoredVisibility('premium', dataset);
+                return dataset;
             });
             
             // 更新图表
             charts.spot.data.datasets = spotDatasets;
             charts.futures.data.datasets = futuresDatasets;
             charts.combined.data.datasets = combinedDatasets;
+            setRelativeComparisonSources(relativeSourceDatasets);
             charts.funding.data.datasets = fundingDatasets;
             const aggregatedMarkers = collectAllFundingMarkers(fundingDatasets);
             updateFundingAxisRange(charts.funding, aggregatedMarkers);
             charts.premium.data.datasets = premiumDatasets;
             
             // 刷新图表
-            Object.values(charts).forEach(chart => chart.update('none'));
+            Object.entries(charts).forEach(([key, chart]) => {
+                if (!chart) return;
+                chart.update('none');
+                rememberChartVisibility(key);
+            });
         }
         
         // 更新统计信息
@@ -1968,7 +2272,9 @@
         // 重置缩放
         function resetZoom() {
             Object.values(charts).forEach(chart => {
-                chart.resetZoom();
+                if (chart && typeof chart.resetZoom === 'function') {
+                    chart.resetZoom();
+                }
             });
         }
         
@@ -1977,6 +2283,13 @@
             initCharts();
             updateChartData();
             initTradePanel();
+            const relativeSelect = document.getElementById('relativeReferenceSelect');
+            if (relativeSelect) {
+                relativeSelect.addEventListener('change', (e) => {
+                    relativeReferenceKey = e.target.value || null;
+                    refreshRelativeComparisonChart();
+                });
+            }
             const input = document.getElementById('symbolSearch');
             input.addEventListener('input', (e) => filterButtons(e.target.value));
             input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goSearch(); });
