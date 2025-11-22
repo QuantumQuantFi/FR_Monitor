@@ -324,6 +324,8 @@ def resample_price_rows(rows, interval):
                 'premium_weighted_sum': _safe_number(row.get('premium_percent_avg')) * data_points,
                 'volume_weighted_sum': _safe_number(row.get('volume_24h_avg')) * data_points,
                 'total_points': data_points,
+                'funding_interval_hours': row.get('funding_interval_hours'),
+                'next_funding_time': row.get('next_funding_time'),
             }
             buckets[key] = entry
         else:
@@ -351,6 +353,8 @@ def resample_price_rows(rows, interval):
                 entry['last_ts'] = ts
                 entry['spot_price_close'] = _safe_number(row.get('spot_price_close'))
                 entry['futures_price_close'] = _safe_number(row.get('futures_price_close'))
+                entry['funding_interval_hours'] = row.get('funding_interval_hours')
+                entry['next_funding_time'] = row.get('next_funding_time')
 
     result = []
     for entry in buckets.values():
@@ -373,6 +377,8 @@ def resample_price_rows(rows, interval):
             'premium_percent_avg': entry['premium_weighted_sum'] / total_points if total_points else 0.0,
             'volume_24h_avg': entry['volume_weighted_sum'] / total_points if total_points else 0.0,
             'data_points': total_points,
+            'funding_interval_hours': entry.get('funding_interval_hours'),
+            'next_funding_time': entry.get('next_funding_time'),
             '_timestamp_dt': timestamp_dt,
         })
     result.sort(key=lambda item: item['_timestamp_dt'], reverse=True)
@@ -1386,7 +1392,9 @@ def get_chart_data(symbol):
                     'spot_prices': [],
                     'futures_prices': [],
                     'funding_rates': [],
-                    'premiums': []
+                    'premiums': [],
+                    'funding_intervals': [],
+                    'next_funding_times': []
                 }
             
             # 使用时间戳作为标签
@@ -1411,6 +1419,8 @@ def get_chart_data(symbol):
             chart_data[exchange_name]['futures_prices'].append(futures_close or 0)
             chart_data[exchange_name]['funding_rates'].append(funding_value or 0)
             chart_data[exchange_name]['premiums'].append(premium_value or 0)
+            chart_data[exchange_name]['funding_intervals'].append(row.get('funding_interval_hours'))
+            chart_data[exchange_name]['next_funding_times'].append(row.get('next_funding_time'))
         
         response_payload = {
             'symbol': symbol,

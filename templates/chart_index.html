@@ -798,17 +798,28 @@
             return null;
         }
 
-        function buildChartPoints(labels, values) {
+        function buildChartPoints(labels, values, extraFields) {
             const safeLabels = Array.isArray(labels) ? labels : [];
             const safeValues = Array.isArray(values) ? values : [];
+            const extras = (extraFields && typeof extraFields === 'object') ? extraFields : null;
             return safeLabels.map((label, index) => {
                 const rawValue = safeValues[index];
                 const numeric = coerceNumeric(rawValue);
-                return {
+                const point = {
                     x: parseTimestamp(label),
                     y: numeric,
                     rawValue
                 };
+                if (extras) {
+                    Object.entries(extras).forEach(([field, fieldValues]) => {
+                        if (!Array.isArray(fieldValues)) return;
+                        const extraValue = fieldValues[index];
+                        if (extraValue !== undefined) {
+                            point[field] = extraValue;
+                        }
+                    });
+                }
+                return point;
             }).filter(point => point.x && point.y !== null);
         }
 
@@ -834,6 +845,118 @@
             }
             const formatted = formatPrice(rawValue !== undefined ? rawValue : fallbackNumeric);
             return formatted === '-' ? '-' : `$${formatted}`;
+        }
+        function formatFundingDistanceForPoint(nextFundingTime, baseTime) {
+            if (!nextFundingTime || !baseTime) return null;
+            const target = parseTimestamp(nextFundingTime);
+            const base = baseTime instanceof Date ? baseTime : parseTimestamp(baseTime);
+            if (!target || !base) return null;
+            const diffMs = target.getTime() - base.getTime();
+            const absMinutes = Math.floor(Math.abs(diffMs) / 60000);
+            const hours = Math.floor(absMinutes / 60);
+            const minutes = absMinutes % 60;
+            const parts = [];
+            if (hours > 0) parts.push(`${hours}小时`);
+            if (minutes > 0 || parts.length === 0) parts.push(`${minutes}分钟`);
+            const label = parts.join('');
+            if (!label) return null;
+            return {
+                label,
+                direction: diffMs >= 0 ? 'future' : 'past'
+            };
+        }
+        function getChartTimeRange(chartData) {
+            let minTs = null;
+            let maxTs = null;
+            if (!chartData) return { min: null, max: null };
+            Object.values(chartData).forEach((dataObj) => {
+                const labels = Array.isArray(dataObj.labels) ? dataObj.labels : [];
+                labels.forEach((label) => {
+                    const parsed = parseTimestamp(label);
+                    if (!parsed) return;
+                    if (!minTs || parsed < minTs) minTs = parsed;
+                    if (!maxTs || parsed > maxTs) maxTs = parsed;
+                });
+            });
+            return { min: minTs, max: maxTs };
+        }
+        function buildFundingMarkersForExchange(exchange, dataObj, timeRange) {
+            const markers = [];
+            if (!dataObj) return markers;
+            const nextTimes = Array.isArray(dataObj.next_funding_times) ? dataObj.next_funding_times : [];
+            if (nextTimes.length === 0) return markers;
+            const { min, max } = timeRange || {};
+            const minMs = min ? min.getTime() - 10 * 60 * 1000 : null;
+            const maxMs = max ? max.getTime() + 10 * 60 * 1000 : null;
+            const seen = new Set();
+            nextTimes.forEach((value) => {
+                const parsed = parseTimestamp(value);
+                if (!parsed) return;
+                const tsMs = parsed.getTime();
+                if (minMs !== null && tsMs < minMs) return;
+                if (maxMs !== null && tsMs > maxMs) return;
+                const key = `${exchange}-${tsMs}`;
+                if (seen.has(key)) return;
+                seen.add(key);
+                markers.push({
+                    exchange,
+                    timestamp: parsed,
+                    label: `${exchange.toUpperCase()} 结算`,
+                    color: exchangeColors[exchange] || '#b3b3b3'
+                });
+            });
+            return markers;
+        }
+        function getLatestTimestampFromDatasets(datasets) {
+            let latest = null;
+            if (!Array.isArray(datasets)) return latest;
+            datasets.forEach((dataset) => {
+                const dataPoints = Array.isArray(dataset.data) ? dataset.data : [];
+                dataPoints.forEach((point) => {
+                    if (!point) return;
+                    const ts = point.x instanceof Date ? point.x : parseTimestamp(point.x);
+                    if (!ts) return;
+                    if (!latest || ts > latest) {
+                        latest = ts;
+                    }
+                });
+            });
+            return latest;
+        }
+        function collectAllFundingMarkers(datasets) {
+            const markers = [];
+            if (!Array.isArray(datasets)) return markers;
+            datasets.forEach(dataset => {
+                if (Array.isArray(dataset.fundingMarkers)) {
+                    dataset.fundingMarkers.forEach(marker => markers.push(marker));
+                }
+            });
+            return markers;
+        }
+        function updateFundingAxisRange(chartInstance, markers) {
+            if (!chartInstance) return;
+            const latestDataTs = getLatestTimestampFromDatasets(chartInstance.data.datasets);
+            let latestMarkerTs = null;
+            if (Array.isArray(markers) && markers.length > 0) {
+                markers.forEach(marker => {
+                    const ts = marker.timestamp instanceof Date ? marker.timestamp : parseTimestamp(marker.timestamp);
+                    if (!ts) return;
+                    if (!latestMarkerTs || ts > latestMarkerTs) {
+                        latestMarkerTs = ts;
+                    }
+                });
+            }
+            const candidate = (() => {
+                if (latestDataTs && latestMarkerTs) {
+                    return latestDataTs.getTime() >= latestMarkerTs.getTime() ? latestDataTs : latestMarkerTs;
+                }
+                return latestDataTs || latestMarkerTs;
+            })();
+            if (candidate) {
+                chartInstance.options.scales.x.suggestedMax = candidate;
+            } else {
+                delete chartInstance.options.scales.x.suggestedMax;
+            }
         }
         function getFundingRateClass(rate) {
             const decimalRate = normalizeFundingRate(rate);
@@ -1387,6 +1510,71 @@
         Chart.defaults.color = '#ffffff';
         Chart.defaults.backgroundColor = '#2b2f36';
         Chart.defaults.borderColor = '#3c4043';
+
+        const fundingMarkerPlugin = {
+            id: 'fundingMarkerPlugin',
+            afterDatasetsDraw(chart, args, opts) {
+                const options = opts || {};
+                if (!options.enabled) return;
+                const xScale = chart.scales.x;
+                if (!xScale) return;
+                const { ctx, chartArea } = chart;
+                const combinedMarkers = [];
+                chart.data.datasets.forEach((dataset, index) => {
+                    const meta = chart.getDatasetMeta(index);
+                    const visible = typeof chart.isDatasetVisible === 'function'
+                        ? chart.isDatasetVisible(index)
+                        : !(meta && meta.hidden);
+                    if (!visible) return;
+                    const datasetMarkers = dataset && dataset.fundingMarkers;
+                    if (!Array.isArray(datasetMarkers) || datasetMarkers.length === 0) return;
+                    datasetMarkers.forEach((marker) => {
+                        combinedMarkers.push({
+                            ...marker,
+                            color: marker.color || dataset.borderColor || '#b3b3b3'
+                        });
+                    });
+                });
+                if (combinedMarkers.length === 0) return;
+                combinedMarkers.sort((a, b) => {
+                    const aTs = a.timestamp instanceof Date ? a.timestamp : parseTimestamp(a.timestamp);
+                    const bTs = b.timestamp instanceof Date ? b.timestamp : parseTimestamp(b.timestamp);
+                    return aTs - bTs;
+                });
+                const bucketUsage = {};
+                const bucketSizeMs = 5 * 60 * 1000;
+                const baseTop = chartArea.top + 12;
+                const rowHeight = 12;
+                const rowGap = 6;
+                combinedMarkers.forEach((marker) => {
+                    const ts = marker.timestamp instanceof Date ? marker.timestamp : parseTimestamp(marker.timestamp);
+                    if (!ts) return;
+                    const xPixel = xScale.getPixelForValue(ts);
+                    if (Number.isNaN(xPixel) || xPixel < chartArea.left || xPixel > chartArea.right) return;
+                    ctx.save();
+                    ctx.strokeStyle = marker.color || 'rgba(255,255,255,0.35)';
+                    ctx.setLineDash([4, 4]);
+                    ctx.lineWidth = 1;
+                    ctx.beginPath();
+                    ctx.moveTo(xPixel, chartArea.top);
+                    ctx.lineTo(xPixel, chartArea.bottom);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                    if (marker.label) {
+                        const bucketKey = bucketSizeMs ? Math.round(ts.getTime() / bucketSizeMs) : ts.getTime();
+                        const bucketIndex = bucketUsage[bucketKey] || 0;
+                        bucketUsage[bucketKey] = bucketIndex + 1;
+                        const labelY = baseTop + bucketIndex * (rowHeight + rowGap);
+                        ctx.fillStyle = marker.color || '#ffffff';
+                        ctx.font = '10px sans-serif';
+                        ctx.textAlign = 'center';
+                        ctx.fillText(marker.label, xPixel, Math.min(labelY, chartArea.bottom - 4));
+                    }
+                    ctx.restore();
+                });
+            }
+        };
+        Chart.register(fundingMarkerPlugin);
         
         // 通用图表配置
         function getChartConfig(type, datasets) {
@@ -1406,10 +1594,21 @@
                                     const rawValue = context.raw ? context.raw.rawValue : undefined;
                                     const fallbackNumeric = context.parsed ? context.parsed.y : undefined;
                                     const displayValue = formatTooltipValue(type, rawValue, fallbackNumeric);
-                                    if (!datasetLabel) {
-                                        return displayValue;
+                                    const baseLabel = datasetLabel ? `${datasetLabel}: ${displayValue}` : displayValue;
+                                    if (type === 'funding') {
+                                        const lines = [baseLabel];
+                                        const distanceInfo = formatFundingDistanceForPoint(context.raw && context.raw.nextFundingTime, context.raw && context.raw.x);
+                                        if (distanceInfo) {
+                                            const directionLabel = distanceInfo.direction === 'future' ? '距下次' : '距上次';
+                                            lines.push(`${directionLabel}: ${distanceInfo.label}`);
+                                        }
+                                        const intervalLabel = formatFundingInterval(context.raw && context.raw.fundingIntervalHours);
+                                        if (intervalLabel) {
+                                            lines.push(`间隔: ${intervalLabel}`);
+                                        }
+                                        return lines;
                                     }
-                                    return `${datasetLabel}: ${displayValue}`;
+                                    return baseLabel;
                                 }
                             }
                         },
@@ -1437,6 +1636,10 @@
                                 usePointStyle: true,
                                 color: '#ffffff'
                             }
+                        }
+                        ,
+                        fundingMarkerPlugin: {
+                            enabled: type === 'funding'
                         }
                     },
                     scales: {
@@ -1570,6 +1773,13 @@
         function updateAllCharts() {
             const exchangeFilter = document.getElementById('exchangeFilter').value;
             const exchanges = exchangeFilter ? [exchangeFilter] : Object.keys(chartData);
+            const filteredChartData = {};
+            exchanges.forEach(exchange => {
+                if (chartData[exchange]) {
+                    filteredChartData[exchange] = chartData[exchange];
+                }
+            });
+            const chartTimeRange = getChartTimeRange(filteredChartData);
             
             // 现货价格图表 - 过滤掉无效数据
             const spotDatasets = exchanges.filter(exchange => 
@@ -1629,13 +1839,21 @@
             const fundingDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].funding_rates, normalizeFundingRate)
             ).map(exchange => {
-                const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].funding_rates);
+                const points = buildChartPoints(
+                    chartData[exchange].labels,
+                    chartData[exchange].funding_rates,
+                    {
+                        nextFundingTime: chartData[exchange].next_funding_times,
+                        fundingIntervalHours: chartData[exchange].funding_intervals
+                    }
+                );
                 return {
                     label: exchange.toUpperCase() + ' 资金费率',
                     data: points,
                     borderColor: exchangeColors[exchange] || '#ffffff',
                     backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                    fill: false
+                    fill: false,
+                    fundingMarkers: buildFundingMarkersForExchange(exchange, chartData[exchange], chartTimeRange)
                 };
             });
             
@@ -1658,6 +1876,8 @@
             charts.futures.data.datasets = futuresDatasets;
             charts.combined.data.datasets = combinedDatasets;
             charts.funding.data.datasets = fundingDatasets;
+            const aggregatedMarkers = collectAllFundingMarkers(fundingDatasets);
+            updateFundingAxisRange(charts.funding, aggregatedMarkers);
             charts.premium.data.datasets = premiumDatasets;
             
             // 刷新图表
