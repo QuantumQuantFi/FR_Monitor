@@ -738,10 +738,102 @@
             const decimalRate = normalizeFundingRate(rate);
             if (decimalRate === null || decimalRate === 0) return '-';
             const percentage = decimalRate * 100;
-            if (Math.abs(percentage) >= 1) return `${percentage.toFixed(4)}%`;
-            if (Math.abs(percentage) >= 0.01) return `${percentage.toFixed(6)}%`;
-            if (Math.abs(percentage) >= 0.0001) return `${percentage.toFixed(8)}%`;
-            return `${percentage.toFixed(10)}%`;
+            return formatPercentageString(percentage);
+        }
+
+        function formatPercentageNumber(value) {
+            const absValue = Math.abs(value);
+            if (absValue >= 1) return value.toFixed(4);
+            if (absValue >= 0.01) return value.toFixed(6);
+            if (absValue >= 0.0001) return value.toFixed(8);
+            return value.toFixed(10);
+        }
+
+        function formatPercentageString(value) {
+            if (typeof value === 'string') {
+                const trimmed = value.trim();
+                if (!trimmed) return '-';
+                if (trimmed.endsWith('%')) return trimmed;
+                const parsed = Number(trimmed);
+                if (Number.isFinite(parsed)) {
+                    return `${formatPercentageNumber(parsed)}%`;
+                }
+                return trimmed;
+            }
+            if (typeof value === 'number') {
+                if (!Number.isFinite(value)) return '-';
+                return `${formatPercentageNumber(value)}%`;
+            }
+            if (value === null || value === undefined) {
+                return '-';
+            }
+            return String(value);
+        }
+
+        function formatAxisPrice(value) {
+            if (!Number.isFinite(value)) return '-';
+            const absValue = Math.abs(value);
+            if (absValue >= 1000) return value.toFixed(2);
+            if (absValue >= 1) return value.toFixed(6);
+            if (absValue >= 0.001) return value.toFixed(6);
+            return value.toFixed(10);
+        }
+
+        function formatAxisPercentage(value, isFunding = false) {
+            if (!Number.isFinite(value)) return '-';
+            const base = isFunding ? value * 100 : value;
+            return formatPercentageNumber(base) + '%';
+        }
+
+        function coerceNumeric(value) {
+            if (typeof value === 'number') {
+                return Number.isFinite(value) ? value : null;
+            }
+            if (typeof value === 'string') {
+                const trimmed = value.trim();
+                if (!trimmed) return null;
+                const parsed = Number(trimmed);
+                return Number.isFinite(parsed) ? parsed : null;
+            }
+            return null;
+        }
+
+        function buildChartPoints(labels, values) {
+            const safeLabels = Array.isArray(labels) ? labels : [];
+            const safeValues = Array.isArray(values) ? values : [];
+            return safeLabels.map((label, index) => {
+                const rawValue = safeValues[index];
+                const numeric = coerceNumeric(rawValue);
+                return {
+                    x: parseTimestamp(label),
+                    y: numeric,
+                    rawValue
+                };
+            }).filter(point => point.x && point.y !== null);
+        }
+
+        function formatTooltipValue(type, rawValue, fallbackNumeric) {
+            if (type === 'funding') {
+                const normalized = normalizeFundingRate(rawValue);
+                if (normalized !== null) {
+                    return formatPercentageString(normalized * 100);
+                }
+                if (Number.isFinite(fallbackNumeric)) {
+                    return formatPercentageString(fallbackNumeric * 100);
+                }
+                return '-';
+            }
+            if (type === 'premium') {
+                if (rawValue !== undefined && rawValue !== null && rawValue !== '') {
+                    return formatPercentageString(rawValue);
+                }
+                if (Number.isFinite(fallbackNumeric)) {
+                    return formatPercentageString(fallbackNumeric);
+                }
+                return '-';
+            }
+            const formatted = formatPrice(rawValue !== undefined ? rawValue : fallbackNumeric);
+            return formatted === '-' ? '-' : `$${formatted}`;
         }
         function getFundingRateClass(rate) {
             const decimalRate = normalizeFundingRate(rate);
@@ -1307,6 +1399,20 @@
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
+                        tooltip: {
+                            callbacks: {
+                                label: function(context) {
+                                    const datasetLabel = context.dataset.label || '';
+                                    const rawValue = context.raw ? context.raw.rawValue : undefined;
+                                    const fallbackNumeric = context.parsed ? context.parsed.y : undefined;
+                                    const displayValue = formatTooltipValue(type, rawValue, fallbackNumeric);
+                                    if (!datasetLabel) {
+                                        return displayValue;
+                                    }
+                                    return `${datasetLabel}: ${displayValue}`;
+                                }
+                            }
+                        },
                         zoom: {
                             zoom: {
                                 wheel: {
@@ -1357,10 +1463,14 @@
                             ticks: {
                                 color: '#8e9297',
                                 callback: function(value) {
-                                    if (type === 'funding' || type === 'premium') {
-                                        return value.toFixed(4) + '%';
+                                    if (type === 'funding') {
+                                        return formatAxisPercentage(value, true);
                                     }
-                                    return '$' + value.toFixed(4);
+                                    if (type === 'premium') {
+                                        return formatAxisPercentage(value, false);
+                                    }
+                                    const formatted = formatAxisPrice(value);
+                                    return formatted === '-' ? '-' : '$' + formatted;
                                 }
                             }
                         }
@@ -1464,30 +1574,30 @@
             // 现货价格图表 - 过滤掉无效数据
             const spotDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].spot_prices)
-            ).map(exchange => ({
-                label: exchange.toUpperCase() + ' 现货',
-                data: chartData[exchange].labels.map((label, index) => ({
-                    x: parseTimestamp(label),
-                    y: chartData[exchange].spot_prices[index]
-                })),
-                borderColor: exchangeColors[exchange] || '#ffffff',
-                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                fill: false
-            }));
+            ).map(exchange => {
+                const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].spot_prices);
+                return {
+                    label: exchange.toUpperCase() + ' 现货',
+                    data: points,
+                    borderColor: exchangeColors[exchange] || '#ffffff',
+                    backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                    fill: false
+                };
+            });
             
             // 期货价格图表 - 过滤掉无效数据
             const futuresDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].futures_prices)
-            ).map(exchange => ({
-                label: exchange.toUpperCase() + ' 期货',
-                data: chartData[exchange].labels.map((label, index) => ({
-                    x: parseTimestamp(label),
-                    y: chartData[exchange].futures_prices[index]
-                })),
-                borderColor: exchangeColors[exchange] || '#ffffff',
-                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                fill: false
-            }));
+            ).map(exchange => {
+                const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].futures_prices);
+                return {
+                    label: exchange.toUpperCase() + ' 期货',
+                    data: points,
+                    borderColor: exchangeColors[exchange] || '#ffffff',
+                    backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                    fill: false
+                };
+            });
             
             // 合并价格图表（现货+期货）
             const combinedDatasets = [];
@@ -1497,7 +1607,7 @@
                 if (isValidDataset(dataObj.spot_prices)) {
                     combinedDatasets.push({
                         label: exchange.toUpperCase() + ' 现货',
-                        data: dataObj.labels.map((label, index) => ({ x: parseTimestamp(label), y: dataObj.spot_prices[index] })),
+                        data: buildChartPoints(dataObj.labels, dataObj.spot_prices),
                         borderColor: exchangeColors[exchange] || '#ffffff',
                         backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                         fill: false
@@ -1506,7 +1616,7 @@
                 if (isValidDataset(dataObj.futures_prices)) {
                     combinedDatasets.push({
                         label: exchange.toUpperCase() + ' 期货',
-                        data: dataObj.labels.map((label, index) => ({ x: parseTimestamp(label), y: dataObj.futures_prices[index] })),
+                        data: buildChartPoints(dataObj.labels, dataObj.futures_prices),
                         borderColor: exchangeColors[exchange] || '#ffffff',
                         backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
                         borderDash: [6, 3],
@@ -1518,34 +1628,30 @@
             // 资金费率图表 - 过滤掉无效数据
             const fundingDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].funding_rates, normalizeFundingRate)
-            ).map(exchange => ({
-                label: exchange.toUpperCase() + ' 资金费率',
-                data: chartData[exchange].labels.map((label, index) => {
-                    const rate = chartData[exchange].funding_rates[index];
-                    const decimalRate = normalizeFundingRate(rate);
-                    return {
-                        x: parseTimestamp(label),
-                        y: decimalRate !== null ? decimalRate * 100 : null // 转换为百分比
-                    };
-                }).filter(point => point.y !== null), // 移除null值
-                borderColor: exchangeColors[exchange] || '#ffffff',
-                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                fill: false
-            }));
+            ).map(exchange => {
+                const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].funding_rates);
+                return {
+                    label: exchange.toUpperCase() + ' 资金费率',
+                    data: points,
+                    borderColor: exchangeColors[exchange] || '#ffffff',
+                    backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                    fill: false
+                };
+            });
             
             // 溢价指数图表 - 过滤掉无效数据
             const premiumDatasets = exchanges.filter(exchange => 
                 chartData[exchange] && isValidDataset(chartData[exchange].premiums)
-            ).map(exchange => ({
-                label: exchange.toUpperCase() + ' 溢价',
-                data: chartData[exchange].labels.map((label, index) => ({
-                    x: parseTimestamp(label),
-                    y: chartData[exchange].premiums[index]
-                })),
-                borderColor: exchangeColors[exchange] || '#ffffff',
-                backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
-                fill: false
-            }));
+            ).map(exchange => {
+                const points = buildChartPoints(chartData[exchange].labels, chartData[exchange].premiums);
+                return {
+                    label: exchange.toUpperCase() + ' 溢价',
+                    data: points,
+                    borderColor: exchangeColors[exchange] || '#ffffff',
+                    backgroundColor: (exchangeColors[exchange] || '#ffffff') + '20',
+                    fill: false
+                };
+            });
             
             // 更新图表
             charts.spot.data.datasets = spotDatasets;
@@ -1582,6 +1688,8 @@
                         const latestPremium = exchangeData.premiums[exchangeData.premiums.length - 1];
                         const displaySpot = formatPrice(latestSpot);
                         const displayFutures = formatPrice(latestFutures);
+                        const displayFunding = normalizedFunding !== null ? formatPercentageString(normalizedFunding * 100) : '-';
+                        const displayPremium = formatPercentageString(latestPremium);
                         
                         statsHtml += `
                             <div class="stat-card">
@@ -1589,8 +1697,8 @@
                                 <div class="stat-value" style="color: ${exchangeColors[exchange]}">
                                     ${hasValidSpot && displaySpot !== '-' ? `现货: $${displaySpot}<br>` : ''}
                                     ${hasValidFutures && displayFutures !== '-' ? `期货: $${displayFutures}<br>` : ''}
-                                    ${hasValidFunding && normalizedFunding !== null ? `资金费率: ${(normalizedFunding * 100).toFixed(4)}%<br>` : ''}
-                                    ${hasValidPremium ? `溢价: ${latestPremium.toFixed(4)}%` : ''}
+                                    ${hasValidFunding && displayFunding !== '-' ? `资金费率: ${displayFunding}<br>` : ''}
+                                    ${hasValidPremium && displayPremium !== '-' ? `溢价: ${displayPremium}` : ''}
                                 </div>
                             </div>
                         `;
