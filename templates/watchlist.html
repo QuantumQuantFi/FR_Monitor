@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binance 关注列表</title>
+    <style>
+        :root {
+            --bg: #0d1117;
+            --panel: #111827;
+            --border: #1f2937;
+            --text: #e5e7eb;
+            --muted: #9ca3af;
+            --accent: #60a5fa;
+            --danger: #f87171;
+            --success: #34d399;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            background: radial-gradient(circle at 20% 20%, rgba(96,165,250,0.08), transparent 25%),
+                        radial-gradient(circle at 80% 0%, rgba(52,211,153,0.05), transparent 30%),
+                        var(--bg);
+            color: var(--text);
+            font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+            line-height: 1.5;
+            padding: 24px;
+        }
+        h1 { margin: 0 0 12px; font-size: 24px; }
+        .container {
+            max-width: 1180px;
+            margin: 0 auto;
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 20px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+        }
+        .meta {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+            margin-bottom: 16px;
+        }
+        .pill {
+            padding: 8px 12px;
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            background: rgba(255,255,255,0.02);
+            color: var(--muted);
+            font-size: 13px;
+        }
+        .pill strong { color: var(--text); }
+        .actions {
+            margin-left: auto;
+            display: flex;
+            gap: 10px;
+        }
+        button {
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid var(--border);
+            background: linear-gradient(135deg, rgba(96,165,250,0.25), rgba(96,165,250,0.45));
+            color: #0b1021;
+            font-weight: 600;
+            cursor: pointer;
+        }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(255,255,255,0.01);
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        thead { background: rgba(255,255,255,0.03); }
+        th, td {
+            padding: 12px 10px;
+            border-bottom: 1px solid var(--border);
+            font-size: 14px;
+            text-align: left;
+        }
+        th { color: var(--muted); font-weight: 600; }
+        tr:hover td { background: rgba(255,255,255,0.02); }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            padding: 6px 10px;
+            border-radius: 8px;
+            font-weight: 600;
+            font-size: 12px;
+            letter-spacing: 0.2px;
+        }
+        .badge.active { background: rgba(52,211,153,0.15); color: var(--success); }
+        .badge.inactive { background: rgba(248,113,113,0.12); color: var(--danger); }
+        .muted { color: var(--muted); }
+        .mono { font-family: "JetBrains Mono", "SFMono-Regular", Menlo, monospace; }
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+        }
+        .dot.on { background: var(--success); }
+        .dot.off { background: var(--border); }
+        @media (max-width: 900px) {
+            body { padding: 12px; }
+            th:nth-child(6), td:nth-child(6),
+            th:nth-child(7), td:nth-child(7),
+            th:nth-child(8), td:nth-child(8) { display: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="meta">
+            <div>
+                <h1>Binance 资金费率关注列表</h1>
+                <div class="muted">只保留过去 2h |funding| ≥ 0.3% 且同时有现货/永续的交易对</div>
+            </div>
+            <div class="actions">
+                <button id="refresh-btn">手动刷新</button>
+            </div>
+        </div>
+
+        <div class="meta" id="summary-row">
+            <div class="pill">活跃 <strong id="active-count">-</strong></div>
+            <div class="pill">总计 <strong id="total-count">-</strong></div>
+            <div class="pill">阈值 <strong id="threshold">0.3%</strong></div>
+            <div class="pill">窗口 <strong id="window">2h</strong></div>
+            <div class="pill">刷新 <strong id="refresh">-</strong></div>
+            <div class="pill">更新时间 <strong id="updated-at">-</strong></div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Symbol</th>
+                    <th>状态</th>
+                    <th>2h内 |Funding| max</th>
+                    <th>最新 funding</th>
+                    <th>最近≥阈值</th>
+                    <th>加入时间</th>
+                    <th>现货/永续</th>
+                    <th>移除原因</th>
+                </tr>
+            </thead>
+            <tbody id="watchlist-body">
+                <tr><td colspan="8" class="muted">加载中...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        const bodyEl = document.getElementById('watchlist-body');
+        const btn = document.getElementById('refresh-btn');
+
+        const summaryEls = {
+            active: document.getElementById('active-count'),
+            total: document.getElementById('total-count'),
+            threshold: document.getElementById('threshold'),
+            window: document.getElementById('window'),
+            refresh: document.getElementById('refresh'),
+            updatedAt: document.getElementById('updated-at'),
+        };
+
+        const formatPct = (value) => {
+            if (value === null || value === undefined) return '-';
+            return (value * 100).toFixed(3) + '%';
+        };
+
+        const formatTime = (value) => {
+            if (!value) return '-';
+            const d = new Date(value);
+            if (isNaN(d.getTime())) return value;
+            return d.toLocaleTimeString();
+        };
+
+        const render = (payload) => {
+            const { summary, entries, timestamp } = payload;
+            summaryEls.active.textContent = summary.active_count;
+            summaryEls.total.textContent = summary.total_tracked;
+            summaryEls.threshold.textContent = formatPct(summary.threshold);
+            summaryEls.window.textContent = summary.lookback_hours + 'h';
+            summaryEls.refresh.textContent = summary.refresh_seconds + 's';
+            summaryEls.updatedAt.textContent = formatTime(timestamp);
+
+            if (!entries || entries.length === 0) {
+                bodyEl.innerHTML = '<tr><td colspan="8" class="muted">暂无符号满足条件</td></tr>';
+                return;
+            }
+
+            bodyEl.innerHTML = entries.map((item) => {
+                const statusCls = item.status === 'active' ? 'badge active' : 'badge inactive';
+                const reason = item.removal_reason ? item.removal_reason : '-';
+                return `
+                    <tr>
+                        <td class="mono">${item.symbol}</td>
+                        <td><span class="${statusCls}">${item.status}</span></td>
+                        <td class="mono">${formatPct(item.max_abs_funding)}</td>
+                        <td class="mono">${formatPct(item.last_funding_rate)} <span class="muted">${formatTime(item.last_funding_time)}</span></td>
+                        <td class="mono">${formatTime(item.last_above_threshold_at)}</td>
+                        <td class="mono">${formatTime(item.added_at)}</td>
+                        <td>
+                            <span class="dot ${item.has_spot ? 'on' : 'off'}"></span> spot
+                            &nbsp;
+                            <span class="dot ${item.has_perp ? 'on' : 'off'}"></span> perp
+                        </td>
+                        <td class="muted">${reason}</td>
+                    </tr>
+                `;
+            }).join('');
+        };
+
+        const loadWatchlist = async () => {
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/api/watchlist');
+                const data = await resp.json();
+                render(data);
+            } catch (err) {
+                bodyEl.innerHTML = `<tr><td colspan="8" class="muted">加载失败: ${err}</td></tr>`;
+            } finally {
+                btn.disabled = false;
+            }
+        };
+
+        btn.addEventListener('click', loadWatchlist);
+        loadWatchlist();
+        setInterval(loadWatchlist, 30000);
+    </script>
+</body>
+</html>

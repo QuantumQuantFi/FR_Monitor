@@ -204,6 +204,16 @@ REST_MERGE_POLICY = {
     'prefer_ws_secs': 0.2,          # 若现有数据在N秒内更新，优先保留WS数据
 }
 
+# 动态关注列表（watchlist）配置
+WATCHLIST_CONFIG = {
+    # 资金费率阈值：0.003 = 0.3%
+    'funding_abs_threshold': float(_get_private('WATCHLIST_FUNDING_THRESHOLD', 'WATCHLIST_FUNDING_THRESHOLD', '0.003')),
+    # 滑动窗口（小时）
+    'lookback_hours': float(_get_private('WATCHLIST_LOOKBACK_HOURS', 'WATCHLIST_LOOKBACK_HOURS', '2')),
+    # 刷新频率（秒），用于扫描符合条件的交易对
+    'refresh_seconds': float(_get_private('WATCHLIST_REFRESH_SECONDS', 'WATCHLIST_REFRESH_SECONDS', '150')),
+}
+
 # 内存优化配置
 MEMORY_OPTIMIZATION_CONFIG = {
     'max_historical_records': 120,     # 内存中的历史记录数（约6分钟窗口）

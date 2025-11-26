@@ -23,6 +23,7 @@ from config import (
     WS_UPDATE_INTERVAL,
     WS_CONNECTION_CONFIG,
     DB_WRITE_INTERVAL_SECONDS,
+    WATCHLIST_CONFIG,
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
@@ -34,6 +35,7 @@ from trading.trade_executor import (
     get_bybit_linear_positions,
     get_bitget_usdt_perp_positions,
 )
+from watchlist_manager import WatchlistManager
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
@@ -879,6 +881,15 @@ arbitrage_monitor = ArbitrageMonitor(
     cooldown_seconds=30.0,
 )
 
+# Binance 动态关注列表管理器
+watchlist_manager = WatchlistManager(WATCHLIST_CONFIG)
+
+# 启动时尝试用数据库过去窗口内的资金费率预热，避免重启后空窗口
+try:
+    watchlist_manager.preload_from_database(db.db_path)
+except Exception as exc:
+    logging.getLogger('watchlist').warning("watchlist preload at startup failed: %s", exc)
+
 # 优化的内存数据结构 - 减少内存占用
 class MemoryDataManager:
     def __init__(self):
@@ -1096,6 +1107,25 @@ def background_data_collection():
         
         time.sleep(DATA_REFRESH_INTERVAL)
 
+
+def watchlist_refresh_loop():
+    """周期性刷新 Binance 关注列表，避免对所有币种全量计算。"""
+    logger = logging.getLogger('watchlist')
+    preloaded = False
+    while True:
+        try:
+            if not preloaded:
+                try:
+                    watchlist_manager.preload_from_database(db.db_path)
+                finally:
+                    preloaded = True
+            all_data = data_collector.get_all_data()
+            exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
+            watchlist_manager.refresh(all_data, exchange_symbols)
+        except Exception as exc:
+            logger.warning("watchlist refresh failed: %s", exc)
+        time.sleep(watchlist_manager.refresh_seconds)
+
 @app.route('/')
 def index():
     """主页 - 增强版按币种聚合展示所有可用币种"""
@@ -1140,6 +1170,13 @@ def charts():
                          default_chart_interval=DEFAULT_CHART_INTERVAL,
                          chart_interval_label_map=CHART_INTERVAL_LABEL_MAP)
 
+
+@app.route('/watchlist')
+def watchlist_view():
+    """Binance 资金费率驱动的关注列表页面"""
+    return render_template('watchlist.html')
+
+
 @app.route('/api/data')
 def get_current_data():
     """获取当前显示币种的实时数据API"""
@@ -1170,6 +1207,13 @@ def get_all_data():
         'exchange_order': EXCHANGE_DISPLAY_ORDER,
         'timestamp': now_utc_iso()
     })
+
+
+@app.route('/api/watchlist')
+def get_watchlist():
+    """获取基于资金费率的Binance关注列表"""
+    return precision_jsonify(watchlist_manager.snapshot())
+
 
 @app.route('/api/history/<symbol>')
 def get_historical_data(symbol):
@@ -1704,6 +1748,10 @@ if __name__ == '__main__':
     # 启动后台数据收集线程
     background_thread = threading.Thread(target=background_data_collection, daemon=True)
     background_thread.start()
+
+    print("👀 启动Binance关注列表刷新线程...")
+    watchlist_thread = threading.Thread(target=watchlist_refresh_loop, daemon=True)
+    watchlist_thread.start()
     
     print("🌐 启动Web服务器...")
     print("📊 系统状态监控: http://localhost:4002/api/system/status")
