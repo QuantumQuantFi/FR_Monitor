@@ -322,3 +322,130 @@ def compute_metrics_for_symbols(db_path: str, symbols: List[str]) -> Dict[str, D
         metrics = compute_metrics_for_symbol(points)
         out[symbol] = metrics.to_dict()
     return out
+
+
+def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, Any]:
+    """
+    生成 6h 价差序列及信号点，便于前端画图。仅用于可视化，不做交易决策。
+    """
+    cfg = WATCHLIST_METRICS_CONFIG
+    window_minutes = int(cfg.get("window_minutes", 60))
+    slope_minutes = int(cfg.get("slope_minutes", 3))
+    midline_minutes = int(cfg.get("midline_minutes", 15))
+    range_short_h = float(cfg.get("range_hours_short", 1))
+    range_long_h = float(cfg.get("range_hours_long", 6))
+    spread_abs_baseline = float(cfg.get("spread_abs_baseline", 0.01))
+    drift_ratio_max = float(cfg.get("drift_ratio_max", 0.3))
+
+    series_map = fetch_spread_series(db_path, symbols, hours=int(range_long_h))
+    out: Dict[str, Any] = {}
+
+    for symbol, points in series_map.items():
+        if not points:
+            out[symbol] = {"points": [], "midline": [], "baseline": [], "entry_signals": [], "exit_signals": []}
+            continue
+
+        spreads = [p.spread_rel for p in points]
+        times = [p.ts for p in points]
+
+        midline_series: List[Optional[float]] = []
+        acc_mid: List[float] = []
+        for v in spreads:
+            acc_mid.append(0.0 if v is None else v)
+            if len(acc_mid) > midline_minutes:
+                acc_mid.pop(0)
+            midline_series.append(sum(acc_mid) / len(acc_mid))
+
+        baseline_series: List[Optional[float]] = []
+        entry_signals: List[Dict[str, Any]] = []
+        exit_signals: List[Dict[str, Any]] = []
+
+        for i, (ts, val) in enumerate(zip(times, spreads)):
+            # 滚动窗口（按索引近似分钟）
+            start_idx = max(0, i - window_minutes + 1)
+            window_vals = [v for v in spreads[start_idx : i + 1] if v is not None]
+            mean, std = _rolling_mean_std(window_vals)
+            baseline = None
+            if mean is not None and std is not None:
+                baseline = mean - 1.5 * std
+            baseline_series.append(baseline)
+
+            # 斜率
+            slope_val = None
+            if i - slope_minutes >= 0 and spreads[i] is not None and spreads[i - slope_minutes] is not None:
+                slope_val = (spreads[i] - spreads[i - slope_minutes]) / slope_minutes
+
+            # range 过滤资金费分钟
+            cutoff_short = ts - timedelta(hours=range_short_h)
+            cutoff_long = ts - timedelta(hours=range_long_h)
+            range_short_vals = [
+                v for t, v in zip(times, spreads) if v is not None and t >= cutoff_short and not _is_funding_minute(t)
+            ]
+            range_long_vals = [
+                v for t, v in zip(times, spreads) if v is not None and t >= cutoff_long and not _is_funding_minute(t)
+            ]
+            range_short = _range(range_short_vals)
+            range_long = _range(range_long_vals)
+
+            # crossings in last 1h
+            one_hour_cutoff = ts - timedelta(hours=1)
+            one_hour_series = [
+                v for t, v in zip(times, spreads) if v is not None and t >= one_hour_cutoff
+            ]
+            one_hour_mid = [m for t, m in zip(times, midline_series) if t >= one_hour_cutoff]
+            crossings = _crossing_count(one_hour_series, one_hour_mid) if one_hour_series else 0
+            drift_ratio = None
+            if one_hour_series and range_short:
+                mid_last = one_hour_mid[-1] if one_hour_mid else None
+                if mid_last is not None and range_short:
+                    drift_ratio = abs(one_hour_series[-1] - mid_last) / range_short
+
+            # 条件
+            entry_condition1 = (
+                val is not None
+                and baseline is not None
+                and val < baseline
+                and val < spread_abs_baseline
+                and (slope_val is not None and slope_val < 0)
+            )
+            entry_condition2 = (
+                (std or 0) >= float(cfg.get("volatility_threshold", 0.0))
+                and (range_short or 0) >= float(cfg.get("range_threshold_short", 0.0))
+                and (range_long or 0) >= float(cfg.get("range_threshold_long", 0.0))
+                and crossings >= int(cfg.get("crossing_min_count", 0))
+                and (drift_ratio is not None and drift_ratio <= drift_ratio_max)
+            )
+
+            # 平仓信号
+            minutes_to_next_hour = _time_to_next_hour(ts)
+            time_factor = max(0.2, min(1.0, minutes_to_next_hour / 60.0))
+            limit_threshold = None
+            take_profit_trigger = False
+            stop_loss_trigger = False
+            if mean is not None and std is not None:
+                limit_threshold = mean + float(cfg.get("take_profit_multiplier", 0.5)) * time_factor * std
+                hits_above = sum(1 for v in window_vals if v is not None and v >= limit_threshold)
+                take_profit_trigger = hits_above >= 3 and (slope_val is not None and slope_val < 0)
+                stop_loss_trigger = val is not None and val <= -(limit_threshold) - float(
+                    cfg.get("stop_loss_buffer", 0.005)
+                )
+            funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
+
+            if entry_condition1 and entry_condition2:
+                entry_signals.append({"t": ts.isoformat(), "v": val})
+            if take_profit_trigger:
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "tp"})
+            if stop_loss_trigger:
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "sl"})
+            if funding_exit_window:
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "funding"})
+
+        out[symbol] = {
+            "points": [{"t": t.isoformat(), "v": v} for t, v in zip(times, spreads) if v is not None],
+            "midline": [{"t": t.isoformat(), "v": m} for t, m in zip(times, midline_series) if m is not None],
+            "baseline": [{"t": t.isoformat(), "v": b} for t, b in zip(times, baseline_series) if b is not None],
+            "entry_signals": entry_signals,
+            "exit_signals": exit_signals,
+        }
+
+    return out

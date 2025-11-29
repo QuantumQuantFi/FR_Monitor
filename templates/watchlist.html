@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Binance 关注列表</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         :root {
             --bg: #0d1117;
@@ -105,6 +106,26 @@
         }
         .dot.on { background: var(--success); }
         .dot.off { background: var(--border); }
+        .charts-grid {
+            margin-top: 18px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            gap: 16px;
+        }
+        .chart-card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px;
+        }
+        .chart-card h3 {
+            margin: 0 0 8px;
+            font-size: 15px;
+        }
+        canvas {
+            width: 100%;
+            height: 220px;
+        }
         @media (max-width: 900px) {
             body { padding: 12px; }
             th:nth-child(6), td:nth-child(6),
@@ -153,10 +174,14 @@
         </table>
     </div>
 
+    <div class="charts-grid" id="charts-grid"></div>
+
     <script>
         const bodyEl = document.getElementById('watchlist-body');
         const btn = document.getElementById('refresh-btn');
         let metricsCache = {};
+        let charts = {};
+        let chartSeries = {};
 
         const summaryEls = {
             active: document.getElementById('active-count'),
@@ -234,6 +259,115 @@
             bodyEl.innerHTML = rows;
         };
 
+        const destroyCharts = () => {
+            Object.values(charts).forEach((c) => c.destroy());
+            charts = {};
+        };
+
+        const renderCharts = (activeSymbols) => {
+            const grid = document.getElementById('charts-grid');
+            destroyCharts();
+            grid.innerHTML = '';
+            if (!activeSymbols.length) return;
+
+            const slice = activeSymbols.slice(0, 8); // 防止一次渲染过多
+            slice.forEach((sym) => {
+                const series = chartSeries[sym];
+                if (!series || !series.points || !series.points.length) return;
+                const card = document.createElement('div');
+                card.className = 'chart-card';
+                card.innerHTML = `<h3>${sym} 价差(6h)</h3><canvas id="chart-${sym}"></canvas>`;
+                grid.appendChild(card);
+
+                const ctx = card.querySelector('canvas').getContext('2d');
+                const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+                const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+                const exitPts = (series.exit_signals || []).map((p) => {
+                    const colorMap = { tp: '#22c55e', sl: '#ef4444', funding: '#a855f7' };
+                    return { x: new Date(p.t), y: p.v * 100, backgroundColor: colorMap[p.type] || '#eab308' };
+                });
+
+                const datasets = [
+                    {
+                        label: 'Spread %',
+                        data: toPts(series.points || []),
+                        borderColor: '#60a5fa',
+                        backgroundColor: 'rgba(96,165,250,0.15)',
+                        tension: 0.2,
+                        pointRadius: 0,
+                        borderWidth: 1.5,
+                    },
+                    {
+                        label: 'Midline 15m',
+                        data: toPts(series.midline || []),
+                        borderColor: '#34d399',
+                        backgroundColor: 'rgba(52,211,153,0.05)',
+                        tension: 0.2,
+                        pointRadius: 0,
+                        borderDash: [4, 4],
+                        borderWidth: 1,
+                    },
+                    {
+                        label: 'Baseline',
+                        data: toPts(series.baseline || []),
+                        borderColor: '#fbbf24',
+                        backgroundColor: 'rgba(251,191,36,0.05)',
+                        tension: 0.2,
+                        pointRadius: 0,
+                        borderDash: [2, 2],
+                        borderWidth: 1,
+                    },
+                    {
+                        label: 'Entry',
+                        data: entryPts,
+                        type: 'scatter',
+                        borderColor: '#22c55e',
+                        backgroundColor: '#22c55e',
+                        pointRadius: 4,
+                    },
+                    {
+                        label: 'Exit',
+                        data: exitPts,
+                        type: 'scatter',
+                        borderColor: '#ef4444',
+                        backgroundColor: exitPts.map((p) => p.backgroundColor || '#ef4444'),
+                        pointRadius: 4,
+                    },
+                ];
+
+                charts[sym] = new Chart(ctx, {
+                    type: 'line',
+                    data: { datasets },
+                    options: {
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                time: { unit: 'hour', tooltipFormat: 'HH:mm' },
+                                ticks: { color: '#9ca3af' },
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                            },
+                            y: {
+                                ticks: {
+                                    color: '#9ca3af',
+                                    callback: (v) => `${v.toFixed(2)}%`,
+                                },
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                            },
+                        },
+                        plugins: {
+                            legend: { labels: { color: '#e5e7eb' } },
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(4)}%`,
+                                },
+                            },
+                        },
+                    },
+                });
+            });
+        };
+
         let refreshTimer = null;
 
         const loadWatchlist = async () => {
@@ -246,8 +380,14 @@
                     const metricsResp = await fetch('/api/watchlist/metrics');
                     const metricsData = await metricsResp.json();
                     metricsCache = metricsData.metrics || {};
+                    const seriesResp = await fetch('/api/watchlist/series');
+                    const seriesData = await seriesResp.json();
+                    chartSeries = seriesData.series || {};
+                    renderCharts(active);
                 } else {
                     metricsCache = {};
+                    chartSeries = {};
+                    renderCharts([]);
                 }
                 render(data);
 
@@ -265,5 +405,6 @@
         btn.addEventListener('click', loadWatchlist);
         loadWatchlist();
     </script>
+    <div class="charts-grid" id="charts-grid"></div>
 </body>
 </html>
