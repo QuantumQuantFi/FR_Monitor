@@ -7,6 +7,8 @@
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- 时间轴需要日期适配器，否则 time scale 无法解析 -->
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+    <!-- 标注插件，用于标记资金费时间线 -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
     <style>
         :root {
             --bg: #0d1117;
@@ -302,6 +304,38 @@
                     const colorMap = { tp: '#22c55e', sl: '#ef4444', funding: '#a855f7' };
                     return { x: new Date(p.t), y: p.v * 100, backgroundColor: colorMap[p.type] || '#eab308' };
                 });
+                const rawPoints = series.points || [];
+                const lastTs = rawPoints.length ? new Date(rawPoints[rawPoints.length - 1].t) : new Date();
+                const xMin = new Date(lastTs.getTime() - 6 * 60 * 60 * 1000); // 固定 6h 窗口
+
+                const fundingAnnotations = (() => {
+                    const anns = {};
+                    const start = new Date(xMin);
+                    start.setMinutes(0, 0, 0);
+                    if (start < xMin) start.setHours(start.getHours() + 1);
+                    const end = lastTs;
+                    let idx = 0;
+                    for (let t = new Date(start); t <= end; t.setHours(t.getHours() + 1)) {
+                        const key = `funding-${sym}-${idx++}`;
+                        anns[key] = {
+                            type: 'line',
+                            xMin: t.getTime(),
+                            xMax: t.getTime(),
+                            borderColor: '#fbbf24',
+                            borderWidth: 1,
+                            borderDash: [4, 4],
+                            label: {
+                                display: true,
+                                content: 'Funding',
+                                color: '#fbbf24',
+                                position: 'start',
+                                rotation: -90,
+                                backgroundColor: 'rgba(0,0,0,0.0)',
+                            },
+                        };
+                    }
+                    return anns;
+                })();
 
                 const datasets = [
                     {
@@ -359,6 +393,8 @@
                         scales: {
                             x: {
                                 type: 'time',
+                                min: xMin,
+                                max: lastTs,
                                 time: { unit: 'hour', tooltipFormat: 'HH:mm' },
                                 ticks: { color: '#9ca3af' },
                                 grid: { color: 'rgba(255,255,255,0.05)' },
@@ -377,6 +413,9 @@
                                 callbacks: {
                                     label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(4)}%`,
                                 },
+                            },
+                            annotation: {
+                                annotations: fundingAnnotations,
                             },
                         },
                     },
