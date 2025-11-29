@@ -158,6 +158,11 @@
             <div class="pill">窗口 <strong id="window">2h</strong></div>
             <div class="pill">刷新 <strong id="refresh">-</strong></div>
             <div class="pill">更新时间 <strong id="updated-at">-</strong></div>
+            <div class="pill">开仓规则 <strong>C1 &amp; C2 同时满足</strong></div>
+        </div>
+        <div class="muted" style="font-size:13px;margin-bottom:12px;line-height:1.5;">
+            指标释义：Spread%=(现货-永续)/现货；均值/基线为近1h滚动均值与均值-1.5σ；区间为1h/6h范围；波动=σ，斜率=近3min变化率；穿越=1h内对15min中线的穿越次数，Drift=|当前-中线|/1h区间。
+            开仓条件：C1=Spread低于基线且低于绝对阈值(1%)且最近斜率&lt;0；C2=波动≥阈值且1h/6h区间达标且穿越次数≥3且Drift≤0.3；必须 C1 &amp; C2 同时成立。
         </div>
 
         <table>
@@ -187,6 +192,7 @@
         let metricsCache = {};
         let charts = {};
         let chartSeries = {};
+        const SPREAD_ABS_BASELINE = 0.01; // 与后端 WATCHLIST_METRICS_CONFIG 保持一致
 
         const summaryEls = {
             active: document.getElementById('active-count'),
@@ -237,6 +243,11 @@
                     metrics.entry_condition1 ? 'C1✔' : '',
                     metrics.entry_condition2 ? 'C2✔' : ''
                 ].filter(Boolean).join(' ') || '-';
+                const entryTitle = [
+                    '开仓需要 C1 和 C2 同时满足',
+                    `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} < 0`,
+                    `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间6h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥3 且 Drift≤0.3)`
+                ].join('\\n');
                 const exitFlags = [
                     metrics.take_profit_trigger ? 'TP' : '',
                     metrics.stop_loss_trigger ? 'SL' : '',
@@ -256,7 +267,7 @@
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
                         <td class="mono">${driftCell}</td>
-                        <td class="mono">${entryFlags}</td>
+                        <td class="mono" title="${entryTitle}">${entryFlags}</td>
                         <td class="mono">${exitFlags}</td>
                     </tr>
                 `;
