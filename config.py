@@ -214,6 +214,25 @@ WATCHLIST_CONFIG = {
     'refresh_seconds': float(_get_private('WATCHLIST_REFRESH_SECONDS', 'WATCHLIST_REFRESH_SECONDS', '150')),
 }
 
+# Watchlist 价差指标配置（仅计算，不做交易决策）
+WATCHLIST_METRICS_CONFIG = {
+    # 价差相对值 = (spot - futures) / spot
+    'window_minutes': 60,                # 用于均值/方差/基线的滚动窗口
+    'slope_minutes': 3,                  # 最近斜率的窗口（分钟）
+    'midline_minutes': 15,               # 中线计算窗口
+    'range_hours_short': 1,
+    'range_hours_long': 6,
+    'spread_abs_baseline': 0.01,         # 价差绝对阈值（1%）
+    'volatility_threshold': 0.005,       # 价差波动率阈值（0.5%）
+    'range_threshold_short': 0.01,       # 1h 区间阈值（1%）
+    'range_threshold_long': 0.015,       # 6h 区间阈值（1.5%）
+    'crossing_min_count': 3,             # 1h 内穿越中线次数阈值
+    'drift_ratio_max': 0.3,              # Drift/RANGE 上限
+    'take_profit_multiplier': 0.5,       # 止盈临界值 = mean + multiplier * time_factor * std
+    'stop_loss_buffer': 0.005,           # 止损缓冲（0.5%）
+    'funding_exit_minutes': 5,           # 靠近资金费时间的提前平仓窗口
+}
+
 # 内存优化配置
 MEMORY_OPTIMIZATION_CONFIG = {
     'max_historical_records': 120,     # 内存中的历史记录数（约6分钟窗口）
