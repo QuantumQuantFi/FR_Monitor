@@ -139,12 +139,12 @@
                 <tr>
                     <th>Symbol</th>
                     <th>状态</th>
-                    <th>2h内 |Funding| max</th>
-                    <th>最新 funding</th>
-                    <th>最近≥阈值</th>
-                    <th>加入时间</th>
-                    <th>现货/永续</th>
-                    <th>移除原因</th>
+                    <th>Spread 最新/均值/基线</th>
+                    <th>区间 (1h/6h)</th>
+                    <th>波动/斜率</th>
+                    <th>穿越/Drift</th>
+                    <th>入场条件</th>
+                    <th>平仓信号</th>
                 </tr>
             </thead>
             <tbody id="watchlist-body">
@@ -156,6 +156,7 @@
     <script>
         const bodyEl = document.getElementById('watchlist-body');
         const btn = document.getElementById('refresh-btn');
+        let metricsCache = {};
 
         const summaryEls = {
             active: document.getElementById('active-count'),
@@ -169,6 +170,11 @@
         const formatPct = (value) => {
             if (value === null || value === undefined) return '-';
             return (value * 100).toFixed(3) + '%';
+        };
+
+        const formatNumber = (value, digits = 4) => {
+            if (value === null || value === undefined) return '-';
+            return Number(value).toFixed(digits);
         };
 
         const formatTime = (value) => {
@@ -187,39 +193,68 @@
             summaryEls.refresh.textContent = summary.refresh_seconds + 's';
             summaryEls.updatedAt.textContent = formatTime(timestamp);
 
-            if (!entries || entries.length === 0) {
-                bodyEl.innerHTML = '<tr><td colspan="8" class="muted">暂无符号满足条件</td></tr>';
+            const activeEntries = (entries || []).filter((item) => item.status === 'active');
+
+            if (!activeEntries.length) {
+                bodyEl.innerHTML = '<tr><td colspan="8" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
             }
 
-            bodyEl.innerHTML = entries.map((item) => {
+            const rows = activeEntries.map((item) => {
                 const statusCls = item.status === 'active' ? 'badge active' : 'badge inactive';
-                const reason = item.removal_reason ? item.removal_reason : '-';
+                const metrics = metricsCache[item.symbol] || {};
+                const entryFlags = [
+                    metrics.entry_condition1 ? 'C1✔' : '',
+                    metrics.entry_condition2 ? 'C2✔' : ''
+                ].filter(Boolean).join(' ') || '-';
+                const exitFlags = [
+                    metrics.take_profit_trigger ? 'TP' : '',
+                    metrics.stop_loss_trigger ? 'SL' : '',
+                    metrics.funding_exit_window ? 'Funding' : ''
+                ].filter(Boolean).join(' ') || '-';
+
+                const spreadCell = `${formatPct(metrics.last_spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
+                const rangeCell = `${formatPct(metrics.range_short)} / ${formatPct(metrics.range_long)}`;
+                const volCell = `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`;
+                const driftCell = `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`;
+
                 return `
                     <tr>
                         <td class="mono">${item.symbol}</td>
                         <td><span class="${statusCls}">${item.status}</span></td>
-                        <td class="mono">${formatPct(item.max_abs_funding)}</td>
-                        <td class="mono">${formatPct(item.last_funding_rate)} <span class="muted">${formatTime(item.last_funding_time)}</span></td>
-                        <td class="mono">${formatTime(item.last_above_threshold_at)}</td>
-                        <td class="mono">${formatTime(item.added_at)}</td>
-                        <td>
-                            <span class="dot ${item.has_spot ? 'on' : 'off'}"></span> spot
-                            &nbsp;
-                            <span class="dot ${item.has_perp ? 'on' : 'off'}"></span> perp
-                        </td>
-                        <td class="muted">${reason}</td>
+                        <td class="mono">${spreadCell}</td>
+                        <td class="mono">${rangeCell}</td>
+                        <td class="mono">${volCell}</td>
+                        <td class="mono">${driftCell}</td>
+                        <td class="mono">${entryFlags}</td>
+                        <td class="mono">${exitFlags}</td>
                     </tr>
                 `;
             }).join('');
+            bodyEl.innerHTML = rows;
         };
+
+        let refreshTimer = null;
 
         const loadWatchlist = async () => {
             btn.disabled = true;
             try {
                 const resp = await fetch('/api/watchlist');
                 const data = await resp.json();
+                const active = (data.entries || []).filter((i) => i.status === 'active').map((i) => i.symbol);
+                if (active.length) {
+                    const metricsResp = await fetch('/api/watchlist/metrics');
+                    const metricsData = await metricsResp.json();
+                    metricsCache = metricsData.metrics || {};
+                } else {
+                    metricsCache = {};
+                }
                 render(data);
+
+                // 调整刷新频率，使前端与后台刷新周期保持一致
+                const nextIntervalMs = Math.max(1000, (data.summary?.refresh_seconds || 30) * 1000);
+                if (refreshTimer) clearInterval(refreshTimer);
+                refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
                 bodyEl.innerHTML = `<tr><td colspan="8" class="muted">加载失败: ${err}</td></tr>`;
             } finally {
@@ -229,7 +264,6 @@
 
         btn.addEventListener('click', loadWatchlist);
         loadWatchlist();
-        setInterval(loadWatchlist, 30000);
     </script>
 </body>
 </html>
