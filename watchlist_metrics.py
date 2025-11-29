@@ -341,6 +341,11 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
     out: Dict[str, Any] = {}
 
     for symbol, points in series_map.items():
+        cutoff = _now_utc() - timedelta(hours=range_long_h)
+        # 显式截取到最近窗口，防止时区误差导致序列无限增长；再做上限裁剪保护前端
+        points = [p for p in points if p.ts >= cutoff]
+        if len(points) > 1000:
+            points = points[-1000:]
         if not points:
             out[symbol] = {"points": [], "midline": [], "baseline": [], "entry_signals": [], "exit_signals": []}
             continue
