@@ -1254,30 +1254,6 @@ def get_watchlist_series():
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
-@app.route('/api/watchlist/metrics')
-def get_watchlist_metrics():
-    """
-    仅计算 watchlist active 符号的价差指标，用于监控/展示，不触发任何交易动作。
-    """
-    try:
-        snapshot = watchlist_manager.snapshot()
-        active_symbols = [entry['symbol'] for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
-        if not active_symbols:
-            return jsonify({
-                'symbols': [],
-                'metrics': {},
-                'message': 'no active symbols',
-                'timestamp': now_utc_iso()
-            })
-        metrics = compute_metrics_for_symbols(db.db_path, active_symbols)
-        return jsonify({
-            'symbols': active_symbols,
-            'metrics': metrics,
-            'timestamp': now_utc_iso()
-        })
-    except Exception as exc:
-        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
-
 
 @app.route('/api/history/<symbol>')
 def get_historical_data(symbol):
