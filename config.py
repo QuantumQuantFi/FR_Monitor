@@ -221,14 +221,14 @@ WATCHLIST_METRICS_CONFIG = {
     'slope_minutes': 3,                  # 最近斜率的窗口（分钟）
     'midline_minutes': 15,               # 中线计算窗口
     'range_hours_short': 1,
-    'range_hours_long': 6,
-    'spread_abs_baseline': 0.01,         # 价差绝对阈值（1%）
+    'range_hours_long': 12,
+    'spread_abs_baseline': 0.05,         # 价差绝对阈值（5%）
     'volatility_threshold': 0.005,       # 价差波动率阈值（0.5%）
     'range_threshold_short': 0.01,       # 1h 区间阈值（1%）
-    'range_threshold_long': 0.015,       # 6h 区间阈值（1.5%）
-    'crossing_min_count': 3,             # 1h 内穿越中线次数阈值
+    'range_threshold_long': 0.015,       # 12h 区间阈值（默认 1.5%）
+    'crossing_min_count': 2,             # 穿越中线次数阈值（3h窗口）
     'drift_ratio_max': 0.3,              # Drift/RANGE 上限
-    'take_profit_multiplier': 0.5,       # 止盈临界值 = mean + multiplier * time_factor * std
+    'take_profit_multiplier': 1.2,       # 止盈临界值 = mean_long + multiplier * std_long
     'stop_loss_buffer': 0.005,           # 止损缓冲（0.5%）
     'funding_exit_minutes': 5,           # 靠近资金费时间的提前平仓窗口
 }

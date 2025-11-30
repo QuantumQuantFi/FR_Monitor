@@ -30,11 +30,33 @@ def _time_to_next_hour(now: datetime) -> float:
     return (next_hour - now).total_seconds() / 60.0
 
 
-def _is_funding_minute(ts: datetime) -> bool:
+def _minutes_to_next_funding(ts: datetime, next_ft: Optional[datetime], interval_hours: Optional[float]) -> Optional[float]:
+    """优先使用下一次资金费时间，否则用周期近似；无法推断时返回 None。"""
+    if next_ft:
+        return (next_ft - ts).total_seconds() / 60.0
+    if interval_hours and interval_hours > 0:
+        interval_min = interval_hours * 60.0
+        minute_in_day = ts.hour * 60.0 + ts.minute + ts.second / 60.0
+        next_minute = ((int(minute_in_day / interval_min) + 1) * interval_min)
+        return next_minute - minute_in_day
+    return None
+
+
+def _is_funding_minute(ts: datetime, interval_hours: Optional[float] = None, ref_time: Optional[datetime] = None) -> bool:
     """
-    Binance 资金费率结算在整点，排除整点前后 1 分钟的数据点。
-    过滤 minute in {59, 0, 1}，防止异常尖点影响统计。
+    判断是否处于资金费率结算附近。
+    优先使用下一次结算时间 ref_time（通常由交易所返回），否则根据 interval_hours 近似判断。
     """
+    if ref_time:
+        return abs((ts - ref_time).total_seconds()) <= 90
+    if interval_hours and interval_hours > 0:
+        # 粗略判断：以整点为锚点的周期（1h/2h/4h/8h）
+        if ts.minute in {59, 0, 1}:
+            try:
+                return (ts.hour % int(round(interval_hours))) == 0
+            except ZeroDivisionError:
+                return False
+    # 默认仍然排除整点附近的异常点
     return ts.minute in {59, 0, 1}
 
 
@@ -43,6 +65,9 @@ class SpreadPoint:
     ts: datetime
     spot: float
     futures: float
+    funding_rate: Optional[float] = None
+    funding_interval_hours: Optional[float] = None
+    next_funding_time: Optional[datetime] = None
 
     @property
     def spread_rel(self) -> Optional[float]:
@@ -94,6 +119,23 @@ def _range(values: List[float]) -> Optional[float]:
     return max(values) - min(values)
 
 
+def _recent_values_within(
+    times: List[datetime],
+    values: List[Optional[float]],
+    now_ts: datetime,
+    window_minutes: int,
+) -> List[float]:
+    cutoff = now_ts - timedelta(minutes=window_minutes)
+    out: List[float] = []
+    for t, v in zip(times, values):
+        if v is None:
+            continue
+        if t < cutoff or t > now_ts:
+            continue
+        out.append(v)
+    return out
+
+
 def _crossing_count(series: List[float], midline: List[float]) -> int:
     """统计序列与中线的穿越次数（符号变化次数）。"""
     count = 0
@@ -142,7 +184,8 @@ def fetch_spread_series(
         for symbol in symbols:
             cursor.execute(
                 """
-                SELECT timestamp, spot_price_close, futures_price_close
+                SELECT timestamp, spot_price_close, futures_price_close,
+                       funding_rate_avg, funding_interval_hours, next_funding_time
                 FROM price_data_1min
                 WHERE symbol = ? AND exchange = 'binance'
                   AND timestamp >= datetime('now', ?)
@@ -151,13 +194,22 @@ def fetch_spread_series(
                 (symbol, cutoff_sql),
             )
             rows = cursor.fetchall()
-            for ts_raw, spot, fut in rows:
+            for ts_raw, spot, fut, fr, interval_hours, next_ft in rows:
                 ts = _parse_ts(ts_raw)
                 if ts is None or spot is None or fut is None:
                     continue
                 if spot <= 0 or fut <= 0:
                     continue
-                results[symbol].append(SpreadPoint(ts=ts, spot=float(spot), futures=float(fut)))
+                results[symbol].append(
+                    SpreadPoint(
+                        ts=ts,
+                        spot=float(spot),
+                        futures=float(fut),
+                        funding_rate=float(fr) if fr is not None else None,
+                        funding_interval_hours=float(interval_hours) if interval_hours is not None else None,
+                        next_funding_time=_parse_ts(next_ft),
+                    )
+                )
     except Exception as exc:
         # 失败时返回空，调用方应处理
         print(f"fetch_spread_series failed: {exc}")
@@ -169,9 +221,14 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     针对单个 symbol 计算价差相关指标，仅做监控输出，不做交易动作。
     """
     cfg = WATCHLIST_METRICS_CONFIG
+    tp_window_minutes = 20          # 局部峰值窗口
+    tp_long_window_minutes = 120    # 止盈长窗
+    cooldown_minutes = 10
     window_minutes = int(cfg.get("window_minutes", 60))
     slope_minutes = int(cfg.get("slope_minutes", 3))
     midline_minutes = int(cfg.get("midline_minutes", 15))
+    crossing_window_h = float(cfg.get("crossing_window_hours", 3.0))
+    crossing_mid_minutes = int(cfg.get("crossing_mid_minutes", 30))
     range_short_h = float(cfg.get("range_hours_short", 1))
     range_long_h = float(cfg.get("range_hours_long", 6))
     drift_ratio_max = float(cfg.get("drift_ratio_max", 0.3))
@@ -223,10 +280,11 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     def _filter_range(hours: float) -> List[float]:
         cutoff = times[-1] - timedelta(hours=hours)
         vals: List[float] = []
-        for ts, val in zip(times, spreads_rel):
-            if val is None or ts < cutoff:
+        for pt in points:
+            val = pt.spread_rel
+            if val is None or pt.ts < cutoff:
                 continue
-            if _is_funding_minute(ts):
+            if _is_funding_minute(pt.ts, pt.funding_interval_hours, pt.next_funding_time):
                 continue
             vals.append(val)
         return vals
@@ -236,16 +294,16 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     range_short = _range(range_short_vals)
     range_long = _range(range_long_vals)
 
-    # 中线与穿越次数（1h内，15m中线）
-    one_hour_cutoff = times[-1] - timedelta(hours=1)
-    one_hour_series = [v for ts, v in zip(times, spreads_rel) if v is not None and ts >= one_hour_cutoff]
-    midline_series = _midline(one_hour_series, midline_minutes) if one_hour_series else []
-    crossings = _crossing_count(one_hour_series, midline_series) if one_hour_series else 0
+    # 中线与穿越次数（3h窗口，30m中线）
+    crossing_cutoff = times[-1] - timedelta(hours=crossing_window_h)
+    crossing_series = [v for ts, v in zip(times, spreads_rel) if v is not None and ts >= crossing_cutoff]
+    midline_series = _midline(crossing_series, crossing_mid_minutes) if crossing_series else []
+    crossings = _crossing_count(crossing_series, midline_series) if crossing_series else 0
     drift_ratio = None
-    if one_hour_series:
+    if crossing_series:
         mid_last = midline_series[-1] if midline_series else None
         if mid_last is not None and range_short:
-            drift_ratio = abs(one_hour_series[-1] - mid_last) / range_short if range_short else None
+            drift_ratio = abs(crossing_series[-1] - mid_last) / range_short if range_short else None
 
     # 触发条件（入场逻辑的计算结果，不执行动作）
     entry_condition1 = (
@@ -253,7 +311,7 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
         and baseline_rel is not None
         and last_spread < baseline_rel
         and last_spread < spread_abs_baseline
-        and (recent_slope is not None and recent_slope < 0)
+        and (recent_slope is not None and recent_slope <= 0)
     )
 
     entry_condition2 = (
@@ -267,22 +325,58 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     # 平仓指标
     now = _now_utc()
     minutes_to_next_hour = _time_to_next_hour(now)
-    time_factor = max(0.2, min(1.0, minutes_to_next_hour / 60.0))
+    interval_hours_hint = points[-1].funding_interval_hours if points else None
+    next_ft = points[-1].next_funding_time if points else None
+    minutes_to_funding = None
+    if next_ft:
+        minutes_to_funding = (next_ft - now).total_seconds() / 60.0
+    # 对于 4h/8h 资金费，阈值保持 1.0；仅 1h 周期按小时缩放
+    if interval_hours_hint and interval_hours_hint >= 4:
+        time_factor = 1.0
+    else:
+        time_factor = max(0.6, min(1.0, minutes_to_next_hour / 60.0))
     limit_threshold = None
     hits_above_limit = 0
     take_profit_trigger = False
     stop_loss_trigger = False
 
     if spread_mean is not None and spread_std is not None:
-        limit_threshold = spread_mean + float(cfg.get("take_profit_multiplier", 0.5)) * time_factor * spread_std
-        lookback_values = [v for v in window_values if v is not None]
-        hits_above_limit = sum(1 for v in lookback_values if v >= limit_threshold)
-        take_profit_trigger = hits_above_limit >= 3 and (recent_slope is not None and recent_slope < 0)
-        stop_loss_trigger = last_spread is not None and last_spread <= -(limit_threshold) - float(
-            cfg.get("stop_loss_buffer", 0.005)
+        long_window_vals = _recent_values_within(times, spreads_rel, times[-1], tp_long_window_minutes)
+        long_mean, long_std = _rolling_mean_std(long_window_vals)
+        if long_mean is not None and long_std is not None:
+            limit_threshold = long_mean + float(cfg.get("take_profit_multiplier", 1.2)) * long_std
+            # 局部峰值确认：当前为近 20 分钟最高且开始回落（斜率<0）
+            recent_peak_vals = _recent_values_within(times, spreads_rel, times[-1], tp_window_minutes)
+            current_val = spreads_rel[-1]
+            is_local_peak = False
+            if current_val is not None and recent_peak_vals:
+                is_local_peak = current_val >= max(recent_peak_vals)
+            take_profit_trigger = (
+                current_val is not None
+                and current_val >= limit_threshold
+                and is_local_peak
+                and (recent_slope is not None and recent_slope < 0)
+            )
+            # 资费前提前落袋：距离资费 <30 分钟且价差高于短窗均值+0.5σ
+            if minutes_to_funding is not None and minutes_to_funding <= 30:
+                pre_funding_threshold = spread_mean + 0.5 * spread_std
+                if current_val is not None and pre_funding_threshold is not None:
+                    take_profit_trigger = take_profit_trigger or (current_val >= pre_funding_threshold)
+
+        # 止损：连续 2 个点跌破 -(threshold + buffer) 且斜率向下
+        stop_loss_threshold = -(limit_threshold) - float(cfg.get("stop_loss_buffer", 0.005))
+        recent_pair = [v for v in spreads_rel[-2:] if v is not None]
+        stop_loss_trigger = (
+            len(recent_pair) == 2 and all(v <= stop_loss_threshold for v in recent_pair) and (recent_slope or 0) < 0
         )
 
-    funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
+    # 资金费离场：依据真实 funding 时间，无法推断则回退到整点
+    minutes_to_funding = _minutes_to_next_funding(now, next_ft, interval_hours_hint)
+    funding_exit_window = False
+    if minutes_to_funding is not None:
+        funding_exit_window = 0 <= minutes_to_funding <= float(cfg.get("funding_exit_minutes", 5))
+    else:
+        funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
 
     details = {
         "minutes_to_next_funding": minutes_to_next_hour,
@@ -329,6 +423,12 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
     生成 6h 价差序列及信号点，便于前端画图。仅用于可视化，不做交易决策。
     """
     cfg = WATCHLIST_METRICS_CONFIG
+    tp_window_minutes = 20
+    tp_long_window_minutes = 120
+    crossing_window_h = float(cfg.get("crossing_window_hours", 3.0))
+    crossing_mid_minutes = int(cfg.get("crossing_mid_minutes", 30))
+    cooldown_minutes = 10
+    sl_consecutive = 2
     window_minutes = int(cfg.get("window_minutes", 60))
     slope_minutes = int(cfg.get("slope_minutes", 3))
     midline_minutes = int(cfg.get("midline_minutes", 15))
@@ -344,14 +444,26 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
         cutoff = _now_utc() - timedelta(hours=range_long_h)
         # 显式截取到最近窗口，防止时区误差导致序列无限增长；再做上限裁剪保护前端
         points = [p for p in points if p.ts >= cutoff]
-        if len(points) > 1000:
-            points = points[-1000:]
+        if len(points) > 1500:
+            points = points[-1500:]
         if not points:
-            out[symbol] = {"points": [], "midline": [], "baseline": [], "entry_signals": [], "exit_signals": []}
+            out[symbol] = {
+                "points": [],
+                "midline": [],
+                "baseline": [],
+                "entry_signals": [],
+                "exit_signals": [],
+                "spot": [],
+                "futures": [],
+                "funding_times": [],
+                "funding_interval_hours": None,
+            }
             continue
 
         spreads = [p.spread_rel for p in points]
         times = [p.ts for p in points]
+        spot_prices = [p.spot for p in points]
+        futures_prices = [p.futures for p in points]
 
         midline_series: List[Optional[float]] = []
         acc_mid: List[float] = []
@@ -365,7 +477,13 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
         entry_signals: List[Dict[str, Any]] = []
         exit_signals: List[Dict[str, Any]] = []
 
-        for i, (ts, val) in enumerate(zip(times, spreads)):
+        funding_times: List[str] = []
+
+        last_tp_ts: Optional[datetime] = None
+        last_sl_ts: Optional[datetime] = None
+        last_funding_ts: Optional[datetime] = None
+
+        for i, (ts, val, pt) in enumerate(zip(times, spreads, points)):
             # 滚动窗口（按索引近似分钟）
             start_idx = max(0, i - window_minutes + 1)
             window_vals = [v for v in spreads[start_idx : i + 1] if v is not None]
@@ -384,26 +502,32 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
             cutoff_short = ts - timedelta(hours=range_short_h)
             cutoff_long = ts - timedelta(hours=range_long_h)
             range_short_vals = [
-                v for t, v in zip(times, spreads) if v is not None and t >= cutoff_short and not _is_funding_minute(t)
+                p.spread_rel
+                for p in points
+                if p.spread_rel is not None
+                and p.ts >= cutoff_short
+                and not _is_funding_minute(p.ts, p.funding_interval_hours, p.next_funding_time)
             ]
             range_long_vals = [
-                v for t, v in zip(times, spreads) if v is not None and t >= cutoff_long and not _is_funding_minute(t)
+                p.spread_rel
+                for p in points
+                if p.spread_rel is not None
+                and p.ts >= cutoff_long
+                and not _is_funding_minute(p.ts, p.funding_interval_hours, p.next_funding_time)
             ]
             range_short = _range(range_short_vals)
             range_long = _range(range_long_vals)
 
-            # crossings in last 1h
-            one_hour_cutoff = ts - timedelta(hours=1)
-            one_hour_series = [
-                v for t, v in zip(times, spreads) if v is not None and t >= one_hour_cutoff
-            ]
-            one_hour_mid = [m for t, m in zip(times, midline_series) if t >= one_hour_cutoff]
-            crossings = _crossing_count(one_hour_series, one_hour_mid) if one_hour_series else 0
+            # crossings in last 3h with 30m midline
+            crossing_cutoff = ts - timedelta(hours=crossing_window_h)
+            crossing_series = [v for t, v in zip(times, spreads) if v is not None and t >= crossing_cutoff]
+            crossing_mid = _midline(crossing_series, crossing_mid_minutes) if crossing_series else []
+            crossings = _crossing_count(crossing_series, crossing_mid) if crossing_series else 0
             drift_ratio = None
-            if one_hour_series and range_short:
-                mid_last = one_hour_mid[-1] if one_hour_mid else None
+            if crossing_series and range_short:
+                mid_last = crossing_mid[-1] if crossing_mid else None
                 if mid_last is not None and range_short:
-                    drift_ratio = abs(one_hour_series[-1] - mid_last) / range_short
+                    drift_ratio = abs(crossing_series[-1] - mid_last) / range_short
 
             # 条件
             entry_condition1 = (
@@ -411,7 +535,7 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
                 and baseline is not None
                 and val < baseline
                 and val < spread_abs_baseline
-                and (slope_val is not None and slope_val < 0)
+                and (slope_val is not None and slope_val <= 0)
             )
             entry_condition2 = (
                 (std or 0) >= float(cfg.get("volatility_threshold", 0.0))
@@ -423,34 +547,77 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
 
             # 平仓信号
             minutes_to_next_hour = _time_to_next_hour(ts)
-            time_factor = max(0.2, min(1.0, minutes_to_next_hour / 60.0))
+            interval_hours_hint = pt.funding_interval_hours
+            next_ft = pt.next_funding_time
+            minutes_to_funding = _minutes_to_next_funding(ts, next_ft, interval_hours_hint)
+            if interval_hours_hint and interval_hours_hint >= 4:
+                time_factor = 1.0
+            else:
+                time_factor = max(0.6, min(1.0, minutes_to_next_hour / 60.0))
             limit_threshold = None
             take_profit_trigger = False
             stop_loss_trigger = False
             if mean is not None and std is not None:
-                limit_threshold = mean + float(cfg.get("take_profit_multiplier", 0.5)) * time_factor * std
-                hits_above = sum(1 for v in window_vals if v is not None and v >= limit_threshold)
-                take_profit_trigger = hits_above >= 3 and (slope_val is not None and slope_val < 0)
-                stop_loss_trigger = val is not None and val <= -(limit_threshold) - float(
-                    cfg.get("stop_loss_buffer", 0.005)
+                long_vals = _recent_values_within(times, spreads, ts, tp_long_window_minutes)
+                long_mean, long_std = _rolling_mean_std(long_vals)
+                if long_mean is not None and long_std is not None:
+                    limit_threshold = long_mean + float(cfg.get("take_profit_multiplier", 1.2)) * long_std
+                    peak_vals = _recent_values_within(times, spreads, ts, tp_window_minutes)
+                    current_val = spreads[i]
+                    is_local_peak = False
+                    if current_val is not None and peak_vals:
+                        is_local_peak = current_val >= max(peak_vals)
+                    take_profit_trigger = (
+                        current_val is not None
+                        and current_val >= limit_threshold
+                        and is_local_peak
+                        and (slope_val is not None and slope_val < 0)
+                    )
+                    if minutes_to_funding is not None and minutes_to_funding <= 30:
+                        pf_threshold = mean + 0.5 * std
+                        if current_val is not None and pf_threshold is not None:
+                            take_profit_trigger = take_profit_trigger or (current_val >= pf_threshold)
+
+                sl_threshold = -(limit_threshold) - float(cfg.get("stop_loss_buffer", 0.005))
+                recent_vals = [v for v in spreads[i - sl_consecutive + 1 : i + 1] if v is not None]
+                stop_loss_trigger = (
+                    len(recent_vals) == sl_consecutive and all(v <= sl_threshold for v in recent_vals) and (slope_val or 0) < 0
                 )
-            funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
+            funding_exit_window = False
+            if minutes_to_funding is not None:
+                funding_exit_window = 0 <= minutes_to_funding <= float(cfg.get("funding_exit_minutes", 5))
+            else:
+                funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
 
             if entry_condition1 and entry_condition2:
                 entry_signals.append({"t": ts.isoformat(), "v": val})
             if take_profit_trigger:
-                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "tp"})
+                if not last_tp_ts or (ts - last_tp_ts) >= timedelta(minutes=max(cooldown_minutes, 15)):
+                    exit_signals.append({"t": ts.isoformat(), "v": val, "type": "tp"})
+                    last_tp_ts = ts
             if stop_loss_trigger:
-                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "sl"})
+                if not last_sl_ts or (ts - last_sl_ts) >= timedelta(minutes=cooldown_minutes):
+                    exit_signals.append({"t": ts.isoformat(), "v": val, "type": "sl"})
+                    last_sl_ts = ts
             if funding_exit_window:
-                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "funding"})
+                min_gap = max(10, int((interval_hours_hint or 1) * 20))
+                if not last_funding_ts or (ts - last_funding_ts) >= timedelta(minutes=min_gap):
+                    exit_signals.append({"t": ts.isoformat(), "v": val, "type": "funding"})
+                    last_funding_ts = ts
+
+            if pt.next_funding_time:
+                funding_times.append(pt.next_funding_time.isoformat())
 
         out[symbol] = {
             "points": [{"t": t.isoformat(), "v": v} for t, v in zip(times, spreads) if v is not None],
             "midline": [{"t": t.isoformat(), "v": m} for t, m in zip(times, midline_series) if m is not None],
             "baseline": [{"t": t.isoformat(), "v": b} for t, b in zip(times, baseline_series) if b is not None],
+            "spot": [{"t": t.isoformat(), "v": v} for t, v in zip(times, spot_prices) if v is not None],
+            "futures": [{"t": t.isoformat(), "v": v} for t, v in zip(times, futures_prices) if v is not None],
             "entry_signals": entry_signals,
             "exit_signals": exit_signals,
+            "funding_times": sorted(list({ft for ft in funding_times})),
+            "funding_interval_hours": points[-1].funding_interval_hours if points else None,
         }
 
     return out

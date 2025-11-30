@@ -20,6 +20,27 @@
             --danger: #f87171;
             --success: #34d399;
         }
+        .info-block {
+            margin-top: 16px;
+            padding: 14px 16px;
+            background: rgba(255,255,255,0.02);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            font-size: 13px;
+            color: var(--muted);
+            line-height: 1.5;
+        }
+        .info-block h3 {
+            margin: 0 0 8px;
+            color: var(--text);
+            font-size: 14px;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+            gap: 10px 14px;
+        }
+        .info-item strong { color: var(--text); }
         * { box-sizing: border-box; }
         body {
             margin: 0;
@@ -113,7 +134,7 @@
         .charts-grid {
             margin-top: 18px;
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+            grid-template-columns: 1fr;
             gap: 16px;
         }
         .chart-card {
@@ -121,7 +142,7 @@
             border: 1px solid var(--border);
             border-radius: 12px;
             padding: 12px;
-            min-height: 260px;
+            min-height: 560px;
         }
         .chart-card h3 {
             margin: 0 0 8px;
@@ -130,14 +151,19 @@
         /* 固定画布高度，防止 Chart.js 多次重算撑高容器 */
         canvas {
             width: 100%;
-            height: 220px !important;
-            max-height: 220px;
+            height: 240px !important;
+            max-height: 240px;
         }
         @media (max-width: 900px) {
             body { padding: 12px; }
-            th:nth-child(6), td:nth-child(6),
-            th:nth-child(7), td:nth-child(7),
-            th:nth-child(8), td:nth-child(8) { display: none; }
+            th:nth-child(8), td:nth-child(8),
+            th:nth-child(9), td:nth-child(9),
+            th:nth-child(10), td:nth-child(10) { display: none; }
+        }
+        .chart-pair {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
         }
     </style>
 </head>
@@ -146,7 +172,7 @@
         <div class="meta">
             <div>
                 <h1>Binance 资金费率关注列表</h1>
-                <div class="muted">只保留过去 2h |funding| ≥ 0.3% 且同时有现货/永续的交易对</div>
+                <div class="muted">最近 2 小时内资金费率绝对值 ≥ 0.3% 且同时有现货/永续的交易对</div>
             </div>
             <div class="actions">
                 <button id="refresh-btn">手动刷新</button>
@@ -163,8 +189,8 @@
             <div class="pill">开仓规则 <strong>C1 &amp; C2 同时满足</strong></div>
         </div>
         <div class="muted" style="font-size:13px;margin-bottom:12px;line-height:1.5;">
-            指标释义：Spread%=(现货-永续)/现货；均值=近1h滚动均值，代表最近一小时价差的中心水平；基线=均值-1.5σ，用于刻画“相对低位”的阈值，价差跌破基线通常意味着价差处于过去1h分布的低端；区间为1h/6h范围；波动=σ，斜率=近3min变化率；穿越=1h内对15min中线的穿越次数，Drift=|当前-中线|/1h区间。
-            开仓条件：C1=Spread低于基线且低于绝对阈值(1%)且最近斜率&lt;0；C2=波动≥阈值且1h/6h区间达标且穿越次数≥3且Drift≤0.3；必须 C1 &amp; C2 同时成立。
+            指标释义（通俗版）：Spread% = (现货-永续)/现货；“均值/基线”用近 1 小时的数据计算：基线=均值-1.5σ，价差跌破基线意味着在近期处于偏低档；区间（1h/12h）是这段时间的最高-最低差，越大说明越活跃；斜率看近 3 分钟涨跌；穿越次数看 3 小时里价差相对 30m 中线“上穿/下穿”几次，越多越像周期性震荡；Drift 衡量当前离中线的偏移程度。
+            开仓条件：C1=价差低于基线且低于绝对阈值(5%)，并且短期斜率不再上行(≤0)；C2=波动/区间达标且穿越≥2且 Drift≤0.3；必须 C1 &amp; C2 同时满足。
         </div>
 
         <table>
@@ -172,8 +198,10 @@
                 <tr>
                     <th>Symbol</th>
                     <th>状态</th>
+                    <th>Funding 周期</th>
+                    <th>资金费率</th>
                     <th>Spread 最新/均值/基线</th>
-                    <th>区间 (1h/6h)</th>
+                    <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
                     <th>穿越/Drift</th>
                     <th>入场条件</th>
@@ -181,12 +209,24 @@
                 </tr>
             </thead>
             <tbody id="watchlist-body">
-                <tr><td colspan="8" class="muted">加载中...</td></tr>
+                <tr><td colspan="10" class="muted">加载中...</td></tr>
             </tbody>
         </table>
-    </div>
 
-    <div class="charts-grid" id="charts-grid"></div>
+        <div class="info-block">
+            <h3>指标说明（基于后端实际计算）</h3>
+            <div class="info-grid">
+                <div class="info-item"><strong>Spread%</strong>： (现货-永续)/现货，取最新 1m 点；均值/基线用最近 60 个点算 μ 与 σ，基线=μ-1.5σ，代表“近期偏低”的水平；波动率=σ。</div>
+                <div class="info-item"><strong>区间 (1h/12h)</strong>：对应窗口的最高-最低（剔除资金费前后 1 分钟），区间越大说明越活跃。</div>
+                <div class="info-item"><strong>斜率</strong>：近 3 分钟涨跌幅 (末值-首值)/3；<strong>中线</strong>：15 点均线，描述短期中枢。</div>
+                <div class="info-item"><strong>穿越/Drift</strong>：3h 内价差相对 30m 中线的翻转次数（判断是否在更长周期里来回波动）；Drift=|当前-中线|/1h 区间，偏移越小越接近震荡。</div>
+                <div class="info-item"><strong>开仓 (C1 &amp; C2 必须同时满足)</strong><br>C1：价差低于基线且低于绝对阈值 5%，且 3min 斜率≤0；<br>C2：波动≥0.5%，区间1h≥1%，区间12h≥1.5%，穿越≥2，Drift≤0.3。</div>
+                <div class="info-item"><strong>平仓信号</strong><br>TP：用 120min 均值/波动，阈值=μ120+1.2σ120，当前是近20min 局部高点且斜率&lt;0，冷静期15min。资费前落袋：距结算≤30min 且价差 ≥ (μ60+0.5σ60) 也标记 TP。SL：连续2个点低于 -(阈值+0.5%) 且斜率&lt;0；Funding：距离结算 ≤5 分钟提示离场（按交易所的实际周期/下一次结算时间绘制）。</div>
+                <div class="info-item"><strong>图表</strong>：近 12 小时价差；蓝线=价差，绿虚线=15m 中线，黄虚线=基线；青色散点=开仓，绿色=TP，红色=SL，紫色=资金费提醒；橙色虚线=资金费结算。</div>
+            </div>
+        </div>
+        <div class="charts-grid" id="charts-grid"></div>
+    </div>
 
     <script>
         const bodyEl = document.getElementById('watchlist-body');
@@ -194,7 +234,7 @@
         let metricsCache = {};
         let charts = {};
         let chartSeries = {};
-        const SPREAD_ABS_BASELINE = 0.01; // 与后端 WATCHLIST_METRICS_CONFIG 保持一致
+        const SPREAD_ABS_BASELINE = 0.05; // 与后端 WATCHLIST_METRICS_CONFIG 保持一致
 
         const summaryEls = {
             active: document.getElementById('active-count'),
@@ -213,6 +253,12 @@
         const formatNumber = (value, digits = 4) => {
             if (value === null || value === undefined) return '-';
             return Number(value).toFixed(digits);
+        };
+
+        const formatInterval = (value) => {
+            if (value === null || value === undefined || value === 0) return '动态/未知';
+            const num = Number(value);
+            return num >= 2 ? `${num.toFixed(0)}h` : `${num.toFixed(1)}h`;
         };
 
         const formatTime = (value) => {
@@ -234,7 +280,7 @@
             const activeEntries = (entries || []).filter((item) => item.status === 'active');
 
             if (!activeEntries.length) {
-                bodyEl.innerHTML = '<tr><td colspan="8" class="muted">暂无活跃符号满足条件</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="10" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
             }
 
@@ -247,8 +293,8 @@
                 ].filter(Boolean).join(' ') || '-';
                 const entryTitle = [
                     '开仓需要 C1 和 C2 同时满足',
-                    `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} < 0`,
-                    `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间6h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥3 且 Drift≤0.3)`
+                    `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} <= 0`,
+                    `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间12h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} (3h/30m) Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥2 且 Drift≤0.3)`
                 ].join('\\n');
                 const exitFlags = [
                     metrics.take_profit_trigger ? 'TP' : '',
@@ -261,10 +307,18 @@
                 const volCell = `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`;
                 const driftCell = `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`;
 
+                const intervalRaw = item.funding_interval_hours ?? (chartSeries[item.symbol]?.funding_interval_hours);
+                const intervalTitle = item.next_funding_time
+                    ? `下一次资金费时间: ${item.next_funding_time}`
+                    : (intervalRaw ? '使用交易所返回的周期估计' : '周期未知，按默认估计');
+                const intervalDisplay = formatInterval(intervalRaw);
+                const fundingRateText = formatPct(item.last_funding_rate);
                 return `
                     <tr>
                         <td class="mono">${item.symbol}</td>
                         <td><span class="${statusCls}">${item.status}</span></td>
+                        <td class="mono" title="${intervalTitle}">${intervalDisplay}</td>
+                        <td class="mono">${fundingRateText}</td>
                         <td class="mono">${spreadCell}</td>
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
@@ -278,7 +332,13 @@
         };
 
         const destroyCharts = () => {
-            Object.values(charts).forEach((c) => c.destroy());
+            Object.values(charts).forEach((entry) => {
+                if (Array.isArray(entry)) {
+                    entry.forEach((c) => c && c.destroy());
+                } else if (entry && entry.destroy) {
+                    entry.destroy();
+                }
+            });
             charts = {};
         };
 
@@ -294,29 +354,71 @@
                 if (!series || !series.points || !series.points.length) return;
                 const card = document.createElement('div');
                 card.className = 'chart-card';
-                card.innerHTML = `<h3>${sym} 价差(6h)</h3><canvas id="chart-${sym}" height="220"></canvas>`;
+                card.innerHTML = `
+                    <h3>${sym} 历史(12h)</h3>
+                    <div class="chart-pair">
+                        <canvas id="chart-spread-${sym}" height="240"></canvas>
+                        <canvas id="chart-price-${sym}" height="240"></canvas>
+                    </div>`;
                 grid.appendChild(card);
 
-                const ctx = card.querySelector('canvas').getContext('2d');
+                const ctxSpread = card.querySelector(`#chart-spread-${sym}`).getContext('2d');
+                const ctxPrice = card.querySelector(`#chart-price-${sym}`).getContext('2d');
                 const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
                 const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
-                const exitPts = (series.exit_signals || []).map((p) => {
-                    const colorMap = { tp: '#22c55e', sl: '#ef4444', funding: '#a855f7' };
-                    return { x: new Date(p.t), y: p.v * 100, backgroundColor: colorMap[p.type] || '#eab308' };
-                });
+                const exitTpPts = (series.exit_signals || [])
+                    .filter((p) => p.type === 'tp')
+                    .map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+                const exitSlPts = (series.exit_signals || [])
+                    .filter((p) => p.type === 'sl')
+                    .map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+                const exitFundingPts = (series.exit_signals || [])
+                    .filter((p) => p.type === 'funding')
+                    .map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
                 const rawPoints = series.points || [];
-                const lastTs = rawPoints.length ? new Date(rawPoints[rawPoints.length - 1].t) : new Date();
-                const xMin = new Date(lastTs.getTime() - 6 * 60 * 60 * 1000); // 固定 6h 窗口
+                const spotPts = (series.spot || []).map((p) => ({ x: new Date(p.t), y: p.v }));
+                const futPts = (series.futures || []).map((p) => ({ x: new Date(p.t), y: p.v }));
+                const lastTs =
+                    rawPoints.length
+                        ? new Date(rawPoints[rawPoints.length - 1].t)
+                        : (spotPts.length ? spotPts[spotPts.length - 1].x : new Date());
+                const windowHours = 12;
+                const xMin = new Date(lastTs.getTime() - windowHours * 60 * 60 * 1000); // 固定 12h 窗口
 
                 const fundingAnnotations = (() => {
                     const anns = {};
+                    const fundingTimes = Array.isArray(series.funding_times) ? series.funding_times : [];
+                    if (fundingTimes.length) {
+                        fundingTimes.forEach((ft, idx) => {
+                            const t = new Date(ft);
+                            const key = `funding-${sym}-${idx}`;
+                            anns[key] = {
+                                type: 'line',
+                                xMin: t.getTime(),
+                                xMax: t.getTime(),
+                                borderColor: '#fbbf24',
+                                borderWidth: 1,
+                                borderDash: [4, 4],
+                                label: {
+                                    display: true,
+                                    content: 'Funding',
+                                    color: '#fbbf24',
+                                    position: 'start',
+                                    rotation: -90,
+                                    backgroundColor: 'rgba(0,0,0,0.0)',
+                                },
+                            };
+                        });
+                        return anns;
+                    }
+                    const intervalH = series.funding_interval_hours;
+                    if (!intervalH || intervalH <= 0) return anns;
                     const start = new Date(xMin);
                     start.setMinutes(0, 0, 0);
-                    if (start < xMin) start.setHours(start.getHours() + 1);
-                    const end = lastTs;
+                    const end = new Date(lastTs.getTime() + intervalH * 60 * 60 * 1000);
                     let idx = 0;
-                    for (let t = new Date(start); t <= end; t.setHours(t.getHours() + 1)) {
-                        const key = `funding-${sym}-${idx++}`;
+                    for (let t = new Date(start); t <= end; t = new Date(t.getTime() + intervalH * 60 * 60 * 1000)) {
+                        const key = `funding-${sym}-fallback-${idx++}`;
                         anns[key] = {
                             type: 'line',
                             xMin: t.getTime(),
@@ -371,21 +473,37 @@
                         label: 'Entry',
                         data: entryPts,
                         type: 'scatter',
-                        borderColor: '#22c55e',
-                        backgroundColor: '#22c55e',
-                        pointRadius: 4,
+                        borderColor: '#06b6d4',
+                        backgroundColor: '#06b6d4',
+                        pointRadius: 5,
                     },
                     {
-                        label: 'Exit',
-                        data: exitPts,
+                        label: 'TP',
+                        data: exitTpPts,
+                        type: 'scatter',
+                        borderColor: '#22c55e',
+                        backgroundColor: '#22c55e',
+                        pointRadius: 5,
+                    },
+                    {
+                        label: 'SL',
+                        data: exitSlPts,
                         type: 'scatter',
                         borderColor: '#ef4444',
-                        backgroundColor: exitPts.map((p) => p.backgroundColor || '#ef4444'),
-                        pointRadius: 4,
+                        backgroundColor: '#ef4444',
+                        pointRadius: 5,
+                    },
+                    {
+                        label: 'Funding',
+                        data: exitFundingPts,
+                        type: 'scatter',
+                        borderColor: '#a855f7',
+                        backgroundColor: '#a855f7',
+                        pointRadius: 5,
                     },
                 ];
 
-                charts[sym] = new Chart(ctx, {
+                const spreadChart = new Chart(ctxSpread, {
                     type: 'line',
                     data: { datasets },
                     options: {
@@ -420,6 +538,58 @@
                         },
                     },
                 });
+
+                const priceChart = new Chart(ctxPrice, {
+                    type: 'line',
+                    data: {
+                        datasets: [
+                            {
+                                label: '现货',
+                                data: spotPts,
+                                borderColor: '#38bdf8',
+                                backgroundColor: 'rgba(56,189,248,0.1)',
+                                tension: 0.15,
+                                pointRadius: 0,
+                                borderWidth: 1.2,
+                            },
+                            {
+                                label: '永续',
+                                data: futPts,
+                                borderColor: '#f97316',
+                                backgroundColor: 'rgba(249,115,22,0.1)',
+                                tension: 0.15,
+                                pointRadius: 0,
+                                borderWidth: 1.2,
+                            },
+                        ],
+                    },
+                    options: {
+                        maintainAspectRatio: false,
+                        scales: {
+                            x: {
+                                type: 'time',
+                                min: xMin,
+                                max: lastTs,
+                                time: { unit: 'hour', tooltipFormat: 'HH:mm' },
+                                ticks: { color: '#9ca3af' },
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                            },
+                            y: {
+                                ticks: { color: '#9ca3af' },
+                                grid: { color: 'rgba(255,255,255,0.05)' },
+                            },
+                        },
+                        plugins: {
+                            legend: { labels: { color: '#e5e7eb' } },
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y}`,
+                                },
+                            },
+                        },
+                    },
+                });
+                charts[sym] = [spreadChart, priceChart];
             });
         };
 
@@ -451,7 +621,7 @@
                 if (refreshTimer) clearInterval(refreshTimer);
                 refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
-                bodyEl.innerHTML = `<tr><td colspan="8" class="muted">加载失败: ${err}</td></tr>`;
+                bodyEl.innerHTML = `<tr><td colspan="10" class="muted">加载失败: ${err}</td></tr>`;
             } finally {
                 btn.disabled = false;
             }

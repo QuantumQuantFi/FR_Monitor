@@ -58,6 +58,8 @@ class WatchlistEntry:
     has_perp: bool
     last_funding_rate: Optional[float]
     last_funding_time: Optional[str]
+    funding_interval_hours: Optional[float]
+    next_funding_time: Optional[str]
     max_abs_funding: float
     last_above_threshold_at: Optional[str]
     added_at: Optional[str]
@@ -76,6 +78,8 @@ class WatchlistManager:
         self.refresh_seconds = float(cfg.get('refresh_seconds', 150))
 
         self._funding_history: Dict[str, Deque[Tuple[datetime, float]]] = {}
+        self._funding_interval: Dict[str, Optional[float]] = {}
+        self._next_funding_time: Dict[str, Optional[datetime]] = {}
         self._entries: Dict[str, WatchlistEntry] = {}
         self._lock = threading.Lock()
         self.logger = logging.getLogger('watchlist')
@@ -83,7 +87,11 @@ class WatchlistManager:
         self._preloaded = False
 
     def _prune_history(self, symbol: str, now: datetime) -> None:
-        window_start = now - self.lookback
+        interval_hours = self._funding_interval.get(symbol)
+        dynamic_window = self.lookback
+        if interval_hours and interval_hours > 0:
+            dynamic_window = max(dynamic_window, timedelta(hours=interval_hours * 1.25 + 0.5))
+        window_start = now - dynamic_window
         history = self._funding_history.get(symbol)
         if not history:
             return
@@ -91,11 +99,25 @@ class WatchlistManager:
             history.popleft()
         if not history:
             self._funding_history.pop(symbol, None)
+            self._funding_interval.pop(symbol, None)
+            self._next_funding_time.pop(symbol, None)
 
-    def _append_event(self, symbol: str, funding_rate: float, ts: datetime) -> None:
+    def _append_event(
+        self,
+        symbol: str,
+        funding_rate: float,
+        ts: datetime,
+        *,
+        interval_hours: Optional[float] = None,
+        next_funding_time: Optional[datetime] = None,
+    ) -> None:
         if symbol not in self._funding_history:
             self._funding_history[symbol] = deque()
         self._funding_history[symbol].append((ts, funding_rate))
+        if interval_hours is not None:
+            self._funding_interval[symbol] = interval_hours
+        if next_funding_time is not None:
+            self._next_funding_time[symbol] = next_funding_time
 
     def preload_from_database(self, db_path: str, *, max_rows: int = 500000) -> int:
         """
@@ -108,7 +130,7 @@ class WatchlistManager:
             conn = sqlite3.connect(db_path, timeout=15.0)
             cur = conn.cursor()
             query = """
-                SELECT symbol, funding_rate, timestamp
+                SELECT symbol, funding_rate, timestamp, funding_interval_hours, next_funding_time
                 FROM price_data
                 WHERE exchange='binance'
                   AND funding_rate IS NOT NULL
@@ -129,7 +151,7 @@ class WatchlistManager:
         now = _utcnow()
         cutoff = now - self.lookback
         added = 0
-        for symbol, fr, ts in rows:
+        for symbol, fr, ts, interval_hours, next_ft in rows:
             if fr is None:
                 continue
             ts_dt = _parse_timestamp(ts) or now
@@ -139,7 +161,13 @@ class WatchlistManager:
                 fr_val = float(fr)
             except (TypeError, ValueError):
                 continue
-            self._append_event(symbol, fr_val, ts_dt)
+            self._append_event(
+                symbol,
+                fr_val,
+                ts_dt,
+                interval_hours=float(interval_hours) if interval_hours not in (None, '') else None,
+                next_funding_time=_parse_timestamp(next_ft),
+            )
             added += 1
 
         self._preloaded = True
@@ -165,7 +193,13 @@ class WatchlistManager:
                 continue
             funding_value = funding_rate_to_float(funding_raw)
             ts = _parse_timestamp(futures.get('timestamp')) or now
-            self._append_event(symbol, funding_value, ts)
+            interval = futures.get('funding_interval_hours')
+            try:
+                interval_val = float(interval) if interval not in (None, '') else None
+            except (TypeError, ValueError):
+                interval_val = None
+            next_ft = _parse_timestamp(futures.get('next_funding_time'))
+            self._append_event(symbol, funding_value, ts, interval_hours=interval_val, next_funding_time=next_ft)
 
         # Step 2: prune history and rebuild entries
         candidates = set(self._funding_history.keys())
@@ -210,6 +244,8 @@ class WatchlistManager:
                     has_perp=has_perp,
                     last_funding_rate=last_rate,
                     last_funding_time=_iso(last_ts),
+                    funding_interval_hours=self._funding_interval.get(symbol),
+                    next_funding_time=_iso(self._next_funding_time.get(symbol)),
                     max_abs_funding=max_abs,
                     last_above_threshold_at=_iso(last_above_ts),
                     added_at=added_at if is_active else None,

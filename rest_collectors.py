@@ -283,7 +283,24 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
     过滤指数合约和清算中合约，避免污染币种价格比较."""
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     ts = _now_iso()
+    now_dt = datetime.now(timezone.utc)
     premium_meta: Dict[str, Dict[str, Any]] = {}
+
+    def _infer_interval_hours(next_ft_iso: Optional[str]) -> Optional[float]:
+        """根据下一次资金费时间估算周期；若无法确定则返回 None。"""
+        if not next_ft_iso:
+            return None
+        try:
+            dt = datetime.fromisoformat(next_ft_iso.replace('Z', '+00:00'))
+            delta_hours = (dt - now_dt).total_seconds() / 3600.0
+            if delta_hours <= 0:
+                return None
+            # Binance 目前常见 1h/4h/8h，取 [0.5, 10] 范围内的值
+            if 0.5 <= delta_hours <= 10:
+                return round(delta_hours, 2)
+        except Exception:
+            return None
+        return None
 
     try:
         premium_payload = _req_json('https://fapi.binance.com/fapi/v1/premiumIndex')
@@ -300,7 +317,7 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                 next_ft = normalize_next_funding_time(item.get('nextFundingTime'))
                 if next_ft:
                     extras['next_funding_time'] = next_ft
-                interval = derive_funding_interval_hours('binance')
+                interval = _infer_interval_hours(next_ft) or derive_funding_interval_hours('binance')
                 if interval:
                     extras['funding_interval_hours'] = interval
                 if extras:
