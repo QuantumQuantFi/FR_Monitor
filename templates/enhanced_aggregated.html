@@ -491,6 +491,7 @@
                 <button class="control-btn" onclick="togglePriceDiffSort()" id="priceDiffBtn">📊 价差排序</button>
                 <button class="control-btn" onclick="window.open('/exchanges', '_blank')">📊 交易所视图</button>
                 <button class="control-btn" onclick="toggleAutoResort()" id="autoResortBtn">排序: 开</button>
+                <button class="control-btn active" id="spotFilterBtn" onclick="toggleSpotFutureFilter()">🚫 屏蔽高现货-低期货</button>
             </div>
         </div>
         
@@ -560,6 +561,8 @@
         let cardOrder = [];              // 当前卡片顺序（冻结时使用）
         let forceResort = false;         // 用户操作触发的一次性重排
         let latestArbitrageSignals = [];
+        let latestArbitrageTimestamp = null;
+        let filterSpotHighFuturesLow = true; // 默认屏蔽高现货-低期货组合
         const EXCHANGE_ORDER = {{ exchange_order|tojson }};
         const trackedExchanges = Array.isArray(EXCHANGE_ORDER) ? EXCHANGE_ORDER.slice() : [];
 
@@ -769,27 +772,39 @@
             
             if (prices.length < 2) return null;
             
-            // 找到最高价和最低价
-            let maxPrice = Math.max(...prices.map(p => p.price));
-            let minPrice = Math.min(...prices.map(p => p.price));
-            let maxPriceInfo = prices.find(p => p.price === maxPrice);
-            let minPriceInfo = prices.find(p => p.price === minPrice);
-            
-            // 计算价差百分比
-            let diffPercent = ((maxPrice - minPrice) / minPrice) * 100;
-            
-            return {
-                maxPrice: maxPrice,
-                minPrice: minPrice,
-                maxExchange: maxPriceInfo.exchange + '(' + maxPriceInfo.type + ')',
-                minExchange: minPriceInfo.exchange + '(' + minPriceInfo.type + ')',
-                maxType: maxPriceInfo.type,
-                minType: minPriceInfo.type,
-                maxTimestamp: maxPriceInfo.timestamp,
-                minTimestamp: minPriceInfo.timestamp,
-                diffPercent: diffPercent,
-                diffAmount: maxPrice - minPrice
+            const shouldSkipPair = (high, low) => {
+                return filterSpotHighFuturesLow && high.type === 'spot' && low.type === 'futures';
             };
+
+            let bestDiff = null;
+
+            for (let i = 0; i < prices.length; i++) {
+                for (let j = 0; j < prices.length; j++) {
+                    if (i === j) continue;
+                    const high = prices[i];
+                    const low = prices[j];
+                    if (high.price <= low.price) continue;
+                    if (shouldSkipPair(high, low)) continue;
+
+                    const diffPercent = ((high.price - low.price) / low.price) * 100;
+                    if (!bestDiff || diffPercent > bestDiff.diffPercent) {
+                        bestDiff = {
+                            maxPrice: high.price,
+                            minPrice: low.price,
+                            maxExchange: high.exchange + '(' + high.type + ')',
+                            minExchange: low.exchange + '(' + low.type + ')',
+                            maxType: high.type,
+                            minType: low.type,
+                            maxTimestamp: high.timestamp,
+                            minTimestamp: low.timestamp,
+                            diffPercent: diffPercent,
+                            diffAmount: high.price - low.price
+                        };
+                    }
+                }
+            }
+
+            return bestDiff;
         }
 
         // 切换价差排序模式
@@ -1111,12 +1126,25 @@
 
             updatedLabel.textContent = fetchedAt ? formatTimestamp(fetchedAt) : '--';
 
-            if (!signals || !signals.length) {
+            const normalizeType = (signal, side) => {
+                const raw = signal?.[`${side}_type`] || signal?.[`${side}_market_type`] || signal?.[`${side}_instrument_type`];
+                if (typeof raw === 'string' && raw.trim()) return raw.trim().toLowerCase();
+                return 'futures';
+            };
+
+            const filteredSignals = (signals || []).filter(signal => {
+                if (!filterSpotHighFuturesLow) return true;
+                const shortType = normalizeType(signal, 'short');
+                const longType = normalizeType(signal, 'long');
+                return !(shortType === 'spot' && longType === 'futures');
+            });
+
+            if (!filteredSignals.length) {
                 container.innerHTML = '<div class="signal-empty">暂无满足条件的套利信号</div>';
                 return;
             }
 
-            const limited = signals.slice(0, 5);
+            const limited = filteredSignals.slice(0, 5);
             const html = limited.map(signal => {
                 const spreadValue = Number(signal.spread_percent ?? 0);
                 const spread = Number.isFinite(spreadValue) ? spreadValue.toFixed(2) : '0.00';
@@ -1145,6 +1173,7 @@
                 const res = await fetch('/api/arbitrage/signals');
                 const data = await res.json();
                 latestArbitrageSignals = data.signals || [];
+                latestArbitrageTimestamp = data.timestamp;
                 renderArbitrageSignals(latestArbitrageSignals, data.timestamp);
             } catch (error) {
                 console.error('套利信号获取失败:', error);
@@ -1223,6 +1252,20 @@
         // 跳转到币种详情页面
         function goToSymbolDetails(symbol) {
             window.location.href = `/charts?symbol=${symbol}`;
+        }
+
+        function toggleSpotFutureFilter() {
+            filterSpotHighFuturesLow = !filterSpotHighFuturesLow;
+            const btn = document.getElementById('spotFilterBtn');
+            if (filterSpotHighFuturesLow) {
+                btn.classList.add('active');
+                btn.textContent = '🚫 屏蔽高现货-低期货';
+            } else {
+                btn.classList.remove('active');
+                btn.textContent = '👀 显示高现货-低期货';
+            }
+            applyFilters(); // 重新计算最大价差
+            renderArbitrageSignals(latestArbitrageSignals, latestArbitrageTimestamp);
         }
     </script>
 </body>
