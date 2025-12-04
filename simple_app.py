@@ -27,6 +27,7 @@ from config import (
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
+from exchange_details import fetch_exchange_details
 from trading.trade_executor import (
     TradeExecutionError,
     execute_dual_perp_market_order,
@@ -1047,6 +1048,89 @@ def build_orderbook_annotation(entries: List[Dict[str, Any]], sweep_notional: fl
             out[symbol] = {'legs': legs, 'forward': None, 'reverse': None}
     return out
 
+
+def build_cross_spread_matrix(entries: List[Dict[str, Any]], all_data: Dict[str, Any], sweep_notional: float = DEFAULT_SWEEP_NOTIONAL) -> Dict[str, Any]:
+    """
+    基于订单簿（扫 100 USDT）计算跨交易所 FF/SF 差价矩阵。
+    - FF：永续 vs 永续
+    - SF：现货 vs 永续
+    方向按 compute_orderbook_spread 的 forward(买高卖低)/reverse(卖高买低) 计算。
+    """
+    result: Dict[str, Any] = {}
+    cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
+
+    def _leg_price(exchange: str, market_type: str, symbol: str) -> Optional[Dict[str, Any]]:
+        key = (exchange.lower(), market_type, symbol.upper())
+        if key in cache:
+            return cache[key]
+        price = fetch_orderbook_prices(exchange.lower(), symbol, market_type, notional=sweep_notional)
+        cache[key] = price
+        return price
+
+    for entry in entries:
+        sym = entry.get('symbol')
+        if not sym:
+            continue
+        legs: List[Dict[str, Any]] = []
+        for exch, sym_map in all_data.items():
+            payload = sym_map.get(sym, {})
+            if payload.get('futures'):
+                legs.append({'exchange': exch, 'market_type': 'perp'})
+            if payload.get('spot'):
+                legs.append({'exchange': exch, 'market_type': 'spot'})
+        priced_legs: List[Dict[str, Any]] = []
+        for leg in legs:
+            price_info = _leg_price(leg['exchange'], leg['market_type'], sym)
+            priced_legs.append({
+                'exchange': leg['exchange'],
+                'market_type': leg['market_type'],
+                'price': price_info,
+                'error': price_info.get('error') if isinstance(price_info, dict) else 'no_data',
+            })
+        perps = [l for l in priced_legs if l['market_type'] == 'perp']
+        spots = [l for l in priced_legs if l['market_type'] == 'spot']
+        pairs: List[Dict[str, Any]] = []
+
+        def _add_pair(a: Dict[str, Any], b: Dict[str, Any], ptype: str):
+            spread = compute_orderbook_spread([a, b])
+            if not spread:
+                return
+            forward = spread.get('forward', {})
+            reverse = spread.get('reverse', {})
+            f_val = forward.get('spread')
+            r_val = reverse.get('spread')
+            if f_val is None and r_val is None:
+                return
+            pairs.append({
+                'type': ptype,
+                'exchange_a': a['exchange'],
+                'exchange_b': b['exchange'],
+                'forward': f_val,
+                'reverse': r_val,
+            })
+
+        for i in range(len(perps)):
+            for j in range(i + 1, len(perps)):
+                if perps[i].get('price') and not perps[i]['price'].get('error') and perps[j].get('price') and not perps[j]['price'].get('error'):
+                    _add_pair(perps[i], perps[j], 'FF')
+        for spot in spots:
+            if not spot.get('price') or spot['price'].get('error'):
+                continue
+            for perp in perps:
+                if perp.get('price') and not perp['price'].get('error'):
+                    _add_pair(spot, perp, 'SF')
+
+        pairs_sorted = sorted(
+            pairs,
+            key=lambda p: max(abs(p['forward'] or 0), abs(p['reverse'] or 0)),
+            reverse=True
+        )
+        result[sym] = {
+            'legs': priced_legs,
+            'pairs': pairs_sorted,
+        }
+    return result
+
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
@@ -1352,7 +1436,77 @@ def get_watchlist():
     try:
         entries = payload.get('entries', [])
         active_entries = [e for e in entries if e.get('status') == 'active']
-        payload['orderbook'] = build_orderbook_annotation(active_entries)
+        all_data = data_collector.get_all_data()
+        try:
+            payload['orderbook'] = build_orderbook_annotation(active_entries)
+            payload['cross_spreads'] = build_cross_spread_matrix(active_entries, all_data)
+        except Exception as ob_exc:
+            payload['orderbook_error'] = str(ob_exc)
+            payload['orderbook'] = {}
+            payload['cross_spreads'] = {}
+
+        # 补充交易所视图：按符号列出各所期现价格、资金费率，以及跨所永续最佳价差
+        def _to_float(val):
+            try:
+                f = float(val)
+                return f if f == f and f != float('inf') and f != float('-inf') else None
+            except Exception:
+                return None
+
+        overview: Dict[str, Any] = {}
+        for entry in active_entries:
+            sym = entry.get('symbol')
+            if not sym:
+                continue
+            rows = []
+            high = None
+            low = None
+            for exch, sym_map in all_data.items():
+                payload_sym = sym_map.get(sym, {})
+                spot = payload_sym.get('spot') or {}
+                fut = payload_sym.get('futures') or {}
+                spot_price = _to_float(spot.get('price'))
+                futures_price = _to_float(fut.get('price') or fut.get('last_price'))
+                funding_rate = _to_float(fut.get('funding_rate'))
+                interval = _to_float(fut.get('funding_interval_hours'))
+                next_ft = fut.get('next_funding_time')
+                if futures_price is not None:
+                    if high is None or futures_price > high['price']:
+                        high = {'exchange': exch, 'price': futures_price, 'funding_rate': funding_rate}
+                    if low is None or futures_price < low['price']:
+                        low = {'exchange': exch, 'price': futures_price, 'funding_rate': funding_rate}
+                row = {
+                    'exchange': exch,
+                    'spot_price': spot_price,
+                    'futures_price': futures_price,
+                    'funding_rate': funding_rate,
+                    'funding_interval_hours': interval,
+                    'next_funding_time': next_ft,
+                }
+                rows.append(row)
+            best = None
+            if high and low and high['price'] and low['price']:
+                base = min(high['price'], low['price'])
+                if base:
+                    best = {
+                        'high_exchange': high['exchange'],
+                        'low_exchange': low['exchange'],
+                        'high_price': high['price'],
+                        'low_price': low['price'],
+                        'spread': (high['price'] - low['price']) / base,
+                        'high_funding': high.get('funding_rate'),
+                        'low_funding': low.get('funding_rate'),
+                    }
+            overview[sym] = {'rows': rows, 'best_perp_spread': best}
+        payload['exchange_overview'] = overview
+
+        # 更完整的交易所指标（资金费上限/下限、OI、24h 额等），直接调用公开 REST
+        try:
+            symbols = [e.get('symbol') for e in active_entries if e.get('symbol')]
+            if symbols:
+                payload['exchange_details'] = fetch_exchange_details(symbols)
+        except Exception as exc:
+            payload['exchange_details_error'] = str(exc)
     except Exception as exc:
         payload['orderbook_error'] = str(exc)
     return precision_jsonify(payload)

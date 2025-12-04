@@ -93,12 +93,18 @@
             cursor: pointer;
         }
         button:disabled { opacity: 0.5; cursor: not-allowed; }
-        table {
+        .table-wrap {
             width: 100%;
+            overflow-x: auto;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.01);
+        }
+        table {
+            width: 1800px;
+            min-width: 1400px;
             border-collapse: collapse;
             background: rgba(255,255,255,0.01);
-            border-radius: 10px;
-            overflow: hidden;
         }
         thead { background: rgba(255,255,255,0.03); }
         th, td {
@@ -165,6 +171,13 @@
             flex-direction: column;
             gap: 10px;
         }
+        .cell-scroll {
+            max-height: 96px;
+            overflow-y: auto;
+            line-height: 1.35;
+        }
+        .col-prices { min-width: 240px; }
+        .col-detail { min-width: 320px; }
     </style>
 </head>
 <body>
@@ -196,6 +209,7 @@
             开仓条件（Type A）：C1=价差低于基线且低于绝对阈值(5%)，且短期斜率不再上行(≤0)；C2=波动/区间达标且穿越≥2且 Drift≤0.3；必须 C1 &amp; C2 同时满足。Type B/C 当前仅展示价差与资金费，不给出自动信号。
         </div>
 
+        <div class="table-wrap">
         <table>
             <thead>
                 <tr>
@@ -206,6 +220,12 @@
                     <th>资金费率</th>
                     <th>Spread (最新/均值/标准差)</th>
                     <th>配对</th>
+                    <th>买高卖低</th>
+                    <th>卖高买低</th>
+                    <th>跨所永续差价</th>
+                    <th class="col-prices">各所资金费&价格</th>
+                    <th class="col-detail">详尽交易所指标</th>
+                    <th>查看</th>
                     <th>图表</th>
                     <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
@@ -215,9 +235,10 @@
                 </tr>
             </thead>
             <tbody id="watchlist-body">
-                <tr><td colspan="13" class="muted">加载中...</td></tr>
+                <tr><td colspan="19" class="muted">加载中...</td></tr>
             </tbody>
         </table>
+        </div>
 
         <div class="info-block">
             <h3>指标说明（基于后端实际计算）</h3>
@@ -234,6 +255,16 @@
         <div class="charts-grid" id="charts-grid"></div>
     </div>
 
+    <div id="modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9999; align-items:center; justify-content:center; padding:12px;">
+        <div id="modal-content" style="max-width:960px; width:100%; background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:16px; color:var(--text); box-shadow:0 20px 50px rgba(0,0,0,0.45);">
+            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                <div id="modal-title" style="font-weight:700;">详情</div>
+                <button id="modal-close" style="background:rgba(255,255,255,0.08); border:1px solid var(--border); color:var(--text); border-radius:6px; padding:6px 10px; cursor:pointer;">关闭</button>
+            </div>
+            <div id="modal-body" class="mono" style="font-size:13px; line-height:1.45; max-height:520px; overflow:auto;"></div>
+        </div>
+    </div>
+
     <script>
         const bodyEl = document.getElementById('watchlist-body');
         const btn = document.getElementById('refresh-btn');
@@ -241,6 +272,8 @@
         const chartsBtn = document.getElementById('charts-btn');
         let metricsCache = {};
         let orderbookMap = {};
+        let exchangeOverview = {};
+        let crossSpreads = {};
         let charts = {};
         let chartSeries = {};
         let chartsLoaded = false;
@@ -256,6 +289,60 @@
             updatedAt: document.getElementById('updated-at'),
         };
 
+        const buildDetailHtml = (symbol, focus = '') => {
+            const dataRows = window.__exchangeDetails?.[symbol] || [];
+            if (!dataRows.length) return '<div class="muted">暂无详情</div>';
+            const matrixRows = (crossSpreads[symbol]?.pairs || []).slice(0, 20);
+            const rowsHtml = dataRows.map((r) => {
+                const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
+                const maxFr = r.funding_cap !== null && r.funding_cap !== undefined ? formatPct(r.funding_cap) : '--';
+                const minFr = r.funding_floor !== null && r.funding_floor !== undefined ? formatPct(r.funding_floor) : '--';
+                const idxDiff = r.index_diff !== null && r.index_diff !== undefined ? formatPct(r.index_diff) : '--';
+                const oi = r.open_interest !== null && r.open_interest !== undefined ? formatHuman(r.open_interest) : '--';
+                const vol = r.volume_quote !== null && r.volume_quote !== undefined ? formatHuman(r.volume_quote) : '--';
+                const period = r.funding_interval_hours ? formatInterval(r.funding_interval_hours) : '动态/未知';
+                const insurance = r.insurance_fund ? formatHuman(r.insurance_fund) : '未提供/--';
+                const hist = Array.isArray(r.funding_history)
+                    ? r.funding_history.map((h) => `${formatTime(h.time)} ${formatPct(h.rate)}`).join('<br>')
+                    : '未提供/--';
+                const comps = Array.isArray(r.index_components) && r.index_components.length
+                    ? r.index_components.slice(0, 10).map((c) => `${c.symbol || c.component}: ${c.weight !== null && c.weight !== undefined ? c.weight : '--'}`).join('<br>')
+                    : '未提供/--';
+                return `
+                    <div style="padding:8px 10px; border:1px solid var(--border); border-radius:8px; margin-bottom:8px;">
+                        <div style="font-weight:700;margin-bottom:4px;">${r.exchange}</div>
+                        <div>周期: ${period} 当前: ${fr} 上限: ${maxFr} 下限: ${minFr}</div>
+                        <div>指数差: ${idxDiff} OI: ${oi} 24h额: ${vol}</div>
+                        <div>保险金: ${insurance}</div>
+                        <div style="margin-top:6px;">历史资金费(最近):<br>${hist}</div>
+                        <div style="margin-top:6px;">指数成分(截取):<br>${comps}</div>
+                    </div>
+                `;
+            }).join('');
+            const matrixHtml = matrixRows.length
+                ? `<div style="padding:8px 10px; border:1px solid var(--border); border-radius:8px; margin-top:8px;">
+                        <div style="font-weight:700;margin-bottom:6px;">差价矩阵 (订单簿扫100 USDT，买高卖低 / 卖高买低)</div>
+                        ${matrixRows.map((m) => {
+                            const fwd = m.forward !== null && m.forward !== undefined ? formatPct(m.forward) : '--';
+                            const rev = m.reverse !== null && m.reverse !== undefined ? formatPct(m.reverse) : '--';
+                            return `[${m.type}] ${m.exchange_a} / ${m.exchange_b} ${fwd} / ${rev}`;
+                        }).join('<br>')}
+                   </div>`
+                : '<div class="muted" style="margin-top:8px;">暂无可用差价矩阵</div>';
+            return rowsHtml + matrixHtml;
+        };
+
+        const showModal = (title, html) => {
+            const overlay = document.getElementById('modal-overlay');
+            const body = document.getElementById('modal-body');
+            document.getElementById('modal-title').textContent = title;
+            body.innerHTML = html;
+            overlay.style.display = 'flex';
+        };
+        const hideModal = () => {
+            document.getElementById('modal-overlay').style.display = 'none';
+        };
+
         const formatPct = (value) => {
             if (value === null || value === undefined) return '-';
             return (value * 100).toFixed(3) + '%';
@@ -269,6 +356,15 @@
         const formatNumber = (value, digits = 4) => {
             if (value === null || value === undefined) return '-';
             return Number(value).toFixed(digits);
+        };
+        const formatHuman = (value) => {
+            const n = Number(value);
+            if (!Number.isFinite(n)) return '--';
+            const abs = Math.abs(n);
+            if (abs >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+            if (abs >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+            if (abs >= 1e3) return (n / 1e3).toFixed(2) + 'K';
+            return n.toFixed(2);
         };
 
         const formatInterval = (value) => {
@@ -296,7 +392,7 @@
             const activeEntries = (entries || []).filter((item) => item.status === 'active');
 
             if (!activeEntries.length) {
-                bodyEl.innerHTML = '<tr><td colspan="13" class="muted">暂无活跃符号满足条件</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="19" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
             }
 
@@ -330,7 +426,14 @@
                 const volCell = `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`;
                 const driftCell = `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`;
 
-                const intervalRaw = item.funding_interval_hours ?? (chartSeries[item.symbol]?.funding_interval_hours);
+                const detailRows = (window.__exchangeDetails && window.__exchangeDetails[item.symbol]) || [];
+                const intervalFromDetails = (() => {
+                    for (const r of detailRows) {
+                        if (r.funding_interval_hours) return r.funding_interval_hours;
+                    }
+                    return null;
+                })();
+                const intervalRaw = intervalFromDetails || item.funding_interval_hours || metrics.interval_hours || (chartSeries[item.symbol]?.funding_interval_hours);
                 const intervalTitle = item.next_funding_time
                     ? `下一次资金费时间: ${item.next_funding_time}`
                     : (intervalRaw ? '使用交易所返回的周期估计' : '周期未知，按默认估计');
@@ -412,6 +515,44 @@
                     const spreadLine = formatObSpread(ob.forward, ob.reverse);
                     pairCell = `${legLines || pairCell}<br><span class="muted">${spreadLine}</span>`;
                 }
+                const forwardSpread = ob?.forward?.spread;
+                const reverseSpread = ob?.reverse?.spread;
+                const forwardCell = forwardSpread === null || forwardSpread === undefined ? '-' : formatPct(forwardSpread);
+                const reverseCell = reverseSpread === null || reverseSpread === undefined ? '-' : formatPct(reverseSpread);
+
+                const exOverview = exchangeOverview[item.symbol] || {};
+                const bestPerp = exOverview.best_perp_spread;
+                const bestPerpCell = bestPerp
+                    ? `高 ${bestPerp.high_exchange} ${formatNumber(bestPerp.high_price, 6)}<br>低 ${bestPerp.low_exchange} ${formatNumber(bestPerp.low_price, 6)}<br>${formatPct(bestPerp.spread)}`
+                    : '-';
+                const exRows = (exOverview.rows || [])
+                    .map((r) => {
+                        const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
+                        const fp = r.futures_price !== null && r.futures_price !== undefined ? formatNumber(r.futures_price, 6) : '--';
+                        const sp = r.spot_price !== null && r.spot_price !== undefined ? formatNumber(r.spot_price, 6) : '--';
+                        const label = (r.exchange && (r.exchange !== 'unsupported')) ? r.exchange : '未提供';
+                        return `${label}: ${fr} | perp ${fp} / spot ${sp}`;
+                    })
+                    .filter(Boolean)
+                    .join('<br>');
+                const exRowsCell = exRows || '-';
+
+                const detailCell = detailRows.length
+                    ? detailRows.map((r) => {
+                        const maxFr = r.funding_cap !== null && r.funding_cap !== undefined ? formatPct(r.funding_cap) : '--';
+                        const minFr = r.funding_floor !== null && r.funding_floor !== undefined ? formatPct(r.funding_floor) : '--';
+                        const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
+                        const idxDiff = r.index_diff !== null && r.index_diff !== undefined ? formatPct(r.index_diff) : '--';
+                        const oi = r.open_interest !== null && r.open_interest !== undefined ? formatHuman(r.open_interest) : '--';
+                        const vol = r.volume_quote !== null && r.volume_quote !== undefined ? formatHuman(r.volume_quote) : '--';
+                        const period = r.funding_interval_hours ? formatInterval(r.funding_interval_hours) : '动态/未知';
+                        const insurance = r.insurance_fund ? ` 保险金 ${formatHuman(r.insurance_fund)}` : '';
+                        const hist = Array.isArray(r.funding_history) && r.funding_history.length
+                            ? ` 历史 ${r.funding_history.slice(0, 3).map((h) => formatPct(h.rate)).join(' / ')}`
+                            : '';
+                        return `${r.exchange}: 周期${period} 上限${maxFr} 下限${minFr} 当前${fr} 指数差${idxDiff} OI ${oi} 24h额 ${vol}${insurance}${hist}`;
+                    }).join('<br>')
+                    : '-';
 
                 return `
                     <tr>
@@ -422,6 +563,12 @@
                         <td class="mono">${fundingRateText}</td>
                         <td class="mono">${spreadCell}</td>
                         <td class="mono">${pairCell}</td>
+                        <td class="mono">${forwardCell}</td>
+                        <td class="mono">${reverseCell}</td>
+                        <td class="mono">${bestPerpCell}</td>
+                        <td class="mono cell-scroll col-prices">${exRowsCell}</td>
+                        <td class="mono cell-scroll col-detail">${detailCell}</td>
+                        <td><button class="detail-btn" data-sym="${item.symbol}">查看</button></td>
                         <td><button class="chart-btn" data-sym="${item.symbol}">图表</button></td>
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
@@ -731,6 +878,9 @@
                 const resp = await fetch('/api/watchlist');
                 const data = await resp.json();
                 orderbookMap = data.orderbook || {};
+                window.__exchangeDetails = data.exchange_details || {};
+                exchangeOverview = data.exchange_overview || {};
+                crossSpreads = data.cross_spreads || {};
                 const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
                 const activeSymbols = activeEntries.map((i) => i.symbol);
                 lastActiveEntries = activeEntries;
@@ -757,7 +907,7 @@
                 if (refreshTimer) clearInterval(refreshTimer);
                 refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
-                bodyEl.innerHTML = `<tr><td colspan="10" class="muted">加载失败: ${err}</td></tr>`;
+                bodyEl.innerHTML = `<tr><td colspan="19" class="muted">加载失败: ${err}</td></tr>`;
             } finally {
                 btn.disabled = false;
             }
@@ -776,17 +926,30 @@
             }
         });
         bodyEl.addEventListener('click', async (event) => {
-            const target = event.target.closest('.chart-btn');
-            if (!target) return;
-            const sym = target.getAttribute('data-sym');
-            const entry = lastActiveEntries.find((e) => e.symbol === sym);
-            if (!entry) return;
-            await loadSeriesData();
-            renderCharts([entry]);
+            const chartBtn = event.target.closest('.chart-btn');
+            if (chartBtn) {
+                const sym = chartBtn.getAttribute('data-sym');
+                const entry = lastActiveEntries.find((e) => e.symbol === sym);
+                if (!entry) return;
+                await loadSeriesData();
+                renderCharts([entry]);
+                return;
+            }
+            const detailBtn = event.target.closest('.detail-btn');
+            if (detailBtn) {
+                const sym = detailBtn.getAttribute('data-sym');
+                const html = buildDetailHtml(sym);
+                showModal(`${sym} 交易所详情`, html);
+                return;
+            }
         });
         chartsBtn.addEventListener('click', async () => {
             await loadSeriesData();
             renderCharts(lastActiveEntries);
+        });
+        document.getElementById('modal-close').addEventListener('click', hideModal);
+        document.getElementById('modal-overlay').addEventListener('click', (e) => {
+            if (e.target.id === 'modal-overlay') hideModal();
         });
         loadWatchlist();
     </script>

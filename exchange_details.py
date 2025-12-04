@@ -1,0 +1,586 @@
+import time
+import requests
+from typing import Dict, Any, List
+
+
+def _get_json(url: str, timeout: float = 5.0):
+    try:
+        resp = requests.get(url, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def _fmt_pct(val):
+    try:
+        f = float(val)
+        return f
+    except Exception:
+        return None
+
+
+def _fmt_float(val):
+    try:
+        f = float(val)
+        return f
+    except Exception:
+        return None
+
+
+def _human_sum_insurance(data: Any) -> float:
+    """Sum USDT/USDC marginBalance from Binance insuranceBalance response."""
+    total = 0.0
+    if isinstance(data, list):
+        for item in data:
+            assets = item.get("assets") if isinstance(item, dict) else None
+            if not assets:
+                continue
+            for a in assets:
+                asset = a.get("asset")
+                if asset in ("USDT", "USDC"):
+                    try:
+                        total += float(a.get("marginBalance", 0))
+                    except Exception:
+                        continue
+    return total or None
+
+
+def _derive_interval_hours(history: List[Dict[str, Any]], key: str = "time") -> float:
+    """
+    依据资金费历史时间戳推断周期（毫秒差值转小时）。
+    当缺少周期字段或交易所未显式返回时使用。
+    """
+    if not isinstance(history, list) or len(history) < 2:
+        return None
+    times = []
+    for h in history:
+        ts = h.get(key) if isinstance(h, dict) else None
+        try:
+            t = float(ts)
+            # Gate 等部分接口返回秒，需要换算
+            if t < 1e12:
+                t *= 1000.0
+            times.append(t)
+        except Exception:
+            continue
+    if len(times) < 2:
+        return None
+    times = sorted(set(times))
+    if len(times) < 2:
+        return None
+    # 取最近两个时间点的间隔
+    diff_ms = times[-1] - times[-2]
+    if diff_ms <= 0:
+        return None
+    hours = diff_ms / 3_600_000.0
+    # 合理区间过滤，常见 1h / 4h / 8h
+    if 0.5 <= hours <= 12:
+        return round(hours, 3)
+    return None
+
+
+def fetch_binance(symbol: str):
+    sym = symbol.upper() + "USDT"
+    now = int(time.time() * 1000)
+    premium = _get_json(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}")
+    fund_info = _get_json(f"https://fapi.binance.com/fapi/v1/fundingInfo?symbol={sym}")
+    oi = _get_json(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period=5m&limit=1")
+    ticker = _get_json(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={sym}")
+    insurance = _get_json("https://fapi.binance.com/fapi/v1/insuranceBalance")
+    history = _get_json(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=20")
+    components = _get_json(f"https://fapi.binance.com/fapi/v1/constituents?symbol={sym}")
+    row = {
+        "exchange": "binance",
+        "symbol": symbol,
+        "funding_interval_hours": None,
+        "funding_rate": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "index_diff": None,
+        "open_interest": None,
+        "risk_fund": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "insurance_fund": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    if premium:
+        fr = premium.get("lastFundingRate")
+        row["funding_rate"] = _fmt_pct(fr)
+        mark = _fmt_float(premium.get("markPrice"))
+        idx = _fmt_float(premium.get("indexPrice"))
+        row["mark_price"] = mark
+        row["index_price"] = idx
+        if mark and idx:
+            base = idx or mark
+            if base:
+                row["index_diff"] = (mark - idx) / base
+        next_ft = premium.get("nextFundingTime")
+        row["next_funding_time"] = next_ft
+    if fund_info and isinstance(fund_info, list) and fund_info:
+        info = fund_info[0]
+        row["funding_interval_hours"] = _fmt_float(info.get("fundingIntervalHours"))
+        row["funding_cap"] = _fmt_pct(info.get("adjustedFundingRateCap"))
+        row["funding_floor"] = _fmt_pct(info.get("adjustedFundingRateFloor"))
+    if row["funding_interval_hours"] is None:
+        row["funding_interval_hours"] = 8.0
+    if oi and isinstance(oi, list) and oi:
+        latest = oi[-1]
+        val = latest.get("sumOpenInterestValue")
+        row["open_interest"] = _fmt_float(val)
+    if ticker:
+        row["volume_quote"] = _fmt_float(ticker.get("quoteVolume"))
+    if insurance:
+        row["insurance_fund"] = _human_sum_insurance(insurance)
+    if isinstance(history, list):
+        row["funding_history"] = [
+            {"time": h.get("fundingTime") or h.get("fundingTime"), "rate": _fmt_pct(h.get("fundingRate"))}
+            for h in history if h.get("fundingRate") is not None
+        ]
+    if components and isinstance(components, dict):
+        basket = components.get("basket") or []
+        parsed = []
+        for item in basket:
+            symb = item.get("symbol")
+            wt = _fmt_float(item.get("weightInQuote") or item.get("weightInUnits"))
+            if symb:
+                parsed.append({"symbol": symb, "weight": wt})
+        row["index_components"] = parsed
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    return row
+
+
+def fetch_bybit(symbol: str):
+    sym = symbol.upper() + "USDT"
+    now = int(time.time() * 1000)
+    ticker = _get_json(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}")
+    insurance = _get_json("https://api.bybit.com/v5/market/insurance?coin=USDT")
+    history = _get_json(f"https://api.bybit.com/v5/market/funding/history?symbol={sym}&limit=20")
+    components = _get_json(f"https://api.bybit.com/v5/market/index-price-components?indexName={sym}")
+    row = {
+        "exchange": "bybit",
+        "symbol": symbol,
+        "funding_interval_hours": 8.0,
+        "funding_rate": None,
+        "index_diff": None,
+        "open_interest": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "insurance_fund": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    try:
+        if ticker and ticker.get("result", {}).get("list"):
+            item = ticker["result"]["list"][0]
+            row["funding_rate"] = _fmt_pct(item.get("fundingRate"))
+            mark = _fmt_float(item.get("markPrice"))
+            idx = _fmt_float(item.get("indexPrice"))
+            row["mark_price"] = mark
+            row["index_price"] = idx
+            if mark and idx:
+                base = idx or mark
+                row["index_diff"] = (mark - idx) / base if base else None
+            row["open_interest"] = _fmt_float(item.get("openInterest"))
+            row["volume_quote"] = _fmt_float(item.get("turnover24h"))
+            row["next_funding_time"] = item.get("nextFundingTime")
+    except Exception:
+        pass
+    try:
+        if insurance and insurance.get("result", {}).get("list"):
+            total = 0.0
+            for bucket in insurance["result"]["list"]:
+                try:
+                    total += float(bucket.get("balance", 0))
+                except Exception:
+                    continue
+            row["insurance_fund"] = total or None
+    except Exception:
+        pass
+    try:
+        if history and history.get("result", {}).get("list"):
+            row["funding_history"] = [
+                {"time": h.get("fundingRateTimestamp"), "rate": _fmt_pct(h.get("fundingRate"))}
+                for h in history["result"]["list"]
+                if h.get("fundingRate") is not None
+            ]
+    except Exception:
+        pass
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    try:
+        comps = components.get("result", {}).get("list", []) if components else []
+        parsed = []
+        for item in comps:
+            symb = item.get("symbol")
+            wt = _fmt_float(item.get("weight"))
+            if symb:
+                parsed.append({"symbol": symb, "weight": wt})
+        row["index_components"] = parsed
+    except Exception:
+        pass
+    return row
+
+
+def fetch_gate(symbol: str):
+    sym = symbol.upper() + "_USDT"
+    now = int(time.time() * 1000)
+    ticker = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/tickers?contract={sym}")
+    stats = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract={sym}&limit=1")
+    history = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract={sym}&limit=20")
+    # Gate 未提供指数成分/保险金公开接口
+    row = {
+        "exchange": "gate",
+        "symbol": symbol,
+        "funding_interval_hours": 8.0,
+        "funding_rate": None,
+        "index_diff": None,
+        "open_interest": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    try:
+        if ticker and isinstance(ticker, list) and ticker:
+            item = ticker[0]
+            row["funding_rate"] = _fmt_pct(item.get("funding_rate"))
+            mark = _fmt_float(item.get("mark_price"))
+            idx = _fmt_float(item.get("index_price"))
+            row["mark_price"] = mark
+            row["index_price"] = idx
+            if mark and idx:
+                base = idx or mark
+                row["index_diff"] = (mark - idx) / base if base else None
+            row["open_interest"] = _fmt_float(item.get("total_size"))
+            row["volume_quote"] = _fmt_float(item.get("volume_quote"))
+        if stats and isinstance(stats, list) and stats:
+            row["funding_interval_hours"] = _fmt_float(stats[0].get("funding_rate_indicative_interval"))
+    except Exception:
+        pass
+    try:
+        if isinstance(history, list):
+            row["funding_history"] = [
+                {"time": h.get("t") or h.get("timestamp"), "rate": _fmt_pct(h.get("r") or h.get("funding_rate"))}
+                for h in history if h.get("r") or h.get("funding_rate") is not None
+            ]
+    except Exception:
+        pass
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    return row
+
+
+def fetch_bitget(symbol: str):
+    sym = symbol.upper() + "USDT"
+    now = int(time.time() * 1000)
+    ticker = _get_json(f"https://api.bitget.com/api/v2/mix/market/ticker?productType=usdt-futures&symbol={sym}")
+    oi = _get_json(f"https://api.bitget.com/api/v2/mix/market/open-interest?productType=usdt-futures&symbol={sym}")
+    fund = _get_json(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=usdt-futures&symbol={sym}")
+    history = _get_json(f"https://api.bitget.com/api/v2/mix/market/history-fundRate?productType=usdt-futures&symbol={sym}&pageSize=20")
+    # Bitget 指数组成/保险金暂无公开接口，标记为空
+    row = {
+        "exchange": "bitget",
+        "symbol": symbol,
+        "funding_interval_hours": 8.0,
+        "funding_rate": None,
+        "index_diff": None,
+        "open_interest": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    try:
+        data = ticker.get("data") if ticker else None
+        item = data[0] if isinstance(data, list) and data else data
+        if item:
+            row["funding_rate"] = _fmt_pct(item.get("fundingRate"))
+            mark = _fmt_float(item.get("markPrice"))
+            idx = _fmt_float(item.get("indexPrice"))
+            row["mark_price"] = mark
+            row["index_price"] = idx
+            if mark and idx:
+                base = idx or mark
+                row["index_diff"] = (mark - idx) / base if base else None
+            row["volume_quote"] = _fmt_float(item.get("quoteVolume"))
+    except Exception:
+        pass
+    try:
+        data = oi.get("data", {}) if oi else {}
+        lst = data.get("openInterestList")
+        if isinstance(lst, list) and lst:
+            latest = lst[0]
+            row["open_interest"] = _fmt_float(latest.get("value") or latest.get("size"))
+    except Exception:
+        pass
+    try:
+        data = fund.get("data") if fund else None
+        item = data[0] if isinstance(data, list) and data else data
+        if item:
+            row["funding_rate"] = _fmt_pct(item.get("fundingRate"))
+            row["funding_interval_hours"] = _fmt_float(item.get("fundingRateInterval")) or 4.0
+            row["funding_cap"] = _fmt_pct(item.get("maxFundingRate"))
+            row["funding_floor"] = _fmt_pct(item.get("minFundingRate"))
+            row["next_funding_time"] = item.get("nextUpdate")
+    except Exception:
+        pass
+    try:
+        if history and history.get("data"):
+            row["funding_history"] = [
+                {
+                    "time": h.get("timestamp") or h.get("fundingTime"),
+                    "rate": _fmt_pct(h.get("fundingRate")),
+                }
+                for h in history["data"]
+                if h.get("fundingRate") is not None
+            ]
+    except Exception:
+        pass
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    if row["funding_interval_hours"] is None:
+        row["funding_interval_hours"] = 4.0
+    return row
+
+
+def fetch_okx(symbol: str):
+    sym = symbol.upper() + "-USDT-SWAP"
+    uly = symbol.upper() + "-USDT"
+    now = int(time.time() * 1000)
+    ticker = _get_json(f"https://www.okx.com/api/v5/market/ticker?instId={sym}")
+    oi_public = _get_json(f"https://www.okx.com/api/v5/public/open-interest?instId={sym}")
+    funding_now = _get_json(f"https://www.okx.com/api/v5/public/funding-rate?instId={sym}")
+    mark_price = _get_json(f"https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId={sym}")
+    index_px = _get_json(f"https://www.okx.com/api/v5/market/index-tickers?quoteCcy=USDT&instId={uly}")
+    insurance = _get_json(f"https://www.okx.com/api/v5/public/insurance-fund?instType=SWAP&uly={uly}")
+    history = _get_json(f"https://www.okx.com/api/v5/public/funding-rate-history?instId={sym}&limit=20")
+    components = _get_json(f"https://www.okx.com/api/v5/market/index-components?index={uly}")
+    row = {
+        "exchange": "okx",
+        "symbol": symbol,
+        "funding_interval_hours": None,
+        "funding_rate": None,
+        "index_diff": None,
+        "open_interest": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "insurance_fund": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    try:
+        if ticker and ticker.get("data"):
+            item = ticker["data"][0]
+            row["open_interest"] = _fmt_float(item.get("oi"))
+            row["volume_quote"] = _fmt_float(item.get("volCcy24h"))
+    except Exception:
+        pass
+    try:
+        if oi_public and oi_public.get("data"):
+            oi_item = oi_public["data"][0]
+            row["open_interest"] = row["open_interest"] or _fmt_float(
+                oi_item.get("oiValue") or oi_item.get("oiUsd") or oi_item.get("oi")
+            )
+    except Exception:
+        pass
+    try:
+        if funding_now and funding_now.get("data"):
+            item = funding_now["data"][0]
+            row["funding_rate"] = _fmt_pct(item.get("fundingRate"))
+            row["funding_cap"] = _fmt_pct(item.get("maxFundingRate"))
+            row["funding_floor"] = _fmt_pct(item.get("minFundingRate"))
+            row["next_funding_time"] = item.get("nextFundingTime") or item.get("fundingTime")
+            row["funding_interval_hours"] = 4.0
+    except Exception:
+        pass
+    if row["funding_interval_hours"] is None:
+        row["funding_interval_hours"] = 4.0
+    try:
+        if mark_price and mark_price.get("data"):
+            mp = mark_price["data"][0]
+            row["mark_price"] = _fmt_float(mp.get("markPx"))
+    except Exception:
+        pass
+    try:
+        if index_px and index_px.get("data"):
+            idx_item = index_px["data"][0]
+            idx_val = _fmt_float(idx_item.get("idxPx"))
+            row["index_price"] = idx_val
+    except Exception:
+        pass
+    try:
+        if row.get("mark_price") and row.get("index_price"):
+            base = row["index_price"] or row["mark_price"]
+            if base:
+                row["index_diff"] = (row["mark_price"] - row["index_price"]) / base
+    except Exception:
+        pass
+    try:
+        if insurance and insurance.get("data"):
+            total = 0.0
+            for bucket in insurance["data"]:
+                details = bucket.get("details") or []
+                for det in details:
+                    try:
+                        total += float(det.get("balance", 0))
+                    except Exception:
+                        continue
+            row["insurance_fund"] = total or None
+    except Exception:
+        pass
+    try:
+        if history and history.get("data"):
+            row["funding_history"] = [
+                {"time": h.get("fundingTime"), "rate": _fmt_pct(h.get("realizedRate"))}
+                for h in history["data"]
+                if h.get("realizedRate") is not None
+            ]
+    except Exception:
+        pass
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    try:
+        comps = components.get("data", []) if components else []
+        parsed = []
+        for block in comps:
+            items = block.get("components") or []
+            for item in items:
+                symb = item.get("component")
+                wt = _fmt_float(item.get("weight"))
+                if symb:
+                    parsed.append({"symbol": symb, "weight": wt})
+        row["index_components"] = parsed
+    except Exception:
+        pass
+    return row
+
+
+def fetch_htx(symbol: str):
+    """
+    Huobi/HTX USDT 永续合约公开接口。
+    """
+    contract = symbol.upper() + "-USDT"
+    now = int(time.time() * 1000)
+    funding = _get_json(f"https://api.hbdm.com/linear-swap-api/v1/swap_funding_rate?contract_code={contract}")
+    oi = _get_json(f"https://api.hbdm.com/linear-swap-api/v1/swap_open_interest?contract_code={contract}")
+    ticker = _get_json(f"https://api.hbdm.com/linear-swap-ex/market/detail/merged?contract_code={contract}")
+    history = _get_json(
+        f"https://api.hbdm.com/linear-swap-api/v1/swap_historical_funding_rate?contract_code={contract}"
+        "&page_size=20&page_index=1"
+    )
+    row = {
+        "exchange": "htx",
+        "symbol": symbol,
+        "funding_interval_hours": 8.0,
+        "funding_rate": None,
+        "index_diff": None,
+        "open_interest": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "funding_history": [],
+        "index_components": [],
+    }
+    try:
+        data = funding.get("data") if funding else None
+        if data:
+            row["funding_rate"] = _fmt_pct(data.get("funding_rate"))
+            row["funding_interval_hours"] = 8.0  # HTX 8h 结算
+            row["next_funding_time"] = data.get("next_funding_time")
+            row["funding_cap"] = _fmt_pct(data.get("max_funding_rate"))
+            row["funding_floor"] = _fmt_pct(data.get("min_funding_rate"))
+            prem = _fmt_pct(data.get("estimated_rate"))
+            if prem is not None and row["funding_rate"] is None:
+                row["funding_rate"] = prem
+    except Exception:
+        pass
+    try:
+        if oi and oi.get("data"):
+            latest = oi["data"][0]
+            row["open_interest"] = _fmt_float(latest.get("value") or latest.get("volume"))
+    except Exception:
+        pass
+    try:
+        if ticker and ticker.get("tick"):
+            t = ticker["tick"]
+            row["mark_price"] = _fmt_float(t.get("close"))
+            row["volume_quote"] = _fmt_float(t.get("trade_turnover"))
+    except Exception:
+        pass
+    try:
+        if history and history.get("data", {}).get("data"):
+            lst = history["data"]["data"]
+            row["funding_history"] = [
+                {"time": item.get("funding_time"), "rate": _fmt_pct(item.get("funding_rate"))}
+                for item in lst
+                if item.get("funding_rate") is not None
+            ]
+    except Exception:
+        pass
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    return row
+
+
+FETCHERS = {
+    "binance": fetch_binance,
+    "bybit": fetch_bybit,
+    "gate": fetch_gate,
+    "bitget": fetch_bitget,
+    "okx": fetch_okx,
+    "htx": fetch_htx,
+}
+
+
+_CACHE: Dict[str, Dict[str, Any]] = {}
+_CACHE_TTL = 30  # seconds
+
+
+def fetch_exchange_details(symbols: List[str]):
+    """
+    返回 {symbol: [rows]}，每行包含资金费、周期、指数差、OI、24h 额等公开接口数据。
+    """
+    result = {}
+    now = time.time()
+    for sym in symbols:
+        cache_key = sym.upper()
+        cached = _CACHE.get(cache_key)
+        if cached and now - cached["ts"] < _CACHE_TTL:
+            result[sym] = cached["rows"]
+            continue
+        rows = []
+        for ex, fn in FETCHERS.items():
+            try:
+                rows.append(fn(sym))
+            except Exception:
+                continue
+        result[sym] = rows
+        _CACHE[cache_key] = {"ts": now, "rows": rows}
+    return result
