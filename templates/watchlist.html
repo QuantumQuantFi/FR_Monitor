@@ -101,8 +101,8 @@
             background: rgba(255,255,255,0.01);
         }
         table {
-            width: 1800px;
-            min-width: 1400px;
+            width: 2100px;
+            min-width: 1600px;
             border-collapse: collapse;
             background: rgba(255,255,255,0.01);
         }
@@ -176,8 +176,10 @@
             overflow-y: auto;
             line-height: 1.35;
         }
-        .col-prices { min-width: 240px; }
-        .col-detail { min-width: 320px; }
+        .col-prices { min-width: 260px; max-width: 340px; white-space: normal; }
+        .col-detail { min-width: 340px; max-width: 460px; white-space: normal; }
+        th.col-prices, td.col-prices,
+        th.col-detail, td.col-detail { vertical-align: top; }
     </style>
 </head>
 <body>
