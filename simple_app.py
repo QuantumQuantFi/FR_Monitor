@@ -38,8 +38,8 @@ from trading.trade_executor import (
 from watchlist_manager import WatchlistManager
 from watchlist_metrics import (
     compute_series_with_signals,
-    compute_pair_spread_series,
     compute_metrics_for_entries,
+    compute_series_for_entries,
 )
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
@@ -1322,21 +1322,7 @@ def get_watchlist_series():
         active_symbols = [entry['symbol'] for entry in active_entries]
         if not active_entries:
             return jsonify({'series': {}, 'symbols': [], 'timestamp': now_utc_iso()})
-
-        type_a_symbols = [e['symbol'] for e in active_entries if e.get('entry_type') == 'A']
-        cross_entries = [e for e in active_entries if e.get('entry_type') in ('B', 'C')]
-
-        series: Dict[str, Any] = {}
-        if type_a_symbols:
-            series.update(compute_series_with_signals(db.db_path, type_a_symbols))
-        if cross_entries:
-            series.update(compute_pair_spread_series(db.db_path, cross_entries))
-
-        # 标记 entry_type，便于前端区分
-        for e in active_entries:
-            sym = e['symbol']
-            if sym in series and 'entry_type' not in series[sym]:
-                series[sym]['entry_type'] = e.get('entry_type')
+        series = compute_series_for_entries(db.db_path, active_entries)
         return jsonify({'series': series, 'symbols': active_symbols, 'timestamp': now_utc_iso()})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500

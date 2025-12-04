@@ -206,6 +206,7 @@
                     <th>资金费率</th>
                     <th>Spread (最新/均值/基线)</th>
                     <th>配对</th>
+                    <th>图表</th>
                     <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
                     <th>穿越/Drift</th>
@@ -380,6 +381,7 @@
                         <td class="mono">${fundingRateText}</td>
                         <td class="mono">${spreadCell}</td>
                         <td class="mono">${pairCell}</td>
+                        <td><button class="chart-btn" data-sym="${item.symbol}">图表</button></td>
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
                         <td class="mono">${driftCell}</td>
@@ -416,105 +418,20 @@
                 const entryType = series.entry_type || entry.entry_type || 'A';
                 const card = document.createElement('div');
                 card.className = 'chart-card';
-                if (entryType === 'A') {
-                    card.innerHTML = `
-                        <h3>${sym} 历史(12h)</h3>
-                        <div class="chart-pair">
-                            <canvas id="chart-spread-${sym}" height="240"></canvas>
-                            <canvas id="chart-price-${sym}" height="240"></canvas>
-                        </div>`;
-                } else {
-                    const title = entryType === 'B'
-                        ? `${sym} 永续跨交易所价差 (${(series.pair_exchanges || []).join(' vs ')})`
-                        : `${sym} 现货 vs 永续 价差 (${(series.pair_exchanges || []).join(' / ')})`;
-                    card.innerHTML = `
-                        <h3>${title}</h3>
-                        <div class="chart-pair">
-                            <canvas id="chart-spread-${sym}" height="240"></canvas>
-                        </div>`;
-                }
+                const pairTitle = entryType === 'A'
+                    ? 'Binance spot vs perp'
+                    : (entryType === 'B'
+                        ? `永续跨所 (${(series.pair_exchanges || []).join(' vs ')})`
+                        : `现货 vs 永续 (${(series.pair_exchanges || []).join(' / ')})`);
+                card.innerHTML = `
+                    <h3>${sym} (${entryType}) - ${pairTitle}</h3>
+                    <div class="chart-pair">
+                        <canvas id="chart-spread-${sym}" height="240"></canvas>
+                        <canvas id="chart-price-${sym}" height="240"></canvas>
+                    </div>`;
                 grid.appendChild(card);
 
                 const ctxSpread = card.querySelector(`#chart-spread-${sym}`).getContext('2d');
-
-                if (entryType !== 'A') {
-                    const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
-                    const datasets = [
-                        {
-                            label: 'Spread %',
-                            data: toPts(series.points || []),
-                            borderColor: '#60a5fa',
-                            backgroundColor: 'rgba(96,165,250,0.15)',
-                            tension: 0.2,
-                            pointRadius: 0,
-                            borderWidth: 1.5,
-                        },
-                    ];
-                    if (entryType === 'B') {
-                        datasets.push({
-                            label: series.pair_exchanges?.[0] || 'A',
-                            data: (series.price_a || []).map((p) => ({ x: new Date(p.t), y: p.v })),
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56,189,248,0.1)',
-                            tension: 0.2,
-                            pointRadius: 0,
-                            yAxisID: 'price',
-                        });
-                        datasets.push({
-                            label: series.pair_exchanges?.[1] || 'B',
-                            data: (series.price_b || []).map((p) => ({ x: new Date(p.t), y: p.v })),
-                            borderColor: '#f97316',
-                            backgroundColor: 'rgba(249,115,22,0.1)',
-                            tension: 0.2,
-                            pointRadius: 0,
-                            yAxisID: 'price',
-                        });
-                    } else if (entryType === 'C') {
-                        datasets.push({
-                            label: series.pair_exchanges?.[0] || 'Spot',
-                            data: (series.price_spot || []).map((p) => ({ x: new Date(p.t), y: p.v })),
-                            borderColor: '#38bdf8',
-                            backgroundColor: 'rgba(56,189,248,0.1)',
-                            tension: 0.2,
-                            pointRadius: 0,
-                            yAxisID: 'price',
-                        });
-                        datasets.push({
-                            label: series.pair_exchanges?.[1] || 'Futures',
-                            data: (series.price_futures || []).map((p) => ({ x: new Date(p.t), y: p.v })),
-                            borderColor: '#f97316',
-                            backgroundColor: 'rgba(249,115,22,0.1)',
-                            tension: 0.2,
-                            pointRadius: 0,
-                            yAxisID: 'price',
-                        });
-                    }
-
-                    const chart = new Chart(ctxSpread, {
-                        type: 'line',
-                        data: { datasets },
-                        options: {
-                            maintainAspectRatio: false,
-                            scales: {
-                                x: { type: 'time', time: { unit: 'hour', tooltipFormat: 'HH:mm' }, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
-                                y: {
-                                    ticks: { color: '#9ca3af', callback: (v) => `${v.toFixed(2)}%` },
-                                    grid: { color: 'rgba(255,255,255,0.05)' },
-                                    position: 'left',
-                                },
-                                price: {
-                                    position: 'right',
-                                    ticks: { color: '#9ca3af' },
-                                    grid: { display: false },
-                                },
-                            },
-                            plugins: { legend: { labels: { color: '#e5e7eb' } } },
-                        },
-                    });
-                    charts[sym] = chart;
-                    return;
-                }
-
                 const ctxPrice = card.querySelector(`#chart-price-${sym}`).getContext('2d');
                 const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
                 const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
@@ -747,20 +664,23 @@
 
         let refreshTimer = null;
 
-        const fetchSeriesAndRender = async () => {
+        let seriesLoading = false;
+        const loadSeriesData = async () => {
+            if (seriesLoading) return;
+            seriesLoading = true;
             chartsBtn.disabled = true;
             chartsBtn.textContent = '加载中...';
             try {
                 const resp = await fetch('/api/watchlist/series');
                 const seriesData = await resp.json();
                 chartSeries = seriesData.series || {};
-                renderCharts(lastActiveEntries);
                 chartsLoaded = true;
             } catch (err) {
                 grid.innerHTML = '<div class="muted">图表加载失败</div>';
             } finally {
                 chartsBtn.disabled = false;
                 chartsBtn.textContent = '显示图表';
+                seriesLoading = false;
             }
         };
 
@@ -776,10 +696,9 @@
                     const metricsResp = await fetch('/api/watchlist/metrics');
                     const metricsData = await metricsResp.json();
                     metricsCache = metricsData.metrics || {};
-                    // 图表改为手动加载，避免页面卡顿
                     if (chartsLoaded) {
-                        // 若用户已手动加载过，再刷新一次以更新图表
-                        await fetchSeriesAndRender();
+                        await loadSeriesData();
+                        renderCharts(lastActiveEntries);
                     } else {
                         renderCharts([]);
                     }
@@ -814,7 +733,19 @@
                 forceBtn.disabled = false;
             }
         });
-        chartsBtn.addEventListener('click', fetchSeriesAndRender);
+        bodyEl.addEventListener('click', async (event) => {
+            const target = event.target.closest('.chart-btn');
+            if (!target) return;
+            const sym = target.getAttribute('data-sym');
+            const entry = lastActiveEntries.find((e) => e.symbol === sym);
+            if (!entry) return;
+            await loadSeriesData();
+            renderCharts([entry]);
+        });
+        chartsBtn.addEventListener('click', async () => {
+            await loadSeriesData();
+            renderCharts(lastActiveEntries);
+        });
         loadWatchlist();
     </script>
 </body>

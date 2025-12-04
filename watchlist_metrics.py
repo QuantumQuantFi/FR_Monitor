@@ -633,6 +633,197 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
     return out
 
 
+def _series_from_points(points: List[SpreadPoint], entry_type: str = "A") -> Dict[str, Any]:
+    """
+    复用 compute_series_with_signals 的逻辑，但直接使用给定的 SpreadPoint 列表（用于 B/C）。
+    """
+    cfg = WATCHLIST_METRICS_CONFIG
+    tp_window_minutes = 20
+    tp_long_window_minutes = 120
+    crossing_window_h = float(cfg.get("crossing_window_hours", 3.0))
+    crossing_mid_minutes = int(cfg.get("crossing_mid_minutes", 30))
+    cooldown_minutes = 10
+    sl_consecutive = 2
+    window_minutes = int(cfg.get("window_minutes", 60))
+    slope_minutes = int(cfg.get("slope_minutes", 3))
+    midline_minutes = int(cfg.get("midline_minutes", 15))
+    range_short_h = float(cfg.get("range_hours_short", 1))
+    range_long_h = float(cfg.get("range_hours_long", 6))
+    spread_abs_baseline = float(cfg.get("spread_abs_baseline", 0.01))
+    drift_ratio_max = float(cfg.get("drift_ratio_max", 0.3))
+
+    cutoff = _now_utc() - timedelta(hours=range_long_h)
+    points = [p for p in points if p.ts >= cutoff]
+    if len(points) > 1500:
+        points = points[-1500:]
+    if not points:
+        return {
+            "points": [],
+            "midline": [],
+            "baseline": [],
+            "entry_signals": [],
+            "exit_signals": [],
+            "spot": [],
+            "futures": [],
+            "funding_times": [],
+            "funding_interval_hours": None,
+            "entry_type": entry_type,
+        }
+
+    spreads = [p.spread_rel for p in points]
+    times = [p.ts for p in points]
+    spot_prices = [p.spot for p in points]
+    futures_prices = [p.futures for p in points]
+
+    midline_series: List[Optional[float]] = []
+    acc_mid: List[float] = []
+    for v in spreads:
+        acc_mid.append(0.0 if v is None else v)
+        if len(acc_mid) > midline_minutes:
+            acc_mid.pop(0)
+        midline_series.append(sum(acc_mid) / len(acc_mid))
+
+    baseline_series: List[Optional[float]] = []
+    entry_signals: List[Dict[str, Any]] = []
+    exit_signals: List[Dict[str, Any]] = []
+    funding_times: List[str] = []
+    last_tp_ts: Optional[datetime] = None
+    last_sl_ts: Optional[datetime] = None
+    last_funding_ts: Optional[datetime] = None
+
+    for i, (ts, val, pt) in enumerate(zip(times, spreads, points)):
+        start_idx = max(0, i - window_minutes + 1)
+        window_vals = [v for v in spreads[start_idx : i + 1] if v is not None]
+        mean, std = _rolling_mean_std(window_vals)
+        baseline = None
+        if mean is not None and std is not None:
+            baseline = mean - 1.5 * std
+        baseline_series.append(baseline)
+
+        slope_val = None
+        if i - slope_minutes >= 0 and spreads[i] is not None and spreads[i - slope_minutes] is not None:
+            slope_val = (spreads[i] - spreads[i - slope_minutes]) / slope_minutes
+
+        cutoff_short = ts - timedelta(hours=range_short_h)
+        cutoff_long = ts - timedelta(hours=range_long_h)
+        range_short_vals = [
+            p.spread_rel
+            for p in points
+            if p.spread_rel is not None
+            and p.ts >= cutoff_short
+            and not _is_funding_minute(p.ts, p.funding_interval_hours, p.next_funding_time)
+        ]
+        range_long_vals = [
+            p.spread_rel
+            for p in points
+            if p.spread_rel is not None
+            and p.ts >= cutoff_long
+            and not _is_funding_minute(p.ts, p.funding_interval_hours, p.next_funding_time)
+        ]
+        range_short = _range(range_short_vals)
+        range_long = _range(range_long_vals)
+
+        crossing_cutoff = ts - timedelta(hours=crossing_window_h)
+        crossing_series = [v for t, v in zip(times, spreads) if v is not None and t >= crossing_cutoff]
+        crossing_mid = _midline(crossing_series, crossing_mid_minutes) if crossing_series else []
+        crossings = _crossing_count(crossing_series, crossing_mid) if crossing_series else 0
+        drift_ratio = None
+        if crossing_series and range_short:
+            mid_last = crossing_mid[-1] if crossing_mid else None
+            if mid_last is not None and range_short:
+                drift_ratio = abs(crossing_series[-1] - mid_last) / range_short
+
+        entry_condition1 = (
+            val is not None
+            and baseline is not None
+            and val < baseline
+            and val < spread_abs_baseline
+            and (slope_val is not None and slope_val <= 0)
+        )
+        entry_condition2 = (
+            (std or 0) >= float(cfg.get("volatility_threshold", 0.0))
+            and (range_short or 0) >= float(cfg.get("range_threshold_short", 0.0))
+            and (range_long or 0) >= float(cfg.get("range_threshold_long", 0.0))
+            and crossings >= int(cfg.get("crossing_min_count", 0))
+            and (drift_ratio is not None and drift_ratio <= drift_ratio_max)
+        )
+
+        minutes_to_next_hour = _time_to_next_hour(ts)
+        interval_hours_hint = pt.funding_interval_hours
+        next_ft = pt.next_funding_time
+        minutes_to_funding = _minutes_to_next_funding(ts, next_ft, interval_hours_hint)
+        if interval_hours_hint and interval_hours_hint >= 4:
+            time_factor = 1.0
+        else:
+            time_factor = max(0.6, min(1.0, minutes_to_next_hour / 60.0))
+        limit_threshold = None
+        take_profit_trigger = False
+        stop_loss_trigger = False
+        if mean is not None and std is not None:
+            long_vals = _recent_values_within(times, spreads, ts, tp_long_window_minutes)
+            long_mean, long_std = _rolling_mean_std(long_vals)
+            if long_mean is not None and long_std is not None:
+                limit_threshold = long_mean + float(cfg.get("take_profit_multiplier", 1.2)) * long_std
+                peak_vals = _recent_values_within(times, spreads, ts, tp_window_minutes)
+                current_val = spreads[i]
+                is_local_peak = False
+                if current_val is not None and peak_vals:
+                    is_local_peak = current_val >= max(peak_vals)
+                take_profit_trigger = (
+                    current_val is not None
+                    and current_val >= limit_threshold
+                    and is_local_peak
+                    and (slope_val is not None and slope_val < 0)
+                )
+                if minutes_to_funding is not None and minutes_to_funding <= 30:
+                    pf_threshold = mean + 0.5 * std
+                    if current_val is not None and pf_threshold is not None:
+                        take_profit_trigger = take_profit_trigger or (current_val >= pf_threshold)
+
+            sl_threshold = -(limit_threshold) - float(cfg.get("stop_loss_buffer", 0.005))
+            recent_vals = [v for v in spreads[i - sl_consecutive + 1 : i + 1] if v is not None]
+            stop_loss_trigger = (
+                len(recent_vals) == sl_consecutive and all(v <= sl_threshold for v in recent_vals) and (slope_val or 0) < 0
+            )
+        funding_exit_window = False
+        if minutes_to_funding is not None:
+            funding_exit_window = 0 <= minutes_to_funding <= float(cfg.get("funding_exit_minutes", 5))
+        else:
+            funding_exit_window = minutes_to_next_hour <= float(cfg.get("funding_exit_minutes", 5))
+
+        if entry_condition1 and entry_condition2:
+            entry_signals.append({"t": ts.isoformat(), "v": val})
+        if take_profit_trigger:
+            if not last_tp_ts or (ts - last_tp_ts) >= timedelta(minutes=max(cooldown_minutes, 15)):
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "tp"})
+                last_tp_ts = ts
+        if stop_loss_trigger:
+            if not last_sl_ts or (ts - last_sl_ts) >= timedelta(minutes=cooldown_minutes):
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "sl"})
+                last_sl_ts = ts
+        if funding_exit_window:
+            min_gap = max(10, int((interval_hours_hint or 1) * 20))
+            if not last_funding_ts or (ts - last_funding_ts) >= timedelta(minutes=min_gap):
+                exit_signals.append({"t": ts.isoformat(), "v": val, "type": "funding"})
+                last_funding_ts = ts
+
+        if pt.next_funding_time:
+            funding_times.append(pt.next_funding_time.isoformat())
+
+    return {
+        "points": [{"t": t.isoformat(), "v": v} for t, v in zip(times, spreads) if v is not None],
+        "midline": [{"t": t.isoformat(), "v": m} for t, m in zip(times, midline_series) if m is not None],
+        "baseline": [{"t": t.isoformat(), "v": b} for t, b in zip(times, baseline_series) if b is not None],
+        "spot": [{"t": t.isoformat(), "v": v} for t, v in zip(times, spot_prices) if v is not None],
+        "futures": [{"t": t.isoformat(), "v": v} for t, v in zip(times, futures_prices) if v is not None],
+        "entry_signals": entry_signals,
+        "exit_signals": exit_signals,
+        "funding_times": sorted(list({ft for ft in funding_times})),
+        "funding_interval_hours": points[-1].funding_interval_hours if points else None,
+        "entry_type": entry_type,
+    }
+
+
 def _fetch_price_map(
     db_path: str,
     symbol: str,
@@ -848,3 +1039,28 @@ def compute_metrics_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> 
     for sym, points in series_map.items():
         metrics[sym] = compute_metrics_for_symbol(points).to_dict()
     return metrics
+
+
+def compute_series_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    统一生成 Type A/B/C 的图表序列：
+    - Type A：复用原有 compute_series_with_signals
+    - Type B/C：使用跨所 SpreadPoint（低价=“spot”、高价=“futures”）复用同样的指标与曲线
+    """
+    out: Dict[str, Any] = {}
+    type_a_symbols = [e["symbol"] for e in entries if e.get("entry_type") == "A"]
+    cross_entries = [e for e in entries if e.get("entry_type") in ("B", "C")]
+    range_long_h = int(WATCHLIST_METRICS_CONFIG.get("range_hours_long", 6))
+    if type_a_symbols:
+        out.update(compute_series_with_signals(db_path, type_a_symbols))
+    for entry in cross_entries:
+        sym = entry.get("symbol")
+        points = _build_cross_points(db_path, entry, hours=range_long_h)
+        series = _series_from_points(points, entry_type=entry.get("entry_type") or "B")
+        trigger = entry.get("trigger_details") or {}
+        if entry.get("entry_type") == "B":
+            series["pair_exchanges"] = trigger.get("pair") or []
+        elif entry.get("entry_type") == "C":
+            series["pair_exchanges"] = [trigger.get("spot_exchange"), trigger.get("futures_exchange")]
+        out[sym] = series
+    return out
