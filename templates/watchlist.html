@@ -176,6 +176,7 @@
             </div>
             <div class="actions">
                 <button id="refresh-btn">手动刷新</button>
+                <button id="charts-btn">显示图表</button>
             </div>
         </div>
 
@@ -197,10 +198,11 @@
             <thead>
                 <tr>
                     <th>Symbol</th>
+                    <th>Type</th>
                     <th>状态</th>
                     <th>Funding 周期</th>
                     <th>资金费率</th>
-                    <th>Spread 最新/均值/基线</th>
+                    <th>Spread / 配对</th>
                     <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
                     <th>穿越/Drift</th>
@@ -231,9 +233,12 @@
     <script>
         const bodyEl = document.getElementById('watchlist-body');
         const btn = document.getElementById('refresh-btn');
+        const chartsBtn = document.getElementById('charts-btn');
         let metricsCache = {};
         let charts = {};
         let chartSeries = {};
+        let chartsLoaded = false;
+        let lastActiveEntries = [];
         const SPREAD_ABS_BASELINE = 0.05; // 与后端 WATCHLIST_METRICS_CONFIG 保持一致
 
         const summaryEls = {
@@ -248,6 +253,11 @@
         const formatPct = (value) => {
             if (value === null || value === undefined) return '-';
             return (value * 100).toFixed(3) + '%';
+        };
+
+        const toNumber = (value) => {
+            const n = Number(value);
+            return Number.isFinite(n) ? n : null;
         };
 
         const formatNumber = (value, digits = 4) => {
@@ -286,36 +296,87 @@
 
             const rows = activeEntries.map((item) => {
                 const statusCls = item.status === 'active' ? 'badge active' : 'badge inactive';
+                const entryType = item.entry_type || 'A';
                 const metrics = metricsCache[item.symbol] || {};
-                const entryFlags = [
-                    metrics.entry_condition1 ? 'C1✔' : '',
-                    metrics.entry_condition2 ? 'C2✔' : ''
-                ].filter(Boolean).join(' ') || '-';
-                const entryTitle = [
-                    '开仓需要 C1 和 C2 同时满足',
-                    `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} <= 0`,
-                    `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间12h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} (3h/30m) Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥2 且 Drift≤0.3)`
-                ].join('\\n');
-                const exitFlags = [
-                    metrics.take_profit_trigger ? 'TP' : '',
-                    metrics.stop_loss_trigger ? 'SL' : '',
-                    metrics.funding_exit_window ? 'Funding' : ''
-                ].filter(Boolean).join(' ') || '-';
+                const trigger = item.trigger_details || {};
+                const entryFlags = entryType === 'A'
+                    ? [
+                        metrics.entry_condition1 ? 'C1✔' : '',
+                        metrics.entry_condition2 ? 'C2✔' : ''
+                    ].filter(Boolean).join(' ') || '-'
+                    : '-';
+                const entryTitle = entryType === 'A'
+                    ? [
+                        '仅 Type A: 开仓需要 C1 和 C2 同时满足',
+                        `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} <= 0`,
+                        `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间12h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} (3h/30m) Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥2 且 Drift≤0.3)`
+                    ].join('\\n')
+                    : 'Type B/C 触发：跨交易所价差条件';
+                const exitFlags = entryType === 'A'
+                    ? [
+                        metrics.take_profit_trigger ? 'TP' : '',
+                        metrics.stop_loss_trigger ? 'SL' : '',
+                        metrics.funding_exit_window ? 'Funding' : ''
+                    ].filter(Boolean).join(' ') || '-'
+                    : '-';
 
-                const spreadCell = `${formatPct(metrics.last_spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
-                const rangeCell = `${formatPct(metrics.range_short)} / ${formatPct(metrics.range_long)}`;
-                const volCell = `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`;
-                const driftCell = `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`;
+                const rangeCell = entryType === 'A'
+                    ? `${formatPct(metrics.range_short)} / ${formatPct(metrics.range_long)}`
+                    : '-';
+                const volCell = entryType === 'A'
+                    ? `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`
+                    : '-';
+                const driftCell = entryType === 'A'
+                    ? `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`
+                    : '-';
 
                 const intervalRaw = item.funding_interval_hours ?? (chartSeries[item.symbol]?.funding_interval_hours);
                 const intervalTitle = item.next_funding_time
                     ? `下一次资金费时间: ${item.next_funding_time}`
                     : (intervalRaw ? '使用交易所返回的周期估计' : '周期未知，按默认估计');
                 const intervalDisplay = formatInterval(intervalRaw);
-                const fundingRateText = formatPct(item.last_funding_rate);
+                let fundingRateText = formatPct(item.last_funding_rate);
+                if (entryType !== 'A') {
+                    const fundingEntries = Object.entries(trigger.funding || {}).map(([ex, fr]) => `${ex}: ${formatPct(toNumber(fr))}`);
+                    fundingRateText = fundingEntries.join('<br>') || '-';
+                }
+                const triggerDetails = item.trigger_details ? JSON.stringify(item.trigger_details) : '';
+
+                let spreadCell = '-';
+                if (entryType === 'A') {
+                    spreadCell = `${formatPct(metrics.last_spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
+                } else if (entryType === 'B') {
+                    const pair = trigger.pair || [];
+                    const prices = trigger.prices || {};
+                    const p1 = toNumber(prices[pair[0]]);
+                    const p2 = toNumber(prices[pair[1]]);
+                    const sp = toNumber(trigger.spread);
+                    let pairText = '';
+                    if (p1 !== null && p2 !== null) {
+                        const high = p1 >= p2 ? { ex: pair[0], price: p1 } : { ex: pair[1], price: p2 };
+                        const low = p1 >= p2 ? { ex: pair[1], price: p2 } : { ex: pair[0], price: p1 };
+                        pairText = `高 ${high.ex}(perp) ${formatNumber(high.price, 6)} | 低 ${low.ex}(perp) ${formatNumber(low.price, 6)}`;
+                    }
+                    spreadCell = (sp !== null ? formatPct(sp) : '-') + (pairText ? `<div class="muted">${pairText}</div>` : '');
+                } else if (entryType === 'C') {
+                    const spotEx = trigger.spot_exchange;
+                    const futEx = trigger.futures_exchange;
+                    const spotPrice = toNumber(trigger.spot_price);
+                    const futPrice = toNumber(trigger.futures_price);
+                    const sp = toNumber(trigger.spread);
+                    let pairText = '';
+                    if (spotPrice !== null && futPrice !== null) {
+                        const high = futPrice >= spotPrice ? { ex: futEx, price: futPrice, kind: 'perp' } : { ex: spotEx, price: spotPrice, kind: 'spot' };
+                        const low = futPrice >= spotPrice ? { ex: spotEx, price: spotPrice, kind: 'spot' } : { ex: futEx, price: futPrice, kind: 'perp' };
+                        pairText = `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)} | 低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
+                    }
+                    spreadCell = (sp !== null ? formatPct(sp) : '-') + (pairText ? `<div class="muted">${pairText}</div>` : '');
+                }
+
                 return `
                     <tr>
                         <td class="mono">${item.symbol}</td>
+                        <td title="${triggerDetails}">${entryType}</td>
                         <td><span class="${statusCls}">${item.status}</span></td>
                         <td class="mono" title="${intervalTitle}">${intervalDisplay}</td>
                         <td class="mono">${fundingRateText}</td>
@@ -342,27 +403,119 @@
             charts = {};
         };
 
-        const renderCharts = (activeSymbols) => {
+        const renderCharts = (activeEntries) => {
             const grid = document.getElementById('charts-grid');
             destroyCharts();
             grid.innerHTML = '';
-            if (!activeSymbols.length) return;
+            if (!activeEntries.length) return;
 
-            const slice = activeSymbols.slice(0, 8); // 防止一次渲染过多
-            slice.forEach((sym) => {
+            const slice = activeEntries.slice(0, 8); // 防止一次渲染过多
+            slice.forEach((entry) => {
+                const sym = entry.symbol;
                 const series = chartSeries[sym];
                 if (!series || !series.points || !series.points.length) return;
+                const entryType = series.entry_type || entry.entry_type || 'A';
                 const card = document.createElement('div');
                 card.className = 'chart-card';
-                card.innerHTML = `
-                    <h3>${sym} 历史(12h)</h3>
-                    <div class="chart-pair">
-                        <canvas id="chart-spread-${sym}" height="240"></canvas>
-                        <canvas id="chart-price-${sym}" height="240"></canvas>
-                    </div>`;
+                if (entryType === 'A') {
+                    card.innerHTML = `
+                        <h3>${sym} 历史(12h)</h3>
+                        <div class="chart-pair">
+                            <canvas id="chart-spread-${sym}" height="240"></canvas>
+                            <canvas id="chart-price-${sym}" height="240"></canvas>
+                        </div>`;
+                } else {
+                    const title = entryType === 'B'
+                        ? `${sym} 永续跨交易所价差 (${(series.pair_exchanges || []).join(' vs ')})`
+                        : `${sym} 现货 vs 永续 价差 (${(series.pair_exchanges || []).join(' / ')})`;
+                    card.innerHTML = `
+                        <h3>${title}</h3>
+                        <div class="chart-pair">
+                            <canvas id="chart-spread-${sym}" height="240"></canvas>
+                        </div>`;
+                }
                 grid.appendChild(card);
 
                 const ctxSpread = card.querySelector(`#chart-spread-${sym}`).getContext('2d');
+
+                if (entryType !== 'A') {
+                    const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+                    const datasets = [
+                        {
+                            label: 'Spread %',
+                            data: toPts(series.points || []),
+                            borderColor: '#60a5fa',
+                            backgroundColor: 'rgba(96,165,250,0.15)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            borderWidth: 1.5,
+                        },
+                    ];
+                    if (entryType === 'B') {
+                        datasets.push({
+                            label: series.pair_exchanges?.[0] || 'A',
+                            data: (series.price_a || []).map((p) => ({ x: new Date(p.t), y: p.v })),
+                            borderColor: '#38bdf8',
+                            backgroundColor: 'rgba(56,189,248,0.1)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            yAxisID: 'price',
+                        });
+                        datasets.push({
+                            label: series.pair_exchanges?.[1] || 'B',
+                            data: (series.price_b || []).map((p) => ({ x: new Date(p.t), y: p.v })),
+                            borderColor: '#f97316',
+                            backgroundColor: 'rgba(249,115,22,0.1)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            yAxisID: 'price',
+                        });
+                    } else if (entryType === 'C') {
+                        datasets.push({
+                            label: series.pair_exchanges?.[0] || 'Spot',
+                            data: (series.price_spot || []).map((p) => ({ x: new Date(p.t), y: p.v })),
+                            borderColor: '#38bdf8',
+                            backgroundColor: 'rgba(56,189,248,0.1)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            yAxisID: 'price',
+                        });
+                        datasets.push({
+                            label: series.pair_exchanges?.[1] || 'Futures',
+                            data: (series.price_futures || []).map((p) => ({ x: new Date(p.t), y: p.v })),
+                            borderColor: '#f97316',
+                            backgroundColor: 'rgba(249,115,22,0.1)',
+                            tension: 0.2,
+                            pointRadius: 0,
+                            yAxisID: 'price',
+                        });
+                    }
+
+                    const chart = new Chart(ctxSpread, {
+                        type: 'line',
+                        data: { datasets },
+                        options: {
+                            maintainAspectRatio: false,
+                            scales: {
+                                x: { type: 'time', time: { unit: 'hour', tooltipFormat: 'HH:mm' }, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                                y: {
+                                    ticks: { color: '#9ca3af', callback: (v) => `${v.toFixed(2)}%` },
+                                    grid: { color: 'rgba(255,255,255,0.05)' },
+                                    position: 'left',
+                                },
+                                price: {
+                                    position: 'right',
+                                    ticks: { color: '#9ca3af' },
+                                    grid: { display: false },
+                                },
+                            },
+                            plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                        },
+                    });
+                    charts[sym] = chart;
+                    return;
+                }
+
                 const ctxPrice = card.querySelector(`#chart-price-${sym}`).getContext('2d');
                 const toPts = (arr) => arr.map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
                 const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
@@ -595,24 +748,47 @@
 
         let refreshTimer = null;
 
+        const fetchSeriesAndRender = async () => {
+            chartsBtn.disabled = true;
+            chartsBtn.textContent = '加载中...';
+            try {
+                const resp = await fetch('/api/watchlist/series');
+                const seriesData = await resp.json();
+                chartSeries = seriesData.series || {};
+                renderCharts(lastActiveEntries);
+                chartsLoaded = true;
+            } catch (err) {
+                grid.innerHTML = '<div class="muted">图表加载失败</div>';
+            } finally {
+                chartsBtn.disabled = false;
+                chartsBtn.textContent = '显示图表';
+            }
+        };
+
         const loadWatchlist = async () => {
             btn.disabled = true;
             try {
                 const resp = await fetch('/api/watchlist');
                 const data = await resp.json();
-                const active = (data.entries || []).filter((i) => i.status === 'active').map((i) => i.symbol);
-                if (active.length) {
+                const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
+                const activeSymbols = activeEntries.map((i) => i.symbol);
+                lastActiveEntries = activeEntries;
+                if (activeSymbols.length) {
                     const metricsResp = await fetch('/api/watchlist/metrics');
                     const metricsData = await metricsResp.json();
                     metricsCache = metricsData.metrics || {};
-                    const seriesResp = await fetch('/api/watchlist/series');
-                    const seriesData = await seriesResp.json();
-                    chartSeries = seriesData.series || {};
-                    renderCharts(active);
+                    // 图表改为手动加载，避免页面卡顿
+                    if (chartsLoaded) {
+                        // 若用户已手动加载过，再刷新一次以更新图表
+                        await fetchSeriesAndRender();
+                    } else {
+                        renderCharts([]);
+                    }
                 } else {
                     metricsCache = {};
                     chartSeries = {};
                     renderCharts([]);
+                    chartsLoaded = false;
                 }
                 render(data);
 
@@ -628,6 +804,7 @@
         };
 
         btn.addEventListener('click', loadWatchlist);
+        chartsBtn.addEventListener('click', fetchSeriesAndRender);
         loadWatchlist();
     </script>
 </body>

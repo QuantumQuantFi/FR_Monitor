@@ -618,6 +618,102 @@ def compute_series_with_signals(db_path: str, symbols: List[str]) -> Dict[str, A
             "exit_signals": exit_signals,
             "funding_times": sorted(list({ft for ft in funding_times})),
             "funding_interval_hours": points[-1].funding_interval_hours if points else None,
+            "entry_type": "A",
         }
 
+    return out
+
+
+def _fetch_price_map(
+    db_path: str,
+    symbol: str,
+    exchange: str,
+    *,
+    use_futures: bool,
+    hours: int = 12,
+    limit: int = 2000,
+) -> Dict[str, float]:
+    """按 timestamp -> price 返回价格映射，方便做交集，仅取最近窗口以降低 IO。"""
+    field = "futures_price_close" if use_futures else "spot_price_close"
+    out: Dict[str, float] = {}
+    try:
+        conn = sqlite3.connect(db_path, timeout=15.0)
+        cursor = conn.cursor()
+        cutoff_sql = f"-{int(hours)} hours"
+        cursor.execute(
+            f"""
+            SELECT timestamp, {field}
+            FROM price_data_1min
+            WHERE symbol = ? AND exchange = ? AND timestamp >= datetime('now', ?)
+            ORDER BY timestamp ASC
+            LIMIT ?
+            """,
+            (symbol, exchange, cutoff_sql, limit),
+        )
+        for ts_raw, price in cursor.fetchall():
+            if price is None or price <= 0:
+                continue
+            out[ts_raw] = float(price)
+    except Exception as exc:
+        print(f"_fetch_price_map failed {symbol} {exchange}: {exc}")
+    return out
+
+
+def compute_pair_spread_series(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    为 Type B/C 生成跨交易所价差序列（简化版，不含信号）。
+    Type B: futures vs futures；Type C: spot vs futures。
+    """
+    out: Dict[str, Any] = {}
+    window_hours = 12
+    for entry in entries:
+        symbol = entry.get("symbol")
+        etype = entry.get("entry_type")
+        trigger = entry.get("trigger_details") or {}
+        if etype == "B":
+            pair = trigger.get("pair") or []
+            if len(pair) != 2:
+                continue
+            a_ex, b_ex = pair
+            price_a = _fetch_price_map(db_path, symbol, a_ex, use_futures=True, hours=window_hours)
+            price_b = _fetch_price_map(db_path, symbol, b_ex, use_futures=True, hours=window_hours)
+            common_ts = sorted(set(price_a.keys()) & set(price_b.keys()))
+            points = []
+            for ts in common_ts:
+                base = min(price_a[ts], price_b[ts])
+                if not base:
+                    continue
+                spread = abs(price_a[ts] - price_b[ts]) / base
+                points.append({"t": ts, "v": spread})
+            out[symbol] = {
+                "entry_type": "B",
+                "pair_exchanges": pair,
+                "points": points,
+                "price_a": [{"t": ts, "v": price_a[ts]} for ts in common_ts],
+                "price_b": [{"t": ts, "v": price_b[ts]} for ts in common_ts],
+            }
+        elif etype == "C":
+            spot_ex = trigger.get("spot_exchange")
+            fut_ex = trigger.get("futures_exchange")
+            if not spot_ex or not fut_ex:
+                continue
+            spot_prices = _fetch_price_map(db_path, symbol, spot_ex, use_futures=False, hours=window_hours)
+            fut_prices = _fetch_price_map(db_path, symbol, fut_ex, use_futures=True, hours=window_hours)
+            common_ts = sorted(set(spot_prices.keys()) & set(fut_prices.keys()))
+            points = []
+            for ts in common_ts:
+                base = spot_prices[ts]
+                if not base:
+                    continue
+                spread = (fut_prices[ts] - base) / base
+                if spread is None:
+                    continue
+                points.append({"t": ts, "v": spread})
+            out[symbol] = {
+                "entry_type": "C",
+                "pair_exchanges": [spot_ex, fut_ex],
+                "points": points,
+                "price_spot": [{"t": ts, "v": spot_prices[ts]} for ts in common_ts],
+                "price_futures": [{"t": ts, "v": fut_prices[ts]} for ts in common_ts],
+            }
     return out

@@ -66,6 +66,8 @@ class WatchlistEntry:
     status: str
     removal_reason: Optional[str] = None
     updated_at: str = field(default_factory=lambda: _iso(_utcnow()))
+    entry_type: str = "A"  # A: Binance funding spike; B: cross-exchange futures diff; C: spot vs futures diff
+    trigger_details: Optional[Dict[str, Any]] = None
 
 
 class WatchlistManager:
@@ -76,6 +78,12 @@ class WatchlistManager:
         self.funding_abs_threshold = float(cfg.get('funding_abs_threshold', 0.003))
         self.lookback = timedelta(hours=float(cfg.get('lookback_hours', 2)))
         self.refresh_seconds = float(cfg.get('refresh_seconds', 150))
+        # Type B/C 配置
+        self.type_b_spread_threshold = float(cfg.get('type_b_spread_threshold', 0.01))
+        self.type_b_funding_min = float(cfg.get('type_b_funding_min', -0.001))
+        self.type_b_funding_max = float(cfg.get('type_b_funding_max', 0.001))
+        self.type_c_spread_threshold = float(cfg.get('type_c_spread_threshold', 0.01))
+        self.type_c_funding_min = float(cfg.get('type_c_funding_min', -0.001))
 
         self._funding_history: Dict[str, Deque[Tuple[datetime, float]]] = {}
         self._funding_interval: Dict[str, Optional[float]] = {}
@@ -252,8 +260,148 @@ class WatchlistManager:
                     status='active' if is_active else 'inactive',
                     removal_reason=removal_reason,
                     updated_at=_iso(now),
+                    entry_type='A',
                 )
                 self._entries[symbol] = entry
+
+        # Type B/C：跨交易所价差与资金费过滤
+        market_snapshots: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        def _to_price(val: Any) -> Optional[float]:
+            try:
+                f = float(val)
+                return f if f > 0 else None
+            except (TypeError, ValueError):
+                return None
+        for exch, sym_map in (all_data or {}).items():
+            if not isinstance(sym_map, dict):
+                continue
+            for symbol, payload in sym_map.items():
+                futures = payload.get('futures') or {}
+                spot = payload.get('spot') or {}
+                fut_price = _to_price(futures.get('price') or futures.get('last_price'))
+                spot_price = _to_price(spot.get('price'))
+                funding = futures.get('funding_rate')
+                if symbol not in market_snapshots:
+                    market_snapshots[symbol] = {}
+                market_snapshots[symbol][exch] = {
+                    'futures_price': fut_price,
+                    'funding_rate': funding_rate_to_float(funding) if funding is not None else None,
+                    'spot_price': spot_price,
+                }
+
+        new_entries: Dict[str, WatchlistEntry] = dict(self._entries)
+
+        def _set_entry(symbol: str, entry: WatchlistEntry) -> None:
+            # A 优先，其次 B，再到 C；仅当已有 entry 处于 active 且优先级更高时跳过
+            existing = new_entries.get(symbol)
+            priority = {'A': 2, 'B': 1, 'C': 0}
+            if existing and existing.status == 'active' and priority.get(existing.entry_type, 0) >= priority.get(entry.entry_type, 0):
+                return
+            new_entries[symbol] = entry
+
+        now_iso = _iso(now)
+        for symbol, exch_data in market_snapshots.items():
+            if symbol in new_entries and new_entries[symbol].entry_type == 'A' and new_entries[symbol].status == 'active':
+                continue  # A 触发优先，不再尝试 B/C
+
+            futures_list = []
+            spot_list = []
+            for exch, vals in exch_data.items():
+                if vals.get('futures_price'):
+                    futures_list.append((exch, vals['futures_price'], vals.get('funding_rate')))
+                if vals.get('spot_price'):
+                    spot_list.append((exch, vals['spot_price']))
+
+            # Type B：两家永续价差 > 阈值，且资金费在区间内
+            best_b = None
+            for i in range(len(futures_list)):
+                for j in range(i + 1, len(futures_list)):
+                    a_ex, a_price, a_fr = futures_list[i]
+                    b_ex, b_price, b_fr = futures_list[j]
+                    if a_fr is None or b_fr is None:
+                        continue
+                    if not (self.type_b_funding_min <= a_fr <= self.type_b_funding_max and self.type_b_funding_min <= b_fr <= self.type_b_funding_max):
+                        continue
+                    base = min(a_price, b_price)
+                    if not base:
+                        continue
+                    diff = abs(a_price - b_price) / base
+                    if diff > self.type_b_spread_threshold:
+                        if best_b is None or diff > best_b['spread']:
+                            best_b = {
+                                'pair': [a_ex, b_ex],
+                                'spread': diff,
+                                'prices': {a_ex: a_price, b_ex: b_price},
+                                'funding': {a_ex: a_fr, b_ex: b_fr},
+                            }
+
+            if best_b:
+                entry = WatchlistEntry(
+                    symbol=symbol,
+                    has_spot=bool(spot_list),
+                    has_perp=True,
+                    last_funding_rate=max(abs(v) for v in best_b['funding'].values() if v is not None),
+                    last_funding_time=None,
+                    funding_interval_hours=None,
+                    next_funding_time=None,
+                    max_abs_funding=max(abs(v) for v in best_b['funding'].values() if v is not None),
+                    last_above_threshold_at=now_iso,
+                    added_at=now_iso,
+                    status='active',
+                    removal_reason=None,
+                    updated_at=now_iso,
+                    entry_type='B',
+                    trigger_details=best_b,
+                )
+                _set_entry(symbol, entry)
+                continue
+
+            # Type C：现货低于任一期货，价差 > 阈值，且两家期货资金费均大于下限
+            if len(futures_list) >= 2 and spot_list:
+                # 选 funding 足够的期货
+                futures_ok = [(ex, p, fr) for ex, p, fr in futures_list if fr is not None and fr >= self.type_c_funding_min]
+                if len(futures_ok) >= 2:
+                    # 取最高期货价与最低现货价
+                    futures_ok.sort(key=lambda x: x[1], reverse=True)
+                    spots_sorted = sorted(spot_list, key=lambda x: x[1])
+                    fut_ex, fut_price, fut_fr = futures_ok[0]
+                    spot_ex, spot_price = spots_sorted[0]
+                    base = spot_price
+                    if base:
+                        diff = (fut_price - spot_price) / base
+                        if diff > self.type_c_spread_threshold:
+                            # 再确认另一家期货资金费也满足
+                            second_fr = futures_ok[1][2]
+                            entry = WatchlistEntry(
+                                symbol=symbol,
+                                has_spot=True,
+                                has_perp=True,
+                                last_funding_rate=fut_fr,
+                                last_funding_time=None,
+                                funding_interval_hours=None,
+                                next_funding_time=None,
+                                max_abs_funding=max(abs(fut_fr or 0), abs(second_fr or 0)),
+                                last_above_threshold_at=now_iso,
+                                added_at=now_iso,
+                                status='active',
+                                removal_reason=None,
+                                updated_at=now_iso,
+                                entry_type='C',
+                                trigger_details={
+                                    'spot_exchange': spot_ex,
+                                    'futures_exchange': fut_ex,
+                                    'spot_price': spot_price,
+                                    'futures_price': fut_price,
+                                    'spread': diff,
+                                    'funding': {
+                                        fut_ex: fut_fr,
+                                        futures_ok[1][0]: second_fr,
+                                    },
+                                },
+                            )
+                            _set_entry(symbol, entry)
+
+        self._entries = new_entries
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -264,6 +412,9 @@ class WatchlistManager:
             entries,
             key=lambda e: (e.status != 'active', -(e.max_abs_funding or 0), e.symbol),
         )
+        type_counts: Dict[str, int] = {}
+        for e in entries_sorted:
+            type_counts[e.entry_type] = type_counts.get(e.entry_type, 0) + 1
         payload = {
             'summary': {
                 'active_count': sum(1 for e in entries_sorted if e.status == 'active'),
@@ -271,6 +422,7 @@ class WatchlistManager:
                 'threshold': self.funding_abs_threshold,
                 'lookback_hours': self.lookback.total_seconds() / 3600.0,
                 'refresh_seconds': self.refresh_seconds,
+                'type_counts': type_counts,
             },
             'entries': [e.__dict__ for e in entries_sorted],
             'timestamp': _iso(_utcnow()),

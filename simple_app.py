@@ -36,7 +36,11 @@ from trading.trade_executor import (
     get_bitget_usdt_perp_positions,
 )
 from watchlist_manager import WatchlistManager
-from watchlist_metrics import compute_metrics_for_symbols, compute_series_with_signals
+from watchlist_metrics import (
+    compute_metrics_for_symbols,
+    compute_series_with_signals,
+    compute_pair_spread_series,
+)
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
@@ -1246,10 +1250,25 @@ def get_watchlist_series():
     """
     try:
         snapshot = watchlist_manager.snapshot()
-        active_symbols = [entry['symbol'] for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
-        if not active_symbols:
+        active_entries = [entry for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
+        active_symbols = [entry['symbol'] for entry in active_entries]
+        if not active_entries:
             return jsonify({'series': {}, 'symbols': [], 'timestamp': now_utc_iso()})
-        series = compute_series_with_signals(db.db_path, active_symbols)
+
+        type_a_symbols = [e['symbol'] for e in active_entries if e.get('entry_type') == 'A']
+        cross_entries = [e for e in active_entries if e.get('entry_type') in ('B', 'C')]
+
+        series: Dict[str, Any] = {}
+        if type_a_symbols:
+            series.update(compute_series_with_signals(db.db_path, type_a_symbols))
+        if cross_entries:
+            series.update(compute_pair_spread_series(db.db_path, cross_entries))
+
+        # 标记 entry_type，便于前端区分
+        for e in active_entries:
+            sym = e['symbol']
+            if sym in series and 'entry_type' not in series[sym]:
+                series[sym]['entry_type'] = e.get('entry_type')
         return jsonify({'series': series, 'symbols': active_symbols, 'timestamp': now_utc_iso()})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
