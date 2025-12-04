@@ -240,6 +240,7 @@
         const forceBtn = document.getElementById('force-btn');
         const chartsBtn = document.getElementById('charts-btn');
         let metricsCache = {};
+        let orderbookMap = {};
         let charts = {};
         let chartSeries = {};
         let chartsLoaded = false;
@@ -295,7 +296,7 @@
             const activeEntries = (entries || []).filter((item) => item.status === 'active');
 
             if (!activeEntries.length) {
-                bodyEl.innerHTML = '<tr><td colspan="10" class="muted">暂无活跃符号满足条件</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="13" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
             }
 
@@ -350,6 +351,21 @@
                     if (!high || !low) return '-';
                     return `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
                 };
+                const ob = orderbookMap[item.symbol];
+                const formatLegLine = (leg) => {
+                    if (!leg || !leg.price) return null;
+                    if (leg.price.error) {
+                        return `${leg.exchange}(${leg.market_type}) 订单簿缺失(${leg.price.error})`;
+                    }
+                    const buy = leg.price.buy !== undefined && leg.price.buy !== null ? formatNumber(leg.price.buy, 6) : '-';
+                    const sell = leg.price.sell !== undefined && leg.price.sell !== null ? formatNumber(leg.price.sell, 6) : '-';
+                    return `${leg.exchange}(${leg.market_type}) 买:${buy} 卖:${sell}`;
+                };
+                const formatObSpread = (forward, reverse) => {
+                    const forwardTxt = forward && forward.spread !== null && forward.spread !== undefined ? `买高卖低 ${formatPct(forward.spread)}` : '买高卖低 -';
+                    const reverseTxt = reverse && reverse.spread !== null && reverse.spread !== undefined ? `卖高买低 ${formatPct(reverse.spread)}` : '卖高买低 -';
+                    return `${forwardTxt} | ${reverseTxt}`;
+                };
                 if (entryType === 'A') {
                     if (lastSpot !== null && lastFut !== null) {
                         const high = lastFut >= lastSpot ? { ex: 'binance', price: lastFut, kind: 'perp' } : { ex: 'binance', price: lastSpot, kind: 'spot' };
@@ -390,6 +406,11 @@
                     } else if (spotEx && futEx) {
                         pairCell = `${spotEx} spot / ${futEx} perp`;
                     }
+                }
+                if (ob) {
+                    const legLines = (ob.legs || []).map(formatLegLine).filter(Boolean).join('<br>');
+                    const spreadLine = formatObSpread(ob.forward, ob.reverse);
+                    pairCell = `${legLines || pairCell}<br><span class="muted">${spreadLine}</span>`;
                 }
 
                 return `
@@ -709,6 +730,7 @@
             try {
                 const resp = await fetch('/api/watchlist');
                 const data = await resp.json();
+                orderbookMap = data.orderbook || {};
                 const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
                 const activeSymbols = activeEntries.map((i) => i.symbol);
                 lastActiveEntries = activeEntries;

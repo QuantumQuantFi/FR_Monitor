@@ -41,6 +41,11 @@ from watchlist_metrics import (
     compute_metrics_for_entries,
     compute_series_for_entries,
 )
+from orderbook_utils import (
+    fetch_orderbook_prices,
+    compute_orderbook_spread,
+    DEFAULT_SWEEP_NOTIONAL,
+)
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
@@ -969,6 +974,79 @@ def now_utc_iso() -> str:
     """
     return datetime.now(timezone.utc).isoformat()
 
+
+def _entry_legs_for_orderbook(entry: Dict[str, Any]) -> List[Dict[str, str]]:
+    etype = entry.get('entry_type')
+    trigger = entry.get('trigger_details') or {}
+    symbol = entry.get('symbol')
+    if not symbol:
+        return []
+    if etype == 'A':
+        return [
+            {'exchange': 'binance', 'market_type': 'spot'},
+            {'exchange': 'binance', 'market_type': 'perp'},
+        ]
+    if etype == 'B':
+        pair = trigger.get('pair') or []
+        if len(pair) == 2:
+            return [
+                {'exchange': pair[0], 'market_type': 'perp'},
+                {'exchange': pair[1], 'market_type': 'perp'},
+            ]
+    if etype == 'C':
+        spot_ex = trigger.get('spot_exchange')
+        fut_ex = trigger.get('futures_exchange')
+        if spot_ex and fut_ex:
+            return [
+                {'exchange': spot_ex, 'market_type': 'spot'},
+                {'exchange': fut_ex, 'market_type': 'perp'},
+            ]
+    return []
+
+
+def build_orderbook_annotation(entries: List[Dict[str, Any]], sweep_notional: float = DEFAULT_SWEEP_NOTIONAL) -> Dict[str, Any]:
+    """
+    对 watchlist 条目补充订单簿扫单价格（模拟 sweep 100 USDT），并计算双向价差：
+    - forward: 高侧用买单簿（asks）价格，低侧用卖单簿（bids）
+    - reverse: 高侧用卖单簿（bids），低侧用买单簿（asks）
+    """
+    out: Dict[str, Any] = {}
+    cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
+
+    def _leg_price(exchange: str, market_type: str, symbol: str) -> Optional[Dict[str, Any]]:
+        key = (exchange.lower(), market_type, symbol.upper())
+        if key in cache:
+            return cache[key]
+        price = fetch_orderbook_prices(exchange.lower(), symbol, market_type, notional=sweep_notional)
+        cache[key] = price
+        return price
+
+    for entry in entries:
+        symbol = entry.get('symbol')
+        if not symbol:
+            continue
+        legs_meta = _entry_legs_for_orderbook(entry)
+        legs: List[Dict[str, Any]] = []
+        for leg in legs_meta:
+            price_info = _leg_price(leg['exchange'], leg['market_type'], symbol)
+            legs.append({
+                'exchange': leg['exchange'],
+                'market_type': leg['market_type'],
+                'price': price_info,
+                'error': price_info.get('error') if isinstance(price_info, dict) else None,
+            })
+        valid_legs = [l for l in legs if isinstance(l.get('price'), dict) and not l['price'].get('error')]
+        spread = compute_orderbook_spread(valid_legs) if len(valid_legs) >= 2 else None
+        if spread:
+            out[symbol] = {
+                'legs': legs,
+                'forward': spread.get('forward'),
+                'reverse': spread.get('reverse'),
+            }
+        else:
+            out[symbol] = {'legs': legs, 'forward': None, 'reverse': None}
+    return out
+
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
@@ -1270,7 +1348,14 @@ def get_all_data():
 @app.route('/api/watchlist')
 def get_watchlist():
     """获取基于资金费率的Binance关注列表"""
-    return precision_jsonify(watchlist_manager.snapshot())
+    payload = watchlist_manager.snapshot()
+    try:
+        entries = payload.get('entries', [])
+        active_entries = [e for e in entries if e.get('status') == 'active']
+        payload['orderbook'] = build_orderbook_annotation(active_entries)
+    except Exception as exc:
+        payload['orderbook_error'] = str(exc)
+    return precision_jsonify(payload)
 
 
 @app.route('/api/watchlist/refresh', methods=['POST'])
