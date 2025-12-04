@@ -37,9 +37,9 @@ from trading.trade_executor import (
 )
 from watchlist_manager import WatchlistManager
 from watchlist_metrics import (
-    compute_metrics_for_symbols,
     compute_series_with_signals,
     compute_pair_spread_series,
+    compute_metrics_for_entries,
 )
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
@@ -1226,15 +1226,16 @@ def get_watchlist_metrics():
     """
     try:
         snapshot = watchlist_manager.snapshot()
-        active_symbols = [entry['symbol'] for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
-        if not active_symbols:
+        active_entries = [entry for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
+        active_symbols = [entry['symbol'] for entry in active_entries]
+        if not active_entries:
             return jsonify({
                 'symbols': [],
                 'metrics': {},
                 'message': 'no active symbols',
                 'timestamp': now_utc_iso()
             })
-        metrics = compute_metrics_for_symbols(db.db_path, active_symbols)
+        metrics = compute_metrics_for_entries(db.db_path, active_entries)
         return jsonify({
             'symbols': active_symbols,
             'metrics': metrics,

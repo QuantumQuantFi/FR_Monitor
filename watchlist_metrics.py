@@ -717,3 +717,77 @@ def compute_pair_spread_series(db_path: str, entries: List[Dict[str, Any]]) -> D
                 "price_futures": [{"t": ts, "v": fut_prices[ts]} for ts in common_ts],
             }
     return out
+
+
+def compute_cross_metrics(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    为 Type B/C 计算基础价差统计（最近窗口的均值/标准差/基线），便于前端统一展示。
+    """
+    metrics: Dict[str, Dict[str, Any]] = {}
+    # 12h 取数，但均值/σ 只看最近约 60 分钟的数据以对齐 Type A 的窗口
+    window_hours = 12
+    rolling_count = 60
+    for entry in entries:
+        symbol = entry.get("symbol")
+        etype = entry.get("entry_type")
+        trigger = entry.get("trigger_details") or {}
+        spreads: List[float] = []
+        if etype == "B":
+            pair = trigger.get("pair") or []
+            if len(pair) != 2:
+                continue
+            a_ex, b_ex = pair
+            price_a = _fetch_price_map(db_path, symbol, a_ex, use_futures=True, hours=window_hours)
+            price_b = _fetch_price_map(db_path, symbol, b_ex, use_futures=True, hours=window_hours)
+            common_ts = sorted(set(price_a.keys()) & set(price_b.keys()))
+            for ts in common_ts:
+                base = min(price_a[ts], price_b[ts])
+                if not base:
+                    continue
+                spreads.append(abs(price_a[ts] - price_b[ts]) / base)
+        elif etype == "C":
+            spot_ex = trigger.get("spot_exchange")
+            fut_ex = trigger.get("futures_exchange")
+            if not spot_ex or not fut_ex:
+                continue
+            spot_prices = _fetch_price_map(db_path, symbol, spot_ex, use_futures=False, hours=window_hours)
+            fut_prices = _fetch_price_map(db_path, symbol, fut_ex, use_futures=True, hours=window_hours)
+            common_ts = sorted(set(spot_prices.keys()) & set(fut_prices.keys()))
+            for ts in common_ts:
+                base = spot_prices[ts]
+                if not base:
+                    continue
+                spreads.append((fut_prices[ts] - base) / base)
+        else:
+            continue
+
+        if not spreads:
+            continue
+        tail = spreads[-rolling_count:] if len(spreads) > rolling_count else spreads
+        spread_mean, spread_std = _rolling_mean_std(tail)
+        baseline_rel = None
+        if spread_mean is not None and spread_std is not None:
+            baseline_rel = spread_mean - 1.5 * spread_std
+        metrics[symbol] = {
+            "last_spread": spreads[-1] if spreads else None,
+            "spread_mean": spread_mean,
+            "spread_std": spread_std,
+            "baseline_rel": baseline_rel,
+        }
+    return metrics
+
+
+def compute_metrics_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """
+    统一计算 Type A/B/C 的价差指标：
+    - Type A 复用原有 spread/funding 指标
+    - Type B/C 仅计算基础统计（last/mean/std/baseline）
+    """
+    metrics: Dict[str, Dict[str, Any]] = {}
+    type_a_symbols = [e["symbol"] for e in entries if e.get("entry_type") == "A"]
+    cross_entries = [e for e in entries if e.get("entry_type") in ("B", "C")]
+    if type_a_symbols:
+        metrics.update(compute_metrics_for_symbols(db_path, type_a_symbols))
+    if cross_entries:
+        metrics.update(compute_cross_metrics(db_path, cross_entries))
+    return metrics

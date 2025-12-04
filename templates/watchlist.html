@@ -203,7 +203,8 @@
                     <th>状态</th>
                     <th>Funding 周期</th>
                     <th>资金费率</th>
-                    <th>Spread / 配对</th>
+                    <th>Spread (最新/均值/基线)</th>
+                    <th>配对</th>
                     <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
                     <th>穿越/Drift</th>
@@ -343,35 +344,35 @@
                 }
                 const triggerDetails = item.trigger_details ? JSON.stringify(item.trigger_details) : '';
 
-                let spreadCell = '-';
+                const spreadCell = `${formatPct(metrics.last_spread ?? trigger.spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
+
+                let pairCell = '-';
                 if (entryType === 'A') {
-                    spreadCell = `${formatPct(metrics.last_spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
+                    pairCell = 'Binance spot vs perp';
                 } else if (entryType === 'B') {
                     const pair = trigger.pair || [];
                     const prices = trigger.prices || {};
                     const p1 = toNumber(prices[pair[0]]);
                     const p2 = toNumber(prices[pair[1]]);
-                    const sp = toNumber(trigger.spread);
-                    let pairText = '';
                     if (p1 !== null && p2 !== null) {
                         const high = p1 >= p2 ? { ex: pair[0], price: p1 } : { ex: pair[1], price: p2 };
                         const low = p1 >= p2 ? { ex: pair[1], price: p2 } : { ex: pair[0], price: p1 };
-                        pairText = `高 ${high.ex}(perp) ${formatNumber(high.price, 6)} | 低 ${low.ex}(perp) ${formatNumber(low.price, 6)}`;
+                        pairCell = `高 ${high.ex}(perp) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(perp) ${formatNumber(low.price, 6)}`;
+                    } else if (pair.length === 2) {
+                        pairCell = `${pair[0]} perp / ${pair[1]} perp`;
                     }
-                    spreadCell = (sp !== null ? formatPct(sp) : '-') + (pairText ? `<div class="muted">${pairText}</div>` : '');
                 } else if (entryType === 'C') {
                     const spotEx = trigger.spot_exchange;
                     const futEx = trigger.futures_exchange;
                     const spotPrice = toNumber(trigger.spot_price);
                     const futPrice = toNumber(trigger.futures_price);
-                    const sp = toNumber(trigger.spread);
-                    let pairText = '';
                     if (spotPrice !== null && futPrice !== null) {
                         const high = futPrice >= spotPrice ? { ex: futEx, price: futPrice, kind: 'perp' } : { ex: spotEx, price: spotPrice, kind: 'spot' };
                         const low = futPrice >= spotPrice ? { ex: spotEx, price: spotPrice, kind: 'spot' } : { ex: futEx, price: futPrice, kind: 'perp' };
-                        pairText = `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)} | 低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
+                        pairCell = `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
+                    } else if (spotEx && futEx) {
+                        pairCell = `${spotEx} spot / ${futEx} perp`;
                     }
-                    spreadCell = (sp !== null ? formatPct(sp) : '-') + (pairText ? `<div class="muted">${pairText}</div>` : '');
                 }
 
                 return `
@@ -382,6 +383,7 @@
                         <td class="mono" title="${intervalTitle}">${intervalDisplay}</td>
                         <td class="mono">${fundingRateText}</td>
                         <td class="mono">${spreadCell}</td>
+                        <td class="mono">${pairCell}</td>
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
                         <td class="mono">${driftCell}</td>
