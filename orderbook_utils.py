@@ -2,8 +2,10 @@ import math
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+import config
 
 HYPERLIQUID_API_BASE_URL = "https://api.hyperliquid.xyz"
+LIGHTER_BASE_URL = config.LIGHTER_REST_BASE_URL.rstrip("/")
 
 DEFAULT_SWEEP_NOTIONAL = 100.0  # USD notional to simulate across orderbooks
 REQUEST_TIMEOUT = 4
@@ -67,6 +69,8 @@ def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]
         return f"{base}USDT"
     if exchange == 'hyperliquid':
         return base
+    if exchange == 'lighter':
+        return base
     return None
 
 
@@ -115,6 +119,30 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
         book = data.get('data') or {}
         bids = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('bids', [])]
         asks = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('asks', [])]
+    elif ex == 'lighter':
+        # Lighter REST 未直接提供档位深度，这里回退到 exchangeStats 的最近成交价作为近似中价
+        try:
+            resp = requests.get(f"{LIGHTER_BASE_URL}/exchangeStats", timeout=REQUEST_TIMEOUT)
+            if resp.status_code != 200:
+                return None, f"status_{resp.status_code}"
+            data = resp.json()
+        except Exception:
+            return None, "http_error"
+        sym_upper = symbol.upper()
+        stats = None
+        if isinstance(data, dict):
+            for entry in data.get('order_book_stats', []):
+                if (entry.get('symbol') or '').upper() == sym_upper:
+                    stats = entry
+                    break
+        if not stats:
+            return None, "no_data"
+        price = _safe_float(stats.get('last_trade_price') or stats.get('mark_price'))
+        if not price:
+            return None, "no_data"
+        # 用单档估计买卖均价，标记误差在前端显示 error=None 以参与计算
+        bids = [(price, 1.0)]
+        asks = [(price, 1.0)]
     elif ex == 'hyperliquid':
         payload = {'type': 'l2Book', 'coin': symbol.upper()}
         try:
