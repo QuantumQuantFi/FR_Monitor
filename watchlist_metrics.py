@@ -78,6 +78,8 @@ class SpreadPoint:
 
 @dataclass
 class SpreadMetrics:
+    last_spot_price: Optional[float]
+    last_futures_price: Optional[float]
     last_spread: Optional[float]
     spread_mean: Optional[float]
     spread_std: Optional[float]
@@ -236,6 +238,8 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
 
     if not points:
         return SpreadMetrics(
+            last_spot_price=None,
+            last_futures_price=None,
             last_spread=None,
             spread_mean=None,
             spread_std=None,
@@ -259,6 +263,8 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     spreads_rel: List[Optional[float]] = [p.spread_rel for p in points]
     times = [p.ts for p in points]
     last_spread = spreads_rel[-1]
+    last_spot_price = points[-1].spot if points else None
+    last_futures_price = points[-1].futures if points else None
 
     # 滚动窗口（基于分钟点数）
     window_values = [v for v in spreads_rel[-window_minutes:] if v is not None]
@@ -394,6 +400,8 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
     }
 
     return SpreadMetrics(
+        last_spot_price=last_spot_price,
+        last_futures_price=last_futures_price,
         last_spread=last_spread,
         spread_mean=spread_mean,
         spread_std=spread_std,

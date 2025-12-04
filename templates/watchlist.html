@@ -204,7 +204,7 @@
                     <th>状态</th>
                     <th>Funding 周期</th>
                     <th>资金费率</th>
-                    <th>Spread (最新/均值/基线)</th>
+                    <th>Spread (最新/均值/标准差)</th>
                     <th>配对</th>
                     <th>图表</th>
                     <th>区间 (1h/12h)</th>
@@ -215,14 +215,14 @@
                 </tr>
             </thead>
             <tbody id="watchlist-body">
-                <tr><td colspan="10" class="muted">加载中...</td></tr>
+                <tr><td colspan="13" class="muted">加载中...</td></tr>
             </tbody>
         </table>
 
         <div class="info-block">
             <h3>指标说明（基于后端实际计算）</h3>
             <div class="info-grid">
-                <div class="info-item"><strong>Spread%</strong>： (现货-永续)/现货，取最新 1m 点；均值/基线用最近 60 个点算 μ 与 σ，基线=μ-1.5σ，代表“近期偏低”的水平；波动率=σ。</div>
+                <div class="info-item"><strong>Spread%</strong>： (现货-永续)/现货，取最新 1m 点；均值/标准差用最近 60 个点算 μ 与 σ，基线=μ-1.5σ（用于信号计算），波动率=σ。</div>
                 <div class="info-item"><strong>区间 (1h/12h)</strong>：对应窗口的最高-最低（剔除资金费前后 1 分钟），区间越大说明越活跃。</div>
                 <div class="info-item"><strong>斜率</strong>：近 3 分钟涨跌幅 (末值-首值)/3；<strong>中线</strong>：15 点均线，描述短期中枢。</div>
                 <div class="info-item"><strong>穿越/Drift</strong>：3h 内价差相对 30m 中线的翻转次数（判断是否在更长周期里来回波动）；Drift=|当前-中线|/1h 区间，偏移越小越接近震荡。</div>
@@ -341,20 +341,38 @@
                 }
                 const triggerDetails = item.trigger_details ? JSON.stringify(item.trigger_details) : '';
 
-                const spreadCell = `${formatPct(metrics.last_spread ?? trigger.spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.baseline_rel)}`;
+                const spreadCell = `${formatPct(metrics.last_spread ?? trigger.spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.spread_std)}`;
 
                 let pairCell = '-';
+                const lastSpot = toNumber(metrics.last_spot_price);
+                const lastFut = toNumber(metrics.last_futures_price);
+                const formatPair = (high, low) => {
+                    if (!high || !low) return '-';
+                    return `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
+                };
                 if (entryType === 'A') {
-                    pairCell = 'Binance spot vs perp';
+                    if (lastSpot !== null && lastFut !== null) {
+                        const high = lastFut >= lastSpot ? { ex: 'binance', price: lastFut, kind: 'perp' } : { ex: 'binance', price: lastSpot, kind: 'spot' };
+                        const low = lastFut >= lastSpot ? { ex: 'binance', price: lastSpot, kind: 'spot' } : { ex: 'binance', price: lastFut, kind: 'perp' };
+                        pairCell = formatPair(high, low);
+                    } else {
+                        pairCell = 'Binance spot vs perp';
+                    }
                 } else if (entryType === 'B') {
                     const pair = trigger.pair || [];
                     const prices = trigger.prices || {};
                     const p1 = toNumber(prices[pair[0]]);
                     const p2 = toNumber(prices[pair[1]]);
                     if (p1 !== null && p2 !== null) {
-                        const high = p1 >= p2 ? { ex: pair[0], price: p1 } : { ex: pair[1], price: p2 };
-                        const low = p1 >= p2 ? { ex: pair[1], price: p2 } : { ex: pair[0], price: p1 };
-                        pairCell = `高 ${high.ex}(perp) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(perp) ${formatNumber(low.price, 6)}`;
+                        const highFromTrigger = p1 >= p2 ? { ex: pair[0], price: p1, kind: 'perp' } : { ex: pair[1], price: p2, kind: 'perp' };
+                        const lowFromTrigger = p1 >= p2 ? { ex: pair[1], price: p2, kind: 'perp' } : { ex: pair[0], price: p1, kind: 'perp' };
+                        const high = lastFut !== null ? { ...highFromTrigger, price: lastFut } : highFromTrigger;
+                        const low = lastSpot !== null ? { ...lowFromTrigger, price: lastSpot } : lowFromTrigger;
+                        pairCell = formatPair(high, low);
+                    } else if (pair.length === 2 && lastSpot !== null && lastFut !== null) {
+                        const high = { ex: pair[1], price: lastFut, kind: 'perp' };
+                        const low = { ex: pair[0], price: lastSpot, kind: 'perp' };
+                        pairCell = formatPair(high, low);
                     } else if (pair.length === 2) {
                         pairCell = `${pair[0]} perp / ${pair[1]} perp`;
                     }
@@ -363,10 +381,12 @@
                     const futEx = trigger.futures_exchange;
                     const spotPrice = toNumber(trigger.spot_price);
                     const futPrice = toNumber(trigger.futures_price);
-                    if (spotPrice !== null && futPrice !== null) {
-                        const high = futPrice >= spotPrice ? { ex: futEx, price: futPrice, kind: 'perp' } : { ex: spotEx, price: spotPrice, kind: 'spot' };
-                        const low = futPrice >= spotPrice ? { ex: spotEx, price: spotPrice, kind: 'spot' } : { ex: futEx, price: futPrice, kind: 'perp' };
-                        pairCell = `高 ${high.ex}(${high.kind}) ${formatNumber(high.price, 6)}<br>低 ${low.ex}(${low.kind}) ${formatNumber(low.price, 6)}`;
+                    if (spotEx && futEx && (spotPrice !== null || lastSpot !== null) && (futPrice !== null || lastFut !== null)) {
+                        const spotVal = lastSpot !== null ? lastSpot : spotPrice;
+                        const futVal = lastFut !== null ? lastFut : futPrice;
+                        const high = futVal >= spotVal ? { ex: futEx, price: futVal, kind: 'perp' } : { ex: spotEx, price: spotVal, kind: 'spot' };
+                        const low = futVal >= spotVal ? { ex: spotEx, price: spotVal, kind: 'spot' } : { ex: futEx, price: futVal, kind: 'perp' };
+                        pairCell = formatPair(high, low);
                     } else if (spotEx && futEx) {
                         pairCell = `${spotEx} spot / ${futEx} perp`;
                     }
