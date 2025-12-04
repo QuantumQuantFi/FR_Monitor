@@ -719,75 +719,123 @@ def compute_pair_spread_series(db_path: str, entries: List[Dict[str, Any]]) -> D
     return out
 
 
-def compute_cross_metrics(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+def _build_cross_points(
+    db_path: str,
+    entry: Dict[str, Any],
+    *,
+    hours: int = 12,
+    limit: int = 2000,
+) -> List[SpreadPoint]:
     """
-    为 Type B/C 计算基础价差统计（最近窗口的均值/标准差/基线），便于前端统一展示。
+    将 Type B/C 的跨所价差转换为 SpreadPoint 序列，便于复用 Type A 的指标计算。
+    现货视为“资金费率=0 且只能做多”的永续，将低价作为 spot，高价作为 futures，保持与 Type A 相同的方向（价差多为负数）。
     """
-    metrics: Dict[str, Dict[str, Any]] = {}
-    # 12h 取数，但均值/σ 只看最近约 60 分钟的数据以对齐 Type A 的窗口
-    window_hours = 12
-    rolling_count = 60
-    for entry in entries:
-        symbol = entry.get("symbol")
-        etype = entry.get("entry_type")
-        trigger = entry.get("trigger_details") or {}
-        spreads: List[float] = []
-        if etype == "B":
-            pair = trigger.get("pair") or []
-            if len(pair) != 2:
-                continue
-            a_ex, b_ex = pair
-            price_a = _fetch_price_map(db_path, symbol, a_ex, use_futures=True, hours=window_hours)
-            price_b = _fetch_price_map(db_path, symbol, b_ex, use_futures=True, hours=window_hours)
-            common_ts = sorted(set(price_a.keys()) & set(price_b.keys()))
-            for ts in common_ts:
-                base = min(price_a[ts], price_b[ts])
-                if not base:
-                    continue
-                spreads.append(abs(price_a[ts] - price_b[ts]) / base)
-        elif etype == "C":
-            spot_ex = trigger.get("spot_exchange")
-            fut_ex = trigger.get("futures_exchange")
-            if not spot_ex or not fut_ex:
-                continue
-            spot_prices = _fetch_price_map(db_path, symbol, spot_ex, use_futures=False, hours=window_hours)
-            fut_prices = _fetch_price_map(db_path, symbol, fut_ex, use_futures=True, hours=window_hours)
-            common_ts = sorted(set(spot_prices.keys()) & set(fut_prices.keys()))
-            for ts in common_ts:
-                base = spot_prices[ts]
-                if not base:
-                    continue
-                spreads.append((fut_prices[ts] - base) / base)
-        else:
-            continue
+    etype = entry.get("entry_type")
+    trigger = entry.get("trigger_details") or {}
+    symbol = entry.get("symbol")
+    points: List[SpreadPoint] = []
 
-        if not spreads:
-            continue
-        tail = spreads[-rolling_count:] if len(spreads) > rolling_count else spreads
-        spread_mean, spread_std = _rolling_mean_std(tail)
-        baseline_rel = None
-        if spread_mean is not None and spread_std is not None:
-            baseline_rel = spread_mean - 1.5 * spread_std
-        metrics[symbol] = {
-            "last_spread": spreads[-1] if spreads else None,
-            "spread_mean": spread_mean,
-            "spread_std": spread_std,
-            "baseline_rel": baseline_rel,
-        }
-    return metrics
+    def _parse_time(ts_raw: str) -> Optional[datetime]:
+        try:
+            return datetime.fromisoformat(ts_raw).replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+
+    if etype == "B":
+        pair = trigger.get("pair") or []
+        if len(pair) != 2:
+            return points
+        a_ex, b_ex = pair
+        price_a = _fetch_price_map(db_path, symbol, a_ex, use_futures=True, hours=hours, limit=limit)
+        price_b = _fetch_price_map(db_path, symbol, b_ex, use_futures=True, hours=hours, limit=limit)
+        common_ts = sorted(set(price_a.keys()) & set(price_b.keys()))
+        funding_map = trigger.get("funding") or {}
+        for ts_raw in common_ts:
+            ts = _parse_time(ts_raw)
+            if not ts:
+                continue
+            pa = price_a.get(ts_raw)
+            pb = price_b.get(ts_raw)
+            if not pa or not pb:
+                continue
+            # 低价视为“spot”，高价视为“futures”，保持 Type A 的 spread 定义
+            if pa <= pb:
+                spot_price, fut_price = pa, pb
+                fr = funding_map.get(b_ex)
+            else:
+                spot_price, fut_price = pb, pa
+                fr = funding_map.get(a_ex)
+            points.append(
+                SpreadPoint(
+                    ts=ts,
+                    spot=spot_price,
+                    futures=fut_price,
+                    funding_rate=float(fr) if fr is not None else None,
+                    funding_interval_hours=None,
+                    next_funding_time=None,
+                )
+            )
+    elif etype == "C":
+        spot_ex = trigger.get("spot_exchange")
+        fut_ex = trigger.get("futures_exchange")
+        if not spot_ex or not fut_ex:
+            return points
+        spot_prices = _fetch_price_map(db_path, symbol, spot_ex, use_futures=False, hours=hours, limit=limit)
+        fut_prices = _fetch_price_map(db_path, symbol, fut_ex, use_futures=True, hours=hours, limit=limit)
+        common_ts = sorted(set(spot_prices.keys()) & set(fut_prices.keys()))
+        funding_map = trigger.get("funding") or {}
+        for ts_raw in common_ts:
+            ts = _parse_time(ts_raw)
+            if not ts:
+                continue
+            sp = spot_prices.get(ts_raw)
+            fp = fut_prices.get(ts_raw)
+            if not sp or not fp:
+                continue
+            # 若极端情况下现货高于永续，仍以低价作为“spot”保持方向一致
+            if sp <= fp:
+                spot_price, fut_price = sp, fp
+                fr = funding_map.get(fut_ex)
+            else:
+                spot_price, fut_price = fp, sp
+                fr = funding_map.get(fut_ex)
+            points.append(
+                SpreadPoint(
+                    ts=ts,
+                    spot=spot_price,
+                    futures=fut_price,
+                    funding_rate=float(fr) if fr is not None else None,
+                    funding_interval_hours=None,
+                    next_funding_time=None,
+                )
+            )
+    return points
 
 
 def compute_metrics_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     """
-    统一计算 Type A/B/C 的价差指标：
-    - Type A 复用原有 spread/funding 指标
-    - Type B/C 仅计算基础统计（last/mean/std/baseline）
+    统一计算 Type A/B/C 的价差指标，均复用 Type A 的 Spread 指标逻辑：
+    - Type A：Binance 现货 vs 永续（原有逻辑）
+    - Type B：任意两家永续，高价视为 futures，低价视为“现货”
+    - Type C：现货 vs 任一期货，若现货反向高于期货，仍将低价视作“现货”以保持方向一致
     """
     metrics: Dict[str, Dict[str, Any]] = {}
     type_a_symbols = [e["symbol"] for e in entries if e.get("entry_type") == "A"]
     cross_entries = [e for e in entries if e.get("entry_type") in ("B", "C")]
+    series_map: Dict[str, List[SpreadPoint]] = {}
     if type_a_symbols:
-        metrics.update(compute_metrics_for_symbols(db_path, type_a_symbols))
-    if cross_entries:
-        metrics.update(compute_cross_metrics(db_path, cross_entries))
+        series_map.update(
+            fetch_spread_series(
+                db_path,
+                type_a_symbols,
+                hours=int(WATCHLIST_METRICS_CONFIG.get("range_hours_long", 6)),
+            )
+        )
+    # 构建跨所的 SpreadPoint 列表
+    for entry in cross_entries:
+        sym = entry.get("symbol")
+        series_map[sym] = _build_cross_points(db_path, entry)
+
+    for sym, points in series_map.items():
+        metrics[sym] = compute_metrics_for_symbol(points).to_dict()
     return metrics

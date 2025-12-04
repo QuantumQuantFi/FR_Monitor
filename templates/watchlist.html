@@ -322,15 +322,9 @@
                     ].filter(Boolean).join(' ') || '-'
                     : '-';
 
-                const rangeCell = entryType === 'A'
-                    ? `${formatPct(metrics.range_short)} / ${formatPct(metrics.range_long)}`
-                    : '-';
-                const volCell = entryType === 'A'
-                    ? `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`
-                    : '-';
-                const driftCell = entryType === 'A'
-                    ? `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`
-                    : '-';
+                const rangeCell = `${formatPct(metrics.range_short)} / ${formatPct(metrics.range_long)}`;
+                const volCell = `${formatPct(metrics.volatility)} / ${formatNumber(metrics.recent_slope, 6)}`;
+                const driftCell = `${metrics.crossings_1h ?? 0} / ${formatNumber(metrics.drift_ratio, 3)}`;
 
                 const intervalRaw = item.funding_interval_hours ?? (chartSeries[item.symbol]?.funding_interval_hours);
                 const intervalTitle = item.next_funding_time
