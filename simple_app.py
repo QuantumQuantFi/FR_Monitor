@@ -14,6 +14,7 @@ import decimal
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor
 from exchange_connectors import ExchangeDataCollector
 from arbitrage import ArbitrageMonitor
 from config import (
@@ -54,6 +55,12 @@ LOG_MAX_BYTES = 25 * 1024 * 1024  # 25MB per file, 4 files total <=100MB
 LOG_BACKUP_COUNT = 3  # plus the active file -> 4*25MB = 100MB cap
 _LOGGING_CONFIGURED = False
 EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']
+
+ORDERBOOK_CACHE: Dict[tuple, Dict[str, Any]] = {}
+ORDERBOOK_CACHE_TTL = 15  # seconds
+ORDERBOOK_FETCH_TIMEOUT = 5.0
+ORDERBOOK_CACHE_LOCK = threading.Lock()
+ORDERBOOK_EXECUTOR = ThreadPoolExecutor(max_workers=16)
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -976,6 +983,46 @@ def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _orderbook_cache_key(exchange: str, market_type: str, symbol: str) -> tuple:
+    return (exchange.lower(), market_type, symbol.upper())
+
+
+def _prefetch_orderbooks(leg_keys: List[tuple], sweep_notional: float) -> Dict[tuple, Dict[str, Any]]:
+    """并发拉取订单簿，带 15s 缓存，避免阻塞 /api/watchlist。"""
+    now = time.time()
+    ready: Dict[tuple, Dict[str, Any]] = {}
+    to_fetch: List[tuple] = []
+    with ORDERBOOK_CACHE_LOCK:
+        for key in set(leg_keys):
+            cached = ORDERBOOK_CACHE.get(key)
+            if cached and now - cached.get('ts', 0) < ORDERBOOK_CACHE_TTL:
+                ready[key] = cached.get('val')
+            else:
+                to_fetch.append(key)
+    futures: Dict[tuple, Any] = {}
+    for key in to_fetch:
+        exch, market_type, sym = key
+        try:
+            futures[key] = ORDERBOOK_EXECUTOR.submit(
+                fetch_orderbook_prices,
+                exch,
+                sym,
+                market_type,
+                notional=sweep_notional,
+            )
+        except Exception:
+            continue
+    for key, fut in futures.items():
+        try:
+            val = fut.result(timeout=ORDERBOOK_FETCH_TIMEOUT)
+        except Exception as exc:
+            val = {'error': str(exc)}
+        ready[key] = val
+        with ORDERBOOK_CACHE_LOCK:
+            ORDERBOOK_CACHE[key] = {'ts': time.time(), 'val': val}
+    return ready
+
+
 def _entry_legs_for_orderbook(entry: Dict[str, Any]) -> List[Dict[str, str]]:
     etype = entry.get('entry_type')
     trigger = entry.get('trigger_details') or {}
@@ -1012,15 +1059,14 @@ def build_orderbook_annotation(entries: List[Dict[str, Any]], sweep_notional: fl
     - reverse: 高侧用卖单簿（bids），低侧用买单簿（asks）
     """
     out: Dict[str, Any] = {}
-    cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
-
-    def _leg_price(exchange: str, market_type: str, symbol: str) -> Optional[Dict[str, Any]]:
-        key = (exchange.lower(), market_type, symbol.upper())
-        if key in cache:
-            return cache[key]
-        price = fetch_orderbook_prices(exchange.lower(), symbol, market_type, notional=sweep_notional)
-        cache[key] = price
-        return price
+    leg_keys: List[tuple] = []
+    for entry in entries:
+        symbol = entry.get('symbol')
+        if not symbol:
+            continue
+        for leg in _entry_legs_for_orderbook(entry):
+            leg_keys.append(_orderbook_cache_key(leg['exchange'], leg['market_type'], symbol))
+    prices = _prefetch_orderbooks(leg_keys, sweep_notional)
 
     for entry in entries:
         symbol = entry.get('symbol')
@@ -1029,7 +1075,8 @@ def build_orderbook_annotation(entries: List[Dict[str, Any]], sweep_notional: fl
         legs_meta = _entry_legs_for_orderbook(entry)
         legs: List[Dict[str, Any]] = []
         for leg in legs_meta:
-            price_info = _leg_price(leg['exchange'], leg['market_type'], symbol)
+            key = _orderbook_cache_key(leg['exchange'], leg['market_type'], symbol)
+            price_info = prices.get(key) or {'error': 'no_data'}
             legs.append({
                 'exchange': leg['exchange'],
                 'market_type': leg['market_type'],
@@ -1057,15 +1104,18 @@ def build_cross_spread_matrix(entries: List[Dict[str, Any]], all_data: Dict[str,
     方向按 compute_orderbook_spread 的 forward(买高卖低)/reverse(卖高买低) 计算。
     """
     result: Dict[str, Any] = {}
-    cache: Dict[tuple, Optional[Dict[str, Any]]] = {}
-
-    def _leg_price(exchange: str, market_type: str, symbol: str) -> Optional[Dict[str, Any]]:
-        key = (exchange.lower(), market_type, symbol.upper())
-        if key in cache:
-            return cache[key]
-        price = fetch_orderbook_prices(exchange.lower(), symbol, market_type, notional=sweep_notional)
-        cache[key] = price
-        return price
+    leg_keys: List[tuple] = []
+    for entry in entries:
+        sym = entry.get('symbol')
+        if not sym:
+            continue
+        for exch, sym_map in all_data.items():
+            payload = sym_map.get(sym, {})
+            if payload.get('futures'):
+                leg_keys.append(_orderbook_cache_key(exch, 'perp', sym))
+            if payload.get('spot'):
+                leg_keys.append(_orderbook_cache_key(exch, 'spot', sym))
+    prices = _prefetch_orderbooks(leg_keys, sweep_notional)
 
     for entry in entries:
         sym = entry.get('symbol')
@@ -1080,7 +1130,8 @@ def build_cross_spread_matrix(entries: List[Dict[str, Any]], all_data: Dict[str,
                 legs.append({'exchange': exch, 'market_type': 'spot'})
         priced_legs: List[Dict[str, Any]] = []
         for leg in legs:
-            price_info = _leg_price(leg['exchange'], leg['market_type'], sym)
+            key = _orderbook_cache_key(leg['exchange'], leg['market_type'], sym)
+            price_info = prices.get(key) or {'error': 'no_data'}
             priced_legs.append({
                 'exchange': leg['exchange'],
                 'market_type': leg['market_type'],

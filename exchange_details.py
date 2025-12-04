@@ -1,9 +1,10 @@
 import time
 import requests
 from typing import Dict, Any, List
+from concurrent.futures import ThreadPoolExecutor
 
 
-def _get_json(url: str, timeout: float = 5.0):
+def _get_json(url: str, timeout: float = 4.0):
     try:
         resp = requests.get(url, timeout=timeout)
         resp.raise_for_status()
@@ -561,6 +562,8 @@ FETCHERS = {
 
 _CACHE: Dict[str, Dict[str, Any]] = {}
 _CACHE_TTL = 30  # seconds
+_FETCH_TIMEOUT = 6.0  # 单个交易所拉取的超时时间，避免阻塞主请求
+_EXECUTOR = ThreadPoolExecutor(max_workers=12)
 
 
 def fetch_exchange_details(symbols: List[str]):
@@ -576,11 +579,22 @@ def fetch_exchange_details(symbols: List[str]):
             result[sym] = cached["rows"]
             continue
         rows = []
+        futures = {}
         for ex, fn in FETCHERS.items():
             try:
-                rows.append(fn(sym))
+                futures[ex] = _EXECUTOR.submit(fn, sym)
             except Exception:
                 continue
+        for ex, fut in futures.items():
+            try:
+                res = fut.result(timeout=_FETCH_TIMEOUT)
+                if res:
+                    rows.append(res)
+            except Exception:
+                continue
+        # 如果本次全部失败，回退使用旧缓存，避免前端空数据
+        if not rows and cached:
+            rows = cached["rows"]
         result[sym] = rows
-        _CACHE[cache_key] = {"ts": now, "rows": rows}
+        _CACHE[cache_key] = {"ts": time.time(), "rows": rows}
     return result
