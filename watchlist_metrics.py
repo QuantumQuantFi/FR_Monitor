@@ -262,6 +262,9 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
 
     # 滚动窗口（基于分钟点数）
     window_values = [v for v in spreads_rel[-window_minutes:] if v is not None]
+    if not window_values:
+        # 兼容跨所数据点较稀疏的情况，退化到全量可用数据
+        window_values = [v for v in spreads_rel if v is not None][-window_minutes:]
     spread_mean, spread_std = _rolling_mean_std(window_values)
     baseline_rel = None
     if spread_mean is not None and spread_std is not None:
@@ -291,12 +294,18 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
 
     range_short_vals = _filter_range(range_short_h)
     range_long_vals = _filter_range(range_long_h)
+    if not range_short_vals:
+        range_short_vals = [v for v in spreads_rel if v is not None][-max(1, int(range_short_h * 60)) :]
+    if not range_long_vals:
+        range_long_vals = [v for v in spreads_rel if v is not None][-max(1, int(range_long_h * 60)) :]
     range_short = _range(range_short_vals)
     range_long = _range(range_long_vals)
 
     # 中线与穿越次数（3h窗口，30m中线）
     crossing_cutoff = times[-1] - timedelta(hours=crossing_window_h)
     crossing_series = [v for ts, v in zip(times, spreads_rel) if v is not None and ts >= crossing_cutoff]
+    if not crossing_series:
+        crossing_series = [v for v in spreads_rel if v is not None][-crossing_mid_minutes * 2 :]
     midline_series = _midline(crossing_series, crossing_mid_minutes) if crossing_series else []
     crossings = _crossing_count(crossing_series, midline_series) if crossing_series else 0
     drift_ratio = None
