@@ -1131,6 +1131,59 @@ def watchlist_refresh_loop():
             logger.warning("watchlist refresh failed: %s", exc)
         time.sleep(watchlist_manager.refresh_seconds)
 
+
+def cold_start_watchlist_from_db(limit_minutes: int = 1) -> None:
+    """
+    用最近 1 分钟数据库行情做一次冷启动扫描，避免等待实时流全连上。
+    仅用于快速填充 Type B/C 所需的跨所价格与资金费率。
+    """
+    logger = logging.getLogger('watchlist')
+    try:
+        conn = sqlite3.connect(db.db_path, timeout=10.0)
+        cur = conn.cursor()
+        cur.execute("SELECT MAX(timestamp) FROM price_data_1min")
+        latest = cur.fetchone()[0]
+        if not latest:
+            logger.info("cold start skipped: no recent rows in price_data_1min")
+            return
+        cur.execute(
+            """
+            SELECT symbol, exchange, spot_price_close, futures_price_close, funding_rate, timestamp
+            FROM price_data_1min
+            WHERE timestamp >= datetime(?, ?)
+            """,
+            (latest, f"-{limit_minutes} minutes"),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            logger.info("cold start skipped: no rows within last minute")
+            return
+
+        all_data: Dict[str, Dict[str, Any]] = {}
+        exchange_symbols: Dict[str, Dict[str, List[str]]] = {}
+        for symbol, exch, spot_price, fut_price, fr, ts_raw in rows:
+            if exch not in all_data:
+                all_data[exch] = {}
+                exchange_symbols[exch] = {'spot': [], 'futures': []}
+            if symbol not in all_data[exch]:
+                all_data[exch][symbol] = {'spot': {}, 'futures': {}}
+            if spot_price and spot_price > 0:
+                all_data[exch][symbol]['spot'] = {'price': float(spot_price), 'timestamp': ts_raw}
+                exchange_symbols[exch]['spot'].append(symbol)
+            if fut_price and fut_price > 0:
+                all_data[exch][symbol]['futures'] = {
+                    'price': float(fut_price),
+                    'last_price': float(fut_price),
+                    'funding_rate': fr,
+                    'timestamp': ts_raw,
+                }
+                exchange_symbols[exch]['futures'].append(symbol)
+
+        watchlist_manager.refresh(all_data, exchange_symbols)
+        logger.info("cold start watchlist completed with %s rows (latest ts %s)", len(rows), latest)
+    except Exception as exc:
+        logger.warning("cold start watchlist failed: %s", exc)
+
 @app.route('/')
 def index():
     """主页 - 增强版按币种聚合展示所有可用币种"""
@@ -1218,6 +1271,20 @@ def get_all_data():
 def get_watchlist():
     """获取基于资金费率的Binance关注列表"""
     return precision_jsonify(watchlist_manager.snapshot())
+
+
+@app.route('/api/watchlist/refresh', methods=['POST'])
+def trigger_watchlist_refresh():
+    """
+    手动触发一次 watchlist 计算，立即使用当前内存行情进行扫描。
+    """
+    try:
+        all_data = data_collector.get_all_data()
+        exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
+        watchlist_manager.refresh(all_data, exchange_symbols)
+        return jsonify({'message': 'ok', 'timestamp': now_utc_iso(), 'summary': watchlist_manager.snapshot().get('summary')})
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
 @app.route('/api/watchlist/metrics')
 def get_watchlist_metrics():
@@ -1803,6 +1870,12 @@ if __name__ == '__main__':
     print("📡 启动数据收集...")
     # 启动数据收集
     data_collector.start_all_connections()
+
+    # 用最近 1 分钟数据库数据做一次冷启动，避免跨所列表长时间为空
+    try:
+        cold_start_watchlist_from_db(limit_minutes=1)
+    except Exception as exc:
+        logging.getLogger('watchlist').warning("cold start at bootstrap failed: %s", exc)
     
     print("🔄 启动后台数据处理...")
     # 启动后台数据收集线程

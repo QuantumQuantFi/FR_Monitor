@@ -176,6 +176,7 @@
             </div>
             <div class="actions">
                 <button id="refresh-btn">手动刷新</button>
+                <button id="force-btn">立即重算</button>
                 <button id="charts-btn">显示图表</button>
             </div>
         </div>
@@ -235,6 +236,7 @@
     <script>
         const bodyEl = document.getElementById('watchlist-body');
         const btn = document.getElementById('refresh-btn');
+        const forceBtn = document.getElementById('force-btn');
         const chartsBtn = document.getElementById('charts-btn');
         let metricsCache = {};
         let charts = {};
@@ -801,6 +803,17 @@
         };
 
         btn.addEventListener('click', loadWatchlist);
+        forceBtn.addEventListener('click', async () => {
+            forceBtn.disabled = true;
+            try {
+                await fetch('/api/watchlist/refresh', { method: 'POST' });
+                await loadWatchlist();
+            } catch (err) {
+                console.error(err);
+            } finally {
+                forceBtn.disabled = false;
+            }
+        });
         chartsBtn.addEventListener('click', fetchSeriesAndRender);
         loadWatchlist();
     </script>

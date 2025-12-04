@@ -211,7 +211,7 @@ WATCHLIST_CONFIG = {
     # 滑动窗口（小时）
     'lookback_hours': float(_get_private('WATCHLIST_LOOKBACK_HOURS', 'WATCHLIST_LOOKBACK_HOURS', '2')),
     # 刷新频率（秒），用于扫描符合条件的交易对
-    'refresh_seconds': float(_get_private('WATCHLIST_REFRESH_SECONDS', 'WATCHLIST_REFRESH_SECONDS', '150')),
+    'refresh_seconds': float(_get_private('WATCHLIST_REFRESH_SECONDS', 'WATCHLIST_REFRESH_SECONDS', '30')),
     # Type B：跨交易所永续价差
     'type_b_spread_threshold': float(_get_private('WATCHLIST_TYPEB_SPREAD', 'WATCHLIST_TYPEB_SPREAD', '0.01')),  # 1%
     'type_b_funding_min': float(_get_private('WATCHLIST_TYPEB_FUNDING_MIN', 'WATCHLIST_TYPEB_FUNDING_MIN', '-0.001')),  # -0.1%
