@@ -68,10 +68,14 @@ class SpreadPoint:
     funding_rate: Optional[float] = None
     funding_interval_hours: Optional[float] = None
     next_funding_time: Optional[datetime] = None
+    abs_spread: bool = False
 
     @property
     def spread_rel(self) -> Optional[float]:
-        if self.spot:
+        if self.spot and self.futures:
+            if self.abs_spread:
+                base = min(self.spot, self.futures)
+                return abs(self.spot - self.futures) / base if base else None
             return (self.spot - self.futures) / self.spot
         return None
 
@@ -936,7 +940,7 @@ def _build_cross_points(
 ) -> List[SpreadPoint]:
     """
     将 Type B/C 的跨所价差转换为 SpreadPoint 序列，便于复用 Type A 的指标计算。
-    现货视为“资金费率=0 且只能做多”的永续，将低价作为 spot，高价作为 futures，保持与 Type A 相同的方向（价差多为负数）。
+    使用 |高-低|/低 作为统一的正向价差，避免方向不一致导致均值/STD 为负。
     """
     etype = entry.get("entry_type")
     trigger = entry.get("trigger_details") or {}
@@ -981,6 +985,7 @@ def _build_cross_points(
                     funding_rate=float(fr) if fr is not None else None,
                     funding_interval_hours=None,
                     next_funding_time=None,
+                    abs_spread=True,
                 )
             )
     elif etype == "C":
@@ -1015,6 +1020,7 @@ def _build_cross_points(
                     funding_rate=float(fr) if fr is not None else None,
                     funding_interval_hours=None,
                     next_funding_time=None,
+                    abs_spread=True,
                 )
             )
     return points
@@ -1024,8 +1030,8 @@ def compute_metrics_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> 
     """
     统一计算 Type A/B/C 的价差指标，均复用 Type A 的 Spread 指标逻辑：
     - Type A：Binance 现货 vs 永续（原有逻辑）
-    - Type B：任意两家永续，高价视为 futures，低价视为“现货”
-    - Type C：现货 vs 任一期货，若现货反向高于期货，仍将低价视作“现货”以保持方向一致
+    - Type B：任意两家永续，使用 |高-低|/低 的绝对价差
+    - Type C：现货 vs 任一期货，使用 |高-低|/低 的绝对价差
     """
     metrics: Dict[str, Dict[str, Any]] = {}
     type_a_symbols = [e["symbol"] for e in entries if e.get("entry_type") == "A"]

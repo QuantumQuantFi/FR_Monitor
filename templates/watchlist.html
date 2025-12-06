@@ -176,10 +176,37 @@
             overflow-y: auto;
             line-height: 1.35;
         }
-        .col-prices { min-width: 260px; max-width: 340px; white-space: normal; }
-        .col-detail { min-width: 340px; max-width: 460px; white-space: normal; }
+        .col-cross { min-width: 220px; max-width: 260px; white-space: nowrap; }
+        .col-prices { min-width: 300px; max-width: 420px; white-space: nowrap; }
+        .col-detail { min-width: 480px; max-width: 720px; white-space: normal; }
         th.col-prices, td.col-prices,
         th.col-detail, td.col-detail { vertical-align: top; }
+        .col-funding { min-width: 220px; max-width: 280px; }
+        .col-spread { min-width: 280px; max-width: 400px; }
+        /* 避免资金费/价差列换行，便于一次看清高低端 */
+        .col-funding, .col-spread { white-space: nowrap; }
+        .cell-scroll.col-prices { overflow-x: auto; }
+        .detail-grid {
+            display: grid;
+            grid-template-columns: 110px 320px 120px 240px 240px;
+            gap: 6px 10px;
+            align-items: start;
+            white-space: normal;
+        }
+        .detail-grid .detail-head {
+            color: var(--muted);
+            font-weight: 700;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 4px;
+        }
+        .detail-grid .detail-cell {
+            padding: 2px 0;
+            border-bottom: 1px dashed rgba(255,255,255,0.05);
+            white-space: nowrap;
+        }
+        .detail-grid .detail-cell:last-child {
+            border-bottom: none;
+        }
     </style>
 </head>
 <body>
@@ -219,12 +246,12 @@
                     <th>Type</th>
                     <th>状态</th>
                     <th>Funding 周期</th>
-                    <th>资金费率</th>
-                    <th>Spread (最新/均值/标准差)</th>
+                    <th class="col-funding">资金费率</th>
+                    <th class="col-spread">Spread (最新/均值/标准差)</th>
                     <th>配对</th>
                     <th>买高卖低</th>
                     <th>卖高买低</th>
-                    <th>跨所永续差价</th>
+                    <th class="col-cross">跨所永续差价</th>
                     <th class="col-prices">各所资金费&价格</th>
                     <th class="col-detail">详尽交易所指标</th>
                     <th>查看</th>
@@ -249,6 +276,8 @@
                 <div class="info-item"><strong>区间 (1h/12h)</strong>：对应窗口的最高-最低（剔除资金费前后 1 分钟），区间越大说明越活跃。</div>
                 <div class="info-item"><strong>斜率</strong>：近 3 分钟涨跌幅 (末值-首值)/3；<strong>中线</strong>：15 点均线，描述短期中枢。</div>
                 <div class="info-item"><strong>穿越/Drift</strong>：3h 内价差相对 30m 中线的翻转次数（判断是否在更长周期里来回波动）；Drift=|当前-中线|/1h 区间，偏移越小越接近震荡。</div>
+                <div class="info-item"><strong>OI / 保险金</strong>：OI=未平仓合约量（合约张数折算的名义价值），反映场内持仓体量；保险金=该所用于穿仓兜底的基金规模，越大意味着极端行情下被动平仓的缓冲能力越强。</div>
+                <div class="info-item"><strong>历史资金费</strong>：展示该交易所最近 3 次资金费记录（由交易所返回的历史/预测序列截取），格式如 “-0.110% / -0.143% / -0.086%”，便于对比当前值与近期水平。</div>
                 <div class="info-item"><strong>开仓 (C1 &amp; C2 必须同时满足)</strong><br>C1：价差低于基线且低于绝对阈值 5%，且 3min 斜率≤0；<br>C2：波动≥0.5%，区间1h≥1%，区间12h≥1.5%，穿越≥2，Drift≤0.3。</div>
                 <div class="info-item"><strong>平仓信号</strong><br>TP：用 120min 均值/波动，阈值=μ120+1.2σ120，当前是近20min 局部高点且斜率&lt;0，冷静期15min。资费前落袋：距结算≤30min 且价差 ≥ (μ60+0.5σ60) 也标记 TP。SL：连续2个点低于 -(阈值+0.5%) 且斜率&lt;0；Funding：距离结算 ≤5 分钟提示离场（按交易所的实际周期/下一次结算时间绘制）。</div>
                 <div class="info-item"><strong>图表</strong>：近 12 小时价差；蓝线=价差，绿虚线=15m 中线，黄虚线=基线；青色散点=开仓，绿色=TP，红色=SL，紫色=资金费提醒；橙色虚线=资金费结算。</div>
@@ -375,6 +404,71 @@
             return num >= 2 ? `${num.toFixed(0)}h` : `${num.toFixed(1)}h`;
         };
 
+        const buildFundingText = (item, metrics) => {
+            const entryType = item.entry_type || 'A';
+            const trigger = item.trigger_details || {};
+            const fundingMap = trigger.funding || {};
+            const formatLine = (label, rate) => `${label} ${formatPct(rate)}`;
+            const composeHighLow = (high, low) => {
+                if (!high && !low) return '-';
+                const highTxt = high ? `高 ${formatLine(high.label, high.rate)}` : '';
+                const lowTxt = low ? `低 ${formatLine(low.label, low.rate)}` : '';
+                return [highTxt, lowTxt].filter(Boolean).join('<br>');
+            };
+
+            if (entryType === 'A') {
+                const spotPrice = toNumber(metrics.last_spot_price ?? trigger.spot_price);
+                const futPrice = toNumber(metrics.last_futures_price ?? trigger.futures_price);
+                const futFr = toNumber(item.last_funding_rate);
+                const spotLeg = { label: 'Binance 现货', price: spotPrice, rate: 0 };
+                const futLeg = { label: 'Binance 永续', price: futPrice, rate: futFr };
+                if (spotPrice !== null && futPrice !== null) {
+                    const highIsSpot = spotPrice >= futPrice;
+                    return composeHighLow(highIsSpot ? spotLeg : futLeg, highIsSpot ? futLeg : spotLeg);
+                }
+                return composeHighLow(futLeg, spotLeg);
+            }
+
+            if (entryType === 'B') {
+                const pair = trigger.pair || [];
+                if (pair.length === 2) {
+                    const [exA, exB] = pair;
+                    const priceA = toNumber((trigger.prices || {})[exA]);
+                    const priceB = toNumber((trigger.prices || {})[exB]);
+                    const frA = toNumber(fundingMap[exA]);
+                    const frB = toNumber(fundingMap[exB]);
+                    if (priceA !== null && priceB !== null) {
+                        const highIsA = priceA >= priceB;
+                        const high = highIsA ? { label: exA, rate: frA } : { label: exB, rate: frB };
+                        const low = highIsA ? { label: exB, rate: frB } : { label: exA, rate: frA };
+                        return composeHighLow(high, low);
+                    }
+                    if (frA !== null || frB !== null) {
+                        return composeHighLow({ label: exA, rate: frA }, { label: exB, rate: frB });
+                    }
+                }
+                const fundingEntries = Object.entries(fundingMap).map(([ex, fr]) => `${ex}: ${formatPct(toNumber(fr))}`);
+                return fundingEntries.join('<br>') || '-';
+            }
+
+            if (entryType === 'C') {
+                const spotEx = trigger.spot_exchange || 'spot';
+                const futEx = trigger.futures_exchange || 'perp';
+                const spotPrice = toNumber(metrics.last_spot_price ?? trigger.spot_price);
+                const futPrice = toNumber(metrics.last_futures_price ?? trigger.futures_price);
+                const futFr = toNumber(fundingMap[futEx] ?? item.last_funding_rate);
+                const spotLeg = { label: `${spotEx} 现货`, price: spotPrice, rate: 0 };
+                const futLeg = { label: `${futEx} 永续`, price: futPrice, rate: futFr };
+                if (spotPrice !== null && futPrice !== null) {
+                    const highIsFut = futPrice >= spotPrice;
+                    return composeHighLow(highIsFut ? futLeg : spotLeg, highIsFut ? spotLeg : futLeg);
+                }
+                return composeHighLow(futLeg, spotLeg);
+            }
+
+            return formatPct(item.last_funding_rate);
+        };
+
         const formatTime = (value) => {
             if (!value) return '-';
             const d = new Date(value);
@@ -440,14 +534,11 @@
                     ? `下一次资金费时间: ${item.next_funding_time}`
                     : (intervalRaw ? '使用交易所返回的周期估计' : '周期未知，按默认估计');
                 const intervalDisplay = formatInterval(intervalRaw);
-                let fundingRateText = formatPct(item.last_funding_rate);
-                if (entryType !== 'A') {
-                    const fundingEntries = Object.entries(trigger.funding || {}).map(([ex, fr]) => `${ex}: ${formatPct(toNumber(fr))}`);
-                    fundingRateText = fundingEntries.join('<br>') || '-';
-                }
+                const fundingRateText = buildFundingText(item, metrics);
                 const triggerDetails = item.trigger_details ? JSON.stringify(item.trigger_details) : '';
 
-                const spreadCell = `${formatPct(metrics.last_spread ?? trigger.spread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.spread_std)}`;
+                const lastSpread = metrics.last_spread ?? trigger.spread;
+                const spreadCell = `${formatPct(lastSpread)} / ${formatPct(metrics.spread_mean)} / ${formatPct(metrics.spread_std)}`;
 
                 let pairCell = '-';
                 const lastSpot = toNumber(metrics.last_spot_price);
@@ -527,33 +618,63 @@
                 const bestPerpCell = bestPerp
                     ? `高 ${bestPerp.high_exchange} ${formatNumber(bestPerp.high_price, 6)}<br>低 ${bestPerp.low_exchange} ${formatNumber(bestPerp.low_price, 6)}<br>${formatPct(bestPerp.spread)}`
                     : '-';
-                const exRows = (exOverview.rows || [])
-                    .map((r) => {
-                        const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
-                        const fp = r.futures_price !== null && r.futures_price !== undefined ? formatNumber(r.futures_price, 6) : '--';
-                        const sp = r.spot_price !== null && r.spot_price !== undefined ? formatNumber(r.spot_price, 6) : '--';
-                        const label = (r.exchange && (r.exchange !== 'unsupported')) ? r.exchange : '未提供';
-                        return `${label}: ${fr} | perp ${fp} / spot ${sp}`;
+                const exItems = [];
+                (exOverview.rows || []).forEach((r) => {
+                    const label = (r.exchange && (r.exchange !== 'unsupported')) ? r.exchange : '未提供';
+                    const spotPrice = toNumber(r.spot_price);
+                    const futPrice = toNumber(r.futures_price);
+                    const futFr = toNumber(r.funding_rate);
+                    exItems.push({ label: `${label} 现货`, price: spotPrice, fr: 0 });
+                    exItems.push({ label: `${label} 永续`, price: futPrice, fr: futFr });
+                });
+                const exRows = exItems
+                    .sort((a, b) => {
+                        const pa = a.price;
+                        const pb = b.price;
+                        if (pa === null && pb === null) return 0;
+                        if (pa === null) return 1;
+                        if (pb === null) return -1;
+                        return pb - pa; // 价格高的在前
+                    })
+                    .map((row) => {
+                        const priceTxt = row.price !== null ? formatNumber(row.price, 6) : '--';
+                        return `${row.label} ${formatPct(row.fr)} ${priceTxt}`;
                     })
                     .filter(Boolean)
                     .join('<br>');
                 const exRowsCell = exRows || '-';
 
                 const detailCell = detailRows.length
-                    ? detailRows.map((r) => {
-                        const maxFr = r.funding_cap !== null && r.funding_cap !== undefined ? formatPct(r.funding_cap) : '--';
-                        const minFr = r.funding_floor !== null && r.funding_floor !== undefined ? formatPct(r.funding_floor) : '--';
-                        const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
-                        const idxDiff = r.index_diff !== null && r.index_diff !== undefined ? formatPct(r.index_diff) : '--';
-                        const oi = r.open_interest !== null && r.open_interest !== undefined ? formatHuman(r.open_interest) : '--';
-                        const vol = r.volume_quote !== null && r.volume_quote !== undefined ? formatHuman(r.volume_quote) : '--';
-                        const period = r.funding_interval_hours ? formatInterval(r.funding_interval_hours) : '动态/未知';
-                        const insurance = r.insurance_fund ? ` 保险金 ${formatHuman(r.insurance_fund)}` : '';
-                        const hist = Array.isArray(r.funding_history) && r.funding_history.length
-                            ? ` 历史 ${r.funding_history.slice(0, 3).map((h) => formatPct(h.rate)).join(' / ')}`
-                            : '';
-                        return `${r.exchange}: 周期${period} 上限${maxFr} 下限${minFr} 当前${fr} 指数差${idxDiff} OI ${oi} 24h额 ${vol}${insurance}${hist}`;
-                    }).join('<br>')
+                    ? (() => {
+                        const header = `
+                            <div class="detail-head">交易所</div>
+                            <div class="detail-head">资金费(周期/上下限/当前)</div>
+                            <div class="detail-head">指数差</div>
+                            <div class="detail-head">OI/24h额/保险金</div>
+                            <div class="detail-head">历史资金费</div>
+                        `;
+                        const rowsHtml = detailRows.map((r) => {
+                            const maxFr = r.funding_cap !== null && r.funding_cap !== undefined ? formatPct(r.funding_cap) : '--';
+                            const minFr = r.funding_floor !== null && r.funding_floor !== undefined ? formatPct(r.funding_floor) : '--';
+                            const fr = r.funding_rate !== null && r.funding_rate !== undefined ? formatPct(r.funding_rate) : '--';
+                            const idxDiff = r.index_diff !== null && r.index_diff !== undefined ? formatPct(r.index_diff) : '--';
+                            const oi = r.open_interest !== null && r.open_interest !== undefined ? formatHuman(r.open_interest) : '--';
+                            const vol = r.volume_quote !== null && r.volume_quote !== undefined ? formatHuman(r.volume_quote) : '--';
+                            const period = r.funding_interval_hours ? formatInterval(r.funding_interval_hours) : '动态/未知';
+                            const insurance = r.insurance_fund ? formatHuman(r.insurance_fund) : '--';
+                            const hist = Array.isArray(r.funding_history) && r.funding_history.length
+                                ? r.funding_history.slice(0, 3).map((h) => formatPct(h.rate)).join(' / ')
+                                : '--';
+                            return `
+                                <div class="detail-cell">${r.exchange}</div>
+                                <div class="detail-cell">周期${period} 上限${maxFr} 下限${minFr} 当前${fr}</div>
+                                <div class="detail-cell">${idxDiff}</div>
+                                <div class="detail-cell">OI ${oi} | 24h ${vol} | 保险 ${insurance}</div>
+                                <div class="detail-cell">历史 ${hist}</div>
+                            `;
+                        }).join('');
+                        return `<div class="detail-grid">${header}${rowsHtml}</div>`;
+                    })()
                     : '-';
 
                 return `
@@ -562,12 +683,12 @@
                         <td title="${triggerDetails}">${entryType}</td>
                         <td><span class="${statusCls}">${item.status}</span></td>
                         <td class="mono" title="${intervalTitle}">${intervalDisplay}</td>
-                        <td class="mono">${fundingRateText}</td>
-                        <td class="mono">${spreadCell}</td>
+                        <td class="mono col-funding">${fundingRateText}</td>
+                        <td class="mono col-spread">${spreadCell}</td>
                         <td class="mono">${pairCell}</td>
                         <td class="mono">${forwardCell}</td>
                         <td class="mono">${reverseCell}</td>
-                        <td class="mono">${bestPerpCell}</td>
+                        <td class="mono col-cross">${bestPerpCell}</td>
                         <td class="mono cell-scroll col-prices">${exRowsCell}</td>
                         <td class="mono cell-scroll col-detail">${detailCell}</td>
                         <td><button class="detail-btn" data-sym="${item.symbol}">查看</button></td>
