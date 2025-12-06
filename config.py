@@ -191,7 +191,7 @@ WS_CONNECTION_CONFIG = {
 
 # REST补充轮询配置
 REST_ENABLED = True                 # 默认开启；可按需关闭
-REST_UPDATE_INTERVAL = 2.0          # REST 快照轮询间隔（秒）
+REST_UPDATE_INTERVAL = 8.0          # REST 快照轮询间隔（秒，降低 CPU 占用）
 REST_CONNECTION_CONFIG = {
     'timeout': 10,                  # 单次请求超时（秒）
     'retry': 1,                     # 失败重试次数（轻量）

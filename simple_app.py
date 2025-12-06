@@ -14,7 +14,7 @@ import decimal
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from typing import Any, Dict, List, Optional
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from exchange_connectors import ExchangeDataCollector
 from arbitrage import ArbitrageMonitor
 from config import (
@@ -57,10 +57,20 @@ _LOGGING_CONFIGURED = False
 EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']
 
 ORDERBOOK_CACHE: Dict[tuple, Dict[str, Any]] = {}
-ORDERBOOK_CACHE_TTL = 15  # seconds
-ORDERBOOK_FETCH_TIMEOUT = 5.0
+ORDERBOOK_CACHE_TTL = 60  # seconds，拉深度频率不必过高
+ORDERBOOK_FETCH_TIMEOUT = 4.0
 ORDERBOOK_CACHE_LOCK = threading.Lock()
-ORDERBOOK_EXECUTOR = ThreadPoolExecutor(max_workers=16)
+# 订单簿抓取线程池减小并发，降低 CPU 占用
+ORDERBOOK_EXECUTOR = ThreadPoolExecutor(max_workers=8)
+
+# watchlist 订单簿/跨所价差的后台缓存，避免在请求路径阻塞
+WATCHLIST_ORDERBOOK_SNAPSHOT = {
+    'orderbook': {},
+    'cross_spreads': {},
+    'timestamp': None,
+    'error': None,
+    'stale_reason': 'not_ready',
+}
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -136,7 +146,8 @@ def configure_logging() -> None:
     stream_handler.setFormatter(formatter)
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    # 记录到文件的默认等级调低，减少锁争用
+    root_logger.setLevel(logging.WARNING)
     root_logger.handlers.clear()
     root_logger.addHandler(handler)
     root_logger.addHandler(stream_handler)
@@ -999,27 +1010,39 @@ def _prefetch_orderbooks(leg_keys: List[tuple], sweep_notional: float) -> Dict[t
                 ready[key] = cached.get('val')
             else:
                 to_fetch.append(key)
-    futures: Dict[tuple, Any] = {}
+    futures: Dict[Any, tuple] = {}
     for key in to_fetch:
         exch, market_type, sym = key
         try:
-            futures[key] = ORDERBOOK_EXECUTOR.submit(
+            fut = ORDERBOOK_EXECUTOR.submit(
                 fetch_orderbook_prices,
                 exch,
                 sym,
                 market_type,
                 notional=sweep_notional,
             )
+            futures[fut] = key
         except Exception:
             continue
-    for key, fut in futures.items():
-        try:
-            val = fut.result(timeout=ORDERBOOK_FETCH_TIMEOUT)
-        except Exception as exc:
-            val = {'error': str(exc)}
-        ready[key] = val
-        with ORDERBOOK_CACHE_LOCK:
-            ORDERBOOK_CACHE[key] = {'ts': time.time(), 'val': val}
+    if futures:
+        done, pending = wait(list(futures.keys()), timeout=ORDERBOOK_FETCH_TIMEOUT)
+        for fut in done:
+            key = futures.get(fut)
+            try:
+                val = fut.result()
+            except Exception as exc:
+                val = {'error': str(exc)}
+            if key:
+                ready[key] = val
+                with ORDERBOOK_CACHE_LOCK:
+                    ORDERBOOK_CACHE[key] = {'ts': time.time(), 'val': val}
+        for fut in pending:
+            key = futures.get(fut)
+            if key:
+                val = {'error': 'timeout'}
+                ready[key] = val
+                with ORDERBOOK_CACHE_LOCK:
+                    ORDERBOOK_CACHE[key] = {'ts': time.time(), 'val': val}
     return ready
 
 
@@ -1181,6 +1204,48 @@ def build_cross_spread_matrix(entries: List[Dict[str, Any]], all_data: Dict[str,
             'pairs': pairs_sorted,
         }
     return result
+
+def refresh_watchlist_orderbook_cache():
+    """后台刷新 watchlist 订单簿/跨所差价缓存，避免在请求路径阻塞。"""
+    logger = logging.getLogger('watchlist')
+    min_interval = 10.0  # 不要太频繁
+    while True:
+        start = time.time()
+        try:
+            snapshot = watchlist_manager.snapshot()
+            active_entries = [e for e in snapshot.get('entries', []) if e.get('status') == 'active']
+            if not active_entries:
+                WATCHLIST_ORDERBOOK_SNAPSHOT.update({
+                    'orderbook': {},
+                    'cross_spreads': {},
+                    'timestamp': now_utc_iso(),
+                    'error': None,
+                    'stale_reason': 'no_active_entries',
+                })
+            else:
+                all_data = data_collector.get_all_data()
+                orderbook = build_orderbook_annotation(active_entries)
+                cross_spreads = build_cross_spread_matrix(active_entries, all_data)
+                WATCHLIST_ORDERBOOK_SNAPSHOT.update({
+                    'orderbook': orderbook,
+                    'cross_spreads': cross_spreads,
+                    'timestamp': now_utc_iso(),
+                    'error': None,
+                    'stale_reason': None,
+                })
+        except Exception as exc:
+            WATCHLIST_ORDERBOOK_SNAPSHOT.update({
+                'orderbook': WATCHLIST_ORDERBOOK_SNAPSHOT.get('orderbook') or {},
+                'cross_spreads': WATCHLIST_ORDERBOOK_SNAPSHOT.get('cross_spreads') or {},
+                'timestamp': now_utc_iso(),
+                'error': str(exc),
+                'stale_reason': 'exception',
+            })
+            logger.warning("watchlist orderbook cache refresh failed: %s", exc)
+        # 将休眠时间与 watchlist 刷新周期对齐，但保留最小间隔
+        elapsed = time.time() - start
+        sleep_seconds = max(min_interval, watchlist_manager.refresh_seconds - elapsed)
+        time.sleep(sleep_seconds)
 
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
@@ -1488,13 +1553,14 @@ def get_watchlist():
         entries = payload.get('entries', [])
         active_entries = [e for e in entries if e.get('status') == 'active']
         all_data = data_collector.get_all_data()
-        try:
-            payload['orderbook'] = build_orderbook_annotation(active_entries)
-            payload['cross_spreads'] = build_cross_spread_matrix(active_entries, all_data)
-        except Exception as ob_exc:
-            payload['orderbook_error'] = str(ob_exc)
-            payload['orderbook'] = {}
-            payload['cross_spreads'] = {}
+        # 使用后台缓存的订单簿/跨所差价，避免请求路径阻塞
+        ob_snapshot = WATCHLIST_ORDERBOOK_SNAPSHOT.copy()
+        payload['orderbook'] = ob_snapshot.get('orderbook') or {}
+        payload['cross_spreads'] = ob_snapshot.get('cross_spreads') or {}
+        payload['orderbook_ts'] = ob_snapshot.get('timestamp')
+        payload['orderbook_stale_reason'] = ob_snapshot.get('stale_reason')
+        if ob_snapshot.get('error'):
+            payload['orderbook_error'] = ob_snapshot.get('error')
 
         # 补充交易所视图：按符号列出各所期现价格、资金费率，以及跨所永续最佳价差
         def _to_float(val):
@@ -2157,6 +2223,10 @@ if __name__ == '__main__':
     # 启动后台数据收集线程
     background_thread = threading.Thread(target=background_data_collection, daemon=True)
     background_thread.start()
+
+    print("📑 启动Watchlist订单簿缓存线程...")
+    watchlist_ob_thread = threading.Thread(target=refresh_watchlist_orderbook_cache, daemon=True)
+    watchlist_ob_thread.start()
 
     print("👀 启动Binance关注列表刷新线程...")
     watchlist_thread = threading.Thread(target=watchlist_refresh_loop, daemon=True)
