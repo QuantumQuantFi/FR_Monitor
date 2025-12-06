@@ -71,6 +71,13 @@ WATCHLIST_ORDERBOOK_SNAPSHOT = {
     'error': None,
     'stale_reason': 'not_ready',
 }
+WATCHLIST_METRICS_SNAPSHOT = {
+    'metrics': {},
+    'symbols': [],
+    'timestamp': None,
+    'error': None,
+    'stale_reason': 'not_ready',
+}
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -1247,6 +1254,45 @@ def refresh_watchlist_orderbook_cache():
         sleep_seconds = max(min_interval, watchlist_manager.refresh_seconds - elapsed)
         time.sleep(sleep_seconds)
 
+def refresh_watchlist_metrics_cache():
+    """后台刷新 watchlist 价差指标缓存，避免接口长时间阻塞导致前端 502。"""
+    logger = logging.getLogger('watchlist')
+    min_interval = 60.0  # 指标不需要太高频
+    while True:
+        start = time.time()
+        try:
+            snapshot = watchlist_manager.snapshot()
+            active_entries = [e for e in snapshot.get('entries', []) if e.get('status') == 'active']
+            if not active_entries:
+                WATCHLIST_METRICS_SNAPSHOT.update({
+                    'metrics': {},
+                    'symbols': [],
+                    'timestamp': now_utc_iso(),
+                    'error': None,
+                    'stale_reason': 'no_active_entries',
+                })
+            else:
+                metrics = compute_metrics_for_entries(db.db_path, active_entries)
+                WATCHLIST_METRICS_SNAPSHOT.update({
+                    'metrics': metrics,
+                    'symbols': [e.get('symbol') for e in active_entries if e.get('symbol')],
+                    'timestamp': now_utc_iso(),
+                    'error': None,
+                    'stale_reason': None,
+                })
+        except Exception as exc:
+            WATCHLIST_METRICS_SNAPSHOT.update({
+                'metrics': WATCHLIST_METRICS_SNAPSHOT.get('metrics') or {},
+                'symbols': WATCHLIST_METRICS_SNAPSHOT.get('symbols') or [],
+                'timestamp': now_utc_iso(),
+                'error': str(exc),
+                'stale_reason': 'exception',
+            })
+            logger.warning("watchlist metrics cache refresh failed: %s", exc)
+        elapsed = time.time() - start
+        sleep_seconds = max(min_interval, watchlist_manager.refresh_seconds - elapsed)
+        time.sleep(sleep_seconds)
+
 def background_data_collection():
     """优化的后台数据收集 - 减少磁盘写入频率"""
     last_maintenance = datetime.now()
@@ -1647,25 +1693,18 @@ def get_watchlist_metrics():
     """
     仅计算 watchlist active 符号的价差指标，用于监控/展示，不触发任何交易动作。
     """
-    try:
-        snapshot = watchlist_manager.snapshot()
-        active_entries = [entry for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
-        active_symbols = [entry['symbol'] for entry in active_entries]
-        if not active_entries:
-            return jsonify({
-                'symbols': [],
-                'metrics': {},
-                'message': 'no active symbols',
-                'timestamp': now_utc_iso()
-            })
-        metrics = compute_metrics_for_entries(db.db_path, active_entries)
-        return jsonify({
-            'symbols': active_symbols,
-            'metrics': metrics,
-            'timestamp': now_utc_iso()
-        })
-    except Exception as exc:
-        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+    snap = WATCHLIST_METRICS_SNAPSHOT.copy()
+    payload = {
+        'symbols': snap.get('symbols') or [],
+        'metrics': snap.get('metrics') or {},
+        'timestamp': snap.get('timestamp') or now_utc_iso(),
+        'stale_reason': snap.get('stale_reason'),
+        'error': snap.get('error'),
+    }
+    status_code = 200 if not snap.get('error') else 500
+    if not snap.get('metrics') and not snap.get('error'):
+        payload['message'] = snap.get('stale_reason') or 'metrics cache not ready'
+    return jsonify(payload), status_code
 
 @app.route('/api/watchlist/series')
 def get_watchlist_series():
@@ -2227,6 +2266,10 @@ if __name__ == '__main__':
     print("📑 启动Watchlist订单簿缓存线程...")
     watchlist_ob_thread = threading.Thread(target=refresh_watchlist_orderbook_cache, daemon=True)
     watchlist_ob_thread.start()
+
+    print("📈 启动Watchlist指标缓存线程...")
+    watchlist_metrics_thread = threading.Thread(target=refresh_watchlist_metrics_cache, daemon=True)
+    watchlist_metrics_thread.start()
 
     print("👀 启动Binance关注列表刷新线程...")
     watchlist_thread = threading.Thread(target=watchlist_refresh_loop, daemon=True)
