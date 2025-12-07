@@ -214,7 +214,11 @@
         <div class="meta">
             <div>
                 <h1>多类型价差关注列表</h1>
-                <div class="muted">支持 Type A（Binance 现货+永续，资金费 |FR| ≥ 0.3%）、Type B（任意两家永续价差 >1%，且双方资金费均在 -0.1%~0.1%）、Type C（现货低于任一期货 >1%，且两家期货资金费 ≥ -0.1%）。</div>
+                <div class="muted">
+                    Type A：Binance 现货+永续同所对冲，资金费 |FR| ≥ 0.3% 的高资费标的；同一保证金账户爆仓风险最低，收益来自价差周期波动，但需付资金费（除非结算前后滚仓）。<br>
+                    Type B：任意两家永续，|a-b|/min > 1% 且双方资金费在 -0.1%~0.1%；套利方向是价差收敛，依赖低且稳定的资金费，适合选择资金费周期更长的一侧持仓。<br>
+                    Type C：现货低于任一期货 > 1%，且两家期货资金费 ≥ -0.1%；做法多现货、空期货，收益主要来自正向基差回归，同时控制资金费不异常、尽量降低付费。
+                </div>
             </div>
             <div class="actions">
                 <button id="refresh-btn">手动刷新</button>
@@ -233,9 +237,9 @@
             <div class="pill">开仓规则 <strong>C1 &amp; C2 同时满足</strong></div>
         </div>
         <div class="muted" style="font-size:13px;margin-bottom:12px;line-height:1.5;">
-            类型说明：Type A 仍旧侧重 Binance 单所的资金费极端与价差均值信号，需同时满足现货+永续与 |FR| ≥ 阈值；Type B 关注跨交易所永续价差的相对套利机会（|a-b|/min(a,b) > 1%，资金费在配置区间内）；Type C 关注现货低于永续的正向差（同样用 |a-b|/min(a,b) 约 1%），并要求期货资金费不为显著负值（≥-0.1%）。
-            指标释义（主要适用于 Type A）：Spread% = (现货-永续)/现货；“均值/基线”用近 1 小时的数据计算，基线=均值-1.5σ，价差跌破基线意味着近期偏低；区间（1h/12h）为高低差，越大越活跃；斜率看近 3 分钟走势；穿越次数看 3 小时内相对 30m 中线“上穿/下穿”次数；Drift 衡量当前离中线偏移。
-            开仓条件（Type A）：C1=价差低于基线且低于绝对阈值(5%)，且短期斜率不再上行(≤0)；C2=波动/区间达标且穿越≥2且 Drift≤0.3；必须 C1 &amp; C2 同时满足。Type B/C 当前仅展示价差与资金费，不给出自动信号。
+            使用提示：A 型聚焦 Binance 内部现货+永续的高资费标的，收益来自价差周期波动，成本是资金费；B 型看跨所永续价差收敛，要求价差>1%且资金费接近 0，更偏中性套利，优先选资金费周期更长的一侧；C 型利用现货低于期货的正向基差，多现货空期货，收益来自基差回归，同时确保期货资金费不为显著负值以压低成本。<br>
+            指标释义（主要适用于 Type A）：Spread% = (现货-永续)/现货；均值/基线用近 1h 数据，基线=均值-1.5σ；区间（1h/12h）为高低差；斜率看近 3 分钟涨跌；穿越次数看 3h 内相对 30m 中线的翻转；Drift=|当前-中线|/1h 区间。<br>
+            信号（Type A）：C1=价差低于基线且低于绝对阈值(5%)，且 3min 斜率≤0；C2=波动/区间达标且穿越≥2且 Drift≤0.3；必须 C1 &amp; C2 同时满足。Type B/C 当前仅展示价差与资金费，不给出自动信号。
         </div>
 
         <div class="table-wrap">
@@ -277,7 +281,7 @@
                 <div class="info-item"><strong>斜率</strong>：近 3 分钟涨跌幅 (末值-首值)/3；<strong>中线</strong>：15 点均线，描述短期中枢。</div>
                 <div class="info-item"><strong>穿越/Drift</strong>：3h 内价差相对 30m 中线的翻转次数（判断是否在更长周期里来回波动）；Drift=|当前-中线|/1h 区间，偏移越小越接近震荡。</div>
                 <div class="info-item"><strong>OI / 保险金</strong>：OI=未平仓合约量（合约张数折算的名义价值），反映场内持仓体量；保险金=该所用于穿仓兜底的基金规模，越大意味着极端行情下被动平仓的缓冲能力越强。</div>
-                <div class="info-item"><strong>历史资金费</strong>：展示该交易所最近 3 次资金费记录（由交易所返回的历史/预测序列截取），格式如 “-0.110% / -0.143% / -0.086%”，便于对比当前值与近期水平。</div>
+                <div class="info-item"><strong>历史资金费</strong>：取该交易所最近 ≤24 次资金费，输出“最新/均值/标准差 (样本数)”用于对比当前水平与波动，例如 “-0.110% / -0.143% / -0.086% (12)”。</div>
                 <div class="info-item"><strong>开仓 (C1 &amp; C2 必须同时满足)</strong><br>C1：价差低于基线且低于绝对阈值 5%，且 3min 斜率≤0；<br>C2：波动≥0.5%，区间1h≥1%，区间12h≥1.5%，穿越≥2，Drift≤0.3。</div>
                 <div class="info-item"><strong>平仓信号</strong><br>TP：用 120min 均值/波动，阈值=μ120+1.2σ120，当前是近20min 局部高点且斜率&lt;0，冷静期15min。资费前落袋：距结算≤30min 且价差 ≥ (μ60+0.5σ60) 也标记 TP。SL：连续2个点低于 -(阈值+0.5%) 且斜率&lt;0；Funding：距离结算 ≤5 分钟提示离场（按交易所的实际周期/下一次结算时间绘制）。</div>
                 <div class="info-item"><strong>图表</strong>：近 12 小时价差；蓝线=价差，绿虚线=15m 中线，黄虚线=基线；青色散点=开仓，绿色=TP，红色=SL，紫色=资金费提醒；橙色虚线=资金费结算。</div>
@@ -402,6 +406,32 @@
             if (value === null || value === undefined || value === 0) return '动态/未知';
             const num = Number(value);
             return num >= 2 ? `${num.toFixed(0)}h` : `${num.toFixed(1)}h`;
+        };
+
+        const computeFundingStats = (history, limit = 24) => {
+            if (!Array.isArray(history)) return null;
+            const sorted = history
+                .map((h) => {
+                    const rate = toNumber(h.rate);
+                    const t = h.time ? new Date(h.time).getTime() : null;
+                    return { rate, t };
+                })
+                .filter((h) => h.rate !== null);
+            if (!sorted.length) return null;
+            sorted.sort((a, b) => {
+                if (a.t === null && b.t === null) return 0;
+                if (a.t === null) return 1;
+                if (b.t === null) return -1;
+                return b.t - a.t; // 最新在前
+            });
+            const rates = sorted.slice(0, limit).map((h) => h.rate);
+            const n = rates.length;
+            if (!n) return null;
+            const latest = rates[0];
+            const mean = rates.reduce((s, v) => s + v, 0) / n;
+            const variance = rates.reduce((s, v) => s + Math.pow(v - mean, 2), 0) / n;
+            const std = Math.sqrt(variance);
+            return { latest, mean, std, count: n };
         };
 
         const buildFundingText = (item, metrics) => {
@@ -651,7 +681,7 @@
                             <div class="detail-head">资金费(周期/上下限/当前)</div>
                             <div class="detail-head">指数差</div>
                             <div class="detail-head">OI/24h额/保险金</div>
-                            <div class="detail-head">历史资金费</div>
+                            <div class="detail-head">历史资金费(最新/均值/Std)</div>
                         `;
                         const rowsHtml = detailRows.map((r) => {
                             const maxFr = r.funding_cap !== null && r.funding_cap !== undefined ? formatPct(r.funding_cap) : '--';
@@ -662,8 +692,9 @@
                             const vol = r.volume_quote !== null && r.volume_quote !== undefined ? formatHuman(r.volume_quote) : '--';
                             const period = r.funding_interval_hours ? formatInterval(r.funding_interval_hours) : '动态/未知';
                             const insurance = r.insurance_fund ? formatHuman(r.insurance_fund) : '--';
-                            const hist = Array.isArray(r.funding_history) && r.funding_history.length
-                                ? r.funding_history.slice(0, 3).map((h) => formatPct(h.rate)).join(' / ')
+                            const histStats = computeFundingStats(r.funding_history, 24);
+                            const hist = histStats
+                                ? `${formatPct(histStats.latest)} / ${formatPct(histStats.mean)} / ${formatPct(histStats.std)} (${histStats.count})`
                                 : '--';
                             return `
                                 <div class="detail-cell">${r.exchange}</div>
