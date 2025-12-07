@@ -501,10 +501,16 @@
         };
 
         const formatTime = (value) => {
-            if (!value) return '-';
-            const d = new Date(value);
-            if (isNaN(d.getTime())) return value;
-            return d.toLocaleTimeString();
+            if (!value && value !== 0) return '-';
+            let ts = value;
+            if (typeof value === 'number' && value < 1e12) {
+                // 兼容秒级时间戳
+                ts = value * 1000;
+            }
+            const d = new Date(ts);
+            if (isNaN(d.getTime())) return String(value);
+            const pad = (n) => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
         };
 
         const render = (payload) => {
