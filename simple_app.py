@@ -1559,6 +1559,12 @@ def watchlist_view():
     return render_template('watchlist.html')
 
 
+@app.route('/watchlist/charts')
+def watchlist_charts():
+    """关注列表的独立图表页面"""
+    return render_template('watchlist_charts.html')
+
+
 @app.route('/api/data')
 def get_current_data():
     """获取当前显示币种的实时数据API"""

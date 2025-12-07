@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Watchlist 图表</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
+    <style>
+        :root { color-scheme: dark; }
+        body { margin: 0; padding: 16px; background: #0b1020; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif; }
+        h1 { margin: 0 0 8px; font-size: 22px; }
+        .muted { color: #9ca3af; font-size: 13px; }
+        .panel { background: #0f172a; border: 1px solid #1f2937; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+        .actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+        button { background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 8px 12px; cursor: pointer; font-weight: 600; }
+        button:disabled { opacity: 0.6; cursor: not-allowed; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(540px, 1fr)); gap: 14px; }
+        .card { background: #0f172a; border: 1px solid #1f2937; border-radius: 12px; padding: 10px; }
+        .card h3 { margin: 0 0 6px; font-size: 15px; display: flex; justify-content: space-between; align-items: center; color: #f1f5f9; }
+        .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        canvas { background: #0b1020; border: 1px solid #1f2937; border-radius: 8px; }
+    </style>
+</head>
+<body>
+    <div class="panel">
+        <h1>Watchlist 图表</h1>
+        <div class="muted" id="subtitle">基于关注列表的 12h 价差与价格时序，支持按 Symbol 过滤。</div>
+        <div class="actions">
+            <button id="refresh-btn">手动刷新</button>
+            <button id="back-btn" onclick="window.open('/watchlist','_self')">返回 Watchlist</button>
+            <span class="muted" id="status">准备就绪</span>
+        </div>
+    </div>
+    <div class="grid" id="charts-grid"></div>
+
+<script>
+    const urlParams = new URLSearchParams(window.location.search);
+    const filterSymbol = urlParams.get('symbol') ? urlParams.get('symbol').toUpperCase() : null;
+    const subtitle = document.getElementById('subtitle');
+    if (filterSymbol) subtitle.textContent = `${filterSymbol} 的 12h 时序图（来自 watchlist 数据）`;
+
+    let charts = {};
+    let chartSeries = {};
+    let refreshTimer = null;
+
+    const destroyCharts = () => {
+        Object.values(charts).forEach((entry) => {
+            if (Array.isArray(entry)) {
+                entry.forEach((c) => c && c.destroy());
+            } else if (entry && entry.destroy) {
+                entry.destroy();
+            }
+        });
+        charts = {};
+    };
+
+    const formatTitle = (entry, series) => {
+        const t = entry.entry_type || series.entry_type || 'A';
+        if (t === 'A') return `${entry.symbol} (A) Binance spot vs perp`;
+        if (t === 'B') return `${entry.symbol} (B) 永续跨所 ${ (series.pair_exchanges || []).join(' vs ')}`;
+        return `${entry.symbol} (C) 现货 vs 永续 ${ (series.pair_exchanges || []).join(' / ')}`;
+    };
+
+    const renderCharts = (entries) => {
+        const grid = document.getElementById('charts-grid');
+        destroyCharts();
+        grid.innerHTML = '';
+        if (!entries.length) {
+            grid.innerHTML = '<div class="muted">暂无活跃符号或没有可用数据</div>';
+            return;
+        }
+        const slice = entries.slice(0, 12);
+        slice.forEach((entry) => {
+            const series = chartSeries[entry.symbol];
+            if (!series || !series.points || !series.points.length) return;
+            const card = document.createElement('div');
+            card.className = 'card';
+            card.innerHTML = `<h3>${formatTitle(entry, series)}<span class="muted">${(series.funding_interval_hours || '-') + 'h'}</span></h3><div class="pair"><canvas id="spread-${entry.symbol}" height="240"></canvas><canvas id="price-${entry.symbol}" height="240"></canvas></div>`;
+            grid.appendChild(card);
+
+            const ctxSpread = card.querySelector(`#spread-${entry.symbol}`).getContext('2d');
+            const ctxPrice = card.querySelector(`#price-${entry.symbol}`).getContext('2d');
+            const toPts = (arr, factor = 1) => arr.map((p) => ({ x: new Date(p.t), y: p.v * factor }));
+            const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+            const exitTpPts = (series.exit_signals || []).filter((p) => p.type === 'tp').map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+            const exitSlPts = (series.exit_signals || []).filter((p) => p.type === 'sl').map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+            const exitFundingPts = (series.exit_signals || []).filter((p) => p.type === 'funding').map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
+            const lastTs = new Date(series.points[series.points.length - 1].t);
+            const xMin = new Date(lastTs.getTime() - 12 * 60 * 60 * 1000);
+
+            const fundingAnnotations = (() => {
+                const anns = {};
+                const times = Array.isArray(series.funding_times) ? series.funding_times : [];
+                times.forEach((ft, idx) => {
+                    const t = new Date(ft);
+                    const key = `funding-${entry.symbol}-${idx}`;
+                    anns[key] = {
+                        type: 'line',
+                        xMin: t.getTime(), xMax: t.getTime(),
+                        borderColor: '#fbbf24', borderWidth: 1, borderDash: [4, 4],
+                        label: { display: true, content: 'Funding', color: '#fbbf24', position: 'start', rotation: -90, backgroundColor: 'rgba(0,0,0,0)' },
+                    };
+                });
+                return anns;
+            })();
+
+            const spreadDatasets = [
+                { label: 'Spread %', data: toPts(series.points, 100), borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.15)', tension: 0.2, pointRadius: 0, borderWidth: 1.5 },
+                { label: 'Midline 15m', data: toPts(series.midline || [], 100), borderColor: '#34d399', backgroundColor: 'rgba(52,211,153,0.05)', tension: 0.2, pointRadius: 0, borderDash: [4, 4], borderWidth: 1 },
+                { label: 'Baseline', data: toPts(series.baseline || [], 100), borderColor: '#fbbf24', backgroundColor: 'rgba(251,191,36,0.05)', tension: 0.2, pointRadius: 0, borderDash: [2, 2], borderWidth: 1 },
+                { label: 'Entry', data: entryPts, type: 'scatter', borderColor: '#06b6d4', backgroundColor: '#06b6d4', pointRadius: 5 },
+                { label: 'TP', data: exitTpPts, type: 'scatter', borderColor: '#22c55e', backgroundColor: '#22c55e', pointRadius: 5 },
+                { label: 'SL', data: exitSlPts, type: 'scatter', borderColor: '#ef4444', backgroundColor: '#ef4444', pointRadius: 5 },
+                { label: 'Funding', data: exitFundingPts, type: 'scatter', borderColor: '#a855f7', backgroundColor: '#a855f7', pointRadius: 5 },
+            ];
+
+            charts[`${entry.symbol}-spread`] = new Chart(ctxSpread, {
+                type: 'line',
+                data: { datasets: spreadDatasets },
+                options: {
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { type: 'time', min: xMin, max: lastTs, time: { unit: 'hour', tooltipFormat: 'HH:mm' }, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { ticks: { color: '#9ca3af', callback: (v) => `${v.toFixed(2)}%` }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    },
+                    plugins: { legend: { labels: { color: '#e5e7eb' } }, annotation: { annotations: fundingAnnotations }, tooltip: { callbacks: { label: (ctx) => `${ctx.dataset.label}: ${ctx.parsed.y.toFixed(3)}%` } } },
+                },
+            });
+
+            charts[`${entry.symbol}-price`] = new Chart(ctxPrice, {
+                type: 'line',
+                data: { datasets: [
+                    { label: 'Spot', data: toPts(series.spot || []), borderColor: '#34d399', tension: 0.2, pointRadius: 0, borderWidth: 1.5 },
+                    { label: 'Perp', data: toPts(series.futures || []), borderColor: '#93c5fd', tension: 0.2, pointRadius: 0, borderWidth: 1.5 },
+                ] },
+                options: {
+                    maintainAspectRatio: false,
+                    scales: {
+                        x: { type: 'time', min: xMin, max: lastTs, time: { unit: 'hour', tooltipFormat: 'HH:mm' }, ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                        y: { ticks: { color: '#9ca3af' }, grid: { color: 'rgba(255,255,255,0.05)' } },
+                    },
+                    plugins: { legend: { labels: { color: '#e5e7eb' } } },
+                },
+            });
+        });
+    };
+
+    const statusEl = document.getElementById('status');
+    const refreshBtn = document.getElementById('refresh-btn');
+
+    const loadData = async () => {
+        if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
+        refreshBtn.disabled = true;
+        statusEl.textContent = '加载中...';
+        try {
+            const [watchlistResp, seriesResp] = await Promise.all([
+                fetch('/api/watchlist'),
+                fetch('/api/watchlist/series'),
+            ]);
+            const watchlist = await watchlistResp.json();
+            const series = await seriesResp.json();
+            chartSeries = series.series || {};
+            const entries = (watchlist.entries || []).filter((i) => i.status === 'active');
+            const filtered = filterSymbol ? entries.filter((e) => e.symbol === filterSymbol) : entries;
+            renderCharts(filtered);
+            const next = Math.max(1000, (watchlist.summary?.refresh_seconds || 30) * 1000);
+            statusEl.textContent = `活跃 ${filtered.length} / 总计 ${(watchlist.entries || []).length} | 下次刷新 ${Math.round(next/1000)}s`;
+            refreshTimer = setTimeout(loadData, next);
+        } catch (err) {
+            statusEl.textContent = `加载失败: ${err}`;
+        } finally {
+            refreshBtn.disabled = false;
+        }
+    };
+
+    refreshBtn.addEventListener('click', loadData);
+    loadData();
+</script>
+</body>
+</html>

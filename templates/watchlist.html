@@ -223,7 +223,7 @@
             <div class="actions">
                 <button id="refresh-btn">手动刷新</button>
                 <button id="force-btn">立即重算</button>
-                <button id="charts-btn">显示图表</button>
+                <button id="charts-btn">图表窗口</button>
             </div>
         </div>
 
@@ -287,7 +287,8 @@
                 <div class="info-item"><strong>图表</strong>：近 12 小时价差；蓝线=价差，绿虚线=15m 中线，黄虚线=基线；青色散点=开仓，绿色=TP，红色=SL，紫色=资金费提醒；橙色虚线=资金费结算。</div>
             </div>
         </div>
-        <div class="charts-grid" id="charts-grid"></div>
+        <div class="muted" style="margin:8px 0 14px;">图表已移动到独立页面，点击“图表窗口”或行内“图表”按钮将在新标签页打开。</div>
+        <div class="charts-grid" id="charts-grid" style="display:none;"></div>
     </div>
 
     <div id="modal-overlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.55); z-index:9999; align-items:center; justify-content:center; padding:12px;">
@@ -1007,24 +1008,7 @@
         let refreshTimer = null;
 
         let seriesLoading = false;
-        const loadSeriesData = async () => {
-            if (seriesLoading) return;
-            seriesLoading = true;
-            chartsBtn.disabled = true;
-            chartsBtn.textContent = '加载中...';
-            try {
-                const resp = await fetch('/api/watchlist/series');
-                const seriesData = await resp.json();
-                chartSeries = seriesData.series || {};
-                chartsLoaded = true;
-            } catch (err) {
-                grid.innerHTML = '<div class="muted">图表加载失败</div>';
-            } finally {
-                chartsBtn.disabled = false;
-                chartsBtn.textContent = '显示图表';
-                seriesLoading = false;
-            }
-        };
+        const loadSeriesData = async () => {};
 
         const loadWatchlist = async () => {
             btn.disabled = true;
@@ -1042,17 +1026,8 @@
                     const metricsResp = await fetch('/api/watchlist/metrics');
                     const metricsData = await metricsResp.json();
                     metricsCache = metricsData.metrics || {};
-                    if (chartsLoaded) {
-                        await loadSeriesData();
-                        renderCharts(lastActiveEntries);
-                    } else {
-                        renderCharts([]);
-                    }
                 } else {
                     metricsCache = {};
-                    chartSeries = {};
-                    renderCharts([]);
-                    chartsLoaded = false;
                 }
                 render(data);
 
@@ -1083,10 +1058,7 @@
             const chartBtn = event.target.closest('.chart-btn');
             if (chartBtn) {
                 const sym = chartBtn.getAttribute('data-sym');
-                const entry = lastActiveEntries.find((e) => e.symbol === sym);
-                if (!entry) return;
-                await loadSeriesData();
-                renderCharts([entry]);
+                window.open(`/watchlist/charts?symbol=${encodeURIComponent(sym)}`, '_blank');
                 return;
             }
             const detailBtn = event.target.closest('.detail-btn');
@@ -1097,9 +1069,8 @@
                 return;
             }
         });
-        chartsBtn.addEventListener('click', async () => {
-            await loadSeriesData();
-            renderCharts(lastActiveEntries);
+        chartsBtn.addEventListener('click', () => {
+            window.open('/watchlist/charts', '_blank');
         });
         document.getElementById('modal-close').addEventListener('click', hideModal);
         document.getElementById('modal-overlay').addEventListener('click', (e) => {
