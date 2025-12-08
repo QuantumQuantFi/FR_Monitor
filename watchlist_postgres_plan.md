@@ -160,6 +160,25 @@
 - [ ] 实现慢指标/回溯 worker（5~15m）仅针对 watchlist 符号；实现 outcome worker。
 - [ ] 视需要补导出/物化视图，供回测/IC。
 
+## Outcome 计算与落地方案（新增）
+- 目标：对每个 `watch_signal_event` 计算未来窗口的表现，用于回测/IC。关注 horizon：1h、4h、8h、24h、48h、96h。
+- 数据源优先级：`watchlist_series_agg`（若已启用 5m 聚合）> SQLite `price_data_1min` > 实时行情缓存。需保证同一符号的资金费时间/周期准确。
+- 资金费处理：每个交易所的资金费周期可能是 1h/4h/8h 动态变化，需要记录 `funding_interval_hours`、`next_funding_time`。计算资金费收益时，对未来窗口内落在 horizon 的资金费点按名义金额累加，若周期变动，以写入时记录为准（可回溯 PG raw/event 的 `funding_interval_hours` 和 `next_funding_time`）。
+- 价差收益：按事件触发时的 spread（spot - perp）与 horizon 终点 spread 的差值；若做多现货空永续，则收益近似 `(spread_end - spread_start)`。
+- 资金费收益：按 perp 名义金额 * Σ(资金费率 * 周期小时/24)。若 horizon 跨多个 funding time，则逐个累加；若只部分覆盖，按覆盖比例估算。
+- 总收益：价差收益 + 资金费收益。可附加 `max_drawdown`、`volatility`（未来窗口实现波动）、`basis_revert` 标签。
+- 落库字段（`future_outcome`）：`event_id`，`horizon_min`，`pnl_total`，`pnl_spread`，`pnl_funding`，`spread_start/end`，`funding_applied jsonb`（记录用到的 funding 费率与时间点），`max_drawdown`，`volatility`，`label jsonb`（正/负例或分位），`computed_at`。
+- 计算流程（worker）：
+  1) 周期扫描 `watch_signal_event` 表，选取 `status in ('open','closed')` 且尚未产生目标 horizon outcome 的事件。
+  2) 对每个 horizon（1h/4h/8h/24h/48h/96h），检查当前时间是否已超过 `start_ts + horizon`。未到期跳过，已到期则计算。
+  3) 拉取起点/终点行情：优先 `watchlist_series_agg`（5m 窗口内取最近一条），若缺则查 SQLite `price_data_1min`。必要时回退实时接口。
+  4) 资金费：收集事件期间的 funding schedule（从 raw/event 聚合出的 `funding_interval_hours`、`next_funding_time`，以及同符号同交易所的历史 funding 记录，如有）。将覆盖 horizon 的 funding 切片累加。
+  5) 计算 `pnl_spread`、`pnl_funding`、`pnl_total`、`max_drawdown`、`volatility`。保存到 `future_outcome`；若数据缺失，置 NULL 并记录 `label.missing=true`。
+  6) 幂等：对同一 `event_id+horizon` upsert，避免重复写。
+- 任务节奏：worker 每 5~10 分钟跑一轮；horizon 多，计算量小（事件数量低）。
+- 前端/回测使用：IC/IR 直接 join `watch_signal_event` 与 `future_outcome`；可加物化视图按 horizon 展平。
+- 待办：实现 worker 脚本（独立守护进程或 simple_app 内后台线程）；为 funding schedule 添加必要缓存/查找函数；在 plan 中保持“资金费周期可能变动”的提示，并在结果中保留 `funding_applied` 以便审计。
+
 ## 当前资源快照（阶段 0 执行）
 - 磁盘：`/` 232G，总用 141G，可用 ~92G（61% 已用）；短期可预留 10GB 给 PG，需保持 <80%。
 - 内存：15Gi，总用 4.5Gi，free 0.39Gi，buff/cache 10Gi，可用 ~10Gi；Swap 未开，需避免 PG 占用过大。
