@@ -233,7 +233,8 @@ WATCHLIST_PG_CONFIG = {
     'flush_seconds': float(_get_private('WATCHLIST_PG_FLUSH_SEC', 'WATCHLIST_PG_FLUSH_SEC', '5')),
     'consecutive_required': int(float(_get_private('WATCHLIST_PG_CONSEC', 'WATCHLIST_PG_CONSEC', '2'))),
     'cooldown_minutes': int(float(_get_private('WATCHLIST_PG_COOLDOWN_MIN', 'WATCHLIST_PG_COOLDOWN_MIN', '3'))),
-    'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '0')),
+    # 默认开启事件合并；如需关闭可设置 WATCHLIST_PG_EVENT_MERGE=0
+    'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '1')),
 }
 
 # Watchlist 价差指标配置（仅计算，不做交易决策）

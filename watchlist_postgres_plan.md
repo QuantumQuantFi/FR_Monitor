@@ -192,7 +192,8 @@
 
 ## 进展概览（截至 2025-12-08）
 - 已落库：价差/波动类因子全套；资金费长窗（7d zscore/3d trend/7d vol）；premium_index_diff；volume_quote_24h（当前多为 NULL，源数据待补）；其他长尾因子均在 `meta.factors`。
-- 未落库：OI/盘口相关（bid_ask_spread、depth_imbalance、book_imbalance、sweep_impact、oi_trend 等）因缺数据源；事件/series/outcome 仍为空。
+- 事件：已开启默认事件合并（N=2/M=3），`watch_signal_event` 已产生少量 open 事件（当前 9 行），冷静期后会更新/关闭。
+- 未落库：OI/盘口相关（bid_ask_spread、depth_imbalance、book_imbalance、sweep_impact、oi_trend 等）因缺数据源；series/outcome 仍为空。
 - 前端：新增“因子”弹窗，异步拉取 metrics，减轻首屏延迟。
 - 24h 成交额现状：`price_data_1min` 已有 `volume_24h_avg` 列；近 1 天非 Binance 行有有效值，Binance 行几乎全为 0/NULL（WS 不带 24h 量）。当前 metrics 仅用 Binance 数据 → `volume_quote_24h` 多为 NULL。后续需在采集层为 watchlist 符号（≤20）补一次轻量 REST `ticker/24hr`（现货/永续各 1 次）更新 `volume_24h`，再经 SQLite→PG 传递。其他交易所有效值会随 SQLite→PG 自动同步，无需额外改动。
 
