@@ -369,27 +369,73 @@
             return rowsHtml + matrixHtml;
         };
 
+        const factorDescriptions = {
+            'last_spread': '最新价差（现货-永续）/现货。',
+            'spread_mean_std': '近 12h 价差均值/标准差（滚动窗口）。',
+            'baseline_rel': '基线 = 均值 - 1.5σ，用于均值回归触发。',
+            'recent_slope': '最近 3 分钟价差斜率，线性回归得到的变化率。',
+            'range_short_long': '价差区间（1h / 12h）= 最大值-最小值。',
+            'crossings_drift': 'crossings_1h 为 1h 内穿越中线次数；drift_ratio=|当前-中线|/1h 区间。',
+            'spread_zscore_1h': '近 1h 价差 Z 分数：(x-mean)/std。',
+            'spread_zscore_12h': '近 12h 价差 Z 分数。',
+            'spread_momentum_15m': '15 分钟动量：spread(t)-spread(t-15m)。',
+            'spread_momentum_60m': '60 分钟动量：spread(t)-spread(t-60m)。',
+            'bollinger_pct_b': '布林带百分位：(x - 下轨) / (上轨 - 下轨)。',
+            'spread_rsi': 'RSI(相对强弱) 基于价差序列，默认 14 样本。',
+            'spread_macd': 'MACD(12,26,9) 的 DIF 值（价差序列）。',
+            'spread_macd_signal': 'MACD 的 DEA/Signal 线。',
+            'spread_adx': 'ADX 趋势强度（价差序列）。',
+            'spread_mean_revert_speed': 'AR(1) 半衰期，越小表示均值回归越快。',
+            'rv_1h': '近 1h 实现波动率 = sqrt(sum(r^2))。',
+            'rv_12h': '近 12h 实现波动率。',
+            'hv_ratio': '短长波比 = rv_1h / rv_12h。',
+            'spread_skew_12h': '近 12h 偏度（非对称性）。',
+            'spread_kurt_12h': '近 12h 峰度（尾部厚度）。',
+            'drawdown_12h': '近 12h 最大回撤（价差序列）。',
+            'vol_of_vol': '近 12h 波动率的波动（σ 的波动）。',
+            'tail_risk_score': '基于偏度/峰度的尾部风险评分（偏度越负、峰度越高风险越高）。',
+            'volume_quote_24h': '24h 成交额（USDT 计价），来自行情 24hr ticker。',
+            'premium_index_diff': '溢价指数差：各所 premium 最大-最小。',
+            'funding_zscore_7d': '7 天资金费 Z 分数。',
+            'funding_trend_3d': '3 天资金费线性斜率。',
+            'funding_vol_7d': '7 天资金费波动率（标准差）。',
+            'funding_term_slope': '资金费 term slope：近 24h 线性斜率。',
+            'funding_regime': '资金费分位（0-1），当前资金费在历史分布中的位置。',
+            'funding_reversal_prob': '基于资金费 Z 分数的回归概率近似=exp(-0.5*z^2)。',
+            'funding_diff_max': '跨所资金费最大差 = max(funding_rates)-min(funding_rates)。',
+            'index_mark_divergence': '标记价 vs 指数价差异的最大值（(mark-index)/index）。',
+            'hour_of_day': 'UTC 小时，用于时段效应。',
+            'session_label': '交易时段标签：asia/europe/us（UTC 0-8/8-16/16-24）。',
+            'signal_persistence': '连续满足基线触发的分钟数（越大代表持续性越强）。',
+        };
+
         const buildFactorHtml = (symbol) => {
             const m = metricsCache[symbol] || {};
             const factors = m.extra_factors || {};
             const baseRows = [
-                ['最新价差', formatPct(m.last_spread)],
-                ['均值/σ', `${formatPct(m.spread_mean)} / ${formatPct(m.spread_std)}`],
-                ['基线', formatPct(m.baseline_rel)],
-                ['斜率(3m)', formatNumber(m.recent_slope, 6)],
-                ['区间(1h/12h)', `${formatPct(m.range_short)} / ${formatPct(m.range_long)}`],
-                ['穿越/Drift', `${m.crossings_1h ?? 0} / ${formatNumber(m.drift_ratio, 3)}`],
+                ['最新价差', formatPct(m.last_spread), 'last_spread'],
+                ['均值/σ', `${formatPct(m.spread_mean)} / ${formatPct(m.spread_std)}`, 'spread_mean_std'],
+                ['基线', formatPct(m.baseline_rel), 'baseline_rel'],
+                ['斜率(3m)', formatNumber(m.recent_slope, 6), 'recent_slope'],
+                ['区间(1h/12h)', `${formatPct(m.range_short)} / ${formatPct(m.range_long)}`, 'range_short_long'],
+                ['穿越/Drift', `${m.crossings_1h ?? 0} / ${formatNumber(m.drift_ratio, 3)}`, 'crossings_drift'],
             ];
             const factorRows = Object.entries(factors).map(([k, v]) => {
                 const display = typeof v === 'number' ? formatNumber(v, 6) : (v ?? '-');
-                return [k, display];
+                return [k, display, k];
             });
             const rows = [...baseRows, ...factorRows];
             if (!rows.length) return '<div class="muted">暂无因子数据</div>';
+            const descList = rows
+                .map(([, , key]) => key)
+                .filter((k) => factorDescriptions[k])
+                .map((k) => `<li><strong>${k}</strong>: ${factorDescriptions[k]}</li>`)
+                .join('');
             return `
                 <div class="info-grid">
                     ${rows.map(([k, v]) => `<div class="info-item"><strong>${k}</strong><br>${v}</div>`).join('')}
                 </div>
+                ${descList ? `<div style="margin-top:12px;"><div style="font-weight:700;margin-bottom:6px;">计算说明</div><ul style="padding-left:18px;line-height:1.5;">${descList}</ul></div>` : ''}
             `;
         };
 
