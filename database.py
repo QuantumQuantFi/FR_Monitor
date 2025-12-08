@@ -107,26 +107,39 @@ class PriceDatabase:
         try:
             with self.lock:
                 timestamp = datetime.now()
-                
-                spot_price = data.get('spot', {}).get('price', 0.0) if data.get('spot') else 0.0
+
+                def _positive_or_none(value):
+                    try:
+                        v = float(value)
+                        return v if v > 0 else None
+                    except (TypeError, ValueError):
+                        return None
+
+                def _float_or_none(value):
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return None
+
+                spot_price = _positive_or_none(data.get('spot', {}).get('price')) if data.get('spot') else None
                 futures_payload = data.get('futures') or {}
-                futures_price = futures_payload.get('price', 0.0)
+                futures_price = _positive_or_none(futures_payload.get('price'))
                 funding_rate_raw = futures_payload.get('funding_rate')
-                funding_rate = funding_rate_to_float(funding_rate_raw)
+                funding_rate = funding_rate_to_float(funding_rate_raw) if funding_rate_raw is not None else None
                 interval_raw = futures_payload.get('funding_interval_hours')
                 try:
                     funding_interval = float(interval_raw) if interval_raw not in (None, '') else None
                 except (TypeError, ValueError):
                     funding_interval = None
                 next_funding_time = normalize_next_funding_time(futures_payload.get('next_funding_time'))
-                mark_price = data.get('futures', {}).get('mark_price', 0.0) if data.get('futures') else 0.0
-                index_price = data.get('futures', {}).get('index_price', 0.0) if data.get('futures') else 0.0
-                volume_24h = data.get('spot', {}).get('volume', 0.0) if data.get('spot') else 0.0
+                mark_price = _positive_or_none(futures_payload.get('mark_price')) if data.get('futures') else None
+                index_price = _positive_or_none(futures_payload.get('index_price')) if data.get('futures') else None
+                volume_24h = _positive_or_none(data.get('spot', {}).get('volume')) if data.get('spot') else None
                 
                 # 计算溢价
-                premium_percent = 0.0
+                premium_percent = None
                 if premium_data and exchange in premium_data:
-                    premium_percent = premium_data[exchange].get('premium_percent', 0.0)
+                    premium_percent = _float_or_none(premium_data[exchange].get('premium_percent'))
                 
                 with self._get_connection() as conn:
                     cursor = conn.cursor()
