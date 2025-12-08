@@ -221,6 +221,21 @@ WATCHLIST_CONFIG = {
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),
 }
 
+# Watchlist PG 写入配置（双写开关）
+WATCHLIST_PG_CONFIG = {
+    'enabled': _is_truthy(_get_private('WATCHLIST_PG_ENABLED', 'WATCHLIST_PG_ENABLED', '1')),
+    'dsn': _get_private(
+        'WATCHLIST_PG_DSN',
+        'WATCHLIST_PG_DSN',
+        'postgresql://wl_writer:wl_writer_A3f9xB2@127.0.0.1:5432/watchlist'
+    ),
+    'batch_size': int(float(_get_private('WATCHLIST_PG_BATCH', 'WATCHLIST_PG_BATCH', '500'))),
+    'flush_seconds': float(_get_private('WATCHLIST_PG_FLUSH_SEC', 'WATCHLIST_PG_FLUSH_SEC', '5')),
+    'consecutive_required': int(float(_get_private('WATCHLIST_PG_CONSEC', 'WATCHLIST_PG_CONSEC', '2'))),
+    'cooldown_minutes': int(float(_get_private('WATCHLIST_PG_COOLDOWN_MIN', 'WATCHLIST_PG_COOLDOWN_MIN', '3'))),
+    'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '0')),
+}
+
 # Watchlist 价差指标配置（仅计算，不做交易决策）
 WATCHLIST_METRICS_CONFIG = {
     # 价差相对值 = (spot - futures) / spot
