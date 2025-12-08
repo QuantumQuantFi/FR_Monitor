@@ -259,6 +259,7 @@
                     <th class="col-prices">各所资金费&价格</th>
                     <th class="col-detail">详尽交易所指标</th>
                     <th>查看</th>
+                    <th>因子</th>
                     <th>图表</th>
                     <th>区间 (1h/12h)</th>
                     <th>波动/斜率</th>
@@ -268,7 +269,7 @@
                 </tr>
             </thead>
             <tbody id="watchlist-body">
-                <tr><td colspan="19" class="muted">加载中...</td></tr>
+                <tr><td colspan="20" class="muted">加载中...</td></tr>
             </tbody>
         </table>
         </div>
@@ -366,6 +367,30 @@
                    </div>`
                 : '<div class="muted" style="margin-top:8px;">暂无可用差价矩阵</div>';
             return rowsHtml + matrixHtml;
+        };
+
+        const buildFactorHtml = (symbol) => {
+            const m = metricsCache[symbol] || {};
+            const factors = m.extra_factors || {};
+            const baseRows = [
+                ['最新价差', formatPct(m.last_spread)],
+                ['均值/σ', `${formatPct(m.spread_mean)} / ${formatPct(m.spread_std)}`],
+                ['基线', formatPct(m.baseline_rel)],
+                ['斜率(3m)', formatNumber(m.recent_slope, 6)],
+                ['区间(1h/12h)', `${formatPct(m.range_short)} / ${formatPct(m.range_long)}`],
+                ['穿越/Drift', `${m.crossings_1h ?? 0} / ${formatNumber(m.drift_ratio, 3)}`],
+            ];
+            const factorRows = Object.entries(factors).map(([k, v]) => {
+                const display = typeof v === 'number' ? formatNumber(v, 6) : (v ?? '-');
+                return [k, display];
+            });
+            const rows = [...baseRows, ...factorRows];
+            if (!rows.length) return '<div class="muted">暂无因子数据</div>';
+            return `
+                <div class="info-grid">
+                    ${rows.map(([k, v]) => `<div class="info-item"><strong>${k}</strong><br>${v}</div>`).join('')}
+                </div>
+            `;
         };
 
         const showModal = (title, html) => {
@@ -730,6 +755,7 @@
                         <td class="mono cell-scroll col-prices">${exRowsCell}</td>
                         <td class="mono cell-scroll col-detail">${detailCell}</td>
                         <td><button class="detail-btn" data-sym="${item.symbol}">查看</button></td>
+                        <td><button class="factor-btn" data-sym="${item.symbol}">因子</button></td>
                         <td><button class="chart-btn" data-sym="${item.symbol}">图表</button></td>
                         <td class="mono">${rangeCell}</td>
                         <td class="mono">${volCell}</td>
@@ -1028,14 +1054,20 @@
                 const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
                 const activeSymbols = activeEntries.map((i) => i.symbol);
                 lastActiveEntries = activeEntries;
+                render(data);
+
+                // 异步拉取指标，避免阻塞首屏
                 if (activeSymbols.length) {
-                    const metricsResp = await fetch('/api/watchlist/metrics');
-                    const metricsData = await metricsResp.json();
-                    metricsCache = metricsData.metrics || {};
+                    fetch('/api/watchlist/metrics')
+                        .then((r) => r.json())
+                        .then((metricsData) => {
+                            metricsCache = metricsData.metrics || {};
+                            render(data);
+                        })
+                        .catch(() => {});
                 } else {
                     metricsCache = {};
                 }
-                render(data);
 
                 // 调整刷新频率，使前端与后台刷新周期保持一致
                 const nextIntervalMs = Math.max(1000, (data.summary?.refresh_seconds || 30) * 1000);
@@ -1072,6 +1104,13 @@
                 const sym = detailBtn.getAttribute('data-sym');
                 const html = buildDetailHtml(sym);
                 showModal(`${sym} 交易所详情`, html);
+                return;
+            }
+            const factorBtn = event.target.closest('.factor-btn');
+            if (factorBtn) {
+                const sym = factorBtn.getAttribute('data-sym');
+                const html = buildFactorHtml(sym);
+                showModal(`${sym} 因子详情`, html);
                 return;
             }
         });

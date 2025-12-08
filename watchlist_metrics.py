@@ -1,9 +1,18 @@
 import sqlite3
+import math
+import numpy as np
+import requests
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from config import WATCHLIST_METRICS_CONFIG
+
+
+_BINANCE_24H_CACHE: Dict[str, Any] = {
+    "ts": None,
+    "data": {},
+}
 
 
 def _now_utc() -> datetime:
@@ -60,6 +69,14 @@ def _is_funding_minute(ts: datetime, interval_hours: Optional[float] = None, ref
     return ts.minute in {59, 0, 1}
 
 
+def _to_float(val: Any) -> Optional[float]:
+    try:
+        f = float(val)
+        return f
+    except Exception:
+        return None
+
+
 @dataclass
 class SpreadPoint:
     ts: datetime
@@ -69,6 +86,8 @@ class SpreadPoint:
     funding_interval_hours: Optional[float] = None
     next_funding_time: Optional[datetime] = None
     abs_spread: bool = False
+    premium_percent: Optional[float] = None
+    volume_quote: Optional[float] = None
 
     @property
     def spread_rel(self) -> Optional[float]:
@@ -102,6 +121,7 @@ class SpreadMetrics:
     hits_above_limit: int
     limit_threshold: Optional[float]
     details: Dict[str, Any]
+    extra_factors: Dict[str, Any]
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -172,6 +192,216 @@ def _midline(series: List[float], window: int) -> List[Optional[float]]:
     return out
 
 
+def _zscore(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    mean, std = _rolling_mean_std(values)
+    if mean is None or std is None or std == 0:
+        return None
+    return (values[-1] - mean) / std
+
+
+def _momentum(values: List[float], window: int) -> Optional[float]:
+    if len(values) <= window:
+        return None
+    try:
+        return values[-1] - values[-window - 1]
+    except Exception:
+        return None
+
+
+def _bollinger_pct_b(values: List[float], window: int = 20, band: float = 2.0) -> Optional[float]:
+    if len(values) < window:
+        return None
+    window_vals = values[-window:]
+    mean, std = _rolling_mean_std(window_vals)
+    if mean is None or std is None or std == 0:
+        return None
+    upper = mean + band * std
+    lower = mean - band * std
+    if upper == lower:
+        return None
+    return (values[-1] - lower) / (upper - lower)
+
+
+def _rsi(values: List[float], period: int = 14) -> Optional[float]:
+    if len(values) < period + 1:
+        return None
+    gains: List[float] = []
+    losses: List[float] = []
+    for i in range(-period, 0):
+        change = values[i] - values[i - 1]
+        if change >= 0:
+            gains.append(change)
+        else:
+            losses.append(-change)
+    avg_gain = sum(gains) / period if gains else 0.0
+    avg_loss = sum(losses) / period if losses else 0.0
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / max(avg_loss, 1e-9)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _macd(values: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Tuple[Optional[float], Optional[float]]:
+    if len(values) < slow + signal:
+        return None, None
+
+    def _ema(series: List[float], period: int) -> float:
+        k = 2 / (period + 1)
+        ema_val = series[0]
+        for v in series[1:]:
+            ema_val = v * k + ema_val * (1 - k)
+        return ema_val
+
+    slice_vals = values[-max(len(values), slow) :]
+    fast_ema = _ema(slice_vals, fast)
+    slow_ema = _ema(slice_vals, slow)
+    macd_val = fast_ema - slow_ema
+    signal_val = _ema([macd_val] + slice_vals[-signal + 1 :], signal) if signal > 1 else macd_val
+    return macd_val, signal_val
+
+
+def _realized_vol(values: List[float]) -> Optional[float]:
+    """简单用一阶差分的标准差近似实现波动率。"""
+    if len(values) < 2:
+        return None
+    diffs = [values[i] - values[i - 1] for i in range(1, len(values))]
+    _, std = _rolling_mean_std(diffs)
+    return std
+
+
+def _ar1_half_life(series: List[float]) -> Optional[float]:
+    """估算 AR(1) 半衰期，返回分钟数。"""
+    if not series or len(series) < 20:
+        return None
+    xs = np.array(series[:-1])
+    ys = np.array(series[1:])
+    denom = np.sum((xs - xs.mean()) ** 2)
+    if denom == 0:
+        return None
+    phi = np.sum((xs - xs.mean()) * (ys - ys.mean())) / denom
+    if phi <= 0 or phi >= 1:
+        return None
+    try:
+        return float(math.log(0.5) / math.log(phi))
+    except Exception:
+        return None
+
+
+def _adx(values: List[float], period: int = 14) -> Optional[float]:
+    """简化版 ADX：使用 spread 单序列的上下动量替代高低价。"""
+    if len(values) < period + 2:
+        return None
+    up_dm: List[float] = []
+    down_dm: List[float] = []
+    tr_list: List[float] = []
+    for i in range(1, len(values)):
+        move = values[i] - values[i - 1]
+        up_dm.append(max(move, 0.0))
+        down_dm.append(max(-move, 0.0))
+        tr_list.append(abs(move))
+
+    def _wilder_smooth(seq: List[float]) -> List[float]:
+        if len(seq) < period:
+            return []
+        smoothed = [sum(seq[:period])]
+        alpha = 1.0 / period
+        for x in seq[period:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] * alpha + x)
+        return smoothed
+
+    sm_up = _wilder_smooth(up_dm)
+    sm_dn = _wilder_smooth(down_dm)
+    sm_tr = _wilder_smooth(tr_list)
+    if not (sm_up and sm_dn and sm_tr) or len(sm_tr) != len(sm_up):
+        return None
+    di_plus = [100 * u / t if t else 0 for u, t in zip(sm_up, sm_tr)]
+    di_minus = [100 * d / t if t else 0 for d, t in zip(sm_dn, sm_tr)]
+    dx = []
+    for p, m in zip(di_plus, di_minus):
+        denom = p + m
+        if denom == 0:
+            dx.append(0.0)
+        else:
+            dx.append(100 * abs(p - m) / denom)
+    if len(dx) < period:
+        return None
+    adx = sum(dx[:period]) / period
+    alpha = 1.0 / period
+    for x in dx[period:]:
+        adx = (adx * (period - 1) + x) * alpha
+    return adx
+
+
+def _vol_of_vol(values: List[float]) -> Optional[float]:
+    """12h 内滚动波动率的波动."""
+    if len(values) < 120:
+        return None
+    vols = []
+    for i in range(60, len(values) + 1):
+        window = values[i - 60 : i]
+        vols.append(np.std(window))
+    if len(vols) < 2:
+        return None
+    return float(np.std(vols[-720:])) if len(vols) >= 720 else float(np.std(vols))
+
+
+def _tail_risk_score(skew: Optional[float], kurt: Optional[float]) -> Optional[float]:
+    if skew is None and kurt is None:
+        return None
+    skew_part = abs(skew) if skew is not None else 0.0
+    kurt_part = max((kurt or 0) - 3.0, 0.0)
+    return skew_part + kurt_part
+
+
+def _skew_kurt(values: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    if not values:
+        return None, None
+    mean, std = _rolling_mean_std(values)
+    if mean is None or std is None or std == 0:
+        return None, None
+    n = len(values)
+    skew = sum(((v - mean) / std) ** 3 for v in values) / n
+    kurt = sum(((v - mean) / std) ** 4 for v in values) / n
+    return skew, kurt
+
+
+def _drawdown(values: List[float]) -> Optional[float]:
+    """以最大幅值为峰计算当前回撤；若全为负则以最小值为峰。"""
+    if not values:
+        return None
+    peak = max(values)
+    trough = min(values)
+    last = values[-1]
+    ref = peak if abs(peak) >= abs(trough) else trough
+    if ref == 0:
+        return None
+    return (ref - last) / abs(ref)
+
+
+def _zscore_window(values: List[float], window: int) -> Optional[float]:
+    if not values:
+        return None
+    window_vals = values[-window:] if len(values) > window else values
+    return _zscore(window_vals)
+
+
+def _slope(values: List[float], window: int) -> Optional[float]:
+    if len(values) < 2:
+        return None
+    vals = values[-window:] if len(values) > window else values
+    n = len(vals)
+    xs = list(range(n))
+    mean_x = sum(xs) / n
+    mean_y = sum(vals) / n
+    denom = sum((x - mean_x) ** 2 for x in xs)
+    if denom == 0:
+        return None
+    numer = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, vals))
+    return numer / denom
+
+
 def fetch_spread_series(
     db_path: str,
     symbols: List[str],
@@ -191,7 +421,8 @@ def fetch_spread_series(
             cursor.execute(
                 """
                 SELECT timestamp, spot_price_close, futures_price_close,
-                       funding_rate_avg, funding_interval_hours, next_funding_time
+                       funding_rate_avg, funding_interval_hours, next_funding_time,
+                       premium_percent_avg, volume_24h_avg
                 FROM price_data_1min
                 WHERE symbol = ? AND exchange = 'binance'
                   AND timestamp >= datetime('now', ?)
@@ -200,7 +431,7 @@ def fetch_spread_series(
                 (symbol, cutoff_sql),
             )
             rows = cursor.fetchall()
-            for ts_raw, spot, fut, fr, interval_hours, next_ft in rows:
+            for ts_raw, spot, fut, fr, interval_hours, next_ft, premium_avg, vol_24h in rows:
                 ts = _parse_ts(ts_raw)
                 if ts is None or spot is None or fut is None:
                     continue
@@ -214,6 +445,8 @@ def fetch_spread_series(
                         funding_rate=float(fr) if fr is not None else None,
                         funding_interval_hours=float(interval_hours) if interval_hours is not None else None,
                         next_funding_time=_parse_ts(next_ft),
+                        premium_percent=float(premium_avg) if premium_avg is not None else None,
+                        volume_quote=float(vol_24h) if vol_24h is not None else None,
                     )
                 )
     except Exception as exc:
@@ -222,7 +455,7 @@ def fetch_spread_series(
     return results
 
 
-def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
+def compute_metrics_for_symbol(points: List[SpreadPoint], cross_ctx: Optional[Dict[str, Any]] = None) -> SpreadMetrics:
     """
     针对单个 symbol 计算价差相关指标，仅做监控输出，不做交易动作。
     """
@@ -262,6 +495,7 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
             hits_above_limit=0,
             limit_threshold=None,
             details={"reason": "no_data"},
+            extra_factors={},
         )
 
     spreads_rel: List[Optional[float]] = [p.spread_rel for p in points]
@@ -403,6 +637,106 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
         "midline_last": midline_series[-1] if midline_series else None,
     }
 
+    clean_spreads = [v for v in spreads_rel if v is not None]
+    macd_val, macd_signal = _macd(clean_spreads) if clean_spreads else (None, None)
+    rv_1h = _realized_vol(clean_spreads[-60:]) if clean_spreads else None
+    rv_12h = _realized_vol(clean_spreads[-720:]) if clean_spreads else None
+    hv_ratio = None
+    if rv_12h not in (None, 0):
+        hv_ratio = (rv_1h or 0) / rv_12h
+    skew_12h, kurt_12h = _skew_kurt(clean_spreads[-720:]) if clean_spreads else (None, None)
+    drawdown_12h = _drawdown(clean_spreads[-720:]) if clean_spreads else None
+    mean_revert_half_life = _ar1_half_life(clean_spreads[-720:]) if clean_spreads else None
+    adx_spread = _adx(clean_spreads) if clean_spreads else None
+    vol_of_vol = _vol_of_vol(clean_spreads[-720:]) if clean_spreads else None
+    tail_risk = _tail_risk_score(skew_12h, kurt_12h)
+    funding_vals = [p.funding_rate for p in points if p.funding_rate is not None]
+    funding_zscore_7d = _zscore_window(funding_vals, 7 * 24 * 60) if funding_vals else None
+    funding_trend_3d = _slope(funding_vals, 3 * 24 * 60) if funding_vals else None
+    funding_vol_7d = _rolling_mean_std(funding_vals[-7 * 24 * 60 :] if len(funding_vals) > 7 * 24 * 60 else funding_vals)[1] if funding_vals else None
+    funding_term_slope = _slope(funding_vals, 24 * 60) if funding_vals else None
+    funding_regime = None
+    if funding_vals:
+        last_funding = funding_vals[-1]
+        sorted_vals = sorted(funding_vals)
+        try:
+            funding_regime = sum(1 for v in sorted_vals if v <= last_funding) / len(sorted_vals)
+        except Exception:
+            funding_regime = None
+    funding_reversal_prob = None
+    if funding_zscore_7d is not None:
+        funding_reversal_prob = math.exp(-0.5 * funding_zscore_7d ** 2)
+    last_premium = points[-1].premium_percent if points else None
+    last_volume_quote = points[-1].volume_quote if points else None
+    last_ts = points[-1].ts if points else None
+    hour_of_day = last_ts.hour if last_ts else None
+    session_label = None
+    if hour_of_day is not None:
+        if 0 <= hour_of_day < 8:
+            session_label = "asia"
+        elif 8 <= hour_of_day < 16:
+            session_label = "europe"
+        else:
+            session_label = "us"
+
+    funding_diff_max = None
+    index_mark_divergence = None
+    if cross_ctx:
+        funding_list = [v for v in cross_ctx.get("funding_rates", []) if v is not None]
+        if len(funding_list) >= 2:
+            funding_diff_max = max(funding_list) - min(funding_list)
+        mark_index_diffs = []
+        for item in cross_ctx.get("entries", []):
+            mark = item.get("mark_price")
+            index_p = item.get("index_price")
+            if mark and index_p and index_p != 0:
+                mark_index_diffs.append((mark - index_p) / index_p)
+        if mark_index_diffs:
+            index_mark_divergence = max(mark_index_diffs, key=lambda x: abs(x))
+
+    signal_persistence = None
+    if baseline_rel is not None and spreads_rel:
+        count = 0
+        for v in reversed(spreads_rel):
+            if v is None or v > baseline_rel:
+                break
+            count += 1
+        signal_persistence = count
+
+    extra_factors = {
+        "spread_zscore_1h": _zscore(clean_spreads[-60:]) if clean_spreads else None,
+        "spread_zscore_12h": _zscore(clean_spreads[-720:]) if clean_spreads else None,
+        "spread_momentum_15m": _momentum(clean_spreads, 15) if clean_spreads else None,
+        "spread_momentum_60m": _momentum(clean_spreads, 60) if clean_spreads else None,
+        "bollinger_pct_b": _bollinger_pct_b(clean_spreads) if clean_spreads else None,
+        "spread_rsi": _rsi(clean_spreads) if clean_spreads else None,
+        "spread_macd": macd_val,
+        "spread_macd_signal": macd_signal,
+        "spread_adx": adx_spread,
+        "spread_mean_revert_speed": mean_revert_half_life,
+        "rv_1h": rv_1h,
+        "rv_12h": rv_12h,
+        "hv_ratio": hv_ratio,
+        "spread_skew_12h": skew_12h,
+        "spread_kurt_12h": kurt_12h,
+        "drawdown_12h": drawdown_12h,
+        "vol_of_vol": vol_of_vol,
+        "tail_risk_score": tail_risk,
+        "volume_quote_24h": last_volume_quote,
+        "premium_index_diff": last_premium,
+        "funding_zscore_7d": funding_zscore_7d,
+        "funding_trend_3d": funding_trend_3d,
+        "funding_vol_7d": funding_vol_7d,
+        "funding_term_slope": funding_term_slope,
+        "funding_regime": funding_regime,
+        "funding_reversal_prob": funding_reversal_prob,
+        "funding_diff_max": funding_diff_max,
+        "index_mark_divergence": index_mark_divergence,
+        "hour_of_day": hour_of_day,
+        "session_label": session_label,
+        "signal_persistence": signal_persistence,
+    }
+
     return SpreadMetrics(
         last_spot_price=last_spot_price,
         last_futures_price=last_futures_price,
@@ -424,17 +758,132 @@ def compute_metrics_for_symbol(points: List[SpreadPoint]) -> SpreadMetrics:
         hits_above_limit=hits_above_limit,
         limit_threshold=limit_threshold,
         details=details,
+        extra_factors=extra_factors,
     )
 
 
-def compute_metrics_for_symbols(db_path: str, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+def _extract_cross_ctx(snapshot: Optional[Dict[str, Any]], symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    从全市场快照提取跨所资金费/标记价/指数价，用于 funding_diff_max / index_mark_divergence。
+    """
+    ctx: Dict[str, Dict[str, Any]] = {}
+    if not snapshot:
+        return ctx
+    symbol_set = set(symbols)
+    for exch, sym_map in snapshot.items():
+        if not isinstance(sym_map, dict):
+            continue
+        for symbol, payload in sym_map.items():
+            if symbol not in symbol_set:
+                continue
+            futures = payload.get("futures") or {}
+            funding = _to_float(futures.get("funding_rate"))
+            mark = _to_float(futures.get("mark_price") or futures.get("markPrice"))
+            index_p = _to_float(futures.get("index_price") or futures.get("indexPrice"))
+            entry = ctx.setdefault(symbol, {"funding_rates": [], "entries": []})
+            if funding is not None:
+                entry["funding_rates"].append(funding)
+            entry["entries"].append(
+                {
+                    "exchange": exch,
+                    "funding_rate": funding,
+                    "mark_price": mark,
+                    "index_price": index_p,
+                }
+            )
+    return ctx
+
+
+def _fetch_binance_24h_quote(symbols: List[str]) -> Dict[str, Optional[float]]:
+    """
+    轻量获取 binance 24h quote volume（优先永续，其次现货），仅用于补 watchlist 缺口。
+    """
+    out: Dict[str, Optional[float]] = {s: None for s in symbols}
+    if not symbols:
+        return out
+    # 简单 6h 缓存，避免频繁调用
+    now = _now_utc()
+    if _BINANCE_24H_CACHE["ts"]:
+        age = (now - _BINANCE_24H_CACHE["ts"]).total_seconds() / 3600.0
+        if age <= 6:
+            cached = _BINANCE_24H_CACHE.get("data") or {}
+            for s in symbols:
+                if s in cached:
+                    out[s] = cached[s]
+            missing = [s for s in symbols if out[s] in (None, 0)]
+            symbols = missing
+    if not symbols:
+        return out
+    # futures
+    try:
+        resp = requests.get(
+            "https://fapi.binance.com/fapi/v1/ticker/24hr",
+            params={"symbol": ",".join(f"{s}USDT" for s in symbols)},
+            timeout=5,
+        )
+        if resp.ok:
+            data = resp.json()
+            if isinstance(data, list):
+                for item in data:
+                    sym = item.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    base = sym[:-4]
+                    vol = _to_float(item.get("quoteVolume"))
+                    if base in out and vol:
+                        out[base] = vol
+    except Exception:
+        pass
+    # spot fallback
+    need_spot = [s for s, v in out.items() if v in (None, 0)]
+    if not need_spot:
+        return out
+    try:
+        resp = requests.get(
+            "https://api.binance.com/api/v3/ticker/24hr",
+            params={"symbols": requests.utils.quote(str([f"{s}USDT" for s in need_spot]))},
+            timeout=5,
+        )
+        if resp.ok:
+            data = resp.json()
+            if isinstance(data, list):
+                for item in data:
+                    sym = item.get("symbol", "")
+                    if not sym.endswith("USDT"):
+                        continue
+                    base = sym[:-4]
+                    vol = _to_float(item.get("quoteVolume"))
+                    if base in out and vol:
+                        out[base] = vol
+    except Exception:
+        pass
+    # 更新缓存
+    _BINANCE_24H_CACHE["ts"] = now
+    _BINANCE_24H_CACHE["data"].update({k: v for k, v in out.items() if v is not None})
+    return out
+
+
+def compute_metrics_for_symbols(
+    db_path: str,
+    symbols: List[str],
+    snapshot: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
     """
     批量计算 watchlist active 符号的指标，返回 {symbol: metrics_dict}
     """
     series_map = fetch_spread_series(db_path, symbols, hours=int(WATCHLIST_METRICS_CONFIG.get("range_hours_long", 6)))
+    # 若 binance 24h 成交额缺失，补一次 REST
+    need_vol = [s for s, pts in series_map.items() if pts and (pts[-1].volume_quote in (None, 0))]
+    if need_vol:
+        vols = _fetch_binance_24h_quote(need_vol)
+        for sym in need_vol:
+            pts = series_map.get(sym) or []
+            if pts and vols.get(sym):
+                pts[-1].volume_quote = vols[sym]
+    cross_ctx = _extract_cross_ctx(snapshot, symbols)
     out: Dict[str, Dict[str, Any]] = {}
     for symbol, points in series_map.items():
-        metrics = compute_metrics_for_symbol(points)
+        metrics = compute_metrics_for_symbol(points, cross_ctx.get(symbol))
         out[symbol] = metrics.to_dict()
     return out
 

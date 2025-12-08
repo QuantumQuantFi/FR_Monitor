@@ -8,8 +8,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Deque, Dict, List, Optional, Tuple
 import sqlite3
 
-from config import WATCHLIST_CONFIG
+from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
 from precision_utils import funding_rate_to_float
+from watchlist_pg_writer import PgWriter, PgWriterConfig
+from watchlist_metrics import compute_metrics_for_symbols
 
 
 def _utcnow() -> datetime:
@@ -73,11 +75,12 @@ class WatchlistEntry:
 class WatchlistManager:
     """Maintain a Binance-only watchlist based on funding spikes."""
 
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, config: Optional[Dict[str, Any]] = None, pg_config: Optional[Dict[str, Any]] = None):
         cfg = config or WATCHLIST_CONFIG
         self.funding_abs_threshold = float(cfg.get('funding_abs_threshold', 0.003))
         self.lookback = timedelta(hours=float(cfg.get('lookback_hours', 2)))
         self.refresh_seconds = float(cfg.get('refresh_seconds', 150))
+        self.db_path = cfg.get('db_path', 'market_data.db')
         # Type B/C 配置
         self.type_b_spread_threshold = float(cfg.get('type_b_spread_threshold', 0.01))
         self.type_b_funding_min = float(cfg.get('type_b_funding_min', -0.001))
@@ -93,6 +96,26 @@ class WatchlistManager:
         self.logger = logging.getLogger('watchlist')
         self.logger.setLevel(logging.INFO)
         self._preloaded = False
+        # PG writer (optional)
+        pg_cfg_dict = pg_config or WATCHLIST_PG_CONFIG
+        self.pg_writer: Optional[PgWriter] = None
+        try:
+            self.pg_writer = PgWriter(
+                PgWriterConfig(
+                    dsn=str(pg_cfg_dict.get('dsn')),
+                    enabled=bool(pg_cfg_dict.get('enabled')),
+                    batch_size=int(pg_cfg_dict.get('batch_size', 500)),
+                    flush_seconds=float(pg_cfg_dict.get('flush_seconds', 5.0)),
+                    consecutive_required=int(pg_cfg_dict.get('consecutive_required', 2)),
+                    cooldown_minutes=int(pg_cfg_dict.get('cooldown_minutes', 3)),
+                    enable_event_merge=bool(pg_cfg_dict.get('enable_event_merge', False)),
+                )
+            )
+        except Exception as exc:  # pragma: no cover - optional path
+            self.logger.warning("pg writer init failed: %s", exc)
+            self.pg_writer = None
+        if self.pg_writer:
+            self.pg_writer.start()
 
     def _prune_history(self, symbol: str, now: datetime) -> None:
         interval_hours = self._funding_interval.get(symbol)
@@ -402,6 +425,7 @@ class WatchlistManager:
                             _set_entry(symbol, entry)
 
         self._entries = new_entries
+        self._emit_pg_raw(new_entries, market_snapshots, now)
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -432,3 +456,96 @@ class WatchlistManager:
     def active_symbols(self) -> List[str]:
         with self._lock:
             return [e.symbol for e in self._entries.values() if e.status == 'active']
+
+    def _emit_pg_raw(
+        self,
+        entries: Dict[str, WatchlistEntry],
+        market_snapshots: Dict[str, Dict[str, Dict[str, Any]]],
+        now: datetime,
+    ) -> None:
+        if not self.pg_writer or not self.pg_writer.config.enabled:
+            return
+        # 仅对当前 watchlist 符号计算指标，避免全市场扫表
+        active_symbols = [e.symbol for e in entries.values() if e.status == 'active']
+        metrics_map: Dict[str, Dict[str, Any]] = {}
+        if active_symbols:
+            try:
+                metrics_map = compute_metrics_for_symbols(self.db_path, active_symbols, snapshot=all_data)
+            except Exception as exc:  # pragma: no cover - 运行时保护
+                self.logger.warning("compute_metrics_for_symbols failed: %s", exc)
+                metrics_map = {}
+
+        rows: List[Dict[str, Any]] = []
+        for entry in entries.values():
+            if entry.status != 'active':
+                continue
+            exch = 'binance' if entry.entry_type == 'A' else 'multi'
+            meta: Dict[str, Any] = {}
+            if entry.trigger_details:
+                meta['trigger_details'] = entry.trigger_details
+            if entry.symbol in market_snapshots:
+                meta['snapshots'] = market_snapshots.get(entry.symbol)
+            snaps = market_snapshots.get(entry.symbol) or {}
+            futures_prices = [v.get('futures_price') for v in snaps.values() if v.get('futures_price')]
+            funding_vals = [v.get('funding_rate') for v in snaps.values() if v.get('funding_rate') is not None]
+            best_buy_high_sell_low = None
+            best_sell_high_buy_low = None
+            funding_diff_max = None
+            if len(futures_prices) >= 2:
+                try:
+                    max_p = max(fp for fp in futures_prices if fp is not None)
+                    min_p = min(fp for fp in futures_prices if fp is not None)
+                    if min_p:
+                        best_buy_high_sell_low = (max_p - min_p) / min_p
+                    if max_p:
+                        best_sell_high_buy_low = (max_p - min_p) / max_p
+                except ValueError:
+                    pass
+            if len(funding_vals) >= 2:
+                funding_diff_max = max(funding_vals) - min(funding_vals)
+
+            metrics = metrics_map.get(entry.symbol) or {}
+            row = {
+                'ts': now,
+                'exchange': exch,
+                'symbol': entry.symbol,
+                'signal_type': entry.entry_type,
+                'type_class': entry.entry_type,
+                'triggered': entry.status == 'active',
+                'status': entry.status,
+                'spread_rel': entry.trigger_details.get('spread') if entry.trigger_details else metrics.get('last_spread'),
+                'funding_rate': entry.last_funding_rate,
+                'funding_interval_hours': entry.funding_interval_hours,
+                'next_funding_time': _parse_timestamp(entry.next_funding_time),
+                'range_1h': metrics.get('range_short'),
+                'range_12h': metrics.get('range_long'),
+                'volatility': metrics.get('volatility'),
+                'slope_3m': metrics.get('recent_slope'),
+                'crossings_1h': metrics.get('crossings_1h'),
+                'drift_ratio': metrics.get('drift_ratio'),
+                'best_buy_high_sell_low': best_buy_high_sell_low,
+                'best_sell_high_buy_low': best_sell_high_buy_low,
+                'funding_diff_max': funding_diff_max,
+                'spot_perp_volume_ratio': None,
+                'oi_to_volume_ratio': None,
+                'bid_ask_spread': None,
+                'depth_imbalance': None,
+                'volume_spike_zscore': None,
+                'premium_index_diff': None,
+                'meta': (
+                    {
+                        **meta,
+                        **({"factors": metrics.get("extra_factors")} if metrics.get("extra_factors") else {}),
+                    }
+                    if meta or metrics.get("extra_factors")
+                    else None
+                ),
+            }
+            rows.append(row)
+        if rows:
+            try:
+                self.pg_writer.flush()  # flush pending before new burst
+                for r in rows:
+                    self.pg_writer.enqueue_raw(r)
+            except Exception as exc:  # pragma: no cover - best-effort
+                self.logger.warning("enqueue pg raw failed: %s", exc)

@@ -25,6 +25,7 @@ from config import (
     WS_CONNECTION_CONFIG,
     DB_WRITE_INTERVAL_SECONDS,
     WATCHLIST_CONFIG,
+    WATCHLIST_PG_CONFIG,
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
@@ -918,7 +919,7 @@ arbitrage_monitor = ArbitrageMonitor(
 )
 
 # Binance 动态关注列表管理器
-watchlist_manager = WatchlistManager(WATCHLIST_CONFIG)
+watchlist_manager = WatchlistManager(WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG)
 
 # 启动时尝试用数据库过去窗口内的资金费率预热，避免重启后空窗口
 try:
