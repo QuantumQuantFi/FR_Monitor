@@ -156,58 +156,62 @@ def _build_funding_schedule(
     end_ts: datetime,
 ) -> Tuple[Optional[float], List[Tuple[datetime, float]]]:
     """
-    根据 funding 序列（含 next_funding_time/interval）推导结算时间点，并按结算点前最近的资金费率累加。
-    返回 (funding_change, used_points)。
+    根据 funding 序列（含 next_funding_time/interval）推导结算时间点，并按结算点前最近的资金费率累加（离散，不做均值）。
+    结算点来源：
+      - 优先使用序列中的 next_funding_time（每条 1min 数据携带的“下次资金费时间”）。
+      - 在一个结算点之后，用“结算点之后第一条非空 next_funding_time”来确定下一个结算点；若缺失，则用最近的 interval_h 推算。
+    返回 (funding_change, used_points)，funding_change 为 sum(rate)（假设 rate 已是该次结算应计比例）。
     """
     if not series:
         return None, []
-    # 确定 interval（最后一个非空）
+    # 序列按时间升序
+    series_sorted = sorted(series, key=lambda x: x[0])
+    used_points: List[Tuple[datetime, float]] = []
+
+    def _find_next_ft(after_ts: datetime, fallback_interval: float) -> Optional[datetime]:
+        for ts, _, _, nft in series_sorted:
+            if nft and nft > after_ts:
+                return nft
+        # fallback: 用最近的 interval 推算
+        return after_ts + timedelta(hours=fallback_interval)
+
+    # 默认 interval（用最后一个非空）
     interval_h = None
-    for _, _, ih, _ in reversed(series):
+    for _, _, ih, _ in reversed(series_sorted):
         if ih and ih > 0:
             interval_h = ih
             break
     interval_h = interval_h or 8.0
 
-    # 确定首个结算时间
+    # 首个结算点：选第一个在 start_ts 之后的 next_funding_time，若无则 start+interval
     next_ft = None
-    for _, _, _, nft in series:
-        if nft and nft >= start_ts - timedelta(hours=interval_h):
+    for _, _, _, nft in series_sorted:
+        if nft and nft >= start_ts:
             next_ft = nft
             break
     if next_ft is None:
-        # 无 next_funding_time，则以 start_ts + interval 推算
         next_ft = start_ts + timedelta(hours=interval_h)
 
-    # 生成 horizon 内的结算点
-    settlement_times: List[datetime] = []
-    ft = next_ft
-    # 若首个在 start_ts 之前，滚动到 start_ts 之后
-    while ft < start_ts:
-        ft += timedelta(hours=interval_h)
-    while ft <= end_ts + timedelta(minutes=1):
-        settlement_times.append(ft)
-        ft += timedelta(hours=interval_h)
-
-    if not settlement_times:
-        return None, []
-
-    # 为每个结算点找到之前最近的资金费率
-    used_points: List[Tuple[datetime, float]] = []
-    for st in settlement_times:
+    while next_ft <= end_ts + timedelta(seconds=1):
+        # 结算点前最近的资金费率
         rate = None
-        for ts, fr, _, _ in reversed(series):
-            if ts <= st and fr is not None:
+        for ts, fr, _, _ in reversed(series_sorted):
+            if ts <= next_ft and fr is not None:
                 rate = fr
                 break
-        if rate is None:
-            continue
-        used_points.append((st, rate))
+        if rate is not None:
+            used_points.append((next_ft, rate))
+        # 找下一个结算点：结算点之后第一条非空 nft，缺失则 interval 推算
+        nxt = _find_next_ft(next_ft, interval_h)
+        if not nxt:
+            break
+        next_ft = nxt
 
     if not used_points:
         return None, []
 
-    funding_change = sum(rate * (interval_h / 24.0) for _, rate in used_points)
+    # 每个结算点直接累加 rate（假设 rate 为当期应收/付比例，不再按 interval 折算）
+    funding_change = sum(rate for _, rate in used_points)
     return funding_change, used_points
 
 
