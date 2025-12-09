@@ -161,7 +161,7 @@
 - [ ] 视需要补导出/物化视图，供回测/IC。
 
 ## Outcome 计算与落地方案（新增）
-- 目标：对每个 `watch_signal_event` 计算未来窗口的表现，用于回测/IC。关注 horizon：1h、4h、8h、24h、48h、96h。
+- 目标：对每个 `watch_signal_event` 计算未来窗口的表现，用于回测/IC。关注 horizon：15m、30m、1h、4h、8h、24h、48h、96h。
 - 数据源优先级：`watchlist_series_agg`（若已启用 5m 聚合）> SQLite `price_data_1min` > 实时行情缓存。需保证同一符号的资金费时间/周期准确。
 - 资金费处理：每个交易所的资金费周期可能是 1h/4h/8h 动态变化，需要记录 `funding_interval_hours`、`next_funding_time`。计算资金费收益时，对未来窗口内落在 horizon 的资金费点按名义金额累加，若周期变动，以写入时记录为准（可回溯 PG raw/event 的 `funding_interval_hours` 和 `next_funding_time`）。
 - 价差收益：按事件触发时的 spread（spot - perp）与 horizon 终点 spread 的差值；若做多现货空永续，则收益近似 `(spread_end - spread_start)`。
