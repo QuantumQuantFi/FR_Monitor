@@ -35,6 +35,7 @@ class Snapshot:
     perp: Optional[float]
     funding_rate: Optional[float]
     funding_interval_hours: Optional[float]
+    next_funding_time: Optional[datetime]
 
 
 def load_event_tasks(conn_pg) -> List[Tuple[int, str, str, datetime]]:
@@ -65,13 +66,23 @@ def load_event_tasks(conn_pg) -> List[Tuple[int, str, str, datetime]]:
     return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
+def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
+    if not ts_str:
+        return None
+    try:
+        ts = datetime.fromisoformat(ts_str)
+        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def load_snapshot(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, target_ts: datetime) -> Optional[Snapshot]:
     """
     取目标时间点之前最近的一条 1min K（聚合数据）。
     """
     cursor = sqlite_conn.execute(
         """
-        SELECT timestamp, spot_price_close, futures_price_close, funding_rate_avg, funding_interval_hours
+        SELECT timestamp, spot_price_close, futures_price_close, funding_rate_avg, funding_interval_hours, next_funding_time
         FROM price_data_1min
         WHERE exchange = ? AND symbol = ? AND timestamp <= ?
         ORDER BY timestamp DESC
@@ -82,13 +93,16 @@ def load_snapshot(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, t
     row = cursor.fetchone()
     if not row:
         return None
-    ts = datetime.fromisoformat(row[0])
+    ts = _parse_ts(row[0])
+    if ts is None:
+        return None
     return Snapshot(
-        ts=ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts,
+        ts=ts,
         spot=row[1],
         perp=row[2],
         funding_rate=row[3],
         funding_interval_hours=row[4],
+        next_funding_time=_parse_ts(row[5]),
     )
 
 
@@ -112,13 +126,15 @@ def load_spread_series(sqlite_conn: sqlite3.Connection, exchange: str, symbol: s
     return out
 
 
-def load_funding_series(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, start: datetime, end: datetime) -> List[Tuple[datetime, float, float]]:
+def load_funding_series(
+    sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, start: datetime, end: datetime
+) -> List[Tuple[datetime, Optional[float], Optional[float], Optional[datetime]]]:
     """
-    返回 (ts, funding_rate_avg, funding_interval_hours)
+    返回 (ts, funding_rate_avg, funding_interval_hours, next_funding_time)
     """
     cursor = sqlite_conn.execute(
         """
-        SELECT timestamp, funding_rate_avg, funding_interval_hours
+        SELECT timestamp, funding_rate_avg, funding_interval_hours, next_funding_time
         FROM price_data_1min
         WHERE exchange = ? AND symbol = ? AND timestamp >= ? AND timestamp <= ?
         ORDER BY timestamp ASC;
@@ -126,11 +142,73 @@ def load_funding_series(sqlite_conn: sqlite3.Connection, exchange: str, symbol: 
         (exchange, symbol, start.isoformat(), end.isoformat()),
     )
     out = []
-    for ts_str, fr, interval_h in cursor.fetchall():
-        ts = datetime.fromisoformat(ts_str)
-        ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
-        out.append((ts, fr, interval_h))
+    for ts_str, fr, interval_h, nft in cursor.fetchall():
+        ts = _parse_ts(ts_str)
+        if ts is None:
+            continue
+        out.append((ts, fr, interval_h, _parse_ts(nft)))
     return out
+
+
+def _build_funding_schedule(
+    series: List[Tuple[datetime, Optional[float], Optional[float], Optional[datetime]]],
+    start_ts: datetime,
+    end_ts: datetime,
+) -> Tuple[Optional[float], List[Tuple[datetime, float]]]:
+    """
+    根据 funding 序列（含 next_funding_time/interval）推导结算时间点，并按结算点前最近的资金费率累加。
+    返回 (funding_change, used_points)。
+    """
+    if not series:
+        return None, []
+    # 确定 interval（最后一个非空）
+    interval_h = None
+    for _, _, ih, _ in reversed(series):
+        if ih and ih > 0:
+            interval_h = ih
+            break
+    interval_h = interval_h or 8.0
+
+    # 确定首个结算时间
+    next_ft = None
+    for _, _, _, nft in series:
+        if nft and nft >= start_ts - timedelta(hours=interval_h):
+            next_ft = nft
+            break
+    if next_ft is None:
+        # 无 next_funding_time，则以 start_ts + interval 推算
+        next_ft = start_ts + timedelta(hours=interval_h)
+
+    # 生成 horizon 内的结算点
+    settlement_times: List[datetime] = []
+    ft = next_ft
+    # 若首个在 start_ts 之前，滚动到 start_ts 之后
+    while ft < start_ts:
+        ft += timedelta(hours=interval_h)
+    while ft <= end_ts + timedelta(minutes=1):
+        settlement_times.append(ft)
+        ft += timedelta(hours=interval_h)
+
+    if not settlement_times:
+        return None, []
+
+    # 为每个结算点找到之前最近的资金费率
+    used_points: List[Tuple[datetime, float]] = []
+    for st in settlement_times:
+        rate = None
+        for ts, fr, _, _ in reversed(series):
+            if ts <= st and fr is not None:
+                rate = fr
+                break
+        if rate is None:
+            continue
+        used_points.append((st, rate))
+
+    if not used_points:
+        return None, []
+
+    funding_change = sum(rate * (interval_h / 24.0) for _, rate in used_points)
+    return funding_change, used_points
 
 
 def compute_outcome(
@@ -166,20 +244,9 @@ def compute_outcome(
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             vol = math.sqrt(var)
 
-    # 资金费：简单估算，按期间均值 * (horizon_hours / interval_hours)
+    # 资金费：按结算点累加
     funding_series = load_funding_series(sqlite_conn, exchange, symbol, snap_start.ts, snap_end.ts)
-    funding_change = None
-    if funding_series:
-        rates = [fr for _, fr, _ in funding_series if fr is not None]
-        if rates:
-            avg_rate = sum(rates) / len(rates)
-            interval_h = None
-            for _, _, ih in reversed(funding_series):
-                if ih and ih > 0:
-                    interval_h = ih
-                    break
-            interval_h = interval_h or 8.0
-            funding_change = avg_rate * (horizon_min / 60.0) / interval_h
+    funding_change, _used = _build_funding_schedule(funding_series, snap_start.ts, snap_end.ts)
 
     pnl_spread = spread_end - spread_start
     pnl_funding = funding_change if funding_change is not None else 0.0
