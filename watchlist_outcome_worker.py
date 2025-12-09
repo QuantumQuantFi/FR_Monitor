@@ -14,7 +14,7 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import psycopg
 import requests
@@ -38,21 +38,25 @@ class Snapshot:
     funding_rate: Optional[float]
     funding_interval_hours: Optional[float]
     next_funding_time: Optional[datetime]
+    leg_a: Optional[Dict[str, Any]] = None
+    leg_b: Optional[Dict[str, Any]] = None
 
 
-def load_event_tasks(conn_pg) -> List[Tuple[int, str, str, datetime]]:
+def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
     """
-    返回需要计算 outcome 的事件 (id, exchange, symbol, start_ts)。
+    返回需要计算 outcome 的事件，包含双腿信息。
     规则：事件 start_ts 已超过最小 horizon，且某些 horizon 尚未写入 outcome。
     """
     min_horizon = min(HORIZONS_MIN)
     sql = """
     WITH need AS (
-        SELECT e.id, e.exchange, e.symbol, e.start_ts
+        SELECT e.id, e.exchange, e.symbol, e.start_ts,
+               e.leg_a_exchange, e.leg_a_symbol, e.leg_a_kind, e.leg_a_price_first, e.leg_a_price_last, e.leg_a_funding_rate_first, e.leg_a_funding_rate_last,
+               e.leg_b_exchange, e.leg_b_symbol, e.leg_b_kind, e.leg_b_price_first, e.leg_b_price_last, e.leg_b_funding_rate_first, e.leg_b_funding_rate_last
         FROM watchlist.watch_signal_event e
         WHERE e.start_ts <= now() - make_interval(mins := %s)
     )
-    SELECT n.id, n.exchange, n.symbol, n.start_ts
+    SELECT n.*
     FROM need n
     WHERE EXISTS (
         SELECT 1 FROM unnest(%s::int[]) h
@@ -65,7 +69,35 @@ def load_event_tasks(conn_pg) -> List[Tuple[int, str, str, datetime]]:
     LIMIT %s;
     """
     rows = conn_pg.execute(sql, (min_horizon, HORIZONS_MIN, MAX_TASKS)).fetchall()
-    return [(r[0], r[1], r[2], r[3]) for r in rows]
+    out = []
+    cols = [desc.name for desc in conn_pg.description] if hasattr(conn_pg, "description") else None
+    for r in rows:
+        if cols:
+            out.append(dict(zip(cols, r)))
+        else:
+            out.append(
+                {
+                    "id": r[0],
+                    "exchange": r[1],
+                    "symbol": r[2],
+                    "start_ts": r[3],
+                    "leg_a_exchange": r[4],
+                    "leg_a_symbol": r[5],
+                    "leg_a_kind": r[6],
+                    "leg_a_price_first": r[7],
+                    "leg_a_price_last": r[8],
+                    "leg_a_funding_rate_first": r[9],
+                    "leg_a_funding_rate_last": r[10],
+                    "leg_b_exchange": r[11],
+                    "leg_b_symbol": r[12],
+                    "leg_b_kind": r[13],
+                    "leg_b_price_first": r[14],
+                    "leg_b_price_last": r[15],
+                    "leg_b_funding_rate_first": r[16],
+                    "leg_b_funding_rate_last": r[17],
+                }
+            )
+    return out
 
 
 def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
@@ -105,6 +137,8 @@ def load_snapshot(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, t
         funding_rate=row[3],
         funding_interval_hours=row[4],
         next_funding_time=_parse_ts(row[5]),
+        leg_a=None,
+        leg_b=None,
     )
 
 
@@ -125,6 +159,32 @@ def load_spread_series(sqlite_conn: sqlite3.Connection, exchange: str, symbol: s
             ts = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
             if spot != 0:
                 out.append((ts, (spot - perp) / spot))
+    return out
+
+
+def load_leg_price_series(
+    sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, kind: str, start: datetime, end: datetime
+) -> Dict[datetime, float]:
+    """
+    返回 ts -> price 的映射，按 kind 选择 spot 或 perp 收盘价。
+    """
+    cursor = sqlite_conn.execute(
+        """
+        SELECT timestamp, spot_price_close, futures_price_close
+        FROM price_data_1min
+        WHERE exchange = ? AND symbol = ? AND timestamp >= ? AND timestamp <= ?
+        ORDER BY timestamp ASC;
+        """,
+        (exchange, symbol, start.isoformat(), end.isoformat()),
+    )
+    out: Dict[datetime, float] = {}
+    for ts_str, spot, perp in cursor.fetchall():
+        ts = _parse_ts(ts_str)
+        if ts is None:
+            continue
+        price = spot if kind == "spot" else perp
+        if price:
+            out[ts] = price
     return out
 
 
@@ -271,25 +331,71 @@ def _build_funding_schedule(
     return funding_change, used_points
 
 
+def _leg_from_event(row: Dict[str, Any], prefix: str) -> Optional[Dict[str, Any]]:
+    ex = row.get(f"{prefix}_exchange")
+    if not ex:
+        return None
+    return {
+        "exchange": ex,
+        "symbol": row.get(f"{prefix}_symbol"),
+        "kind": row.get(f"{prefix}_kind"),
+        "price_first": row.get(f"{prefix}_price_first"),
+        "price_last": row.get(f"{prefix}_price_last"),
+        "funding_first": row.get(f"{prefix}_funding_rate_first"),
+        "funding_last": row.get(f"{prefix}_funding_rate_last"),
+    }
+
+
 def compute_outcome(
     sqlite_conn: sqlite3.Connection,
-    exchange: str,
-    symbol: str,
-    start_ts: datetime,
+    event_row: Dict[str, Any],
     horizon_min: int,
     rest_fetcher: Optional[FundingHistoryFetcher] = None,
 ) -> Optional[Dict[str, object]]:
-    end_ts = start_ts + timedelta(minutes=horizon_min)
-    snap_start = load_snapshot(sqlite_conn, exchange, symbol, start_ts)
-    snap_end = load_snapshot(sqlite_conn, exchange, symbol, end_ts)
-    if not snap_start or not snap_end or not snap_start.spot or not snap_start.perp or not snap_end.spot or not snap_end.perp:
+    leg_a = _leg_from_event(event_row, "leg_a")
+    leg_b = _leg_from_event(event_row, "leg_b")
+    if not leg_a or not leg_b:
         return None
-    spread_start = (snap_start.spot - snap_start.perp) / snap_start.spot if snap_start.spot else None
-    spread_end = (snap_end.spot - snap_end.perp) / snap_end.spot if snap_end.spot else None
-    if spread_start is None or spread_end is None:
+    exchange = event_row.get("exchange")
+    symbol = event_row.get("symbol")
+    start_ts: datetime = event_row.get("start_ts")
+    end_ts = start_ts + timedelta(minutes=horizon_min)
+    # 起终点价：按腿类型取 spot/perp
+    snap_a_start = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], start_ts)
+    snap_b_start = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], start_ts)
+    snap_a_end = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], end_ts)
+    snap_b_end = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], end_ts)
+
+    def leg_price(kind: str, snap: Optional[Snapshot]) -> Optional[float]:
+        if not snap:
+            return None
+        if kind == "spot":
+            return snap.spot
+        return snap.perp
+
+    a_start_price = leg_price(leg_a.get("kind"), snap_a_start)
+    b_start_price = leg_price(leg_b.get("kind"), snap_b_start)
+    a_end_price = leg_price(leg_a.get("kind"), snap_a_end)
+    b_end_price = leg_price(leg_b.get("kind"), snap_b_end)
+    if None in (a_start_price, b_start_price, a_end_price, b_end_price):
         return None
 
-    spread_series = load_spread_series(sqlite_conn, exchange, symbol, snap_start.ts, snap_end.ts)
+    def rel_spread(a_price: float, b_price: float) -> float:
+        return (a_price - b_price) / a_price if a_price else 0.0
+
+    spread_start = rel_spread(a_start_price, b_start_price)
+    spread_end = rel_spread(a_end_price, b_end_price)
+
+    # 构造 spread 时间序列（对齐两腿时间）
+    series_a = load_leg_price_series(sqlite_conn, leg_a["exchange"], leg_a["symbol"], leg_a["kind"], start_ts, end_ts)
+    series_b = load_leg_price_series(sqlite_conn, leg_b["exchange"], leg_b["symbol"], leg_b["kind"], start_ts, end_ts)
+    spread_series: List[Tuple[datetime, float]] = []
+    for ts, pa in series_a.items():
+        pb = series_b.get(ts)
+        if pb:
+            spread_series.append((ts, rel_spread(pa, pb)))
+    spread_series.sort(key=lambda x: x[0])
+
     max_dd = None
     vol = None
     if spread_series:
@@ -305,30 +411,43 @@ def compute_outcome(
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             vol = math.sqrt(var)
 
-    funding_change = None
-    used_points: List[Tuple[datetime, float]] = []
-    # 优先尝试 REST funding 历史
-    if rest_fetcher:
-        rest_points = rest_fetcher.fetch(exchange, symbol, snap_start.ts, snap_end.ts)
-        if rest_points:
-            funding_change = sum(rate for _, rate in rest_points)
-            used_points = rest_points
-    if funding_change is None:
-        # 回退：本地 1min funding_rate + next_funding_time 推导
-        funding_series = load_funding_series(sqlite_conn, exchange, symbol, snap_start.ts, snap_end.ts)
-        funding_change, used_points = _build_funding_schedule(funding_series, snap_start.ts, snap_end.ts)
+    funding_change_total = 0.0
+    funding_applied: Dict[str, Any] = {}
+    legs_info = [("a", leg_a), ("b", leg_b)]
+    for label, leg in legs_info:
+        if leg.get("kind") != "perp":
+            continue
+        fc = None
+        used_points: List[Tuple[datetime, float]] = []
+        if rest_fetcher:
+            rest_points = rest_fetcher.fetch(leg["exchange"], leg["symbol"], start_ts, end_ts)
+            if rest_points:
+                fc = sum(rate for _, rate in rest_points)
+                used_points = rest_points
+        if fc is None:
+            funding_series = load_funding_series(sqlite_conn, leg["exchange"], leg["symbol"], start_ts, end_ts)
+            fc, used_points = _build_funding_schedule(funding_series, start_ts, end_ts)
+        if fc is not None:
+            funding_change_total += fc
+        funding_applied[label] = {
+            "exchange": leg["exchange"],
+            "symbol": leg["symbol"],
+            "used_points": [(ts.isoformat(), rate) for ts, rate in used_points],
+            "source": "rest" if rest_fetcher and used_points else "local",
+        }
 
     pnl_spread = spread_end - spread_start
-    pnl_funding = funding_change if funding_change is not None else 0.0
+    pnl_funding = funding_change_total
     pnl_total = pnl_spread + pnl_funding
 
     return {
         "horizon_min": horizon_min,
         "spread_change": pnl_spread,
-        "funding_change": funding_change,
+        "funding_change": funding_change_total if funding_applied else None,
         "pnl": pnl_total,
         "max_drawdown": max_dd,
         "volatility": vol,
+        "funding_applied": funding_applied or None,
     }
 
 
@@ -336,15 +455,16 @@ def upsert_outcome(conn_pg, event_id: int, outcome: Dict[str, object]) -> None:
     conn_pg.execute(
         """
         INSERT INTO watchlist.future_outcome
-          (event_id, horizon_min, pnl, spread_change, funding_change, max_drawdown, volatility)
-        VALUES (%(event_id)s, %(horizon_min)s, %(pnl)s, %(spread_change)s, %(funding_change)s, %(max_drawdown)s, %(volatility)s)
+          (event_id, horizon_min, pnl, spread_change, funding_change, max_drawdown, volatility, funding_applied)
+        VALUES (%(event_id)s, %(horizon_min)s, %(pnl)s, %(spread_change)s, %(funding_change)s, %(max_drawdown)s, %(volatility)s, %(funding_applied)s)
         ON CONFLICT (event_id, horizon_min)
         DO UPDATE SET
           pnl = EXCLUDED.pnl,
           spread_change = EXCLUDED.spread_change,
           funding_change = EXCLUDED.funding_change,
           max_drawdown = EXCLUDED.max_drawdown,
-          volatility = EXCLUDED.volatility;
+          volatility = EXCLUDED.volatility,
+          funding_applied = EXCLUDED.funding_applied;
         """,
         {**outcome, "event_id": event_id},
     )
@@ -379,16 +499,16 @@ def main(loop_once: bool = True) -> None:
             logger.info("no pending events")
             return
         processed = 0
-        for event_id, exchange, symbol, start_ts in tasks:
+        for row in tasks:
             missing = [h for h in HORIZONS_MIN if not pg_conn.execute(
                 "SELECT 1 FROM watchlist.future_outcome WHERE event_id=%s AND horizon_min=%s",
-                (event_id, h),
+                (row["id"], h),
             ).fetchone()]
             for h in missing:
-                out = compute_outcome(sqlite_conn, exchange, symbol, start_ts, h, rest_fetcher=fetcher)
+                out = compute_outcome(sqlite_conn, row, h, rest_fetcher=fetcher)
                 if not out:
                     continue
-                upsert_outcome(pg_conn, event_id, out)
+                upsert_outcome(pg_conn, row["id"], out)
                 processed += 1
             if processed >= MAX_TASKS:
                 break

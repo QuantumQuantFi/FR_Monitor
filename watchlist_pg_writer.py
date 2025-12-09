@@ -46,6 +46,8 @@ class PgWriter:
         self._stop = threading.Event()
         # state for event merge: (exchange, symbol, signal_type) -> state dict
         self._event_state: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        # 缓存最近一次双腿信息，便于事件聚合时保留首/末腿快照
+        self._last_legs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -128,6 +130,28 @@ class PgWriter:
         n_required = max(1, int(self.config.consecutive_required or 1))
         cooldown = max(1, int(self.config.cooldown_minutes or 1))
 
+        def leg_payload(legs: Optional[Dict[str, Any]], first: bool = False) -> Dict[str, Any]:
+            if not legs:
+                return {}
+            a = legs.get("a") or {}
+            b = legs.get("b") or {}
+            return {
+                "leg_a_exchange": a.get("exchange"),
+                "leg_a_symbol": a.get("symbol"),
+                "leg_a_kind": a.get("kind"),
+                "leg_a_price_first": a.get("price") if first else None,
+                "leg_a_price_last": a.get("price"),
+                "leg_a_funding_rate_first": a.get("funding_rate") if first else None,
+                "leg_a_funding_rate_last": a.get("funding_rate"),
+                "leg_b_exchange": b.get("exchange"),
+                "leg_b_symbol": b.get("symbol"),
+                "leg_b_kind": b.get("kind"),
+                "leg_b_price_first": b.get("price") if first else None,
+                "leg_b_price_last": b.get("price"),
+                "leg_b_funding_rate_first": b.get("funding_rate") if first else None,
+                "leg_b_funding_rate_last": b.get("funding_rate"),
+            }
+
         for row in rows_sorted:
             ts = row.get("ts") or now
             ex = str(row.get("exchange") or "")
@@ -185,33 +209,40 @@ class PgWriter:
             state["last_trigger_ts"] = ts
             state["triggered_count"] += 1
             state["agg"] = self._agg_update(state["agg"], row)
+            # 缓存最新腿信息
+            if row.get("legs"):
+                self._last_legs[key] = row.get("legs")
 
             if not state["open"] and state["pending_count"] >= n_required:
                 # open new event
                 state["open"] = True
                 state["start_ts"] = ts
                 state["event_id"] = None
-                ops["insert"].append(
-                    {
-                        "exchange": ex,
-                        "symbol": sym,
-                        "signal_type": sig,
-                        "start_ts": ts,
-                        "end_ts": ts,
-                        "duration_sec": 0,
-                        "triggered_count": state["triggered_count"],
-                        "features_agg": self._agg_finalize(state["agg"]),
-                    }
-                )
+                legs = self._last_legs.get(key)
+                payload = {
+                    "exchange": ex,
+                    "symbol": sym,
+                    "signal_type": sig,
+                    "start_ts": ts,
+                    "end_ts": ts,
+                    "duration_sec": 0,
+                    "triggered_count": state["triggered_count"],
+                    "features_agg": self._agg_finalize(state["agg"], legs=legs),
+                }
+                payload.update(leg_payload(legs, first=True))
+                ops["insert"].append(payload)
             elif state["open"] and state["event_id"]:
+                legs = self._last_legs.get(key)
+                leg_fields = leg_payload(legs, first=False)
                 ops["update"].append(
                     {
                         "event_id": state["event_id"],
                         "end_ts": ts,
                         "duration_sec": int((ts - (state["start_ts"] or ts)).total_seconds()),
-                        "features_agg": self._agg_finalize(state["agg"]),
+                        "features_agg": self._agg_finalize(state["agg"], legs=self._last_legs.get(key)),
                         "triggered_count": state["triggered_count"],
                         "close": False,
+                        **leg_fields,
                     }
                 )
 
@@ -246,7 +277,7 @@ class PgWriter:
         agg["meta_last"] = row.get("meta")
         return agg
 
-    def _agg_finalize(self, agg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    def _agg_finalize(self, agg: Optional[Dict[str, Any]], legs: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         if not agg:
             return None
         out: Dict[str, Any] = {}
@@ -257,6 +288,8 @@ class PgWriter:
             out[f"{name}_max"] = stats.get("max")
         out["meta_first"] = agg.get("meta_first")
         out["meta_last"] = agg.get("meta_last")
+        if legs:
+            out["legs_last"] = legs
         out["count"] = agg.get("count")
         return out or None
 
@@ -285,8 +318,12 @@ class PgWriter:
                         cur.execute(
                             """
                             INSERT INTO watchlist.watch_signal_event
-                              (exchange, symbol, signal_type, start_ts, end_ts, duration_sec, triggered_count, status, features_agg)
-                            VALUES (%(exchange)s, %(symbol)s, %(signal_type)s, %(start_ts)s, %(end_ts)s, %(duration_sec)s, %(triggered_count)s, 'open', %(features_agg)s)
+                              (exchange, symbol, signal_type, start_ts, end_ts, duration_sec, triggered_count, status, features_agg,
+                               leg_a_exchange, leg_a_symbol, leg_a_kind, leg_a_price_first, leg_a_price_last, leg_a_funding_rate_first, leg_a_funding_rate_last,
+                               leg_b_exchange, leg_b_symbol, leg_b_kind, leg_b_price_first, leg_b_price_last, leg_b_funding_rate_first, leg_b_funding_rate_last)
+                            VALUES (%(exchange)s, %(symbol)s, %(signal_type)s, %(start_ts)s, %(end_ts)s, %(duration_sec)s, %(triggered_count)s, 'open', %(features_agg)s,
+                                    %(leg_a_exchange)s, %(leg_a_symbol)s, %(leg_a_kind)s, %(leg_a_price_first)s, %(leg_a_price_last)s, %(leg_a_funding_rate_first)s, %(leg_a_funding_rate_last)s,
+                                    %(leg_b_exchange)s, %(leg_b_symbol)s, %(leg_b_kind)s, %(leg_b_price_first)s, %(leg_b_price_last)s, %(leg_b_funding_rate_first)s, %(leg_b_funding_rate_last)s)
                             RETURNING id
                             """,
                             _normalize_payload(ins),
@@ -303,6 +340,20 @@ class PgWriter:
                                    duration_sec = COALESCE(%(duration_sec)s, duration_sec),
                                    triggered_count = COALESCE(%(triggered_count)s, triggered_count),
                                    features_agg = COALESCE(%(features_agg)s, features_agg),
+                                   leg_a_exchange = COALESCE(%(leg_a_exchange)s, leg_a_exchange),
+                                   leg_a_symbol = COALESCE(%(leg_a_symbol)s, leg_a_symbol),
+                                   leg_a_kind = COALESCE(%(leg_a_kind)s, leg_a_kind),
+                                   leg_a_price_first = COALESCE(%(leg_a_price_first)s, leg_a_price_first),
+                                   leg_a_price_last = COALESCE(%(leg_a_price_last)s, leg_a_price_last),
+                                   leg_a_funding_rate_first = COALESCE(%(leg_a_funding_rate_first)s, leg_a_funding_rate_first),
+                                   leg_a_funding_rate_last = COALESCE(%(leg_a_funding_rate_last)s, leg_a_funding_rate_last),
+                                   leg_b_exchange = COALESCE(%(leg_b_exchange)s, leg_b_exchange),
+                                   leg_b_symbol = COALESCE(%(leg_b_symbol)s, leg_b_symbol),
+                                   leg_b_kind = COALESCE(%(leg_b_kind)s, leg_b_kind),
+                                   leg_b_price_first = COALESCE(%(leg_b_price_first)s, leg_b_price_first),
+                                   leg_b_price_last = COALESCE(%(leg_b_price_last)s, leg_b_price_last),
+                                   leg_b_funding_rate_first = COALESCE(%(leg_b_funding_rate_first)s, leg_b_funding_rate_first),
+                                   leg_b_funding_rate_last = COALESCE(%(leg_b_funding_rate_last)s, leg_b_funding_rate_last),
                                    status = CASE WHEN %(close)s THEN 'closed' ELSE status END
                              WHERE id = %(event_id)s
                             """,
@@ -340,6 +391,18 @@ class PgWriter:
             "depth_imbalance",
             "volume_spike_zscore",
             "premium_index_diff",
+            "leg_a_exchange",
+            "leg_a_symbol",
+            "leg_a_kind",
+            "leg_a_price",
+            "leg_a_funding_rate",
+            "leg_a_next_funding_time",
+            "leg_b_exchange",
+            "leg_b_symbol",
+            "leg_b_kind",
+            "leg_b_price",
+            "leg_b_funding_rate",
+            "leg_b_next_funding_time",
             "meta",
         ]
         placeholders = ",".join([f"%({c})s" for c in cols])
@@ -354,6 +417,13 @@ class PgWriter:
                     r["meta"] = Json(r["meta"])
                 except Exception:
                     pass
+            # normalize legs timestamps to datetime for json
+            for k in ("leg_a_next_funding_time", "leg_b_next_funding_time"):
+                if isinstance(r.get(k), str):
+                    try:
+                        r[k] = datetime.fromisoformat(r[k])
+                    except Exception:
+                        pass
             return r
         try:
             with psycopg.connect(self.config.dsn, autocommit=True) as conn:

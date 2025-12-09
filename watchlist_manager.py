@@ -470,7 +470,7 @@ class WatchlistManager:
         metrics_map: Dict[str, Dict[str, Any]] = {}
         if active_symbols:
             try:
-                metrics_map = compute_metrics_for_symbols(self.db_path, active_symbols, snapshot=all_data)
+                metrics_map = compute_metrics_for_symbols(self.db_path, active_symbols, snapshot=market_snapshots)
             except Exception as exc:  # pragma: no cover - 运行时保护
                 self.logger.warning("compute_metrics_for_symbols failed: %s", exc)
                 metrics_map = {}
@@ -505,6 +505,7 @@ class WatchlistManager:
                 funding_diff_max = max(funding_vals) - min(funding_vals)
 
             metrics = metrics_map.get(entry.symbol) or {}
+            leg_a, leg_b = self._build_legs(entry, snaps, metrics)
             row = {
                 'ts': now,
                 'exchange': exch,
@@ -532,6 +533,19 @@ class WatchlistManager:
                 'depth_imbalance': None,
                 'volume_spike_zscore': None,
                 'premium_index_diff': None,
+                'leg_a_exchange': leg_a.get('exchange') if leg_a else None,
+                'leg_a_symbol': leg_a.get('symbol') if leg_a else None,
+                'leg_a_kind': leg_a.get('kind') if leg_a else None,
+                'leg_a_price': leg_a.get('price') if leg_a else None,
+                'leg_a_funding_rate': leg_a.get('funding_rate') if leg_a else None,
+                'leg_a_next_funding_time': leg_a.get('next_funding_time') if leg_a else None,
+                'leg_b_exchange': leg_b.get('exchange') if leg_b else None,
+                'leg_b_symbol': leg_b.get('symbol') if leg_b else None,
+                'leg_b_kind': leg_b.get('kind') if leg_b else None,
+                'leg_b_price': leg_b.get('price') if leg_b else None,
+                'leg_b_funding_rate': leg_b.get('funding_rate') if leg_b else None,
+                'leg_b_next_funding_time': leg_b.get('next_funding_time') if leg_b else None,
+                'legs': {'a': leg_a, 'b': leg_b} if leg_a or leg_b else None,
                 'meta': (
                     {
                         **meta,
@@ -549,3 +563,80 @@ class WatchlistManager:
                     self.pg_writer.enqueue_raw(r)
             except Exception as exc:  # pragma: no cover - best-effort
                 self.logger.warning("enqueue pg raw failed: %s", exc)
+
+    def _build_legs(self, entry: WatchlistEntry, snaps: Dict[str, Dict[str, Any]], metrics: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+        """
+        构造双腿信息：
+        - Type A：同所 spot/perp
+        - Type B：两条 perp（跨所高/低）
+        - Type C：spot vs perp（跨所）
+        """
+        leg_a = leg_b = None
+        td = entry.trigger_details or {}
+        if entry.entry_type == 'A':
+            # 同所（Binance）现货/永续
+            spot_price = None
+            perp_price = None
+            funding = None
+            snap = snaps.get('binance') or {}
+            spot_price = snap.get('spot_price')
+            perp_price = snap.get('futures_price')
+            funding = snap.get('funding_rate')
+            leg_a = {
+                'exchange': 'binance',
+                'symbol': entry.symbol,
+                'kind': 'spot',
+                'price': spot_price or metrics.get('last_spot_price'),
+                'funding_rate': 0.0,
+                'next_funding_time': None,
+            }
+            leg_b = {
+                'exchange': 'binance',
+                'symbol': entry.symbol,
+                'kind': 'perp',
+                'price': perp_price or metrics.get('last_futures_price'),
+                'funding_rate': funding or entry.last_funding_rate,
+                'next_funding_time': _parse_timestamp(entry.next_funding_time),
+            }
+        elif entry.entry_type == 'B':
+            pair = td.get('pair') or []
+            prices = td.get('prices') or {}
+            funding = td.get('funding') or {}
+            if len(pair) == 2:
+                leg_a = {
+                    'exchange': pair[0],
+                    'symbol': entry.symbol,
+                    'kind': 'perp',
+                    'price': prices.get(pair[0]),
+                    'funding_rate': funding.get(pair[0]),
+                    'next_funding_time': None,
+                }
+                leg_b = {
+                    'exchange': pair[1],
+                    'symbol': entry.symbol,
+                    'kind': 'perp',
+                    'price': prices.get(pair[1]),
+                    'funding_rate': funding.get(pair[1]),
+                    'next_funding_time': None,
+                }
+        elif entry.entry_type == 'C':
+            spot_ex = td.get('spot_exchange')
+            fut_ex = td.get('futures_exchange')
+            if spot_ex and fut_ex:
+                leg_a = {
+                    'exchange': spot_ex,
+                    'symbol': entry.symbol,
+                    'kind': 'spot',
+                    'price': td.get('spot_price'),
+                    'funding_rate': 0.0,
+                    'next_funding_time': None,
+                }
+                leg_b = {
+                    'exchange': fut_ex,
+                    'symbol': entry.symbol,
+                    'kind': 'perp',
+                    'price': td.get('futures_price'),
+                    'funding_rate': (td.get('funding') or {}).get(fut_ex),
+                    'next_funding_time': None,
+                }
+        return leg_a, leg_b

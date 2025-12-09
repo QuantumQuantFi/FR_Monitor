@@ -194,12 +194,17 @@
   - 未记录 `funding_applied` 明细，无法审计用到了哪些结算点/来源。
   - 对缺失数据未标记 label.missing，易与有效样本混淆。
   - 运行方式仍手动，未加 cron/后台守护。
+- 跨所/双腿缺口（新增关注）：
+  - 当前 raw/event 仅有 `exchange/symbol`，跨所场景用 `exchange=multi`，没有保存两条腿的交易所/品种/价格/资金费，outcome 只能算“单所现货-永续”基差。
+  - 需要在 raw/event 存两条腿：`leg_a_exchange/kind(spot|perp)/symbol/price/funding/next_funding_time`，`leg_b_*` 同理；Type A 也按 spot/perp 填，Type B/C 按跨所永续或现货-永续填。
+  - outcome 需按两腿价差和两腿资金费累加，现货腿资金费=0，永续腿用结算点累加；旧事件无法回算，新增事件开始写双腿。
 - 下一步改进：
   - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
   - 如果 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
   - 在 outcome 中写入 `funding_applied`（包含结算时间、费率、来源 rest/local）。
   - 增加 cron（每 10 分钟）或后台线程自动跑 worker。
   - 监控/日志：统计缺数据比例、REST 命中率、调用次数，便于调优。
+  - 开始落地双腿写入：raw/event 写入 leg_a/leg_b（交易所/品种/价格/资金费/next_funding_time），outcome 用两腿价差与两腿资金费累加；未来资金费按两腿分别累加，现货腿资金费=0。
 
 ## 当前资源快照（阶段 0 执行）
 - 磁盘：`/` 232G，总用 141G，可用 ~92G（61% 已用）；短期可预留 10GB 给 PG，需保持 <80%。
