@@ -9,7 +9,8 @@
 - 新约束：关注币种通常 <20 个；可接受 1~5 分钟落库一次（watchlist 及因子）。
 - 量级重估（按 20 个符号，每 1 分钟）：20 * 60/h ≈ 1.2k 行/小时，≈ 28.8k 行/天；行尺寸 ~200B/行，则日增 ~6MB，7 天 ~42MB。
 - 若 5 分钟落库：日增 ~1.2MB，基本可忽略。触发事件行数更低（<千级/天）。
-- 结论：在 20 符号、1~5m 频率下，存储占用极小，保留期可拉长（raw 14~30 天，event/outcome 180 天），仍保持分区与周期清理以防膨胀。
+- 实测（2025-12-09）：两天 raw 分区合计 ~27MB（含订单簿精简数据）；全库 ~29MB。推算 30 天约 0.6GB 上下（含索引/WAL 预留 <1GB）。  
+- 结论：在 20 符号、1~5m 频率下，存储占用极小，保留期可拉长（raw 30 天，event/outcome 180 天），仍保持分区与周期清理以防膨胀。
 
 ## 与现有 watchlist 页面/接口的对应
 - 页面：`templates/watchlist.html`（列表+指标）与 `templates/watchlist_charts.html`（12h 时序）。
@@ -201,6 +202,16 @@
   - 需要在 raw/event 存两条腿：`leg_a_exchange/kind(spot|perp)/symbol/price/funding/next_funding_time`，`leg_b_*` 同理；Type A 也按 spot/perp 填，Type B/C 按跨所永续或现货-永续填。
   - outcome 需按两腿价差和两腿资金费累加，现货腿资金费=0，永续腿用结算点累加；旧事件无法回算，新增事件开始写双腿。
 - 当前运行快照：raw 27,008 行，event 450 行，future_outcome 92 行（均为最新批次数据）；最新事件已含双腿字段，早期事件仍缺腿信息且被 outcome 跳过。
+
+## 现状快照（2025-12-09）
+- PG 占用：~29MB，总体含两日 raw 分区（20.27MB / 7.17MB）+ event ~0.8MB + outcome ~0.17MB；推算 30 天约 0.6GB。
+- 进程：simple_app + outcome worker 已常驻（nohup），outcome 每 600s 轮询。
+- 新功能：raw.meta.orderbook 持久化扫单价与跨所矩阵；/watchlist/db 浏览页上线。
+
+## 下一步（短期）
+- 补齐非 Binance 资金费历史 fetch（OKX/Bybit/Bitget 已在计划，继续扩展并加强缓存）。
+- 对旧事件缺腿信息的情况：worker 已跳过；新增事件保持双腿完整。必要时考虑重放新事件以覆盖样本。
+- 监控：每周查看分区大小与 outcome 覆盖率；确保 funding_applied/funding_hist 持续写入。
 - 下一步改进：
   - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
   - 如果 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
