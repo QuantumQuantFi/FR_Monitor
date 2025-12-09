@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>Watchlist 数据库浏览</title>
+    <style>
+        body { font-family: Arial, sans-serif; padding: 16px; }
+        h2 { margin-top: 0; }
+        form { margin-bottom: 12px; }
+        table { border-collapse: collapse; width: 100%; font-size: 13px; }
+        th, td { border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }
+        th { background: #f2f2f2; position: sticky; top: 0; }
+        .error { color: #c00; margin-bottom: 10px; }
+        .pager { margin-top: 8px; }
+        .pager a { margin-right: 12px; text-decoration: none; color: #0366d6; }
+        .meta { color: #555; }
+    </style>
+</head>
+<body>
+    <h2>Watchlist 数据库浏览</h2>
+    <form method="get">
+        <label>表：
+            <select name="table">
+                <option value="raw" {% if table_key == 'raw' %}selected{% endif %}>watch_signal_raw</option>
+                <option value="event" {% if table_key == 'event' %}selected{% endif %}>watch_signal_event</option>
+                <option value="outcome" {% if table_key == 'outcome' %}selected{% endif %}>future_outcome</option>
+            </select>
+        </label>
+        <label style="margin-left:10px;">每页
+            <input type="number" name="limit" value="{{ limit }}" min="1" max="200" style="width:60px;">
+        </label>
+        <label style="margin-left:10px;">页码
+            <input type="number" name="page" value="{{ page }}" min="1" style="width:60px;">
+        </label>
+        <button type="submit">查看</button>
+    </form>
+
+    {% if error %}
+        <div class="error">错误：{{ error }}</div>
+    {% endif %}
+    {% if total_count is not none %}
+        <div class="meta">总行数：{{ total_count }} （可能略有延迟）</div>
+    {% endif %}
+
+    <table>
+        <thead>
+            <tr>
+                {% if columns %}
+                    {% for c in columns %}
+                        <th>{{ c }}</th>
+                    {% endfor %}
+                {% else %}
+                    <th>无数据</th>
+                {% endif %}
+            </tr>
+        </thead>
+        <tbody>
+            {% if rows %}
+                {% for row in rows %}
+                    <tr>
+                        {% for c in columns %}
+                            <td>{{ row[c] }}</td>
+                        {% endfor %}
+                    </tr>
+                {% endfor %}
+            {% else %}
+                <tr><td colspan="{{ columns|length if columns else 1 }}">暂无数据</td></tr>
+            {% endif %}
+        </tbody>
+    </table>
+
+    <div class="pager">
+        {% if page > 1 %}
+            <a href="?table={{ table_key }}&limit={{ limit }}&page={{ page - 1 }}">上一页</a>
+        {% endif %}
+        {% if has_next %}
+            <a href="?table={{ table_key }}&limit={{ limit }}&page={{ page + 1 }}">下一页</a>
+        {% endif %}
+    </div>
+</body>
+</html>

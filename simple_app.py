@@ -49,6 +49,13 @@ from orderbook_utils import (
     compute_orderbook_spread,
     DEFAULT_SWEEP_NOTIONAL,
 )
+# optional PG browse
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except Exception:  # pragma: no cover - optional dependency
+    psycopg = None
+    dict_row = None
 
 LOG_DIR = os.environ.get("SIMPLE_APP_LOG_DIR", os.path.join("logs", "simple_app"))
 LOG_FILE_NAME = "simple_app.log"
@@ -1451,7 +1458,7 @@ def watchlist_refresh_loop():
                     preloaded = True
             all_data = data_collector.get_all_data()
             exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
-            watchlist_manager.refresh(all_data, exchange_symbols)
+            watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
         except Exception as exc:
             logger.warning("watchlist refresh failed: %s", exc)
         time.sleep(watchlist_manager.refresh_seconds)
@@ -1471,14 +1478,16 @@ def cold_start_watchlist_from_db(limit_minutes: int = 1) -> None:
         if not latest:
             logger.info("cold start skipped: no recent rows in price_data_1min")
             return
-        cur.execute(
-            """
-            SELECT symbol, exchange, spot_price_close, futures_price_close, funding_rate, timestamp
+        # 检查是否有 funding_rate 列，兼容旧版 SQLite
+        cur.execute("PRAGMA table_info(price_data_1min)")
+        cols = [row[1] for row in cur.fetchall()]
+        has_funding = "funding_rate" in cols
+        select_sql = """
+            SELECT symbol, exchange, spot_price_close, futures_price_close, {funding}, timestamp
             FROM price_data_1min
             WHERE timestamp >= datetime(?, ?)
-            """,
-            (latest, f"-{limit_minutes} minutes"),
-        )
+        """.format(funding="funding_rate" if has_funding else "NULL AS funding_rate")
+        cur.execute(select_sql, (latest, f"-{limit_minutes} minutes"))
         rows = cur.fetchall()
         if not rows:
             logger.info("cold start skipped: no rows within last minute")
@@ -1504,7 +1513,7 @@ def cold_start_watchlist_from_db(limit_minutes: int = 1) -> None:
                 }
                 exchange_symbols[exch]['futures'].append(symbol)
 
-        watchlist_manager.refresh(all_data, exchange_symbols)
+        watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
         logger.info("cold start watchlist completed with %s rows (latest ts %s)", len(rows), latest)
     except Exception as exc:
         logger.warning("cold start watchlist failed: %s", exc)
@@ -1690,10 +1699,97 @@ def trigger_watchlist_refresh():
     try:
         all_data = data_collector.get_all_data()
         exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
-        watchlist_manager.refresh(all_data, exchange_symbols)
+        watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
         return jsonify({'message': 'ok', 'timestamp': now_utc_iso(), 'summary': watchlist_manager.snapshot().get('summary')})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+
+@app.route('/watchlist/db')
+def watchlist_db_view():
+    """
+    简易的 watchlist PG 浏览页面，随用随查。
+    - 支持 raw/event/outcome 三张核心表。
+    - 默认每页 10 条，可通过 ?page=2&limit=20 翻页。
+    """
+    if psycopg is None:
+        return render_template('watchlist_db_view.html', error='psycopg 未安装，无法连接 PG')
+
+    table_key = request.args.get('table', 'raw')
+    page = max(1, int(request.args.get('page', 1) or 1))
+    limit = int(request.args.get('limit', 10) or 10)
+    limit = min(max(limit, 1), 200)
+    offset = (page - 1) * limit
+
+    table_map = {
+        'raw': ('watchlist.watch_signal_raw', 'ts'),
+        'event': ('watchlist.watch_signal_event', 'start_ts'),
+        'outcome': ('watchlist.future_outcome', 'event_id'),
+    }
+    if table_key not in table_map:
+        table_key = 'raw'
+    table_name, order_col = table_map[table_key]
+
+    def _shorten(val: Any, max_len: int = 200) -> str:
+        if val is None:
+            return ''
+        try:
+            if isinstance(val, (dict, list)):
+                text = json.dumps(val, ensure_ascii=False)
+            elif isinstance(val, (datetime,)):
+                text = val.isoformat()
+            else:
+                text = str(val)
+        except Exception:
+            text = str(val)
+        if len(text) > max_len:
+            return text[:max_len] + ' …'
+        return text
+
+    rows: List[Dict[str, Any]] = []
+    total_count: Optional[int] = None
+    error: Optional[str] = None
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            try:
+                total_row = conn.execute(f"SELECT COUNT(*) AS cnt FROM {table_name}").fetchone()
+                total_count = total_row['cnt'] if total_row else None
+            except Exception:
+                total_count = None
+            order_sql = f"ORDER BY {order_col} DESC"
+            if table_key == 'outcome':
+                order_sql = "ORDER BY event_id DESC, horizon_min ASC"
+            cur = conn.execute(
+                f"SELECT * FROM {table_name} {order_sql} LIMIT %s OFFSET %s",
+                (limit, offset),
+            )
+            fetched = cur.fetchall()
+            if dict_row:
+                for r in fetched:
+                    rows.append({k: _shorten(v) for k, v in r.items()})
+            else:
+                cols = [d.name for d in cur.description] if cur.description else []
+                for r in fetched:
+                    rows.append({col: _shorten(val) for col, val in zip(cols, r)})
+    except Exception as exc:
+        error = str(exc)
+
+    columns = list(rows[0].keys()) if rows else []
+    has_next = len(rows) == limit and (total_count is None or offset + len(rows) < total_count)
+    return render_template(
+        'watchlist_db_view.html',
+        table_key=table_key,
+        rows=rows,
+        columns=columns,
+        page=page,
+        limit=limit,
+        has_next=has_next,
+        total_count=total_count,
+        error=error,
+    )
 
 @app.route('/api/watchlist/metrics')
 def get_watchlist_metrics():

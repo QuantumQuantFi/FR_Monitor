@@ -5,6 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 RUNTIME_DIR="${SIMPLE_APP_RUNTIME_DIR:-${PROJECT_ROOT}/runtime/simple_app}"
 PID_FILE="${RUNTIME_DIR}/simple_app.pid"
+OUTCOME_WORKER_PID_FILE="${RUNTIME_DIR}/outcome_worker.pid"
 
 mkdir -p "${RUNTIME_DIR}"
 
@@ -64,4 +65,25 @@ else
 fi
 
 rm -f "${PID_FILE}"
+
+# 停掉 outcome worker（循环任务）
+if [[ -f "${OUTCOME_WORKER_PID_FILE}" ]]; then
+    PID_FROM_FILE="$(<"${OUTCOME_WORKER_PID_FILE}")"
+    if [[ -n "${PID_FROM_FILE}" && "${PID_FROM_FILE}" =~ ^[0-9]+$ ]]; then
+        if kill -0 "${PID_FROM_FILE}" 2>/dev/null; then
+            echo "[stop] 正在停止 outcome worker PID ${PID_FROM_FILE}"
+            kill -TERM "${PID_FROM_FILE}" 2>/dev/null || true
+        fi
+    fi
+    rm -f "${OUTCOME_WORKER_PID_FILE}"
+fi
+if command -v pgrep >/dev/null 2>&1; then
+    while read -r pid; do
+        if kill -0 "${pid}" 2>/dev/null; then
+            echo "[stop] 终止残留 outcome worker PID ${pid}"
+            kill -TERM "${pid}" 2>/dev/null || true
+        fi
+    done < <(pgrep -f "[w]atchlist_outcome_worker\\.py" 2>/dev/null || true)
+fi
+
 echo "[stop] 运行目录: ${RUNTIME_DIR}"

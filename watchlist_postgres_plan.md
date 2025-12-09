@@ -13,6 +13,7 @@
 
 ## 与现有 watchlist 页面/接口的对应
 - 页面：`templates/watchlist.html`（列表+指标）与 `templates/watchlist_charts.html`（12h 时序）。
+- 新增：`/watchlist/db` 简易 PG 浏览页，可分页查看 raw/event/outcome；默认 10 行，便于随用随查。
 - 接口：`/api/watchlist`（列表）、`/api/watchlist/metrics`（Type A 指标）、`/api/watchlist/series`（12h 图表）。
 - 列表字段：Type A/B/C、资金费率、Spread 最新/均值/σ、区间(1h/12h)、斜率/穿越/Drift、跨所差价矩阵（订单簿扫单）、下一次资金费时间等。
 - 图表需求：12h 分钟级价差（spot/futures）、15m 中线、基线、开/平仓点、资金费时间标注。
@@ -96,6 +97,7 @@
     "notes": "front-end hints or debug"
   }
   ```
+- 订单簿/矩阵落库（已上线）：在 raw.meta.orderbook 存 sweep 价格与前 5 对跨所价差（forward/reverse），字段：legs[exchange,type,buy,sell,mid,error]，forward_spread/reverse_spread，cross_pairs[top5]，带快照 ts/stale_reason，控制宽度。
 - 事件表（event.features_agg）：保留首/末/均/极值的核心标量（同上），再附带 `pairs_top` 与 `funding_diff_top` 的首末快照，以便回溯。
 - 序列表（`watchlist_series_agg`）：继续按 5m 聚合开列 `spot_price`、`futures_price`、`spread_rel`、`funding_rate`、`funding_interval_hours`、`next_funding_time`，其余如矩阵/跨所资金费差保持在 `series_meta jsonb`（最多存当时 top1 跨所价差与 top1 资金费差，控制行宽）。
 
@@ -198,6 +200,7 @@
   - 当前 raw/event 仅有 `exchange/symbol`，跨所场景用 `exchange=multi`，没有保存两条腿的交易所/品种/价格/资金费，outcome 只能算“单所现货-永续”基差。
   - 需要在 raw/event 存两条腿：`leg_a_exchange/kind(spot|perp)/symbol/price/funding/next_funding_time`，`leg_b_*` 同理；Type A 也按 spot/perp 填，Type B/C 按跨所永续或现货-永续填。
   - outcome 需按两腿价差和两腿资金费累加，现货腿资金费=0，永续腿用结算点累加；旧事件无法回算，新增事件开始写双腿。
+- 当前运行快照：raw 27,008 行，event 450 行，future_outcome 92 行（均为最新批次数据）；最新事件已含双腿字段，早期事件仍缺腿信息且被 outcome 跳过。
 - 下一步改进：
   - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
   - 如果 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
@@ -232,7 +235,7 @@
 - 脚本/适配：新增 `scripts/manage_watchlist_partitions.sh`（日分区滚动，默认 raw 14d、series 7d）；新增 `watchlist_pg_writer.py`（PG 写入缓冲骨架，含事件归并占位、双写开关）。
 - Cron：已添加每日 00:05 UTC 运行 `scripts/manage_watchlist_partitions.sh`（日志 `logs/partition_maintenance.log`），默认 raw 14d、series 7d、预建 2d。
 - 依赖：`requirements.txt` 已加入 `psycopg[binary]`（通过 venv 安装），`requests` 升级至 2.32.3 以兼容 grvt-pysdk。
-- 运行状况（双写）：simple_app 以 venv 重启，`WATCHLIST_PG_ENABLED=1`。`watch_signal_raw` 持续写入；事件表仍 0 行（需更多连续触发或放宽 N=2/M=3 规则）。分区脚本手动运行成功。
+- 运行状况（双写）：simple_app 以 venv 重启，`WATCHLIST_PG_ENABLED=1`。`watch_signal_raw` 持续写入；事件表已生成带双腿字段的 open 事件（N=2/M=3 规则），覆盖率仍在提升。分区脚本手动运行成功。
 - 事件归并实现：`watchlist_pg_writer` 内置 N 连续/M 冷静归并（默认 N=2、M=3 分钟），聚合首/末/极值，开/关事件写入 `watch_signal_event`。当前实时数据未出现事件（需更多触发样本）；本地测试用例可写入/关闭事件。
 - 因子落库：`watchlist_manager` 计算并填充价差类因子（range/vol/slope/crossings/drift）及 `extra_factors`（zscore/momentum/RSI/MACD/rv/hv/skew/kurt/drawdown/资金费7d zscore与趋势/vol、premium_index_diff、volume_quote_24h 等）存入 `meta.factors`；前端 watchlist 页面新增“因子”按钮异步展示。
 
@@ -245,5 +248,5 @@
 
 ## 下一步（短期可执行）
 - 补数据源并填值：检查 SQLite `price_data_1min` 是否写入 `premium_percent_avg`、`volume_24h_avg`；若缺，采集端补全以消除 NULL；若有盘口/OI 数据，扩展快照填 `bid_ask_spread`/`depth_imbalance`/`book_imbalance`/`oi_trend`。
-- 运行验证：跑 24h 观察 `meta.factors` 覆盖度与磁盘增量，检查事件是否生成；必要时临时调事件归并 N=1 观测。
+- 运行验证：跑 24h 观察 `meta.factors` 覆盖度与磁盘增量，检查事件是否生成；必要时临时调事件归并 N=1 观测；已修复 PG event 更新 jsonb 类型冲突与 datetime 序列化问题。
 - 健康与回退：给 PG writer 增加写失败降级（文件/SQLite）与日志；启动 `watchlist_series_agg` 写入（5m 聚合）及 outcome worker（多 horizon）为回测/IC 产出标签。

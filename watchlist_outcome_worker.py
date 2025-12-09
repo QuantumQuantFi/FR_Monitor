@@ -55,6 +55,8 @@ def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
                e.leg_b_exchange, e.leg_b_symbol, e.leg_b_kind, e.leg_b_price_first, e.leg_b_price_last, e.leg_b_funding_rate_first, e.leg_b_funding_rate_last
         FROM watchlist.watch_signal_event e
         WHERE e.start_ts <= now() - make_interval(mins := %s)
+          AND e.leg_a_exchange IS NOT NULL
+          AND e.leg_b_exchange IS NOT NULL
     )
     SELECT n.*
     FROM need n
@@ -214,7 +216,7 @@ def load_funding_series(
 
 class FundingHistoryFetcher:
     """
-    轻量 REST funding 历史获取。当前只实现 Binance，其他交易所返回空。
+    轻量 REST funding 历史获取。实现 Binance / OKX / Bybit / Bitget，带缓存与频控。
     """
 
     def __init__(self):
@@ -233,6 +235,12 @@ class FundingHistoryFetcher:
         try:
             if exchange.lower() == "binance":
                 out = self._fetch_binance(symbol, start_ts, end_ts)
+            elif exchange.lower() == "okx":
+                out = self._fetch_okx(symbol, start_ts, end_ts)
+            elif exchange.lower() == "bybit":
+                out = self._fetch_bybit(symbol, start_ts, end_ts)
+            elif exchange.lower() == "bitget":
+                out = self._fetch_bitget(symbol, start_ts, end_ts)
             # 其他交易所可按需扩展
         except Exception:
             out = []
@@ -246,23 +254,186 @@ class FundingHistoryFetcher:
         sym = symbol.upper()
         if not sym.endswith("USDT"):
             sym = f"{sym}USDT"
+        out: List[Tuple[datetime, float]] = []
+        cursor_start = int(start_ts.timestamp() * 1000)
+        while cursor_start < int(end_ts.timestamp() * 1000) and self._calls < MAX_REST_CALLS:
+            params = {
+                "symbol": sym,
+                "startTime": cursor_start,
+                "endTime": int(end_ts.timestamp() * 1000),
+                "limit": 1000,
+            }
+            resp = self.session.get("https://fapi.binance.com/fapi/v1/fundingRate", params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            chunk: List[Tuple[datetime, float]] = []
+            last_ts_ms = None
+            for item in data:
+                try:
+                    ts_ms = int(item["fundingTime"])
+                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                    if ts < start_ts or ts > end_ts:
+                        continue
+                    rate = float(item["fundingRate"])
+                    chunk.append((ts, rate))
+                    last_ts_ms = ts_ms
+                except Exception:
+                    continue
+            out.extend(chunk)
+            if last_ts_ms is None or len(data) < 1000:
+                break
+            cursor_start = last_ts_ms + 1
+            self._calls += 1
+        return out
+
+    def _fetch_okx(self, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
+        inst_id = f"{symbol.upper()}-USDT-SWAP"
+        out: List[Tuple[datetime, float]] = []
+
+        def _call(before: Optional[int], after: Optional[int]) -> List[Tuple[datetime, float]]:
+            params = {
+                "instId": inst_id,
+                "limit": 100,
+            }
+            if before:
+                params["before"] = before
+            if after:
+                params["after"] = after
+            resp = self.session.get("https://www.okx.com/api/v5/public/funding-rate-history", params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            out_local: List[Tuple[datetime, float]] = []
+            for item in data:
+                try:
+                    ts = datetime.fromtimestamp(int(item.get("fundingTime")) / 1000, tz=timezone.utc)
+                    rate_raw = item.get("realizedRate") or item.get("fundingRate")
+                    rate = float(rate_raw)
+                    if start_ts <= ts <= end_ts:
+                        out_local.append((ts, rate))
+                except Exception:
+                    continue
+            return out_local
+
+        # 一次带 before/after 查询
+        before = int(end_ts.timestamp() * 1000)
+        after = int(start_ts.timestamp() * 1000)
+        # OKX 接口返回倒序，以 after 作为游标翻页
+        while before > after and self._calls < MAX_REST_CALLS:
+            chunk = _call(before, after)
+            out.extend(chunk)
+            self._calls += 1
+            if not chunk:
+                break
+            min_ts = min(ts for ts, _ in chunk)
+            before = int((min_ts - timedelta(milliseconds=1)).timestamp() * 1000)
+            if len(chunk) < 100:
+                break
+        # 若仍为空，再做一次不带窗口获取最新一页
+        if not out:
+            out.extend(_call(None, None))
+        return out
+
+    def _fetch_bybit(self, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
+        sym = f"{symbol.upper()}USDT"
+        out: List[Tuple[datetime, float]] = []
+        cursor = None
+        calls = 0
+        while calls < 5 and self._calls < MAX_REST_CALLS:
+            params = {
+                "category": "linear",
+                "symbol": sym,
+                "start": int(start_ts.timestamp() * 1000),
+                "end": int(end_ts.timestamp() * 1000),
+                "limit": 200,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            resp = self.session.get("https://api.bybit.com/v5/market/funding/history", params=params, timeout=5)
+            resp.raise_for_status()
+            result = resp.json().get("result", {}) or {}
+            list_data = result.get("list") or []
+            for item in list_data:
+                try:
+                    ts = datetime.fromtimestamp(int(item["fundingRateTimestamp"]) / 1000, tz=timezone.utc)
+                    rate = float(item["fundingRate"])
+                    if start_ts <= ts <= end_ts:
+                        out.append((ts, rate))
+                except Exception:
+                    continue
+            cursor = result.get("nextPageCursor")
+            calls += 1
+            self._calls += 1
+            if not cursor or not list_data:
+                break
+        return out
+
+    def _fetch_bitget(self, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
+        inst_id = f"{symbol.upper()}USDT"
+        def _query(params: Dict[str, object]) -> List[Tuple[datetime, float]]:
+            resp = self.session.get("https://api.bitget.com/api/v2/mix/market/history-fund-rate", params=params, timeout=5)
+            resp.raise_for_status()
+            data = resp.json().get("data") or []
+            out_local: List[Tuple[datetime, float]] = []
+            for item in data:
+                try:
+                    ts_raw = item.get("fundingTime") or item.get("timestamp")
+                    ts = datetime.fromtimestamp(int(ts_raw) / 1000, tz=timezone.utc)
+                    rate = float(item.get("fundingRate"))
+                    if start_ts <= ts <= end_ts:
+                        out_local.append((ts, rate))
+                except Exception:
+                    continue
+            return out_local
+
         params = {
-            "symbol": sym,
+            "symbol": inst_id,
+            "productType": "umcbl",  # USDT 本位永续
             "startTime": int(start_ts.timestamp() * 1000),
             "endTime": int(end_ts.timestamp() * 1000),
             "limit": 1000,
         }
-        resp = self.session.get("https://fapi.binance.com/fapi/v1/fundingRate", params=params, timeout=5)
-        resp.raise_for_status()
-        data = resp.json()
         out: List[Tuple[datetime, float]] = []
-        for item in data:
+        try:
+            out.extend(_query(params))
+        except Exception:
+            pass
+        # 若窗口或 instId 查询无结果，再尝试不带时间/不带 _UMCBL 的符号
+        if not out:
             try:
-                ts = datetime.fromtimestamp(item["fundingTime"] / 1000, tz=timezone.utc)
-                rate = float(item["fundingRate"])
-                out.append((ts, rate))
+                out.extend(_query({"symbol": inst_id, "productType": "umcbl", "limit": 200}))
             except Exception:
-                continue
+                pass
+        if not out:
+            plain_sym = f"{symbol.upper()}USDT"
+            try:
+                out.extend(_query({"symbol": plain_sym, "productType": "umcbl", "limit": 200}))
+            except Exception:
+                pass
+        # 仍为空，尝试旧版 v1 接口兜底并分页
+        if not out:
+            page_no = 1
+            while page_no <= 5 and self._calls < MAX_REST_CALLS:
+                try:
+                    params_v1 = {"symbol": inst_id, "pageSize": 100, "pageNo": page_no}
+                    resp3 = self.session.get("https://api.bitget.com/api/mix/v1/market/history-fundRate", params=params_v1, timeout=5)
+                    resp3.raise_for_status()
+                    data3 = resp3.json().get("data") or []
+                    if not data3:
+                        break
+                    for item in data3:
+                        try:
+                            ts = datetime.fromtimestamp(int(item["fundingTime"]) / 1000, tz=timezone.utc)
+                            rate = float(item["fundingRate"])
+                            if start_ts <= ts <= end_ts:
+                                out.append((ts, rate))
+                        except Exception:
+                            continue
+                    page_no += 1
+                    self._calls += 1
+                except Exception:
+                    break
         return out
 
 
@@ -346,6 +517,27 @@ def _leg_from_event(row: Dict[str, Any], prefix: str) -> Optional[Dict[str, Any]
     }
 
 
+def _funding_stats(series: List[Tuple[datetime, float]]) -> Dict[str, Any]:
+    if not series:
+        return {}
+    vals = [v for _, v in series]
+    mean = sum(vals) / len(vals)
+    var = sum((v - mean) ** 2 for v in vals) / len(vals) if vals else 0
+    std = var ** 0.5
+    last_ts, last_val = series[-1]
+    momentum = vals[-1] - vals[0] if len(vals) >= 2 else None
+    return {
+        "n": len(vals),
+        "mean": mean,
+        "std": std,
+        "min": min(vals),
+        "max": max(vals),
+        "last_ts": last_ts.isoformat(),
+        "last": last_val,
+        "momentum": momentum,
+    }
+
+
 def compute_outcome(
     sqlite_conn: sqlite3.Connection,
     event_row: Dict[str, Any],
@@ -413,6 +605,7 @@ def compute_outcome(
 
     funding_change_total = 0.0
     funding_applied: Dict[str, Any] = {}
+    funding_hist: Dict[str, Any] = {}
     legs_info = [("a", leg_a), ("b", leg_b)]
     for label, leg in legs_info:
         if leg.get("kind") != "perp":
@@ -435,6 +628,13 @@ def compute_outcome(
             "used_points": [(ts.isoformat(), rate) for ts, rate in used_points],
             "source": "rest" if rest_fetcher and used_points else "local",
         }
+        if used_points:
+            # 仅保留近 50 条，计算基础统计 + 动量，便于事件层持久化
+            tail = used_points[-50:]
+            funding_hist[label] = {
+                "stats": _funding_stats(tail),
+                "tail": [(ts.isoformat(), rate) for ts, rate in tail],
+            }
 
     pnl_spread = spread_end - spread_start
     pnl_funding = funding_change_total
@@ -448,10 +648,18 @@ def compute_outcome(
         "max_drawdown": max_dd,
         "volatility": vol,
         "funding_applied": funding_applied or None,
+        "funding_hist": funding_hist or None,
     }
 
 
 def upsert_outcome(conn_pg, event_id: int, outcome: Dict[str, object]) -> None:
+    try:
+        from psycopg.types.json import Json  # type: ignore
+    except Exception:  # pragma: no cover
+        Json = None
+    params = {**outcome, "event_id": event_id}
+    if Json and outcome.get("funding_applied") is not None:
+        params["funding_applied"] = Json(outcome["funding_applied"])
     conn_pg.execute(
         """
         INSERT INTO watchlist.future_outcome
@@ -466,7 +674,28 @@ def upsert_outcome(conn_pg, event_id: int, outcome: Dict[str, object]) -> None:
           volatility = EXCLUDED.volatility,
           funding_applied = EXCLUDED.funding_applied;
         """,
-        {**outcome, "event_id": event_id},
+        params,
+    )
+
+
+def update_event_funding_hist(conn_pg, event_id: int, funding_hist: Optional[Dict[str, Any]]) -> None:
+    """将 funding_hist 写回事件 features_agg，便于回测/特征使用。"""
+    if not funding_hist:
+        return
+    try:
+        from psycopg.types.json import Json  # type: ignore
+    except Exception:  # pragma: no cover
+        Json = None
+    payload = funding_hist
+    if Json:
+        payload = Json(funding_hist)
+    conn_pg.execute(
+        """
+        UPDATE watchlist.watch_signal_event
+           SET features_agg = COALESCE(features_agg, '{}'::jsonb) || jsonb_build_object('funding_hist', %s)
+         WHERE id = %s;
+        """,
+        (payload, event_id),
     )
 
 
@@ -498,17 +727,24 @@ def main(loop_once: bool = True) -> None:
         if not tasks:
             logger.info("no pending events")
             return
+        now_ts = _utcnow()
         processed = 0
         for row in tasks:
-            missing = [h for h in HORIZONS_MIN if not pg_conn.execute(
-                "SELECT 1 FROM watchlist.future_outcome WHERE event_id=%s AND horizon_min=%s",
-                (row["id"], h),
-            ).fetchone()]
+            missing = [
+                h
+                for h in HORIZONS_MIN
+                if row["start_ts"] + timedelta(minutes=h) <= now_ts
+                and not pg_conn.execute(
+                    "SELECT 1 FROM watchlist.future_outcome WHERE event_id=%s AND horizon_min=%s",
+                    (row["id"], h),
+                ).fetchone()
+            ]
             for h in missing:
                 out = compute_outcome(sqlite_conn, row, h, rest_fetcher=fetcher)
                 if not out:
                     continue
                 upsert_outcome(pg_conn, row["id"], out)
+                update_event_funding_hist(pg_conn, row["id"], out.get("funding_hist"))
                 processed += 1
             if processed >= MAX_TASKS:
                 break

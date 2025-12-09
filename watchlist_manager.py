@@ -208,7 +208,12 @@ class WatchlistManager:
             self.logger.info("watchlist preload finished with no recent rows")
         return added
 
-    def refresh(self, all_data: Dict[str, Any], exchange_symbols: Dict[str, Dict[str, List[str]]]) -> None:
+    def refresh(
+        self,
+        all_data: Dict[str, Any],
+        exchange_symbols: Dict[str, Dict[str, List[str]]],
+        orderbook_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Ingest latest funding ticks and rebuild watchlist entries."""
         now = _utcnow()
         spot_set = set(exchange_symbols.get('binance', {}).get('spot') or [])
@@ -425,7 +430,7 @@ class WatchlistManager:
                             _set_entry(symbol, entry)
 
         self._entries = new_entries
-        self._emit_pg_raw(new_entries, market_snapshots, now)
+        self._emit_pg_raw(new_entries, market_snapshots, now, orderbook_snapshot or {})
 
     def snapshot(self) -> Dict[str, Any]:
         with self._lock:
@@ -462,6 +467,7 @@ class WatchlistManager:
         entries: Dict[str, WatchlistEntry],
         market_snapshots: Dict[str, Dict[str, Dict[str, Any]]],
         now: datetime,
+        orderbook_snapshot: Dict[str, Any],
     ) -> None:
         if not self.pg_writer or not self.pg_writer.config.enabled:
             return
@@ -472,8 +478,34 @@ class WatchlistManager:
             try:
                 metrics_map = compute_metrics_for_symbols(self.db_path, active_symbols, snapshot=market_snapshots)
             except Exception as exc:  # pragma: no cover - 运行时保护
-                self.logger.warning("compute_metrics_for_symbols failed: %s", exc)
+                self.logger.warning("compute_metrics_for_symbols failed: %s", exc, exc_info=True)
                 metrics_map = {}
+
+        ob_data = orderbook_snapshot or {}
+        ob_orderbook = ob_data.get('orderbook') or {}
+        ob_cross = ob_data.get('cross_spreads') or {}
+        ob_ts = ob_data.get('timestamp')
+        ob_stale = ob_data.get('stale_reason')
+
+        def _compact_leg(leg: Dict[str, Any]) -> Dict[str, Any]:
+            price = leg.get('price') or {}
+            return {
+                'exchange': leg.get('exchange'),
+                'type': leg.get('market_type'),
+                'buy': price.get('buy'),
+                'sell': price.get('sell'),
+                'mid': price.get('mid'),
+                'error': leg.get('error') or price.get('error'),
+            }
+
+        def _compact_pair(pair: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                'type': pair.get('type'),
+                'exch_a': pair.get('exchange_a'),
+                'exch_b': pair.get('exchange_b'),
+                'forward': pair.get('forward'),
+                'reverse': pair.get('reverse'),
+            }
 
         rows: List[Dict[str, Any]] = []
         for entry in entries.values():
@@ -485,6 +517,20 @@ class WatchlistManager:
                 meta['trigger_details'] = entry.trigger_details
             if entry.symbol in market_snapshots:
                 meta['snapshots'] = market_snapshots.get(entry.symbol)
+            ob_entry = ob_orderbook.get(entry.symbol) if isinstance(ob_orderbook, dict) else None
+            cs_entry = ob_cross.get(entry.symbol) if isinstance(ob_cross, dict) else None
+            orderbook_meta: Dict[str, Any] = {}
+            if ob_entry:
+                orderbook_meta['legs'] = [_compact_leg(l) for l in ob_entry.get('legs', [])]
+                orderbook_meta['forward_spread'] = (ob_entry.get('forward') or {}).get('spread')
+                orderbook_meta['reverse_spread'] = (ob_entry.get('reverse') or {}).get('spread')
+            if cs_entry:
+                pairs = cs_entry.get('pairs') or []
+                orderbook_meta['cross_pairs'] = [_compact_pair(p) for p in pairs[:5]]
+            if orderbook_meta:
+                orderbook_meta['ts'] = ob_ts
+                orderbook_meta['stale_reason'] = ob_stale
+                meta['orderbook'] = orderbook_meta
             snaps = market_snapshots.get(entry.symbol) or {}
             futures_prices = [v.get('futures_price') for v in snaps.values() if v.get('futures_price')]
             funding_vals = [v.get('funding_rate') for v in snaps.values() if v.get('funding_rate') is not None]

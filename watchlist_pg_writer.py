@@ -5,7 +5,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
 # psycopg is not in requirements yet; keep import lazy and fail soft.
@@ -13,6 +13,8 @@ try:
     import psycopg
 except Exception:  # pragma: no cover - optional dependency
     psycopg = None  # type: ignore
+
+import requests
 
 
 def _utcnow() -> datetime:
@@ -48,6 +50,9 @@ class PgWriter:
         self._event_state: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # 缓存最近一次双腿信息，便于事件聚合时保留首/末腿快照
         self._last_legs: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        # funding history cache: key=(exchange,symbol,day_bucket)
+        self._funding_cache: Dict[Tuple[str, str, int], List[Tuple[datetime, float]]] = {}
+        self._funding_calls = 0
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -130,12 +135,131 @@ class PgWriter:
         n_required = max(1, int(self.config.consecutive_required or 1))
         cooldown = max(1, int(self.config.cooldown_minutes or 1))
 
+        def _funding_stats(series: List[Tuple[datetime, float]]) -> Dict[str, Any]:
+            if not series:
+                return {}
+            vals = [v for _, v in series]
+            mean = sum(vals) / len(vals)
+            var = sum((v - mean) ** 2 for v in vals) / len(vals) if vals else 0
+            std = var ** 0.5
+            last_ts, last_val = series[-1]
+            momentum = vals[-1] - vals[0] if len(vals) >= 2 else None
+            return {
+                "n": len(vals),
+                "mean": mean,
+                "std": std,
+                "min": min(vals),
+                "max": max(vals),
+                "last_ts": last_ts.isoformat(),
+                "last": last_val,
+                "momentum": momentum,
+            }
+
+        def _fetch_funding_hist(exchange: str, symbol: str, days: int = 7) -> List[Tuple[datetime, float]]:
+            # 简单缓存 + 限频，避免阻塞
+            if self._funding_calls >= 50:
+                return []
+            end_ts = _utcnow()
+            start_ts = end_ts - timedelta(days=days)
+            bucket = int(end_ts.timestamp()) // 3600  # 按小时缓存
+            key = (exchange, symbol, bucket)
+            if key in self._funding_cache:
+                return self._funding_cache[key]
+            url = None
+            params: Dict[str, Any] = {}
+            ex = exchange.lower()
+            if ex == "binance":
+                sym = symbol.upper()
+                if not sym.endswith("USDT"):
+                    sym = f"{sym}USDT"
+                url = "https://fapi.binance.com/fapi/v1/fundingRate"
+                params = {
+                    "symbol": sym,
+                    "startTime": int(start_ts.timestamp() * 1000),
+                    "endTime": int(end_ts.timestamp() * 1000),
+                    "limit": 1000,
+                }
+            elif ex == "okx":
+                inst = f"{symbol.upper()}-USDT-SWAP"
+                url = "https://www.okx.com/api/v5/public/funding-rate-history"
+                params = {"instId": inst, "limit": 100}
+            elif ex == "bybit":
+                sym = f"{symbol.upper()}USDT"
+                url = "https://api.bybit.com/v5/market/funding/history"
+                params = {
+                    "category": "linear",
+                    "symbol": sym,
+                    "start": int(start_ts.timestamp() * 1000),
+                    "end": int(end_ts.timestamp() * 1000),
+                    "limit": 200,
+                }
+            elif ex == "bitget":
+                sym = f"{symbol.upper()}USDT"
+                url = "https://api.bitget.com/api/v2/mix/market/history-fund-rate"
+                params = {
+                    "symbol": sym,
+                    "productType": "umcbl",
+                    "startTime": int(start_ts.timestamp() * 1000),
+                    "endTime": int(end_ts.timestamp() * 1000),
+                    "limit": 1000,
+                }
+            else:
+                return []
+
+            try:
+                resp = requests.get(url, params=params, timeout=5)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception:
+                return []
+
+            out: List[Tuple[datetime, float]] = []
+            def _add(ts_ms: int, rate_raw: Any) -> None:
+                try:
+                    ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                    if not (start_ts <= ts <= end_ts):
+                        return
+                    rate = float(rate_raw)
+                    out.append((ts, rate))
+                except Exception:
+                    return
+
+            if ex == "binance":
+                for item in data or []:
+                    _add(int(item.get("fundingTime")), item.get("fundingRate"))
+            elif ex == "okx":
+                for item in data.get("data") or []:
+                    _add(int(item.get("fundingTime")), item.get("realizedRate") or item.get("fundingRate"))
+            elif ex == "bybit":
+                for item in (data.get("result") or {}).get("list") or []:
+                    _add(int(item.get("fundingRateTimestamp")), item.get("fundingRate"))
+            elif ex == "bitget":
+                for item in data.get("data") or []:
+                    ts_raw = item.get("fundingTime") or item.get("timestamp")
+                    _add(int(ts_raw), item.get("fundingRate"))
+
+            out.sort(key=lambda x: x[0])
+            self._funding_cache[key] = out
+            self._funding_calls += 1
+            return out
+
         def leg_payload(legs: Optional[Dict[str, Any]], first: bool = False) -> Dict[str, Any]:
             if not legs:
                 return {}
             a = legs.get("a") or {}
             b = legs.get("b") or {}
-            return {
+            funding_hist: Dict[str, Any] = {}
+            for label, leg in (("a", a), ("b", b)):
+                if not leg or leg.get("kind") != "perp":
+                    continue
+                hist = _fetch_funding_hist(leg.get("exchange", ""), leg.get("symbol", ""))
+                if hist:
+                    tail = hist[-50:]
+                    funding_hist[label] = {
+                        "stats": _funding_stats(tail),
+                        "tail": [(ts.isoformat(), rate) for ts, rate in tail],
+                    }
+            payload = {
                 "leg_a_exchange": a.get("exchange"),
                 "leg_a_symbol": a.get("symbol"),
                 "leg_a_kind": a.get("kind"),
@@ -150,7 +274,9 @@ class PgWriter:
                 "leg_b_price_last": b.get("price"),
                 "leg_b_funding_rate_first": b.get("funding_rate") if first else None,
                 "leg_b_funding_rate_last": b.get("funding_rate"),
+                "funding_hist": funding_hist if funding_hist else None,
             }
+            return payload
 
         for row in rows_sorted:
             ts = row.get("ts") or now
@@ -182,7 +308,7 @@ class PgWriter:
                         "duration_sec": int((state["last_trigger_ts"] - state["start_ts"]).total_seconds())
                         if state["start_ts"]
                         else None,
-                        "features_agg": self._agg_finalize(state["agg"]),
+                        "features_agg": self._agg_finalize(state["agg"], legs=self._last_legs.get(key)),
                         "close": True,
                     }
                 )
@@ -219,6 +345,7 @@ class PgWriter:
                 state["start_ts"] = ts
                 state["event_id"] = None
                 legs = self._last_legs.get(key)
+                leg_fields = leg_payload(legs, first=True)
                 payload = {
                     "exchange": ex,
                     "symbol": sym,
@@ -227,9 +354,14 @@ class PgWriter:
                     "end_ts": ts,
                     "duration_sec": 0,
                     "triggered_count": state["triggered_count"],
-                    "features_agg": self._agg_finalize(state["agg"], legs=legs),
+                    "features_agg": self._agg_finalize(
+                        state["agg"],
+                        legs=legs,
+                        funding_hist=leg_fields.get("funding_hist"),
+                    ),
                 }
-                payload.update(leg_payload(legs, first=True))
+                leg_fields.pop("funding_hist", None)
+                payload.update(leg_fields)
                 ops["insert"].append(payload)
             elif state["open"] and state["event_id"]:
                 legs = self._last_legs.get(key)
@@ -239,7 +371,11 @@ class PgWriter:
                         "event_id": state["event_id"],
                         "end_ts": ts,
                         "duration_sec": int((ts - (state["start_ts"] or ts)).total_seconds()),
-                        "features_agg": self._agg_finalize(state["agg"], legs=self._last_legs.get(key)),
+                        "features_agg": self._agg_finalize(
+                            state["agg"],
+                            legs=self._last_legs.get(key),
+                            funding_hist=leg_fields.get("funding_hist"),
+                        ),
                         "triggered_count": state["triggered_count"],
                         "close": False,
                         **leg_fields,
@@ -277,7 +413,7 @@ class PgWriter:
         agg["meta_last"] = row.get("meta")
         return agg
 
-    def _agg_finalize(self, agg: Optional[Dict[str, Any]], legs: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    def _agg_finalize(self, agg: Optional[Dict[str, Any]], legs: Optional[Dict[str, Any]] = None, funding_hist: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         if not agg:
             return None
         out: Dict[str, Any] = {}
@@ -290,6 +426,8 @@ class PgWriter:
         out["meta_last"] = agg.get("meta_last")
         if legs:
             out["legs_last"] = legs
+        if funding_hist:
+            out["funding_hist"] = funding_hist
         out["count"] = agg.get("count")
         return out or None
 
@@ -302,13 +440,36 @@ class PgWriter:
         if not inserts and not updates:
             return
         def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+            """确保 JSON 可序列化并与 jsonb 兼容。"""
+            def _json_safe(val: Any) -> Any:
+                if isinstance(val, dict):
+                    return {k: _json_safe(v) for k, v in val.items()}
+                if isinstance(val, list):
+                    return [_json_safe(v) for v in val]
+                if isinstance(val, tuple):
+                    return [_json_safe(v) for v in val]
+                if isinstance(val, (datetime,)):
+                    return val.isoformat()
+                return val
+
             if psycopg is not None:
                 try:
                     from psycopg.types.json import Json  # type: ignore
                     if payload.get("features_agg") is not None:
-                        payload["features_agg"] = Json(payload["features_agg"])
+                        payload["features_agg"] = Json(_json_safe(payload["features_agg"]))
                 except Exception:
                     pass
+            return payload
+        def _ensure_event_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
+            required_keys = [
+                "leg_a_exchange", "leg_a_symbol", "leg_a_kind", "leg_a_price_first", "leg_a_price_last",
+                "leg_a_funding_rate_first", "leg_a_funding_rate_last",
+                "leg_b_exchange", "leg_b_symbol", "leg_b_kind", "leg_b_price_first", "leg_b_price_last",
+                "leg_b_funding_rate_first", "leg_b_funding_rate_last",
+                "triggered_count", "features_agg", "close", "end_ts", "duration_sec",
+            ]
+            for k in required_keys:
+                payload.setdefault(k, None if k != "close" else False)
             return payload
 
         try:
@@ -326,7 +487,7 @@ class PgWriter:
                                     %(leg_b_exchange)s, %(leg_b_symbol)s, %(leg_b_kind)s, %(leg_b_price_first)s, %(leg_b_price_last)s, %(leg_b_funding_rate_first)s, %(leg_b_funding_rate_last)s)
                             RETURNING id
                             """,
-                            _normalize_payload(ins),
+                            _normalize_payload(_ensure_event_defaults(ins)),
                         )
                         event_id = cur.fetchone()[0]
                         key = (ins["exchange"], ins["symbol"], ins["signal_type"])
@@ -339,7 +500,7 @@ class PgWriter:
                                SET end_ts = COALESCE(%(end_ts)s, end_ts),
                                    duration_sec = COALESCE(%(duration_sec)s, duration_sec),
                                    triggered_count = COALESCE(%(triggered_count)s, triggered_count),
-                                   features_agg = COALESCE(%(features_agg)s, features_agg),
+                                   features_agg = COALESCE(%(features_agg)s::jsonb, features_agg),
                                    leg_a_exchange = COALESCE(%(leg_a_exchange)s, leg_a_exchange),
                                    leg_a_symbol = COALESCE(%(leg_a_symbol)s, leg_a_symbol),
                                    leg_a_kind = COALESCE(%(leg_a_kind)s, leg_a_kind),
@@ -357,7 +518,7 @@ class PgWriter:
                                    status = CASE WHEN %(close)s THEN 'closed' ELSE status END
                              WHERE id = %(event_id)s
                             """,
-                            _normalize_payload(upd),
+                            _normalize_payload(_ensure_event_defaults(upd)),
                         )
             self.logger.info("event ops applied: %s inserts, %s updates", len(inserts), len(updates))
         except Exception as exc:

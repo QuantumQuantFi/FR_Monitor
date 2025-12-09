@@ -89,7 +89,7 @@ def fetch_binance(symbol: str):
     oi = _get_json(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period=5m&limit=1")
     ticker = _get_json(f"https://fapi.binance.com/fapi/v1/ticker/24hr?symbol={sym}")
     insurance = _get_json("https://fapi.binance.com/fapi/v1/insuranceBalance")
-    history = _get_json(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=20")
+    history = _get_json(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=200")
     components = _get_json(f"https://fapi.binance.com/fapi/v1/constituents?symbol={sym}")
     row = {
         "exchange": "binance",
@@ -162,7 +162,7 @@ def fetch_bybit(symbol: str):
     now = int(time.time() * 1000)
     ticker = _get_json(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}")
     insurance = _get_json("https://api.bybit.com/v5/market/insurance?coin=USDT")
-    history = _get_json(f"https://api.bybit.com/v5/market/funding/history?symbol={sym}&limit=20")
+    history = _get_json(f"https://api.bybit.com/v5/market/funding/history?category=linear&symbol={sym}&limit=200")
     components = _get_json(f"https://api.bybit.com/v5/market/index-price-components?indexName={sym}")
     row = {
         "exchange": "bybit",
@@ -237,7 +237,7 @@ def fetch_gate(symbol: str):
     now = int(time.time() * 1000)
     ticker = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/tickers?contract={sym}")
     stats = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/contract_stats?contract={sym}&limit=1")
-    history = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract={sym}&limit=20")
+    history = _get_json(f"https://api.gateio.ws/api/v4/futures/usdt/funding_rate?contract={sym}&limit=200")
     # Gate 未提供指数成分/保险金公开接口
     row = {
         "exchange": "gate",
@@ -290,7 +290,7 @@ def fetch_bitget(symbol: str):
     ticker = _get_json(f"https://api.bitget.com/api/v2/mix/market/ticker?productType=usdt-futures&symbol={sym}")
     oi = _get_json(f"https://api.bitget.com/api/v2/mix/market/open-interest?productType=usdt-futures&symbol={sym}")
     fund = _get_json(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=usdt-futures&symbol={sym}")
-    history = _get_json(f"https://api.bitget.com/api/v2/mix/market/history-fundRate?productType=usdt-futures&symbol={sym}&pageSize=20")
+    history = _get_json(f"https://api.bitget.com/api/v2/mix/market/history-fundRate?productType=usdt-futures&symbol={sym}&pageSize=200")
     # Bitget 指数组成/保险金暂无公开接口，标记为空
     row = {
         "exchange": "bitget",
@@ -372,7 +372,7 @@ def fetch_okx(symbol: str):
     mark_price = _get_json(f"https://www.okx.com/api/v5/public/mark-price?instType=SWAP&instId={sym}")
     index_px = _get_json(f"https://www.okx.com/api/v5/market/index-tickers?quoteCcy=USDT&instId={uly}")
     insurance = _get_json(f"https://www.okx.com/api/v5/public/insurance-fund?instType=SWAP&uly={uly}")
-    history = _get_json(f"https://www.okx.com/api/v5/public/funding-rate-history?instId={sym}&limit=20")
+    history = _get_json(f"https://www.okx.com/api/v5/public/funding-rate-history?instId={sym}&limit=200")
     components = _get_json(f"https://www.okx.com/api/v5/market/index-components?index={uly}")
     row = {
         "exchange": "okx",
