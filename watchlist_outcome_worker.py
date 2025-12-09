@@ -17,11 +17,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import psycopg
+import requests
 
 import config
 
 HORIZONS_MIN = [15, 30, 60, 240, 480, 1440, 2880, 5760]  # 15m,30m,1h,4h,8h,24h,48h,96h
 MAX_TASKS = 200  # 每次运行最多处理的 event-horizon 组合，防止扫全表
+MAX_REST_CALLS = 50  # 每轮允许的 REST 调用上限，防止过载
 
 
 def _utcnow() -> datetime:
@@ -150,6 +152,60 @@ def load_funding_series(
     return out
 
 
+class FundingHistoryFetcher:
+    """
+    轻量 REST funding 历史获取。当前只实现 Binance，其他交易所返回空。
+    """
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "watchlist-outcome-worker/1.0"})
+        self._cache: Dict[Tuple[str, str, int, int], List[Tuple[datetime, float]]] = {}
+        self._calls = 0
+
+    def fetch(self, exchange: str, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
+        if self._calls >= MAX_REST_CALLS:
+            return []
+        key = (exchange, symbol, int(start_ts.timestamp()), int(end_ts.timestamp()))
+        if key in self._cache:
+            return self._cache[key]
+        out: List[Tuple[datetime, float]] = []
+        try:
+            if exchange.lower() == "binance":
+                out = self._fetch_binance(symbol, start_ts, end_ts)
+            # 其他交易所可按需扩展
+        except Exception:
+            out = []
+        self._cache[key] = out
+        if out:
+            self._calls += 1
+        return out
+
+    def _fetch_binance(self, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
+        # Binance USDT 合约符号通常为 <base>USDT
+        sym = symbol.upper()
+        if not sym.endswith("USDT"):
+            sym = f"{sym}USDT"
+        params = {
+            "symbol": sym,
+            "startTime": int(start_ts.timestamp() * 1000),
+            "endTime": int(end_ts.timestamp() * 1000),
+            "limit": 1000,
+        }
+        resp = self.session.get("https://fapi.binance.com/fapi/v1/fundingRate", params=params, timeout=5)
+        resp.raise_for_status()
+        data = resp.json()
+        out: List[Tuple[datetime, float]] = []
+        for item in data:
+            try:
+                ts = datetime.fromtimestamp(item["fundingTime"] / 1000, tz=timezone.utc)
+                rate = float(item["fundingRate"])
+                out.append((ts, rate))
+            except Exception:
+                continue
+        return out
+
+
 def _build_funding_schedule(
     series: List[Tuple[datetime, Optional[float], Optional[float], Optional[datetime]]],
     start_ts: datetime,
@@ -221,6 +277,7 @@ def compute_outcome(
     symbol: str,
     start_ts: datetime,
     horizon_min: int,
+    rest_fetcher: Optional[FundingHistoryFetcher] = None,
 ) -> Optional[Dict[str, object]]:
     end_ts = start_ts + timedelta(minutes=horizon_min)
     snap_start = load_snapshot(sqlite_conn, exchange, symbol, start_ts)
@@ -248,9 +305,18 @@ def compute_outcome(
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             vol = math.sqrt(var)
 
-    # 资金费：按结算点累加
-    funding_series = load_funding_series(sqlite_conn, exchange, symbol, snap_start.ts, snap_end.ts)
-    funding_change, _used = _build_funding_schedule(funding_series, snap_start.ts, snap_end.ts)
+    funding_change = None
+    used_points: List[Tuple[datetime, float]] = []
+    # 优先尝试 REST funding 历史
+    if rest_fetcher:
+        rest_points = rest_fetcher.fetch(exchange, symbol, snap_start.ts, snap_end.ts)
+        if rest_points:
+            funding_change = sum(rate for _, rate in rest_points)
+            used_points = rest_points
+    if funding_change is None:
+        # 回退：本地 1min funding_rate + next_funding_time 推导
+        funding_series = load_funding_series(sqlite_conn, exchange, symbol, snap_start.ts, snap_end.ts)
+        funding_change, used_points = _build_funding_schedule(funding_series, snap_start.ts, snap_end.ts)
 
     pnl_spread = spread_end - spread_start
     pnl_funding = funding_change if funding_change is not None else 0.0
@@ -305,6 +371,7 @@ def main(loop_once: bool = True) -> None:
     logger = logging.getLogger("outcome_worker")
     pg_dsn = config.WATCHLIST_PG_CONFIG["dsn"]
     sqlite_path = config.WATCHLIST_CONFIG.get("db_path", "market_data.db")
+    fetcher = FundingHistoryFetcher()
     with sqlite3.connect(sqlite_path) as sqlite_conn, psycopg.connect(pg_dsn, autocommit=True) as pg_conn:
         ensure_unique_index(pg_conn)
         tasks = load_event_tasks(pg_conn)
@@ -318,7 +385,7 @@ def main(loop_once: bool = True) -> None:
                 (event_id, h),
             ).fetchone()]
             for h in missing:
-                out = compute_outcome(sqlite_conn, exchange, symbol, start_ts, h)
+                out = compute_outcome(sqlite_conn, exchange, symbol, start_ts, h, rest_fetcher=fetcher)
                 if not out:
                     continue
                 upsert_outcome(pg_conn, event_id, out)

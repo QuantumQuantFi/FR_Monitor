@@ -166,7 +166,7 @@
 - 资金费处理（从均值估算升级为结算点累加）：
   - 记录并使用资金费结算时间/周期：`funding_interval_hours`、`next_funding_time` 已在 raw/event 中；worker 按时间轴枚举 horizon 内的结算点逐笔累加，而非简单均值估算。
   - 周期动态：若 interval 变化，则分段累加；若缺 `next_funding_time`，用最近值推算，超出容忍则标记缺失。
-  - REST 补全（可选）：若本地缺资金费序列，可调用交易所历史资金费接口（Binance `/fapi/v1/fundingRate`、OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history` 等）仅拉取 horizon 覆盖时间段，命中率不足再退回均值估算。调用频率受限（每 5~10 分钟、仅缺口补）。
+  - REST 补全：若本地缺资金费序列，调用交易所历史资金费接口（当前 worker 已接入 Binance `/fapi/v1/fundingRate`，其他所可按需扩展）仅拉取 horizon 覆盖时间段，命中率不足再退回本地数据/推算。每轮有调用上限，避免过载。
 - 价差收益：按事件触发时的 spread（spot - perp）与 horizon 终点 spread 的差值；若做多现货空永续，则收益近似 `(spread_end - spread_start)`。
 - 资金费收益：按 perp 名义金额 * Σ(资金费率 * 周期小时/24)。需按实际结算时间累加；若 horizon 仅覆盖部分周期，可截断到 horizon 结束或按比例折算。
 - 总收益：价差收益 + 资金费收益。可附加 `max_drawdown`、`volatility`（未来窗口实现波动）、`basis_revert` 标签。
