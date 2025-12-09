@@ -182,6 +182,25 @@
 - 前端/回测使用：IC/IR 直接 join `watch_signal_event` 与 `future_outcome`；可加物化视图按 horizon 展平。
 - 待办：实现 worker 中的 funding 结算点累加、REST 缺口补偿；为 `funding_applied` 写入来源/时间；在 plan 中保持“资金费周期可能变动”的提示，并在结果中保留审计信息。
 
+### Outcome 实施现状（2025-12-09 审计）
+- 已实现：
+  - worker 已上线（手动运行成功），每次处理最多 200 个 event-horizon，防止扫全表。
+  - 资金费：优先 REST（Binance fundingRate，调用上限 50/轮）取 horizon 覆盖的结算点；否则用本地 1min 的 `next_funding_time` 离散结算点 + “结算点前最近资金费率”累加（不做均值）。
+  - 价差：起点/终点用最近 <= 目标时间的 1min 聚合；max_drawdown/volatility 用窗口内 spread 序列计算。
+  - 幂等 upsert：`event_id+horizon` 唯一。
+- 存在问题/缺口：
+  - `future_outcome` 仅少量样本（14 行），短 horizon 多为 0/None，原因可能是数据缺口或终点与起点相同。
+  - 大部分 `next_funding_time`/funding 在 PG raw 里为空，非 Binance 资金费缺口较大；需扩展 REST（OKX/Bybit/Bitget 等）或采集层补写。
+  - 未记录 `funding_applied` 明细，无法审计用到了哪些结算点/来源。
+  - 对缺失数据未标记 label.missing，易与有效样本混淆。
+  - 运行方式仍手动，未加 cron/后台守护。
+- 下一步改进：
+  - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
+  - 如果 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
+  - 在 outcome 中写入 `funding_applied`（包含结算时间、费率、来源 rest/local）。
+  - 增加 cron（每 10 分钟）或后台线程自动跑 worker。
+  - 监控/日志：统计缺数据比例、REST 命中率、调用次数，便于调优。
+
 ## 当前资源快照（阶段 0 执行）
 - 磁盘：`/` 232G，总用 141G，可用 ~92G（61% 已用）；短期可预留 10GB 给 PG，需保持 <80%。
 - 内存：15Gi，总用 4.5Gi，free 0.39Gi，buff/cache 10Gi，可用 ~10Gi；Swap 未开，需避免 PG 占用过大。
