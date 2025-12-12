@@ -40,6 +40,7 @@ runtime/
 *.tsv
 *.pid
 binance_contract_cache.json
+reports/
 
 # IDE
 .vscode/

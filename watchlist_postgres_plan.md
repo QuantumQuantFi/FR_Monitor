@@ -120,8 +120,8 @@
 
 ### 事件归并规则（草案）
 - 触发条件：连续 N 分钟满足阈值才生成 event（默认 N=2）；冷静期 M 分钟内重复满足视为同一 event（默认 M=3）。
-- 事件窗口：`start_ts`=首次满足时间；`end_ts`=最后一次满足或冷静期结束；`duration_sec`=差值。
-- 特征聚合：`features_agg` 记录首末值、均值、极值（spread、funding、volatility、range、slope、book_impact 等）。
+- 事件窗口（以代码实现为准）：`start_ts`=满足 N 连续触发时刻（即 “确认入场时点/decision_ts”，不是首次触发时刻）；`end_ts`=最后一次满足或冷静期结束；`duration_sec`=差值。
+- 特征聚合：`features_agg` 记录首末值、极值（当前已聚合 spread/funding/跨所最优差等）；**注意回测避免泄露**：event 会在后续分钟持续更新 `features_agg.last/min/max`，不能直接拿“最终版 features_agg”当入场因子。
 - 去重/防抖：相同 `exchange+symbol+signal_type` 且 `start_ts` 间隔 < M 的 event 合并。
 
 ## 分阶段落地计划
@@ -143,6 +143,58 @@
 - 存储侧：分区 + 短保留优先，压缩次之；核心数值列拆开，长尾字段放 JSONB。  
 - 查询侧：`/api/watchlist` 与 `/api/watchlist/metrics` 先读内存缓存/Redis（保持与现有前端刷新节奏一致），PG 作为冷启动或回溯数据源；`/api/watchlist/series` 直接查 `watchlist_series_agg` 12h 窗口；回测/看板/IC 计算走 `watch_signal_event + future_outcome` 或物化视图，限制时间范围避免扫热表。
   - IC/IR 计算：优先从 `watch_signal_event` 拉事件，再 join `future_outcome` 多 horizon（例如 30/60/180/360 分钟）；对照基准用 `watchlist_symbol_ref` 或外部行情。
+
+## 回测/IC：用 event 预测 outcome PnL（推荐口径）
+目标：把 `watch_signal_event` 当作“可交易机会的触发点”，用事件时点可得的因子去预测 `future_outcome` 的未来收益（`pnl/spread_change/funding_change`），并对每个因子计算 IC/IR。
+
+### 1) 数据集定义（避免信息泄露）
+- 决策时点：`decision_ts = watch_signal_event.start_ts`（代码里是满足 N 连续触发的那一分钟）。
+- 因子快照（强烈建议）：用 `watch_signal_raw` **在 `ts=decision_ts` 的那一行**作为因子输入（它是当时 refresh 计算出来的快照，不会被“事件后续分钟”覆盖）。
+  - join 方式：`watch_signal_event` → LATERAL 子查询取 `watch_signal_raw`（同 `exchange/symbol/signal_type/ts`），`ORDER BY id DESC LIMIT 1`。
+  - 同时保留 event 的腿字段（`leg_*_exchange/symbol/kind/price_first/funding_rate_first/...`）作为结构化特征来源。
+- label：用 `future_outcome`（`event_id + horizon_min` 唯一）：
+  - 默认 label：`pnl`（现阶段= `spread_change + funding_change`，不含手续费/滑点）。
+  - 辅助 label：`spread_change`（只看价差回归）、`funding_change`（只看资金费贡献）。
+  - Type B 特别注意：当前 `spread_change/pnl` 的符号会受 “腿顺序（leg_a/leg_b）” 影响；做 IC/回测前需要做 **canonical 化**（例如：perp-perp 情况下若 `leg_a_price_first > leg_b_price_first` 则对 `spread_change` 取负，使 “价差收敛” 恒为正 label），或在 worker 中直接落库 `spread_change_canon/pnl_canon`。
+  - 建议顺序：先用 `spread_change_canon` 做第一版 IC/IR（只评估价差回归，不受 funding 方向/结算点缺口影响），再在 funding 链路审计完全稳定后引入 `pnl`。
+- 样本范围：保持 “复合 A/B/C 条件触发池” 原样（raw 只写 active/watchlist，天然是正样本池）；回测/IC 的结论仅对该触发池有效（存在选择偏差属预期）。
+
+### 2) 因子库（第一版建议）
+从 `raw + event legs` 直接可得、且不引入未来信息的因子（示例）：
+- 价差：`spread_rel`（raw），或由 `leg_*_price_first` 计算；`abs(spread_rel)`。
+- 波动/区间/趋势（raw）：`volatility`、`range_1h`、`range_12h`、`slope_3m`、`crossings_1h`、`drift_ratio`。
+- 资金费结构（event legs）：`leg_a_funding_rate_first`、`leg_b_funding_rate_first`、`funding_rate_diff = a-b`、`max_abs_funding`。
+- 资金费时点/周期（event legs）：`time_to_next_funding_min = min(perp_legs(next_funding_time - decision_ts))`、`funding_interval_hours`（perp leg）。
+- 盘口/跨所最优差（raw）：`best_buy_high_sell_low`、`best_sell_high_buy_low`、`funding_diff_max`、`premium_index_diff`（若非空）。
+
+### 3) IC/IR 计算口径（建议先用横截面 IC）
+- 对每个 horizon 单独算一套 IC/IR（例如 60m/240m/480m）。
+- 分桶：把事件按 `decision_ts` 做时间分桶（例如每 60 分钟一个 bucket，或按自然日）。
+- 在每个 bucket 内做横截面相关：
+  - IC：`SpearmanCorr(factor, label)`（推荐秩相关，鲁棒些）。
+  - IR：`mean(IC_t) / std(IC_t)`（也可输出 t-stat：`mean / (std/sqrt(n))`）。
+- 去重/重叠处理（可选但推荐）：同一 `symbol+signal_type` 在同一 bucket 只保留第一条/最大绝对价差一条，避免重复样本抬高置信度；horizon 重叠导致的自相关要在报告里明确。
+
+### 4) “回测能否开始”的验收门槛（最小集）
+- 覆盖率：目标 horizon（如 60m/240m/480m）在 `future_outcome` 覆盖率 >95%（`pnl` 非空）。
+- 可用性：`watch_signal_raw` 在 `ts=event.start_ts` 的 join 命中率 >99%（否则说明写入/对齐仍有问题）。
+- schedule：perp 腿 `next_funding_time/funding_interval_hours` 缺失率低（回测可先只做 `spread_change`，再逐步引入 funding label）。
+
+### 5) 落地步骤（从“能算 IC”到“能回测策略”）
+1) 先做数据集抽取（SQL/view）并固化字段清单（raw + legs + outcome）。
+2) 先跑 “单 horizon + 少量因子” 的 IC/IR，确认方向正确、无明显泄露。
+3) 扩到多 horizon、多分组（signal_type/交易所组合/币种流动性分层）。
+4) 才引入策略约束做回测：并发上限、冷静期、持仓时长、止损/止盈、费用/滑点、资金费结算点对齐审计。
+
+### 工具与命令（现成可跑）
+- IC/IR 脚本（直接读 PG）：`backtest/pg_event_ic_ir.py`
+  - 示例：`venv/bin/python backtest/pg_event_ic_ir.py --days 7 --horizon-min 240 --signal-types B,C --label spread_change_canon --bucket-min 60 --min-bucket-n 10`
+- 首次回测报告（多 horizon + 分组 + CSV/Markdown）：`backtest/first_backtest_report.py`
+  - 示例（最近 1 天，先用 canonical outcome）：`venv/bin/python backtest/first_backtest_report.py --days 1 --horizons 60,240,480 --signal-types A,B,C --label pnl --bucket-min 60 --min-bucket-n 10 --quantiles 5 --dedup max_abs_spread --require-position-rule --breakdown signal_type --out-dir reports`
+- 数据集抽取 SQL 模板：`scripts/watchlist_event_factor_outcome.sql`
+- Outcome 口径回填/重算（用于修复 canonical 与 funding 方向后覆盖历史）：`watchlist_outcome_worker.py`
+  - 示例（按窗口分批，从最近往前扫）：`venv/bin/python watchlist_outcome_worker.py --recompute-since 2025-12-11T00:00:00+00:00 --recompute-until 2025-12-12T00:00:00+00:00 --recompute-horizons all --recompute-limit 50000 --max-tasks 5000`
+  - 抽样审计（重算对比）：`venv/bin/python scripts/audit_future_outcome_pnl_components.py --days 1 --horizon-min 480 --limit 50 --use-rest`
 
 ## 事件 / outcome 实施细节（结合现有代码）
 - 触发入口：`watchlist_manager.refresh()` 现有刷新周期；在刷新后调用写入适配层，按符号产生 raw 记录。
@@ -175,10 +227,11 @@
   - 记录并使用资金费结算时间/周期：raw 已写入 `funding_interval_hours/next_funding_time`；event 侧通过新增列 + 回填脚本补齐 schedule（见下方“历史回填”）；worker 按时间轴枚举 horizon 内的结算点逐笔累加，而非简单均值估算。
   - 周期动态：若 interval 变化，则分段累加；若缺 `next_funding_time`，用最近值推算，超出容忍则标记缺失。
   - REST 补全：若本地缺资金费序列，调用交易所历史资金费接口（当前 worker 已接入 Binance `/fapi/v1/fundingRate`，其他所可按需扩展）仅拉取 horizon 覆盖时间段，命中率不足再退回本地数据/推算。每轮有调用上限，避免过载。
-- 价差收益：按事件触发时的 spread（spot - perp）与 horizon 终点 spread 的差值；若做多现货空永续，则收益近似 `(spread_end - spread_start)`。
-- 资金费收益：按 perp 名义金额 * Σ(资金费率 * 周期小时/24)。需按实际结算时间累加；若 horizon 仅覆盖部分周期，可截断到 horizon 结束或按比例折算。
-- 总收益：价差收益 + 资金费收益。可附加 `max_drawdown`、`volatility`（未来窗口实现波动）、`basis_revert` 标签。
-- 落库字段（`future_outcome`）：`event_id`，`horizon_min`，`pnl_total`，`pnl_spread`，`pnl_funding`，`spread_start/end`，`funding_applied jsonb`（记录 funding 时间点与费率来源、本地/REST）、`max_drawdown`，`volatility`，`label jsonb`（正/负例或分位），`computed_at`。
+- 价差收益（canonical）：用对冲后的 **log 比值**作为价差度量：`spread_metric = log(short_price/long_price)`，并定义 `pnl_spread = spread_metric_start - spread_metric_end`（价差向 0 收敛为正收益）。
+  - Type C：固定 `long=spot`、`short=perp`（现货低于永续）；Type B：固定 `long=低价 perp`、`short=高价 perp`；Type A：默认按“收资金费”方向选择 `long/short`（见下方 `label.position_rule`）。
+- 资金费收益（canonical）：按结算点逐笔累加 realized funding rates（REST 优先），并按持仓方向取符号：`long` 视作 **支付** `+rate`，`short` 视作 **收取** `+rate`，因此单腿资金费贡献为 `pnl_funding_leg = -pos_sign * Σ(rate)`（`pos_sign=+1` long，`-1` short）。不再按 `interval_hours/24` 二次折算（API 返回的 fundingRate 已是该次结算应计比例）。
+- 总收益：`pnl_total = pnl_spread + pnl_funding`。同时在 `future_outcome.label` 里落库 `spread_metric_start/end`、`pnl_spread/pnl_funding/pnl_total` 与 `position_rule`，用于审计与回测口径锁定。
+- 落库字段（`future_outcome`，以当前表结构为准）：`event_id`，`horizon_min`，`pnl`（= `pnl_total`），`spread_change`（= `pnl_spread`），`funding_change`（= `pnl_funding`），`max_drawdown`，`volatility`，`funding_applied jsonb`（记录 funding 时间点、费率、来源、持仓方向），`label jsonb`（落库 canonical 口径与审计信息）。
 - 计算流程（worker）：
   1) 周期扫描 `watch_signal_event` 表，选取 `status in ('open','closed')` 且尚未产生目标 horizon outcome 的事件。
   2) 对每个 horizon（15/30/60/240/480/1440/2880/5760m），检查当前时间是否已超过 `start_ts + horizon`。未到期跳过，已到期则计算。
@@ -189,6 +242,7 @@
 - 任务节奏：worker 每 5~10 分钟跑一轮；horizon 多，计算量小（事件数量低）。
 - 前端/回测使用：IC/IR 直接 join `watch_signal_event` 与 `future_outcome`；可加物化视图按 horizon 展平。
 - 待办：实现 worker 中的 funding 结算点累加、REST 缺口补偿；为 `funding_applied` 写入来源/时间；在 plan 中保持“资金费周期可能变动”的提示，并在结果中保留审计信息。
+  - 审计脚本：`scripts/audit_future_outcome_pnl_components.py`（抽样重算并对比 PG 已落库的 `pnl/spread_change/funding_change`）。
 
 ### Outcome 实施现状（2025-12-12 审计）
 - 数据量（当前 PG）：
