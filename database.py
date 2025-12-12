@@ -306,6 +306,27 @@ class PriceDatabase:
         except Exception as e:
             print(f"数据清理错误: {e}")
 
+    def checkpoint_and_vacuum(self, vacuum_timeout: float = 600.0):
+        """执行 WAL checkpoint + VACUUM，减少 WAL 和碎片。"""
+        start = time.time()
+        try:
+            with self._get_connection() as conn:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except Exception as exc:
+            print(f"WAL checkpoint 失败: {exc}")
+            return
+
+        try:
+            # VACUUM 需要独占锁，可能耗时，临时提升超时时间
+            with sqlite3.connect(self.db_path, timeout=vacuum_timeout) as conn:
+                conn.execute("VACUUM")
+        except Exception as exc:
+            print(f"VACUUM 失败: {exc}")
+            return
+
+        elapsed = time.time() - start
+        print(f"WAL checkpoint + VACUUM 完成，耗时 {elapsed:.2f}s")
+
     def get_latest_prices(self, symbol):
         """获取最新价格数据"""
         try:

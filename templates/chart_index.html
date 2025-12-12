@@ -496,8 +496,7 @@
                     <option value="1">1小时</option>
                     <option value="6">6小时</option>
                     <option value="24">24小时</option>
-                    <option value="168">7天</option>
-                    <option value="720" selected>30天</option>
+                    <option value="168" selected>7天</option>
                 </select>
             </div>
             <div class="control-group">
@@ -645,6 +644,10 @@
         const DEFAULT_INTERVAL = "{{ default_chart_interval }}";
         let relativeComparisonSources = [];
         let relativeReferenceKey = null;
+        let chartRefreshTimer = null;
+        const DEFAULT_REFRESH_MS = 30000;
+        const MEDIUM_REFRESH_MS = 60000;
+        const LONG_REFRESH_MS = 900000; // 7天以上拉长刷新，避免重复重算
         const chartVisibilityStore = {};
         const defaultLegendClickHandler = (typeof Chart !== 'undefined' && Chart.defaults && Chart.defaults.plugins && Chart.defaults.plugins.legend)
             ? Chart.defaults.plugins.legend.onClick
@@ -2267,8 +2270,24 @@
         // 更新图表
         function updateCharts() {
             updateChartData();
+            scheduleChartRefresh();
         }
-        
+
+        function scheduleChartRefresh() {
+            if (chartRefreshTimer) {
+                clearInterval(chartRefreshTimer);
+                chartRefreshTimer = null;
+            }
+            const timeRange = parseInt(document.getElementById('timeRange').value || '1', 10);
+            let intervalMs = DEFAULT_REFRESH_MS;
+            if (timeRange >= 168) {
+                intervalMs = LONG_REFRESH_MS;
+            } else if (timeRange >= 24) {
+                intervalMs = MEDIUM_REFRESH_MS;
+            }
+            chartRefreshTimer = setInterval(updateChartData, intervalMs);
+        }
+
         // 重置缩放
         function resetZoom() {
             Object.values(charts).forEach(chart => {
@@ -2294,8 +2313,8 @@
             input.addEventListener('input', (e) => filterButtons(e.target.value));
             input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goSearch(); });
             
-            // 设置定时刷新（每30秒）
-            setInterval(updateChartData, 30000);
+            // 设置定时刷新（窗口越大刷新越慢，7天按15分钟刷新）
+            scheduleChartRefresh();
 
             // 单币种卡片每秒刷新一次
             fetchAndRenderSymbolCard();

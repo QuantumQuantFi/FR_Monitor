@@ -170,7 +170,7 @@ SUPPORTED_SYMBOLS = [
 ]
 
 # 数据刷新间隔（秒） - 优化频率减少资源消耗
-DATA_REFRESH_INTERVAL = 2.0  # 2秒，减少主循环频率
+DATA_REFRESH_INTERVAL = 15.0  # 进一步放缓主循环，减少CPU占用避免接口阻塞
 
 # WebSocket数据推送频率控制（秒） - 同一币种数据更新间隔
 WS_UPDATE_INTERVAL = 3.0  # 3秒，同一币种数据更新间隔

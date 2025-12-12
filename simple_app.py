@@ -62,6 +62,10 @@ LOG_FILE_NAME = "simple_app.log"
 LOG_MAX_BYTES = 25 * 1024 * 1024  # 25MB per file, 4 files total <=100MB
 LOG_BACKUP_COUNT = 3  # plus the active file -> 4*25MB = 100MB cap
 _LOGGING_CONFIGURED = False
+RUNTIME_DIR = os.environ.get("SIMPLE_APP_RUNTIME_DIR", os.path.join("runtime", "simple_app"))
+os.makedirs(RUNTIME_DIR, exist_ok=True)
+DAILY_DB_MAINTENANCE_HOUR_UTC = 4  # 04:00 UTC 低峰期执行 WAL checkpoint + VACUUM
+DAILY_DB_MAINTENANCE_STATE = os.path.join(RUNTIME_DIR, "daily_db_maintenance.json")
 EXCHANGE_DISPLAY_ORDER = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid']
 
 ORDERBOOK_CACHE: Dict[tuple, Dict[str, Any]] = {}
@@ -105,10 +109,14 @@ CHART_INTERVAL_MINUTES = {
     '4h': 240,
     '1day': 1440,
 }
-DEFAULT_CHART_INTERVAL = '5min'
+DEFAULT_CHART_INTERVAL = '15min'
 CHART_INTERVAL_LABEL_MAP = {value: label for value, label in CHART_INTERVAL_OPTIONS}
-CHART_CACHE_TTL_SECONDS = 60
+CHART_CACHE_TTL_SECONDS = 900  # 15 分钟缓存，便于大窗口重复请求直接命中
 CHART_CACHE_MAX_ENTRIES = 64
+CHART_MAX_HOURS = 168  # 图表查询最大时间范围（小时），避免拉取超大窗口导致超时
+CHART_PREWARM_ITEMS = [
+    {'symbol': 'AIA', 'hours': 168, 'interval': '15min'},
+]
 _chart_cache = {}
 _chart_cache_lock = threading.Lock()
 
@@ -134,6 +142,56 @@ def _set_chart_cache_entry(cache_key, payload):
             oldest_key = min(_chart_cache.items(), key=lambda item: item[1]['timestamp'])[0]
             _chart_cache.pop(oldest_key, None)
         _chart_cache[cache_key] = {'timestamp': now, 'payload': payload}
+
+
+def prewarm_chart_cache(items=None):
+    """在启动时预热部分大窗口图表，避免首个请求超时。"""
+    items = items or CHART_PREWARM_ITEMS
+    logger = logging.getLogger('charts')
+    for item in items:
+        symbol = (item or {}).get('symbol')
+        if not symbol:
+            continue
+        hours = (item or {}).get('hours', 168)
+        interval = (item or {}).get('interval', DEFAULT_CHART_INTERVAL)
+        try:
+            with app.test_request_context(f"/api/chart/{symbol}?hours={hours}&interval={interval}"):
+                resp = get_chart_data(symbol)
+                status_code = getattr(resp, "status_code", None)
+                if status_code and status_code >= 400:
+                    logger.warning("chart prewarm failed symbol=%s hours=%s interval=%s status=%s", symbol, hours, interval, status_code)
+                else:
+                    print(f"chart prewarm done: {symbol} hours={hours} interval={interval}")
+                    logger.info("chart prewarm done symbol=%s hours=%s interval=%s", symbol, hours, interval)
+        except Exception as exc:
+            print(f"chart prewarm error {symbol} hours={hours} interval={interval}: {exc}")
+            logger.warning("chart prewarm error symbol=%s hours=%s interval=%s err=%s", symbol, hours, interval, exc)
+
+
+def _load_daily_maintenance_state() -> dict:
+    try:
+        with open(DAILY_DB_MAINTENANCE_STATE, "r", encoding="utf-8") as fp:
+            return json.load(fp)
+    except Exception:
+        return {}
+
+
+def _mark_daily_db_maintenance(now_utc: datetime) -> None:
+    state = {"last_run_date": now_utc.date().isoformat()}
+    try:
+        with open(DAILY_DB_MAINTENANCE_STATE, "w", encoding="utf-8") as fp:
+            json.dump(state, fp)
+    except Exception:
+        pass
+
+
+def _should_run_daily_db_maintenance(now_utc: datetime) -> bool:
+    """Return True if we are within the daily maintenance window and not already run."""
+    if now_utc.hour != DAILY_DB_MAINTENANCE_HOUR_UTC:
+        return False
+    state = _load_daily_maintenance_state()
+    last_run = state.get("last_run_date")
+    return last_run != now_utc.date().isoformat()
 
 
 def configure_logging() -> None:
@@ -1319,7 +1377,7 @@ def background_data_collection():
             timestamp = observed_at.isoformat()
             
             # 为每个币种保存历史数据 - 使用动态支持列表，兼容LINEA等新币
-            for symbol in data_collector.supported_symbols:
+            for idx, symbol in enumerate(data_collector.supported_symbols):
                 premium_data = data_collector.calculate_premium(symbol)
                 futures_prices = {}
                 
@@ -1383,6 +1441,9 @@ def background_data_collection():
                             f"{signal.short_exchange}->{signal.long_exchange}",
                             f"spread={signal.spread_percent:.2f}%",
                         )
+
+                # 每个币种处理后短暂让出 GIL，避免长时间占用导致接口阻塞
+                time.sleep(0.01)
             
             # 定期维护任务（每5分钟执行一次）
             current_time = datetime.now()
@@ -1422,6 +1483,13 @@ def background_data_collection():
                     # 数据库维护（降低频率）
                     db.aggregate_to_1min()
                     db.cleanup_old_data()
+
+                    # 每日 04:00 UTC 额外做一次 WAL checkpoint + VACUUM（提前写完缓冲）
+                    now_utc = datetime.utcnow()
+                    if _should_run_daily_db_maintenance(now_utc):
+                        print("开始每日数据库维护: WAL checkpoint + VACUUM")
+                        db.checkpoint_and_vacuum()
+                        _mark_daily_db_maintenance(now_utc)
                     
                     last_maintenance = current_time
                     print("定期维护任务完成")
@@ -1730,7 +1798,7 @@ def watchlist_db_view():
         table_key = 'raw'
     table_name, order_col = table_map[table_key]
 
-    def _shorten(val: Any, max_len: int = 200) -> str:
+    def _stringify(val: Any) -> str:
         if val is None:
             return ''
         try:
@@ -1742,8 +1810,6 @@ def watchlist_db_view():
                 text = str(val)
         except Exception:
             text = str(val)
-        if len(text) > max_len:
-            return text[:max_len] + ' …'
         return text
 
     rows: List[Dict[str, Any]] = []
@@ -1769,11 +1835,11 @@ def watchlist_db_view():
             fetched = cur.fetchall()
             if dict_row:
                 for r in fetched:
-                    rows.append({k: _shorten(v) for k, v in r.items()})
+                    rows.append({k: _stringify(v) for k, v in r.items()})
             else:
                 cols = [d.name for d in cur.description] if cur.description else []
                 for r in fetched:
-                    rows.append({col: _shorten(val) for col, val in zip(cols, r)})
+                    rows.append({col: _stringify(val) for col, val in zip(cols, r)})
     except Exception as exc:
         error = str(exc)
 
@@ -1973,6 +2039,8 @@ def execute_dual_trade():
 def get_chart_data(symbol):
     """获取图表数据API - 优化格式用于Chart.js"""
     symbol = symbol.upper()
+    request_start = time.time()
+    chart_logger = logging.getLogger('charts')
     # 使用动态支持列表
     if symbol not in data_collector.supported_symbols:
         return jsonify({'error': 'Unsupported symbol'}), 400
@@ -1983,8 +2051,8 @@ def get_chart_data(symbol):
     interval = request.args.get('interval', DEFAULT_CHART_INTERVAL)
     interval = (interval or DEFAULT_CHART_INTERVAL).lower()
     
-    # 限制查询范围
-    hours = min(hours, 720)  # 最多30天
+    # 限制查询范围，避免过大窗口拖慢数据库
+    hours = min(hours, CHART_MAX_HOURS)
     
     supported_intervals = set(CHART_INTERVAL_MINUTES.keys()) | {'raw'}
     if interval not in supported_intervals:
@@ -1994,6 +2062,14 @@ def get_chart_data(symbol):
     
     cache_key = (symbol, exchange or '', interval, hours)
     cached_entry = _get_chart_cache_entry(cache_key)
+
+    # 同一 (symbol, interval, hours) 请求在 60s 内直接返回缓存，避免重复重算/重查
+    if cached_entry:
+        payload = dict(cached_entry['payload'])
+        payload['from_cache'] = True
+        payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
+        return precision_jsonify(payload)
+
     raw_data = None
     last_error = None
     retry_attempts = 3
@@ -2085,9 +2161,26 @@ def get_chart_data(symbol):
             'timestamp': now_utc_iso()
         }
         _set_chart_cache_entry(cache_key, response_payload)
+        chart_logger.warning(
+            "chart response built symbol=%s hours=%s interval=%s rows=%s elapsed=%.3fs from_cache=%s",
+            symbol,
+            hours,
+            interval,
+            sum(len(v['labels']) for v in chart_data.values()),
+            time.time() - request_start,
+            False,
+        )
         return precision_jsonify(response_payload)
         
     except Exception as e:
+        chart_logger.warning(
+            "chart response failed symbol=%s hours=%s interval=%s elapsed=%.3fs error=%s",
+            symbol,
+            hours,
+            interval,
+            time.time() - request_start,
+            e,
+        )
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/latest/<symbol>')
@@ -2377,6 +2470,10 @@ if __name__ == '__main__':
     print("👀 启动Binance关注列表刷新线程...")
     watchlist_thread = threading.Thread(target=watchlist_refresh_loop, daemon=True)
     watchlist_thread.start()
+
+    print("🔥 启动图表预热线程（7天大窗口）...")
+    chart_prewarm_thread = threading.Thread(target=prewarm_chart_cache, name="chart-prewarm", daemon=True)
+    chart_prewarm_thread.start()
     
     print("🌐 启动Web服务器...")
     print("📊 系统状态监控: http://localhost:4002/api/system/status")
