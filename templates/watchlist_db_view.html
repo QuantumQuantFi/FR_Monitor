@@ -4,16 +4,37 @@
     <meta charset="UTF-8">
     <title>Watchlist 数据库浏览</title>
     <style>
-        body { font-family: Arial, sans-serif; padding: 16px; }
+        * { box-sizing: border-box; }
+        body { font-family: Arial, sans-serif; padding: 16px; background: #f7f9fb; color: #111; }
         h2 { margin-top: 0; }
-        form { margin-bottom: 12px; }
-        table { border-collapse: collapse; width: 100%; font-size: 13px; }
-        th, td { border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }
-        th { background: #f2f2f2; position: sticky; top: 0; }
+        form { margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        .table-wrap {
+            margin-top: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 8px;
+            background: #fff;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.06);
+            overflow: auto;
+            max-height: 75vh;
+        }
+        table { border-collapse: collapse; width: 100%; min-width: 960px; font-size: 13px; table-layout: fixed; }
+        th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 10px; vertical-align: top; }
+        th { background: #f3f4f6; position: sticky; top: 0; z-index: 2; text-align: left; }
+        tbody tr:nth-child(even) td { background: #fafbfc; }
+        tbody tr:hover td { background: #f6f8fb; }
         .error { color: #c00; margin-bottom: 10px; }
         .pager { margin-top: 8px; }
         .pager a { margin-right: 12px; text-decoration: none; color: #0366d6; }
         .meta { color: #555; }
+        .cell-box {
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 260px;
+            overflow: auto;
+            font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+            line-height: 1.35;
+        }
+        .tip { color: #6b7280; font-size: 12px; margin-top: 4px; line-height: 1.45; }
     </style>
 </head>
 <body>
@@ -41,33 +62,42 @@
     {% if total_count is not none %}
         <div class="meta">总行数：{{ total_count }} （可能略有延迟）</div>
     {% endif %}
+    <div class="tip">
+        提示：长文本（如 meta/features_agg）已允许换行和滚动，鼠标悬停可查看完整内容。<br>
+        outcome 表字段含义：pnl = spread_change + funding_change，其中 spread_change = (legA_end-legB_end)/legA_end - (legA_start-legB_start)/legA_start，
+        funding_change 为两条永续腿在区间内的资金费结算累加（spot 腿资金费视为 0）。方向采用 legA 为基准价差，未做杠杆/仓位倍数放大。
+    </div>
 
-    <table>
-        <thead>
-            <tr>
-                {% if columns %}
-                    {% for c in columns %}
-                        <th>{{ c }}</th>
+    <div class="table-wrap">
+        <table>
+            <thead>
+                <tr>
+                    {% if columns %}
+                        {% for c in columns %}
+                            <th>{{ c }}</th>
+                        {% endfor %}
+                    {% else %}
+                        <th>无数据</th>
+                    {% endif %}
+                </tr>
+            </thead>
+            <tbody>
+                {% if rows %}
+                    {% for row in rows %}
+                        <tr>
+                            {% for c in columns %}
+                                <td title="{{ row[c] }}">
+                                    <div class="cell-box">{{ row[c] }}</div>
+                                </td>
+                            {% endfor %}
+                        </tr>
                     {% endfor %}
                 {% else %}
-                    <th>无数据</th>
+                    <tr><td colspan="{{ columns|length if columns else 1 }}">暂无数据</td></tr>
                 {% endif %}
-            </tr>
-        </thead>
-        <tbody>
-            {% if rows %}
-                {% for row in rows %}
-                    <tr>
-                        {% for c in columns %}
-                            <td>{{ row[c] }}</td>
-                        {% endfor %}
-                    </tr>
-                {% endfor %}
-            {% else %}
-                <tr><td colspan="{{ columns|length if columns else 1 }}">暂无数据</td></tr>
-            {% endif %}
-        </tbody>
-    </table>
+            </tbody>
+        </table>
+    </div>
 
     <div class="pager">
         {% if page > 1 %}
