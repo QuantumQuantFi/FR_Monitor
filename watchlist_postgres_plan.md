@@ -189,15 +189,18 @@
 
 ### Outcome 实施现状（2025-12-12 审计）
 - 数据量（当前 PG）：
-  - raw 142k 行（2025-12-08 起）；其中 A（binance）~11k、B ~86k、C ~16k。
-  - event 5.8k 行；约 6.9% 旧事件缺双腿（404 行），被 outcome 自动跳过。
-  - future_outcome 覆盖较好：15/30/60/240/480m 各 ~5k 行，1440m ~3.1k 行，2880m ~1.3k 行；仅 2 行 funding_applied 为空。
-  - watchlist_series_agg / watchlist_symbol_ref / watchlist_outcome 仍为空（未启用/未落库）。
+  - raw 145,229 行（2025-12-08 起）；A=16,149（binance），B=106,893（multi），C=22,187（multi）。
+  - event 5,939 行；双腿字段缺失=0。
+  - future_outcome：15m=5,860，30m=5,854，60m=5,823，240m=5,688，480m=5,534，1440m=4,081，2880m=1,788；`pnl` 均非空；`funding_applied` 仅少数为空（15/30/60/240/480m 各 2 行）。
+  - watchlist_series_agg / watchlist_symbol_ref / watchlist_outcome：仍为空（未启用/未落库）。
 - 发现的问题/缺口（以回测/一致性为目标）：
-  - Type B/C raw/event 的 `funding_interval_hours` 与 `next_funding_time` 目前为空（exchange=multi），双腿也未写 `leg_*_next_funding_time`，导致资金费累加只能依赖 REST 推断，审计困难。
-  - Type B/C 的窗口指标（range/vol/slope/drift）大量为空，原因是指标仍按 `exchange=multi` 回查 SQLite 无序列；需要改为按腿的真实交易所回查并计算。
-  - 双腿字段已上线并用于 outcome，但腿价格为触发时刻 tick 快照，可能与 SQLite 1min close 有 1–3% 差异；当前缺 `leg_*_ts/source` 字段，难做严格对齐审计。
-  - watchlist_series_agg 未落库，outcome 全退回 SQLite；PG 侧回放/可视化与性能优化空间尚未释放。
+  - Type B/C（exchange=multi）funding schedule 仍不稳定：
+    - raw 顶层：`funding_interval_hours` NULL=254；`next_funding_time` NULL=2,623；`next_funding_time <= ts-1m`=13,626。
+    - raw 腿级：`leg_a_kind='perp'` 且 `leg_a_next_funding_time` 缺失=11,743 / 过期=10,523；`leg_b_kind='perp'` 缺失=13,379 / 过期=10,189。
+    - 主要集中：`hyperliquid/grvt` 无 next_funding_time；`lighter` next_funding_time 多为“已过去的 funding_timestamp”；`bybit/bitget` 存在“字段抖动”（WS 增量包不带 nextFundingTime 时会把旧值冲掉）。
+  - Type B/C 窗口指标仍有缺口（multi rows）：B 约 19,7xx 行缺 range/vol/slope/drift；C 约 1,26x 行缺（主要集中在 lighter/hyperliquid 组合，SQLite 序列缺失/对齐失败）。
+  - 资金费周期为“按交易对动态”（Binance/OKX/Bybit 等已出现 1h/4h/8h 混合）；当前 SQLite/PG 中 `funding_interval_hours` 仍存在错误/抖动，导致资金费累加与审计不够可靠。
+  - watchlist_series_agg 未落库，outcome 仍主要依赖 SQLite；PG 侧回放/可视化与抽样审计成本偏高。
 - 当前运行快照：raw/event/outcome 持续增长；outcome worker 已常驻轮询，多数事件已覆盖短/中 horizon。
 
 ## 现状快照（2025-12-09）
@@ -213,11 +216,12 @@
   - 3) 写入 `watchlist_symbol_ref`（exchange/symbol/状态/流动性/行业等），支撑后续分组分析。
   - 4) 增加腿级审计字段（`leg_*_ts`/`leg_*_source`）并提供抽样对照脚本，解决价格源/时点差异难审计的问题。
   - 5) 在策略侧收敛 watchlist 规模（阈值/冷静期/上限），回到“关注池”语义并降低噪声。
-- 补齐非 Binance 资金费历史 fetch（OKX/Bybit/Bitget 仍未上线），并加缓存/调用上限。
+- 资金费历史 fetch：Binance/OKX/Bybit/Bitget 已接入（用于 future_outcome）；当前更大的缺口在于“结算周期/next 时间”落库稳定性与动态周期来源（见上方审计）。
 - 对旧事件缺腿信息：worker 已跳过；如需样本可重放。新增事件已写双腿。
 - 监控：每周查看分区大小与 outcome 覆盖率；确保 funding_applied/funding_hist 持续写入。
 - 下一步改进：
-  - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
+  - 将 “funding schedule” 从依赖 `next_funding_time/interval` 改为优先使用 REST funding history 的时间戳序列（按结算点直接累加），从根源上降低对 next/interval 字段完整性的依赖。
+  - 采集层补齐/稳定写入：Binance 使用 `/fapi/v1/fundingInfo` 提供 per-symbol interval；OKX 用 `nextFundingTime-fundingTime` 推断 per-symbol interval；Bitget 用 `current-fund-rate` 获取 nextUpdate/interval；Lighter 修正 funding_timestamp 语义并推算 next。
   - 若 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
   - 在 outcome 中写入 `funding_applied`（包含结算时间、费率、来源 rest/local）。
   - 增加 cron（每 10 分钟）或后台线程自动跑 worker（已以 nohup 600s 跑，但可独立 cron 化）。
@@ -269,6 +273,82 @@
 ## 审计对照（2025-12-12）
 - 运行状态：simple_app + outcome worker 常驻轮询；PG 双写开启，raw/event/outcome 持续写入。
 - 数据范围：raw 仅记录复合 A/B/C 条件的触发快照（正样本池），符合回测范围设定。
-- 一致性：Binance funding 与 REST 抽样对齐；Type A 腿价与 SQLite/REST 在分钟对齐下仍有 1–3% 时点/源差异，建议补腿级 `ts/source` 以支持严格审计。
-- 完整性缺口：Type B/C 的 `funding_interval_hours`/`next_funding_time` 为空；Type B/C 的窗口指标（range/vol/slope/drift）大量为空；`watchlist_series_agg`/`watchlist_symbol_ref`/`watchlist_outcome` 仍为空。
-- 规模偏离：近 24h 触发写入涉及 300+ 符号，高于“关注池 <20”假设，需在策略侧收敛阈值/限流或增加冷静期。
+- SQLite（近 24h，price_data_1min）funding schedule 完整性问题突出：
+  - `bybit`：`funding_interval_hours<=0` 121,617 行，`next_funding_time` 缺失 231,684 行（同一 symbol 可出现分钟级抖动）。
+  - `bitget`：`funding_interval_hours<=0` 161,540 行，`next_funding_time` 缺失 162,312 行（但可用 REST `current-fund-rate` 补齐）。
+  - `okx`：`funding_interval_hours<=0` 92,332 行，`next_funding_time` 缺失 92,498 行（存在动态 4h/8h）。
+  - `lighter`：`next_funding_time` 大多为过去时间（110,204/112,339），应视作 last_funding_time 并推算 next。
+  - `hyperliquid/grvt`：`next_funding_time` 近乎全缺失（当前采集未提供）。
+- REST 抽样一致性（以交易所为准）：
+  - Binance：`/fapi/v1/fundingInfo` 显示不同合约存在 1h/4h/8h（如 `LRCUSDT=1h`、`ATUSDT=4h`）；现有 SQLite/PG 仍出现 8h 默认值与抖动。
+  - OKX：`/api/v5/public/funding-rate` 可用 `nextFundingTime-fundingTime` 推断动态周期（如 `BARD-USDT-SWAP` 为 4h）。
+  - Bybit：ticker 返回 `fundingIntervalHour`（如 `BARDUSDT=1h`、`CYSUSDT=4h`、`BTCUSDT=8h`）。
+  - Bitget：`/api/v2/mix/market/current-fund-rate` 返回 `fundingRateInterval` 与 `nextUpdate`（可补齐 next_funding_time）。
+
+### 现状更新：修复后“新写入”已对齐（2025-12-12）
+- 结论：对 **修复上线后的新增数据**，`funding_interval_hours` 与 `next_funding_time` 已能稳定对齐交易所权威口径（并消除“字段抖动/空值覆盖/next 过期写入”）。
+- 验证方式：
+  - 使用 `scripts/audit_funding_schedule_pg_vs_rest.py` 对 `watch_signal_raw(exchange=binance)` 和 `watch_signal_raw(exchange=multi).meta.snapshots.*` 做窗口抽样对照 REST。
+  - 以“近 1 分钟”为窗口时，抽样结果可达到 `bad=0`（可能因触发符号变化/窗口过窄而偶尔无样本，需扩大窗口复查）。
+- 注意事项：
+  - 该结论仅覆盖“修复后新写入”行；**修复前的历史行**仍可能存在 interval 默认 8h、next 过期/NULL 等问题，需要单独回填/矫正后才能宣称“全量历史准确”。
+  - `CURRENT_SUPPORTED_SYMBOLS` 之外的 symbol 仍可能出现在 multi 事件腿（来自跨所触发/别名/动态发现），建议按 “watchlist 触发池” 而不是静态全量列表来做 schedule 回查与约束。
+
+### Funding schedule 权威口径（逐交易所，必须全覆盖）
+目标：对每条 perp 快照都能稳定得到：
+1) `funding_interval_hours`（当前资金费率周期，按合约动态）；2) `next_funding_time`（距离下次资金费时间 = `next_funding_time - snapshot_ts`）。
+
+**Binance（USDT-M perpetual）**
+- 权威字段：
+  - `nextFundingTime`：`GET https://fapi.binance.com/fapi/v1/premiumIndex`（单 symbol 或全量）。
+  - `fundingIntervalHours`：`GET https://fapi.binance.com/fapi/v1/fundingInfo`（可全量返回；禁止用“距离 nextFundingTime 的剩余时间”反推周期）。
+- 已落地修复：
+  - `rest_collectors.py`：用 `fundingInfo` 全量缓存获取 per-symbol interval；`premiumIndex` 仅提供 nextFundingTime/lastFundingRate，不再错误推断 interval。
+  - `exchange_connectors.py`：WS `markPrice` 更新不再用默认 8h 覆盖 interval，且不再用空值覆盖旧 schedule。
+- 校验方式：随机抽样 symbol，比对 interval（1/4/8h）与 nextFundingTime（允许 <90s 偏差）。
+
+**OKX（SWAP）**
+- 权威字段：`GET https://www.okx.com/api/v5/public/funding-rate?instId=XXX-USDT-SWAP`，返回 `fundingTime/nextFundingTime`，周期=差值（存在动态 4h/8h）。
+- 已落地修复：`exchange_connectors.py` OKX WS `funding-rate` 频道用 `nextFundingTime - fundingTime` 推导 per-symbol interval，避免写死 8h。
+- 补充（建议）：`rest_collectors.py` 也应对 **当轮出现的 bases** 做小批量 funding-rate 回查，确保即使 WS 缺字段也能补齐 interval/next（避免 meta.snapshots 内缺失）。
+- 校验方式：抽样多 symbol，确认 interval 在 {4,8} 等合理集合且 nextFundingTime 总是未来时间。
+
+**Bybit（linear perpetual）**
+- 权威字段：`GET https://api.bybit.com/v5/market/tickers?category=linear&symbol=XXXUSDT`，返回 `fundingIntervalHour` 与 `nextFundingTime`。
+- 已落地修复：
+  - `exchange_connectors.py`：修复 “全量 ticker 包缺字段时覆盖掉旧 next/interval” 的抖动；增量包也支持独立更新 interval（不再依赖 nextFundingTime 字段是否存在）。
+  - `exchange_connectors.py`：REST merge 在 WS 很新时仍可补齐 schedule（避免 WS 缺字段导致长期 NULL）。
+- 校验方式：对同一 symbol 连续观察数分钟，`funding_interval_hours/next_funding_time` 不应出现分钟级来回变空/变默认值。
+
+**Bitget（USDT-FUTURES）**
+- 权威字段：`GET https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=XXXUSDT`，返回 `fundingRateInterval` 与 `nextUpdate`。
+- 已落地修复：`rest_collectors.py` 增加 schedule 缓存 + 对当轮 bases 小批量补齐，确保 `next_funding_time/interval` 在 meta.snapshots 中稳定可用。
+- 校验方式：抽样 symbol，nextUpdate 必须未来，interval 必须 >0（常见 8h，部分可为 4h/1h）。
+
+**Hyperliquid**
+- 权威口径：官方文档表述 “funding hourly”；公共 API 不直接返回 next funding timestamp。
+- 实施口径：`funding_interval_hours=1`；`next_funding_time` 对齐到下一个 UTC 整点小时（rule-based）。
+- 已落地修复：`rest_collectors.py` 与 `exchange_connectors.py` 补齐 next 并避免 WS 覆盖掉 schedule。
+- 校验方式：DB 中 next_funding_time 应始终落在整点小时且 > snapshot_ts。
+
+**Lighter**
+- 权威口径：面板/公告标注每小时结算；WS 字段 `funding_timestamp` 语义不稳定（审计观察更像 last funding time）。
+- 实施口径：若提供的 funding timestamp 在过去，则按 interval=1h 推进到下一个结算点；否则视作 next funding time。
+- 已落地修复：
+  - `dex/exchanges/lighter.py`：不再把 `funding_timestamp` 直接标为 `next_funding_time`（改为原始字段，交由上游归一化）。
+  - `exchange_connectors.py`：对 `funding_timestamp/next_funding_time` 做“归一化+推进”，避免写入 past next。
+  - `rest_collectors.py`：补齐 rule-based 的 next（UTC 整点）。
+- 校验方式：next_funding_time 不得长期落在过去（允许 60s 容忍），并且应当接近整点。
+
+**GRVT**
+- 权威字段：若 SDK/ticker 返回 `next_funding_time`，直接采用；否则先按 8h 边界（0/8/16 UTC）规则兜底，并保留审计标记。
+- 已落地修复：`rest_collectors.py` 缺 next 时补齐 8h 边界；`exchange_connectors.py` 统一对 next 做“归一化+推进”。
+
+### 统一审计脚本（DB vs REST）
+- 新增：`scripts/audit_funding_schedule_pg_vs_rest.py`
+  - 运行：`./venv/bin/python scripts/audit_funding_schedule_pg_vs_rest.py --minutes 60 --limit 50`
+  - 说明：对 `watch_signal_raw(exchange=binance)` 与 `watch_signal_raw(exchange=multi).meta.snapshots.*` 的 schedule 抽样对照 REST；`lighter/hyperliquid/grvt` 用 rule/SDK 口径。
+- 回测就绪结论（阶段性）：
+  - 可开始：以 `watch_signal_event` + `future_outcome` 做第一版回测/IC（spread 为主），并把 “资金费相关” 先限定在 legs=Binance/OKX/Bybit 且 REST 可回查的事件子集（目前约 1,168 个 event）。
+  - 仍阻塞：若要做“资金费严格对齐/跨所全覆盖”的回测与审计，必须先修复采集层对 `funding_interval_hours/next_funding_time` 的写入稳定性与动态周期来源，并对历史样本做回填/重算（至少覆盖 Bybit/OKX/Binance/Bitget 的周期与 next 时间）。
+- 规模偏离：触发写入涉及符号数仍偏大（>300），高于“关注池 <20”假设；需在策略侧继续收敛阈值/限流或增加冷静期。
