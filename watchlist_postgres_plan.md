@@ -102,6 +102,9 @@
 - 订单簿/矩阵落库（已上线）：在 raw.meta.orderbook 存 sweep 价格与前 5 对跨所价差（forward/reverse），字段：legs[exchange,type,buy,sell,mid,error]，forward_spread/reverse_spread，cross_pairs[top5]，带快照 ts/stale_reason，控制宽度。
 - 双腿字段（已上线）：raw/event 现已写入 `leg_a_*`、`leg_b_*`（exchange/symbol/kind/price/funding/next_funding_time）；老数据缺腿信息，outcome worker 会跳过。
 - 事件表（event.features_agg）：保留首/末/均/极值的核心标量（同上），再附带 `pairs_top` 与 `funding_diff_top` 的首末快照，以便回溯。
+- 事件表补充（2025-12-12）：`watch_signal_event` 新增并回填了 funding schedule 列（仅修复 schedule，不修改 funding_rate）：
+  - event 顶层：`funding_interval_hours`、`next_funding_time`
+  - event 腿级：`leg_a_funding_interval_hours`、`leg_a_next_funding_time`、`leg_b_funding_interval_hours`、`leg_b_next_funding_time`
 - 序列表（`watchlist_series_agg`）：继续按 5m 聚合开列 `spot_price`、`futures_price`、`spread_rel`、`funding_rate`、`funding_interval_hours`、`next_funding_time`，其余如矩阵/跨所资金费差保持在 `series_meta jsonb`（最多存当时 top1 跨所价差与 top1 资金费差，控制行宽）。
 
 ### 因子补充（从现有行情/资金费/历史序列可计算）
@@ -169,7 +172,7 @@
 - 目标：对每个 `watch_signal_event` 计算未来窗口的表现，用于回测/IC。关注 horizon：15m、30m、1h、4h、8h、24h、48h、96h。
 - 数据源优先级：`watchlist_series_agg`（若已启用 5m 聚合）> SQLite `price_data_1min` > 实时行情缓存。需保证同一符号的资金费时间/周期准确。
 - 资金费处理（从均值估算升级为结算点累加）：
-  - 记录并使用资金费结算时间/周期：`funding_interval_hours`、`next_funding_time` 已在 raw/event 中；worker 按时间轴枚举 horizon 内的结算点逐笔累加，而非简单均值估算。
+  - 记录并使用资金费结算时间/周期：raw 已写入 `funding_interval_hours/next_funding_time`；event 侧通过新增列 + 回填脚本补齐 schedule（见下方“历史回填”）；worker 按时间轴枚举 horizon 内的结算点逐笔累加，而非简单均值估算。
   - 周期动态：若 interval 变化，则分段累加；若缺 `next_funding_time`，用最近值推算，超出容忍则标记缺失。
   - REST 补全：若本地缺资金费序列，调用交易所历史资金费接口（当前 worker 已接入 Binance `/fapi/v1/fundingRate`，其他所可按需扩展）仅拉取 horizon 覆盖时间段，命中率不足再退回本地数据/推算。每轮有调用上限，避免过载。
 - 价差收益：按事件触发时的 spread（spot - perp）与 horizon 终点 spread 的差值；若做多现货空永续，则收益近似 `(spread_end - spread_start)`。
@@ -291,7 +294,7 @@
   - 使用 `scripts/audit_funding_schedule_pg_vs_rest.py` 对 `watch_signal_raw(exchange=binance)` 和 `watch_signal_raw(exchange=multi).meta.snapshots.*` 做窗口抽样对照 REST。
   - 以“近 1 分钟”为窗口时，抽样结果可达到 `bad=0`（可能因触发符号变化/窗口过窄而偶尔无样本，需扩大窗口复查）。
 - 注意事项：
-  - 该结论仅覆盖“修复后新写入”行；**修复前的历史行**仍可能存在 interval 默认 8h、next 过期/NULL 等问题，需要单独回填/矫正后才能宣称“全量历史准确”。
+  - 该结论仅覆盖“修复后新写入”行；**修复前的历史行**仍可能存在 interval 默认 8h、next 过期/NULL 等问题，需要单独回填/矫正后才能宣称“全量历史准确”。当前已增加 event schedule 列并按 REST funding history 做了回填（见下方）。
   - `CURRENT_SUPPORTED_SYMBOLS` 之外的 symbol 仍可能出现在 multi 事件腿（来自跨所触发/别名/动态发现），建议按 “watchlist 触发池” 而不是静态全量列表来做 schedule 回查与约束。
 
 ### Funding schedule 权威口径（逐交易所，必须全覆盖）
@@ -319,6 +322,17 @@
   - `exchange_connectors.py`：修复 “全量 ticker 包缺字段时覆盖掉旧 next/interval” 的抖动；增量包也支持独立更新 interval（不再依赖 nextFundingTime 字段是否存在）。
   - `exchange_connectors.py`：REST merge 在 WS 很新时仍可补齐 schedule（避免 WS 缺字段导致长期 NULL）。
 - 校验方式：对同一 symbol 连续观察数分钟，`funding_interval_hours/next_funding_time` 不应出现分钟级来回变空/变默认值。
+
+## 历史回填：event schedule（2025-12-12）
+- 背景：event 是回测/审计的“机会级别”归并表；修复前 event 表缺乏可直接查询的 funding schedule 字段，且历史 raw 的 schedule 也曾存在抖动/缺失。
+- 原则：仅回填/修复 `funding_interval_hours` + `next_funding_time`（含腿级字段）；**不修改** event/legs 的 `funding_rate`（监控时刻 funding rate 与结算时刻 realized funding rate 本就不同）。
+- 数据源：对 Binance/OKX/Bybit/Bitget，使用交易所 REST “历史资金费率”接口的时间戳序列作为权威；其余（如无历史接口）按规则兜底（UTC 边界对齐）。
+- 一次性回填脚本：`scripts/backfill_watchlist_event_schedule_from_rest.py`
+  - 示例（全量窗口按需调 days）：`venv/bin/python scripts/backfill_watchlist_event_schedule_from_rest.py --days 10`
+  - 增量补齐最近数据：`venv/bin/python scripts/backfill_watchlist_event_schedule_from_rest.py --days 1 --until-hours-ago 0`
+- 快速验收 SQL（示例）：
+  - 腿级 perp 不应缺 next：`SELECT COUNT(*) FROM watchlist.watch_signal_event WHERE leg_a_kind='perp' AND leg_a_next_funding_time IS NULL;`
+  - next 不应早于 start_ts：`SELECT COUNT(*) FROM watchlist.watch_signal_event WHERE (leg_a_kind='perp' OR leg_b_kind='perp') AND next_funding_time <= start_ts - interval '1 minute';`
 
 **Bitget（USDT-FUTURES）**
 - 权威字段：`GET https://api.bitget.com/api/v2/mix/market/current-fund-rate?productType=USDT-FUTURES&symbol=XXXUSDT`，返回 `fundingRateInterval` 与 `nextUpdate`。
