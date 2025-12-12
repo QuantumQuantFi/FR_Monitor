@@ -61,12 +61,35 @@ class PgWriter:
         if psycopg is None:
             self.logger.error("psycopg not installed; cannot start PG writer")
             return
+        try:
+            self._ensure_event_schedule_columns()
+        except Exception as exc:  # pragma: no cover - best-effort DDL
+            self.logger.warning("ensure PG schema failed: %s", exc)
         if self._thread:
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_loop, name="pg-writer", daemon=True)
         self._thread.start()
         self.logger.info("PG writer started (batch=%s, flush=%ss)", self.config.batch_size, self.config.flush_seconds)
+
+    def _ensure_event_schedule_columns(self) -> None:
+        """
+        Ensure watch_signal_event has funding schedule columns.
+        This prevents runtime failures after code adds new INSERT columns.
+        """
+        if psycopg is None:
+            return
+        ddl = """
+        ALTER TABLE watchlist.watch_signal_event
+          ADD COLUMN IF NOT EXISTS funding_interval_hours double precision,
+          ADD COLUMN IF NOT EXISTS next_funding_time timestamptz,
+          ADD COLUMN IF NOT EXISTS leg_a_funding_interval_hours double precision,
+          ADD COLUMN IF NOT EXISTS leg_a_next_funding_time timestamptz,
+          ADD COLUMN IF NOT EXISTS leg_b_funding_interval_hours double precision,
+          ADD COLUMN IF NOT EXISTS leg_b_next_funding_time timestamptz;
+        """
+        with psycopg.connect(self.config.dsn, autocommit=True) as conn:
+            conn.execute(ddl)
 
     def stop(self) -> None:
         if not self._thread:
@@ -267,6 +290,8 @@ class PgWriter:
                 "leg_a_price_last": a.get("price"),
                 "leg_a_funding_rate_first": a.get("funding_rate") if first else None,
                 "leg_a_funding_rate_last": a.get("funding_rate"),
+                "leg_a_funding_interval_hours": a.get("funding_interval_hours"),
+                "leg_a_next_funding_time": a.get("next_funding_time"),
                 "leg_b_exchange": b.get("exchange"),
                 "leg_b_symbol": b.get("symbol"),
                 "leg_b_kind": b.get("kind"),
@@ -274,6 +299,8 @@ class PgWriter:
                 "leg_b_price_last": b.get("price"),
                 "leg_b_funding_rate_first": b.get("funding_rate") if first else None,
                 "leg_b_funding_rate_last": b.get("funding_rate"),
+                "leg_b_funding_interval_hours": b.get("funding_interval_hours"),
+                "leg_b_next_funding_time": b.get("next_funding_time"),
                 "funding_hist": funding_hist if funding_hist else None,
             }
             return payload
@@ -354,6 +381,8 @@ class PgWriter:
                     "end_ts": ts,
                     "duration_sec": 0,
                     "triggered_count": state["triggered_count"],
+                    "funding_interval_hours": row.get("funding_interval_hours"),
+                    "next_funding_time": row.get("next_funding_time"),
                     "features_agg": self._agg_finalize(
                         state["agg"],
                         legs=legs,
@@ -371,6 +400,8 @@ class PgWriter:
                         "event_id": state["event_id"],
                         "end_ts": ts,
                         "duration_sec": int((ts - (state["start_ts"] or ts)).total_seconds()),
+                        "funding_interval_hours": row.get("funding_interval_hours"),
+                        "next_funding_time": row.get("next_funding_time"),
                         "features_agg": self._agg_finalize(
                             state["agg"],
                             legs=self._last_legs.get(key),
@@ -462,10 +493,14 @@ class PgWriter:
             return payload
         def _ensure_event_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
             required_keys = [
+                "funding_interval_hours",
+                "next_funding_time",
                 "leg_a_exchange", "leg_a_symbol", "leg_a_kind", "leg_a_price_first", "leg_a_price_last",
                 "leg_a_funding_rate_first", "leg_a_funding_rate_last",
+                "leg_a_funding_interval_hours", "leg_a_next_funding_time",
                 "leg_b_exchange", "leg_b_symbol", "leg_b_kind", "leg_b_price_first", "leg_b_price_last",
                 "leg_b_funding_rate_first", "leg_b_funding_rate_last",
+                "leg_b_funding_interval_hours", "leg_b_next_funding_time",
                 "triggered_count", "features_agg", "close", "end_ts", "duration_sec",
             ]
             for k in required_keys:
@@ -479,12 +514,20 @@ class PgWriter:
                         cur.execute(
                             """
                             INSERT INTO watchlist.watch_signal_event
-                              (exchange, symbol, signal_type, start_ts, end_ts, duration_sec, triggered_count, status, features_agg,
-                               leg_a_exchange, leg_a_symbol, leg_a_kind, leg_a_price_first, leg_a_price_last, leg_a_funding_rate_first, leg_a_funding_rate_last,
-                               leg_b_exchange, leg_b_symbol, leg_b_kind, leg_b_price_first, leg_b_price_last, leg_b_funding_rate_first, leg_b_funding_rate_last)
-                            VALUES (%(exchange)s, %(symbol)s, %(signal_type)s, %(start_ts)s, %(end_ts)s, %(duration_sec)s, %(triggered_count)s, 'open', %(features_agg)s,
-                                    %(leg_a_exchange)s, %(leg_a_symbol)s, %(leg_a_kind)s, %(leg_a_price_first)s, %(leg_a_price_last)s, %(leg_a_funding_rate_first)s, %(leg_a_funding_rate_last)s,
-                                    %(leg_b_exchange)s, %(leg_b_symbol)s, %(leg_b_kind)s, %(leg_b_price_first)s, %(leg_b_price_last)s, %(leg_b_funding_rate_first)s, %(leg_b_funding_rate_last)s)
+                              (exchange, symbol, signal_type, start_ts, end_ts, duration_sec, triggered_count, status,
+                               funding_interval_hours, next_funding_time,
+                               features_agg,
+                               leg_a_exchange, leg_a_symbol, leg_a_kind, leg_a_price_first, leg_a_price_last,
+                               leg_a_funding_rate_first, leg_a_funding_rate_last, leg_a_funding_interval_hours, leg_a_next_funding_time,
+                               leg_b_exchange, leg_b_symbol, leg_b_kind, leg_b_price_first, leg_b_price_last,
+                               leg_b_funding_rate_first, leg_b_funding_rate_last, leg_b_funding_interval_hours, leg_b_next_funding_time)
+                            VALUES (%(exchange)s, %(symbol)s, %(signal_type)s, %(start_ts)s, %(end_ts)s, %(duration_sec)s, %(triggered_count)s, 'open',
+                                    %(funding_interval_hours)s, %(next_funding_time)s,
+                                    %(features_agg)s,
+                                    %(leg_a_exchange)s, %(leg_a_symbol)s, %(leg_a_kind)s, %(leg_a_price_first)s, %(leg_a_price_last)s,
+                                    %(leg_a_funding_rate_first)s, %(leg_a_funding_rate_last)s, %(leg_a_funding_interval_hours)s, %(leg_a_next_funding_time)s,
+                                    %(leg_b_exchange)s, %(leg_b_symbol)s, %(leg_b_kind)s, %(leg_b_price_first)s, %(leg_b_price_last)s,
+                                    %(leg_b_funding_rate_first)s, %(leg_b_funding_rate_last)s, %(leg_b_funding_interval_hours)s, %(leg_b_next_funding_time)s)
                             RETURNING id
                             """,
                             _normalize_payload(_ensure_event_defaults(ins)),
@@ -500,6 +543,8 @@ class PgWriter:
                                SET end_ts = COALESCE(%(end_ts)s, end_ts),
                                    duration_sec = COALESCE(%(duration_sec)s, duration_sec),
                                    triggered_count = COALESCE(%(triggered_count)s, triggered_count),
+                                   funding_interval_hours = COALESCE(funding_interval_hours, %(funding_interval_hours)s),
+                                   next_funding_time = COALESCE(next_funding_time, %(next_funding_time)s),
                                    features_agg = COALESCE(%(features_agg)s::jsonb, features_agg),
                                    leg_a_exchange = COALESCE(%(leg_a_exchange)s, leg_a_exchange),
                                    leg_a_symbol = COALESCE(%(leg_a_symbol)s, leg_a_symbol),
@@ -508,6 +553,8 @@ class PgWriter:
                                    leg_a_price_last = COALESCE(%(leg_a_price_last)s, leg_a_price_last),
                                    leg_a_funding_rate_first = COALESCE(%(leg_a_funding_rate_first)s, leg_a_funding_rate_first),
                                    leg_a_funding_rate_last = COALESCE(%(leg_a_funding_rate_last)s, leg_a_funding_rate_last),
+                                   leg_a_funding_interval_hours = COALESCE(leg_a_funding_interval_hours, %(leg_a_funding_interval_hours)s),
+                                   leg_a_next_funding_time = COALESCE(leg_a_next_funding_time, %(leg_a_next_funding_time)s),
                                    leg_b_exchange = COALESCE(%(leg_b_exchange)s, leg_b_exchange),
                                    leg_b_symbol = COALESCE(%(leg_b_symbol)s, leg_b_symbol),
                                    leg_b_kind = COALESCE(%(leg_b_kind)s, leg_b_kind),
@@ -515,6 +562,8 @@ class PgWriter:
                                    leg_b_price_last = COALESCE(%(leg_b_price_last)s, leg_b_price_last),
                                    leg_b_funding_rate_first = COALESCE(%(leg_b_funding_rate_first)s, leg_b_funding_rate_first),
                                    leg_b_funding_rate_last = COALESCE(%(leg_b_funding_rate_last)s, leg_b_funding_rate_last),
+                                   leg_b_funding_interval_hours = COALESCE(leg_b_funding_interval_hours, %(leg_b_funding_interval_hours)s),
+                                   leg_b_next_funding_time = COALESCE(leg_b_next_funding_time, %(leg_b_next_funding_time)s),
                                    status = CASE WHEN %(close)s THEN 'closed' ELSE status END
                              WHERE id = %(event_id)s
                             """,

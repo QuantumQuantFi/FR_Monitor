@@ -683,6 +683,7 @@ class WatchlistManager:
                 'price': spot_price or metrics.get('last_spot_price'),
                 'funding_rate': 0.0,
                 'next_funding_time': None,
+                'funding_interval_hours': None,
             }
             leg_b = {
                 'exchange': 'binance',
@@ -691,6 +692,7 @@ class WatchlistManager:
                 'price': perp_price or metrics.get('last_futures_price'),
                 'funding_rate': funding or entry.last_funding_rate,
                 'next_funding_time': _parse_timestamp(entry.next_funding_time),
+                'funding_interval_hours': entry.funding_interval_hours,
             }
         elif entry.entry_type == 'B':
             pair = td.get('pair') or []
@@ -706,6 +708,7 @@ class WatchlistManager:
                     'price': prices.get(pair[0]),
                     'funding_rate': funding.get(pair[0]),
                     'next_funding_time': snap_a.get('next_funding_time'),
+                    'funding_interval_hours': snap_a.get('funding_interval_hours'),
                 }
                 leg_b = {
                     'exchange': pair[1],
@@ -714,6 +717,7 @@ class WatchlistManager:
                     'price': prices.get(pair[1]),
                     'funding_rate': funding.get(pair[1]),
                     'next_funding_time': snap_b.get('next_funding_time'),
+                    'funding_interval_hours': snap_b.get('funding_interval_hours'),
                 }
         elif entry.entry_type == 'C':
             spot_ex = td.get('spot_exchange')
@@ -727,6 +731,7 @@ class WatchlistManager:
                     'price': td.get('spot_price'),
                     'funding_rate': 0.0,
                     'next_funding_time': None,
+                    'funding_interval_hours': None,
                 }
                 leg_b = {
                     'exchange': fut_ex,
@@ -735,5 +740,6 @@ class WatchlistManager:
                     'price': td.get('futures_price'),
                     'funding_rate': (td.get('funding') or {}).get(fut_ex),
                     'next_funding_time': fut_snap.get('next_funding_time'),
+                    'funding_interval_hours': fut_snap.get('funding_interval_hours'),
                 }
         return leg_a, leg_b
