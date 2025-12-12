@@ -267,13 +267,10 @@ class FundingHistoryFetcher:
             sym = f"{sym}USDT"
         out: List[Tuple[datetime, float]] = []
         cursor_start = int(start_ts.timestamp() * 1000)
-        while cursor_start < int(end_ts.timestamp() * 1000) and self._calls < MAX_REST_CALLS:
-            params = {
-                "symbol": sym,
-                "startTime": cursor_start,
-                "endTime": int(end_ts.timestamp() * 1000),
-                "limit": 1000,
-            }
+        # NOTE: Binance has occasional WAF/403 when using very large limits or startTime+endTime together.
+        # Use startTime-only pagination with modest limit and stop when reaching end_ts.
+        while self._calls < MAX_REST_CALLS:
+            params = {"symbol": sym, "startTime": cursor_start, "limit": 200}
             resp = self.session.get("https://fapi.binance.com/fapi/v1/fundingRate", params=params, timeout=5)
             resp.raise_for_status()
             data = resp.json()
@@ -281,10 +278,14 @@ class FundingHistoryFetcher:
                 break
             chunk: List[Tuple[datetime, float]] = []
             last_ts_ms = None
+            reached_end = False
             for item in data:
                 try:
                     ts_ms = int(item["fundingTime"])
                     ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+                    if ts > end_ts:
+                        reached_end = True
+                        break
                     if ts < start_ts or ts > end_ts:
                         continue
                     rate = float(item["fundingRate"])
@@ -293,7 +294,7 @@ class FundingHistoryFetcher:
                 except Exception:
                     continue
             out.extend(chunk)
-            if last_ts_ms is None or len(data) < 1000:
+            if reached_end or last_ts_ms is None or len(data) < 200:
                 break
             cursor_start = last_ts_ms + 1
             self._calls += 1
