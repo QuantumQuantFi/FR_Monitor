@@ -455,6 +455,121 @@ def fetch_spread_series(
     return results
 
 
+def fetch_spread_series_for_legs(
+    db_path: str,
+    leg_a: Dict[str, Any],
+    leg_b: Dict[str, Any],
+    *,
+    hours: int = 6,
+    abs_spread: bool = True,
+) -> List[SpreadPoint]:
+    """
+    从 sqlite 抽取分钟级两腿价格序列（可跨交易所/跨品种），对齐时间戳后构造 SpreadPoint。
+    - leg dict 至少包含 exchange/symbol/kind(spot|perp)。
+    - 默认使用 abs_spread（即 |a-b|/min(a,b)），用于 Type B/C 的跨所/跨品种价差。
+    """
+    cutoff_sql = f"-{int(hours)} hours"
+    points: List[SpreadPoint] = []
+
+    try:
+        conn = sqlite3.connect(db_path, timeout=15.0)
+        cursor = conn.cursor()
+    except Exception:
+        return points
+
+    def _load_leg_series(exchange: str, symbol: str, kind: str) -> Dict[datetime, Tuple[float, Optional[float], Optional[float], Optional[datetime]]]:
+        out: Dict[datetime, Tuple[float, Optional[float], Optional[float], Optional[datetime]]] = {}
+        try:
+            cursor.execute(
+                """
+                SELECT timestamp, spot_price_close, futures_price_close,
+                       funding_rate_avg, funding_interval_hours, next_funding_time
+                FROM price_data_1min
+                WHERE symbol = ? AND exchange = ?
+                  AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp ASC
+                """,
+                (symbol, exchange, cutoff_sql),
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            rows = []
+        for ts_raw, spot, fut, fr, interval_hours, next_ft in rows:
+            ts = _parse_ts(ts_raw)
+            if ts is None:
+                continue
+            price = spot if kind == "spot" else fut
+            if price is None or price <= 0:
+                continue
+            fr_val = float(fr) if fr not in (None, 0, "") else None
+            interval_val = float(interval_hours) if interval_hours not in (None, 0, "") else None
+            next_val = _parse_ts(next_ft)
+            out[ts] = (float(price), fr_val, interval_val, next_val)
+        return out
+
+    ex_a = str(leg_a.get("exchange") or "").lower()
+    ex_b = str(leg_b.get("exchange") or "").lower()
+    sym_a = str(leg_a.get("symbol") or "").upper()
+    sym_b = str(leg_b.get("symbol") or "").upper()
+    kind_a = str(leg_a.get("kind") or "perp").lower()
+    kind_b = str(leg_b.get("kind") or "perp").lower()
+
+    try:
+        series_a = _load_leg_series(ex_a, sym_a, kind_a)
+        series_b = _load_leg_series(ex_b, sym_b, kind_b)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not series_a or not series_b:
+        return points
+
+    common_ts = sorted(set(series_a.keys()) & set(series_b.keys()))
+    for ts in common_ts:
+        pa, fr_a, interval_a, next_a = series_a[ts]
+        pb, fr_b, interval_b, next_b = series_b[ts]
+        interval_hint = None
+        for iv in (interval_a, interval_b):
+            if iv and iv > 0:
+                interval_hint = iv if interval_hint is None else min(interval_hint, iv)
+        next_candidates = [n for n in (next_a, next_b) if n]
+        next_hint = min(next_candidates) if next_candidates else None
+        funding_hint = fr_a if fr_a is not None else fr_b
+        points.append(
+            SpreadPoint(
+                ts=ts,
+                spot=pa,
+                futures=pb,
+                funding_rate=funding_hint,
+                funding_interval_hours=interval_hint,
+                next_funding_time=next_hint,
+                abs_spread=abs_spread,
+            )
+        )
+
+    return points
+
+
+def compute_metrics_for_legs(
+    db_path: str,
+    leg_a: Dict[str, Any],
+    leg_b: Dict[str, Any],
+    *,
+    hours: Optional[int] = None,
+    abs_spread: bool = True,
+) -> Dict[str, Any]:
+    """
+    针对跨所/跨品种两腿计算价差指标（Type B/C 使用）。
+    返回结构与 compute_metrics_for_symbols 一致：metrics.to_dict()。
+    """
+    if hours is None:
+        hours = int(WATCHLIST_METRICS_CONFIG.get("range_hours_long", 6))
+    points = fetch_spread_series_for_legs(db_path, leg_a, leg_b, hours=hours, abs_spread=abs_spread)
+    metrics = compute_metrics_for_symbol(points, cross_ctx=None)
+    return metrics.to_dict()
+
+
 def compute_metrics_for_symbol(points: List[SpreadPoint], cross_ctx: Optional[Dict[str, Any]] = None) -> SpreadMetrics:
     """
     针对单个 symbol 计算价差相关指标，仅做监控输出，不做交易动作。

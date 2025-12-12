@@ -11,7 +11,7 @@ import sqlite3
 from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
 from precision_utils import funding_rate_to_float
 from watchlist_pg_writer import PgWriter, PgWriterConfig
-from watchlist_metrics import compute_metrics_for_symbols
+from watchlist_metrics import compute_metrics_for_symbols, compute_metrics_for_legs
 
 
 def _utcnow() -> datetime:
@@ -309,11 +309,19 @@ class WatchlistManager:
                 fut_price = _to_price(futures.get('price') or futures.get('last_price'))
                 spot_price = _to_price(spot.get('price'))
                 funding = futures.get('funding_rate')
+                interval_raw = futures.get('funding_interval_hours')
+                try:
+                    interval_val = float(interval_raw) if interval_raw not in (None, '') else None
+                except (TypeError, ValueError):
+                    interval_val = None
+                next_ft_val = _parse_timestamp(futures.get('next_funding_time'))
                 if symbol not in market_snapshots:
                     market_snapshots[symbol] = {}
                 market_snapshots[symbol][exch] = {
                     'futures_price': fut_price,
                     'funding_rate': funding_rate_to_float(funding) if funding is not None else None,
+                    'funding_interval_hours': interval_val,
+                    'next_funding_time': next_ft_val,
                     'spot_price': spot_price,
                 }
 
@@ -364,14 +372,24 @@ class WatchlistManager:
                             }
 
             if best_b:
+                intervals = []
+                next_fts = []
+                for ex_name in best_b.get('pair') or []:
+                    snap = exch_data.get(ex_name) or {}
+                    iv = snap.get('funding_interval_hours')
+                    if iv:
+                        intervals.append(float(iv))
+                    nft = snap.get('next_funding_time')
+                    if isinstance(nft, datetime):
+                        next_fts.append(nft)
                 entry = WatchlistEntry(
                     symbol=symbol,
                     has_spot=bool(spot_list),
                     has_perp=True,
                     last_funding_rate=max(abs(v) for v in best_b['funding'].values() if v is not None),
                     last_funding_time=None,
-                    funding_interval_hours=None,
-                    next_funding_time=None,
+                    funding_interval_hours=int(round(min(intervals))) if intervals else None,
+                    next_funding_time=_iso(min(next_fts)) if next_fts else None,
                     max_abs_funding=max(abs(v) for v in best_b['funding'].values() if v is not None),
                     last_above_threshold_at=now_iso,
                     added_at=now_iso,
@@ -400,14 +418,17 @@ class WatchlistManager:
                         if diff > self.type_c_spread_threshold:
                             # 再确认另一家期货资金费也满足
                             second_fr = futures_ok[1][2]
+                            fut_snap = exch_data.get(fut_ex) or {}
+                            fut_interval = fut_snap.get('funding_interval_hours')
+                            fut_next_ft = fut_snap.get('next_funding_time')
                             entry = WatchlistEntry(
                                 symbol=symbol,
                                 has_spot=True,
                                 has_perp=True,
                                 last_funding_rate=fut_fr,
                                 last_funding_time=None,
-                                funding_interval_hours=None,
-                                next_funding_time=None,
+                                funding_interval_hours=int(round(float(fut_interval))) if fut_interval else None,
+                                next_funding_time=_iso(fut_next_ft) if isinstance(fut_next_ft, datetime) else None,
                                 max_abs_funding=max(abs(fut_fr or 0), abs(second_fr or 0)),
                                 last_above_threshold_at=now_iso,
                                 added_at=now_iso,
@@ -516,7 +537,16 @@ class WatchlistManager:
             if entry.trigger_details:
                 meta['trigger_details'] = entry.trigger_details
             if entry.symbol in market_snapshots:
-                meta['snapshots'] = market_snapshots.get(entry.symbol)
+                snaps_meta: Dict[str, Any] = {}
+                for ex_name, snap in (market_snapshots.get(entry.symbol) or {}).items():
+                    if not isinstance(snap, dict):
+                        continue
+                    snap_copy = dict(snap)
+                    nft = snap_copy.get('next_funding_time')
+                    if isinstance(nft, datetime):
+                        snap_copy['next_funding_time'] = _iso(nft)
+                    snaps_meta[ex_name] = snap_copy
+                meta['snapshots'] = snaps_meta
             ob_entry = ob_orderbook.get(entry.symbol) if isinstance(ob_orderbook, dict) else None
             cs_entry = ob_cross.get(entry.symbol) if isinstance(ob_cross, dict) else None
             orderbook_meta: Dict[str, Any] = {}
@@ -552,6 +582,16 @@ class WatchlistManager:
 
             metrics = metrics_map.get(entry.symbol) or {}
             leg_a, leg_b = self._build_legs(entry, snaps, metrics)
+            if entry.entry_type in ('B', 'C') and leg_a and leg_b:
+                try:
+                    metrics = compute_metrics_for_legs(self.db_path, leg_a, leg_b)
+                except Exception as exc:  # pragma: no cover - runtime safeguard
+                    self.logger.warning(
+                        "compute_metrics_for_legs failed symbol=%s type=%s: %s",
+                        entry.symbol,
+                        entry.entry_type,
+                        exc,
+                    )
             row = {
                 'ts': now,
                 'exchange': exch,
@@ -649,13 +689,15 @@ class WatchlistManager:
             prices = td.get('prices') or {}
             funding = td.get('funding') or {}
             if len(pair) == 2:
+                snap_a = snaps.get(pair[0]) or {}
+                snap_b = snaps.get(pair[1]) or {}
                 leg_a = {
                     'exchange': pair[0],
                     'symbol': entry.symbol,
                     'kind': 'perp',
                     'price': prices.get(pair[0]),
                     'funding_rate': funding.get(pair[0]),
-                    'next_funding_time': None,
+                    'next_funding_time': snap_a.get('next_funding_time'),
                 }
                 leg_b = {
                     'exchange': pair[1],
@@ -663,12 +705,13 @@ class WatchlistManager:
                     'kind': 'perp',
                     'price': prices.get(pair[1]),
                     'funding_rate': funding.get(pair[1]),
-                    'next_funding_time': None,
+                    'next_funding_time': snap_b.get('next_funding_time'),
                 }
         elif entry.entry_type == 'C':
             spot_ex = td.get('spot_exchange')
             fut_ex = td.get('futures_exchange')
             if spot_ex and fut_ex:
+                fut_snap = snaps.get(fut_ex) or {}
                 leg_a = {
                     'exchange': spot_ex,
                     'symbol': entry.symbol,
@@ -683,6 +726,6 @@ class WatchlistManager:
                     'kind': 'perp',
                     'price': td.get('futures_price'),
                     'funding_rate': (td.get('funding') or {}).get(fut_ex),
-                    'next_funding_time': None,
+                    'next_funding_time': fut_snap.get('next_funding_time'),
                 }
         return leg_a, leg_b

@@ -22,7 +22,8 @@
 
 ## 最小可行表结构（迭代式上线，兼顾因子/IC）
 1) `watch_signal_raw`（分钟级原始因子池）
-   - 作用：完整保留 watchlist 逻辑每分钟或每次扫描的特征，不漏样本，供因子池/IC 计算。
+   - 作用：保留复合 A/B/C 条件的分钟级快照（正样本池），用于回测/因子标签与后续分析。
+   - 范围：仅对当轮扫描中满足 A/B/C 触发条件的币种/腿组合写入；不覆盖全市场低信号样本。若未来需要负样本，可另设抽样表或离线作业补齐。
    - 字段：`id bigserial pk`, `ts timestamptz`, `exchange`, `symbol`, `signal_type`(A/B/C)、核心特征列（价差、资金费、成交额、深度/滑点等）、`triggered bool`, `meta jsonb`。
    - 分区：日分区，保留 7~14 天；索引仅 (`exchange`,`symbol`,`ts`) + (`ts` DESC)。
 
@@ -186,23 +187,18 @@
 - 前端/回测使用：IC/IR 直接 join `watch_signal_event` 与 `future_outcome`；可加物化视图按 horizon 展平。
 - 待办：实现 worker 中的 funding 结算点累加、REST 缺口补偿；为 `funding_applied` 写入来源/时间；在 plan 中保持“资金费周期可能变动”的提示，并在结果中保留审计信息。
 
-### Outcome 实施现状（2025-12-09 审计）
-- 已实现：
-  - worker 已上线（手动运行成功），每次处理最多 200 个 event-horizon，防止扫全表。
-  - 资金费：优先 REST（Binance fundingRate，调用上限 50/轮）取 horizon 覆盖的结算点；否则用本地 1min 的 `next_funding_time` 离散结算点 + “结算点前最近资金费率”累加（不做均值）。
-  - 价差：起点/终点用最近 <= 目标时间的 1min 聚合；max_drawdown/volatility 用窗口内 spread 序列计算。
-  - 幂等 upsert：`event_id+horizon` 唯一。
-- 存在问题/缺口：
-  - `future_outcome` 仅少量样本（14 行），短 horizon 多为 0/None，原因可能是数据缺口或终点与起点相同。
-  - 大部分 `next_funding_time`/funding 在 PG raw 里为空，非 Binance 资金费缺口较大；需扩展 REST（OKX/Bybit/Bitget 等）或采集层补写。
-  - 未记录 `funding_applied` 明细，无法审计用到了哪些结算点/来源。
-  - 对缺失数据未标记 label.missing，易与有效样本混淆。
-  - 运行方式仍手动，未加 cron/后台守护。
-- 跨所/双腿缺口（新增关注）：
-  - 当前 raw/event 仅有 `exchange/symbol`，跨所场景用 `exchange=multi`，没有保存两条腿的交易所/品种/价格/资金费，outcome 只能算“单所现货-永续”基差。
-  - 需要在 raw/event 存两条腿：`leg_a_exchange/kind(spot|perp)/symbol/price/funding/next_funding_time`，`leg_b_*` 同理；Type A 也按 spot/perp 填，Type B/C 按跨所永续或现货-永续填。
-  - outcome 需按两腿价差和两腿资金费累加，现货腿资金费=0，永续腿用结算点累加；旧事件无法回算，新增事件开始写双腿。
-- 当前运行快照：raw 27,008 行，event 450 行，future_outcome 92 行（均为最新批次数据）；最新事件已含双腿字段，早期事件仍缺腿信息且被 outcome 跳过。
+### Outcome 实施现状（2025-12-12 审计）
+- 数据量（当前 PG）：
+  - raw 142k 行（2025-12-08 起）；其中 A（binance）~11k、B ~86k、C ~16k。
+  - event 5.8k 行；约 6.9% 旧事件缺双腿（404 行），被 outcome 自动跳过。
+  - future_outcome 覆盖较好：15/30/60/240/480m 各 ~5k 行，1440m ~3.1k 行，2880m ~1.3k 行；仅 2 行 funding_applied 为空。
+  - watchlist_series_agg / watchlist_symbol_ref / watchlist_outcome 仍为空（未启用/未落库）。
+- 发现的问题/缺口（以回测/一致性为目标）：
+  - Type B/C raw/event 的 `funding_interval_hours` 与 `next_funding_time` 目前为空（exchange=multi），双腿也未写 `leg_*_next_funding_time`，导致资金费累加只能依赖 REST 推断，审计困难。
+  - Type B/C 的窗口指标（range/vol/slope/drift）大量为空，原因是指标仍按 `exchange=multi` 回查 SQLite 无序列；需要改为按腿的真实交易所回查并计算。
+  - 双腿字段已上线并用于 outcome，但腿价格为触发时刻 tick 快照，可能与 SQLite 1min close 有 1–3% 差异；当前缺 `leg_*_ts/source` 字段，难做严格对齐审计。
+  - watchlist_series_agg 未落库，outcome 全退回 SQLite；PG 侧回放/可视化与性能优化空间尚未释放。
+- 当前运行快照：raw/event/outcome 持续增长；outcome worker 已常驻轮询，多数事件已覆盖短/中 horizon。
 
 ## 现状快照（2025-12-09）
 - PG 占用：~29MB，总体含两日 raw 分区（20.27MB / 7.17MB）+ event ~0.8MB + outcome ~0.17MB；推算 30 天约 0.6GB。
@@ -211,6 +207,12 @@
 - 数据量（当前）：raw 27,101 行，event 462 行，future_outcome 93 行；新增事件已带双腿信息，老事件缺腿且被 worker 自动跳过。
 
 ## 下一步（短期）
+- 优先级（结合 2025-12-12 审计，以回测可用性为准）：
+  - 1) 修复 Type B/C 完整性：补腿级 `funding_interval_hours`/`next_funding_time`；窗口指标按两腿真实交易所回查并填满。
+  - 2) 启用 `watchlist_series_agg` 的 5m 聚合落库与回读，提高 PG 侧可回放性与 outcome 对齐能力。
+  - 3) 写入 `watchlist_symbol_ref`（exchange/symbol/状态/流动性/行业等），支撑后续分组分析。
+  - 4) 增加腿级审计字段（`leg_*_ts`/`leg_*_source`）并提供抽样对照脚本，解决价格源/时点差异难审计的问题。
+  - 5) 在策略侧收敛 watchlist 规模（阈值/冷静期/上限），回到“关注池”语义并降低噪声。
 - 补齐非 Binance 资金费历史 fetch（OKX/Bybit/Bitget 仍未上线），并加缓存/调用上限。
 - 对旧事件缺腿信息：worker 已跳过；如需样本可重放。新增事件已写双腿。
 - 监控：每周查看分区大小与 outcome 覆盖率；确保 funding_applied/funding_hist 持续写入。
@@ -264,9 +266,9 @@
 - 运行验证：当前已跑 >24h，raw/event 持续增长；可继续观察 `meta.factors` 覆盖度与磁盘增量，必要时临时调事件归并 N=1 观测。
 - 健康与回退：PG writer 已常驻；仍需写失败降级（文件/SQLite）与日志。`watchlist_series_agg` 分区已创建但尚未大量写入，后续补 5m 聚合；outcome worker 已以 nohup 每 600s 跑一轮，多 horizon 标签已写入 93 条，仍需提高覆盖率。
 
-## 审计对照（2025-12-09 07:40 UTC）
-- 运行状态：simple_app + outcome worker 正在运行（nohup）；PG 双写开启，raw 08/09 分区活跃。
-- 数据质量：最新 raw/event 含双腿与订单簿快照；旧事件缺腿，outcome 跳过。资金费历史仅 Binance REST 覆盖，其他交易所多为空；`funding_applied` 未落库，需补。
-- 覆盖度：raw 27,101 行，event 462 行，future_outcome 93 行；outcome 样本仍偏少，主要因资金费/行情缺口与旧事件跳过。
-- 前端：/watchlist 因子弹窗可见 `meta.factors`；新增 /watchlist/db 浏览页可分页查看 raw/event/outcome。
-- 存储：总占用 ~29MB；日分区滚动脚本已运行，保留周期未达上限。
+## 审计对照（2025-12-12）
+- 运行状态：simple_app + outcome worker 常驻轮询；PG 双写开启，raw/event/outcome 持续写入。
+- 数据范围：raw 仅记录复合 A/B/C 条件的触发快照（正样本池），符合回测范围设定。
+- 一致性：Binance funding 与 REST 抽样对齐；Type A 腿价与 SQLite/REST 在分钟对齐下仍有 1–3% 时点/源差异，建议补腿级 `ts/source` 以支持严格审计。
+- 完整性缺口：Type B/C 的 `funding_interval_hours`/`next_funding_time` 为空；Type B/C 的窗口指标（range/vol/slope/drift）大量为空；`watchlist_series_agg`/`watchlist_symbol_ref`/`watchlist_outcome` 仍为空。
+- 规模偏离：近 24h 触发写入涉及 300+ 符号，高于“关注池 <20”假设，需在策略侧收敛阈值/限流或增加冷静期。
