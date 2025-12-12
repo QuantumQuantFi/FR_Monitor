@@ -315,6 +315,14 @@ class WatchlistManager:
                 except (TypeError, ValueError):
                     interval_val = None
                 next_ft_val = _parse_timestamp(futures.get('next_funding_time'))
+                if (
+                    fut_price is None
+                    and spot_price is None
+                    and funding is None
+                    and interval_val is None
+                    and next_ft_val is None
+                ):
+                    continue
                 if symbol not in market_snapshots:
                     market_snapshots[symbol] = {}
                 market_snapshots[symbol][exch] = {

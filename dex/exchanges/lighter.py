@@ -719,7 +719,9 @@ class LighterMarketWebSocket:
         funding_ts = entry.get('funding_timestamp')
         funding_iso = self._ms_to_iso(funding_ts)
         if funding_iso:
-            snapshot['next_funding_time'] = funding_iso
+            # Upstream field name is ambiguous (observed as "last funding timestamp" in our audits).
+            # Keep it as a raw timestamp and let the aggregator normalize to "next_funding_time".
+            snapshot['funding_timestamp'] = funding_iso
 
         return snapshot
 

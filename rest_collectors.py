@@ -5,7 +5,7 @@ Uses lightweight requests with timeouts; avoids asyncio for simplicity.
 """
 
 from collections import deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import threading
 from typing import Any, Dict, List, Optional
 import time
@@ -35,7 +35,11 @@ from config import (
 from binance_contract_filter import binance_filter
 from bitget_symbol_filter import bitget_filter
 from precision_utils import normalize_funding_rate
-from funding_utils import normalize_next_funding_time, derive_funding_interval_hours
+from funding_utils import (
+    derive_funding_interval_hours,
+    derive_interval_hours_from_times,
+    normalize_next_funding_time,
+)
 
 
 def _now_iso() -> str:
@@ -83,6 +87,67 @@ def _ms_to_iso(value: Optional[Any]) -> Optional[str]:
         return datetime.fromtimestamp(float(value) / 1000.0, tz=timezone.utc).isoformat()
     except Exception:
         return None
+
+
+def _next_utc_boundary_iso(step_hours: int, now: Optional[datetime] = None) -> str:
+    step_hours = int(step_hours)
+    if step_hours <= 0:
+        step_hours = 1
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    floored = now.replace(minute=0, second=0, microsecond=0)
+    base_hour = (floored.hour // step_hours) * step_hours
+    base = floored.replace(hour=base_hour)
+    candidate = base + timedelta(hours=step_hours)
+    if candidate <= now:
+        candidate = candidate + timedelta(hours=step_hours)
+    return candidate.isoformat()
+
+
+# -------------------------------
+# Binance funding interval cache
+# -------------------------------
+_BINANCE_FUNDING_INTERVALS: Dict[str, float] = {}
+_BINANCE_FUNDING_INTERVALS_LOCK = threading.Lock()
+_BINANCE_FUNDING_INTERVALS_LAST_REFRESH = 0.0
+_BINANCE_FUNDING_INTERVALS_TTL_SECONDS = 3600.0
+
+
+def _get_binance_funding_interval_map(force_refresh: bool = False) -> Dict[str, float]:
+    global _BINANCE_FUNDING_INTERVALS_LAST_REFRESH, _BINANCE_FUNDING_INTERVALS
+    now = time.time()
+    with _BINANCE_FUNDING_INTERVALS_LOCK:
+        has_cache = bool(_BINANCE_FUNDING_INTERVALS)
+        last_refresh = _BINANCE_FUNDING_INTERVALS_LAST_REFRESH
+    if not force_refresh and has_cache and (now - last_refresh) < _BINANCE_FUNDING_INTERVALS_TTL_SECONDS:
+        with _BINANCE_FUNDING_INTERVALS_LOCK:
+            return dict(_BINANCE_FUNDING_INTERVALS)
+
+    try:
+        payload = _req_json('https://fapi.binance.com/fapi/v1/fundingInfo')
+    except Exception as exc:
+        print(f"Binance fundingInfo 获取失败: {exc}")
+        with _BINANCE_FUNDING_INTERVALS_LOCK:
+            return dict(_BINANCE_FUNDING_INTERVALS)
+
+    intervals: Dict[str, float] = {}
+    if isinstance(payload, list):
+        for item in payload:
+            sym = (item.get('symbol') or '').upper()
+            if not sym.endswith('USDT'):
+                continue
+            base = sym[:-4]
+            interval = derive_funding_interval_hours('binance', item.get('fundingIntervalHours'), fallback=False)
+            if interval:
+                intervals[base] = float(interval)
+
+    if intervals:
+        with _BINANCE_FUNDING_INTERVALS_LOCK:
+            _BINANCE_FUNDING_INTERVALS = intervals
+            _BINANCE_FUNDING_INTERVALS_LAST_REFRESH = now
+            return dict(_BINANCE_FUNDING_INTERVALS)
+
+    with _BINANCE_FUNDING_INTERVALS_LOCK:
+        return dict(_BINANCE_FUNDING_INTERVALS)
 
 
 # -------------------------------
@@ -195,6 +260,162 @@ _LIGHTER_MARKET_LOCK = threading.Lock()
 _LIGHTER_LAST_REFRESH = 0.0
 
 
+# -------------------------------
+# Bitget funding schedule cache
+# -------------------------------
+_BITGET_FUNDING_CACHE: Dict[str, Dict[str, Any]] = {}
+_BITGET_FUNDING_LOCK = threading.Lock()
+_BITGET_SYMBOL_QUEUE: deque[str] = deque()
+_BITGET_QUEUE_LOCK = threading.Lock()
+
+
+# -------------------------------
+# OKX funding schedule cache
+# -------------------------------
+_OKX_FUNDING_CACHE: Dict[str, Dict[str, Any]] = {}
+_OKX_FUNDING_LOCK = threading.Lock()
+_OKX_SYMBOL_QUEUE: deque[str] = deque()
+_OKX_QUEUE_LOCK = threading.Lock()
+
+
+def _ensure_bitget_symbol_queue(symbols_or_bases: List[str]):
+    """Initialize Bitget funding schedule queue from either bases or XXXUSDT symbols."""
+    bases: List[str] = []
+    for sym in symbols_or_bases or []:
+        sym = (sym or '').upper()
+        if not sym:
+            continue
+        if sym.endswith('USDT'):
+            bases.append(sym[:-4])
+        else:
+            bases.append(sym)
+    if not bases:
+        return
+
+    with _BITGET_QUEUE_LOCK:
+        existing = set(_BITGET_SYMBOL_QUEUE)
+        for base in bases:
+            if base not in existing:
+                _BITGET_SYMBOL_QUEUE.append(base)
+                existing.add(base)
+
+
+def _bitget_fetch_schedule(base: str) -> Optional[Dict[str, Any]]:
+    base = (base or '').upper()
+    if not base:
+        return None
+    symbol = f"{base}USDT"
+    url = (
+        "https://api.bitget.com/api/v2/mix/market/current-fund-rate"
+        f"?productType=USDT-FUTURES&symbol={symbol}"
+    )
+    try:
+        payload = _req_json(url)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get('code') != '00000':
+        return None
+    data = payload.get('data') or []
+    if not data or not isinstance(data, list):
+        return None
+    entry = data[0] if isinstance(data[0], dict) else None
+    if not entry:
+        return None
+
+    schedule: Dict[str, Any] = {'timestamp': _now_iso()}
+    next_ft = normalize_next_funding_time(entry.get('nextUpdate'))
+    if next_ft:
+        schedule['next_funding_time'] = next_ft
+    interval = derive_funding_interval_hours('bitget', entry.get('fundingRateInterval'), fallback=False)
+    if interval:
+        schedule['funding_interval_hours'] = float(interval)
+    return schedule if len(schedule) > 1 else None
+
+
+def _get_bitget_funding_schedule_map(
+    symbols_or_bases: Optional[List[str]] = None, *, batch_size: int = 32
+) -> Dict[str, Dict[str, Any]]:
+    """Return cached funding schedule, refreshing a small batch each call."""
+    if symbols_or_bases:
+        _ensure_bitget_symbol_queue(symbols_or_bases)
+
+    refreshed: Dict[str, Dict[str, Any]] = {}
+    with _BITGET_QUEUE_LOCK:
+        for _ in range(min(int(batch_size), len(_BITGET_SYMBOL_QUEUE))):
+            base = _BITGET_SYMBOL_QUEUE.popleft()
+            _BITGET_SYMBOL_QUEUE.append(base)
+            schedule = _bitget_fetch_schedule(base)
+            if schedule:
+                refreshed[base] = schedule
+
+    if refreshed:
+        with _BITGET_FUNDING_LOCK:
+            _BITGET_FUNDING_CACHE.update(refreshed)
+
+    with _BITGET_FUNDING_LOCK:
+        return dict(_BITGET_FUNDING_CACHE)
+
+
+def _ensure_okx_symbol_queue(bases: List[str]):
+    bases = [(b or '').upper() for b in (bases or []) if (b or '').strip()]
+    if not bases:
+        return
+    with _OKX_QUEUE_LOCK:
+        existing = set(_OKX_SYMBOL_QUEUE)
+        for base in bases:
+            if base not in existing:
+                _OKX_SYMBOL_QUEUE.append(base)
+                existing.add(base)
+
+
+def _okx_fetch_schedule(base: str) -> Optional[Dict[str, Any]]:
+    base = (base or '').upper()
+    if not base:
+        return None
+    inst_id = f"{base}-USDT-SWAP"
+    url = f"https://www.okx.com/api/v5/public/funding-rate?instId={inst_id}"
+    try:
+        payload = _req_json(url)
+    except Exception:
+        return None
+    if not isinstance(payload, dict) or payload.get('code') != '0':
+        return None
+    data = payload.get('data') or []
+    if not data or not isinstance(data, list) or not isinstance(data[0], dict):
+        return None
+    entry = data[0]
+
+    schedule: Dict[str, Any] = {'timestamp': _now_iso()}
+    next_ft = normalize_next_funding_time(entry.get('nextFundingTime'))
+    if next_ft:
+        schedule['next_funding_time'] = next_ft
+    interval = derive_interval_hours_from_times(entry.get('fundingTime'), entry.get('nextFundingTime'))
+    if interval:
+        schedule['funding_interval_hours'] = float(interval)
+    return schedule if len(schedule) > 1 else None
+
+
+def _get_okx_funding_schedule_map(bases: Optional[List[str]] = None, *, batch_size: int = 16) -> Dict[str, Dict[str, Any]]:
+    if bases:
+        _ensure_okx_symbol_queue(bases)
+
+    refreshed: Dict[str, Dict[str, Any]] = {}
+    with _OKX_QUEUE_LOCK:
+        for _ in range(min(int(batch_size), len(_OKX_SYMBOL_QUEUE))):
+            base = _OKX_SYMBOL_QUEUE.popleft()
+            _OKX_SYMBOL_QUEUE.append(base)
+            schedule = _okx_fetch_schedule(base)
+            if schedule:
+                refreshed[base] = schedule
+
+    if refreshed:
+        with _OKX_FUNDING_LOCK:
+            _OKX_FUNDING_CACHE.update(refreshed)
+
+    with _OKX_FUNDING_LOCK:
+        return dict(_OKX_FUNDING_CACHE)
+
+
 def _lighter_base_url() -> str:
     return LIGHTER_REST_BASE_URL.rstrip('/')
 
@@ -283,24 +504,8 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
     过滤指数合约和清算中合约，避免污染币种价格比较."""
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     ts = _now_iso()
-    now_dt = datetime.now(timezone.utc)
+    interval_map = _get_binance_funding_interval_map()
     premium_meta: Dict[str, Dict[str, Any]] = {}
-
-    def _infer_interval_hours(next_ft_iso: Optional[str]) -> Optional[float]:
-        """根据下一次资金费时间估算周期；若无法确定则返回 None。"""
-        if not next_ft_iso:
-            return None
-        try:
-            dt = datetime.fromisoformat(next_ft_iso.replace('Z', '+00:00'))
-            delta_hours = (dt - now_dt).total_seconds() / 3600.0
-            if delta_hours <= 0:
-                return None
-            # Binance 目前常见 1h/4h/8h，取 [0.5, 10] 范围内的值
-            if 0.5 <= delta_hours <= 10:
-                return round(delta_hours, 2)
-        except Exception:
-            return None
-        return None
 
     try:
         premium_payload = _req_json('https://fapi.binance.com/fapi/v1/premiumIndex')
@@ -317,9 +522,6 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                 next_ft = normalize_next_funding_time(item.get('nextFundingTime'))
                 if next_ft:
                     extras['next_funding_time'] = next_ft
-                interval = _infer_interval_hours(next_ft) or derive_funding_interval_hours('binance')
-                if interval:
-                    extras['funding_interval_hours'] = interval
                 if extras:
                     premium_meta[base] = extras
     except Exception as exc:
@@ -365,10 +567,9 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                             extras = premium_meta.get(base)
                             if extras:
                                 futures_snapshot.update(extras)
-                            else:
-                                interval = derive_funding_interval_hours('binance')
-                                if interval:
-                                    futures_snapshot['funding_interval_hours'] = interval
+                            interval = interval_map.get(base)
+                            if interval:
+                                futures_snapshot['funding_interval_hours'] = float(interval)
                             out[base]['futures'] = futures_snapshot
                     elif has_fut_filter and sym in valid_symbols['futures_invalid']:
                         # 过滤的无效合约（指数/清算中）
@@ -386,6 +587,9 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
         if 'timestamp' not in entry:
             entry['timestamp'] = ts
         entry.update(extras)
+        interval = interval_map.get(base)
+        if interval and 'funding_interval_hours' not in entry:
+            entry['funding_interval_hours'] = float(interval)
         
     return out
 
@@ -393,6 +597,7 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
 def fetch_okx() -> Dict[str, Dict[str, Dict[str, Any]]]:
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
     ts = _now_iso()
+    allowed = set(CURRENT_SUPPORTED_SYMBOLS or [])
     try:
         data = _req_json('https://www.okx.com/api/v5/market/tickers?instType=SPOT')
         if isinstance(data, dict) and data.get('code') == '0':
@@ -400,6 +605,8 @@ def fetch_okx() -> Dict[str, Dict[str, Dict[str, Any]]]:
                 inst_id = item.get('instId', '')  # e.g., BTC-USDT
                 if inst_id.endswith('-USDT'):
                     base = inst_id.split('-')[0]
+                    if allowed and base not in allowed:
+                        continue
                     price = float(item.get('last') or 0)
                     if price:
                         out.setdefault(base, {}).setdefault('spot', {})
@@ -410,18 +617,54 @@ def fetch_okx() -> Dict[str, Dict[str, Dict[str, Any]]]:
     try:
         data = _req_json('https://www.okx.com/api/v5/market/tickers?instType=SWAP')
         if isinstance(data, dict) and data.get('code') == '0':
+            bases_seen: List[str] = []
             for item in data.get('data', []):
                 inst_id = item.get('instId', '')  # e.g., BTC-USDT-SWAP
                 if inst_id.endswith('-USDT-SWAP'):
                     base = inst_id.split('-')[0]
+                    if allowed and base not in allowed:
+                        continue
                     price = float(item.get('last') or 0)
                     if price:
+                        bases_seen.append(base)
                         out.setdefault(base, {}).setdefault('futures', {})
                         snapshot = {'price': price, 'timestamp': ts, 'symbol': inst_id}
-                        interval = derive_funding_interval_hours('okx')
-                        if interval:
-                            snapshot['funding_interval_hours'] = interval
                         out[base]['futures'] = snapshot
+            if bases_seen:
+                schedule_map = _get_okx_funding_schedule_map(bases_seen, batch_size=24)
+                for base in bases_seen:
+                    schedule = schedule_map.get(base)
+                    if not schedule:
+                        continue
+                    snap = out.get(base, {}).get('futures')
+                    if not isinstance(snap, dict):
+                        continue
+                    if schedule.get('next_funding_time'):
+                        snap['next_funding_time'] = schedule['next_funding_time']
+                    if schedule.get('funding_interval_hours'):
+                        snap['funding_interval_hours'] = schedule['funding_interval_hours']
+                # 对本轮出现的 base 做少量补齐，避免 queue 未覆盖导致短期缺失
+                missing = [
+                    b for b in bases_seen
+                    if isinstance(out.get(b, {}).get('futures'), dict)
+                    and (
+                        'next_funding_time' not in out[b]['futures']
+                        or 'funding_interval_hours' not in out[b]['futures']
+                    )
+                ]
+                for base in missing[:6]:
+                    schedule = _okx_fetch_schedule(base)
+                    if not schedule:
+                        continue
+                    snap = out.get(base, {}).get('futures')
+                    if not isinstance(snap, dict):
+                        continue
+                    if schedule.get('next_funding_time'):
+                        snap['next_funding_time'] = schedule['next_funding_time']
+                    if schedule.get('funding_interval_hours'):
+                        snap['funding_interval_hours'] = schedule['funding_interval_hours']
+                    with _OKX_FUNDING_LOCK:
+                        _OKX_FUNDING_CACHE[base] = schedule
     except Exception:
         pass
     return out
@@ -674,6 +917,8 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
         )
         if next_ft:
             snapshot['next_funding_time'] = next_ft
+        else:
+            snapshot['next_funding_time'] = _next_utc_boundary_iso(int(interval or 8))
 
         out.setdefault(symbol, {})['futures'] = snapshot
 
@@ -710,6 +955,7 @@ def fetch_hyperliquid() -> Dict[str, Dict[str, Dict[str, Any]]]:
         interval = derive_funding_interval_hours('hyperliquid')
         if interval:
             snapshot['funding_interval_hours'] = interval
+        snapshot['next_funding_time'] = _next_utc_boundary_iso(int(interval or 1))
 
         ctx = funding_map.get(base_upper)
         if ctx:
@@ -774,6 +1020,7 @@ def fetch_lighter() -> Dict[str, Dict[str, Dict[str, Any]]]:
         interval = derive_funding_interval_hours('lighter')
         if interval:
             snapshot['funding_interval_hours'] = interval
+        snapshot['next_funding_time'] = _next_utc_boundary_iso(int(interval or 1))
 
         market_meta = market_info.get(symbol)
         if market_meta:
@@ -820,6 +1067,7 @@ def fetch_bitget() -> Dict[str, Dict[str, Dict[str, Any]]]:
         data = _req_json('https://api.bitget.com/api/v2/mix/market/tickers?productType=USDT-FUTURES')
         if isinstance(data, dict) and data.get('code') == '00000':
             filtered_count = 0
+            bases_seen: List[str] = []
             for item in data.get('data', []):
                 sym = item.get('symbol', '')  # e.g., BTCUSDT
                 if sym.endswith('USDT'):
@@ -827,17 +1075,50 @@ def fetch_bitget() -> Dict[str, Dict[str, Dict[str, Any]]]:
                         base = sym[:-4]
                         price = float(item.get('lastPr') or 0)
                         if price:
+                            bases_seen.append(base)
                             out.setdefault(base, {}).setdefault('futures', {})
                             snapshot = {'price': price, 'timestamp': ts, 'symbol': sym}
-                            interval = derive_funding_interval_hours('bitget')
-                            if interval:
-                                snapshot['funding_interval_hours'] = interval
                             out[base]['futures'] = snapshot
                     elif has_fut_filter:
                         filtered_count += 1
             
             if filtered_count > 0:
                 print(f"Bitget期货REST已过滤 {filtered_count} 个异常币种")
+            if bases_seen:
+                schedule_map = _get_bitget_funding_schedule_map(bases_seen, batch_size=32)
+                for base in bases_seen:
+                    schedule = schedule_map.get(base)
+                    if not schedule:
+                        continue
+                    snap = out.get(base, {}).get('futures')
+                    if not isinstance(snap, dict):
+                        continue
+                    if schedule.get('next_funding_time'):
+                        snap['next_funding_time'] = schedule['next_funding_time']
+                    if schedule.get('funding_interval_hours'):
+                        snap['funding_interval_hours'] = schedule['funding_interval_hours']
+                # 对本轮出现的 base 做少量补齐，避免 queue 未覆盖导致短期缺失
+                missing = [
+                    b for b in bases_seen
+                    if isinstance(out.get(b, {}).get('futures'), dict)
+                    and (
+                        'next_funding_time' not in out[b]['futures']
+                        or 'funding_interval_hours' not in out[b]['futures']
+                    )
+                ]
+                for base in missing[:8]:
+                    schedule = _bitget_fetch_schedule(base)
+                    if not schedule:
+                        continue
+                    snap = out.get(base, {}).get('futures')
+                    if not isinstance(snap, dict):
+                        continue
+                    if schedule.get('next_funding_time'):
+                        snap['next_funding_time'] = schedule['next_funding_time']
+                    if schedule.get('funding_interval_hours'):
+                        snap['funding_interval_hours'] = schedule['funding_interval_hours']
+                    with _BITGET_FUNDING_LOCK:
+                        _BITGET_FUNDING_CACHE[base] = schedule
                 
     except Exception:
         pass

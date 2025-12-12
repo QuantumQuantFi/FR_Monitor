@@ -29,7 +29,12 @@ from dex.exchanges.grvt import GrvtMarketWebSocket
 from dex.exchanges.lighter import LighterMarketWebSocket
 from dex.exchanges.hyperliquid import HyperliquidMarketWebSocket
 from precision_utils import normalize_funding_rate
-from funding_utils import normalize_next_funding_time, derive_funding_interval_hours
+from funding_utils import (
+    derive_funding_interval_hours,
+    derive_interval_hours_from_times,
+    normalize_and_advance_next_funding_time,
+    normalize_next_funding_time,
+)
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -486,31 +491,43 @@ class ExchangeDataCollector:
                 except Exception:
                     is_fresh = False
 
-                if not is_fresh:
-                    merged = {k: v for k, v in existing.items() if k not in ('price', 'timestamp', 'symbol')}
-                    merged.update({
-                        'price': new_data.get('price', 0),
-                        'timestamp': synced_at,
-                        'symbol': new_data.get('symbol')
-                    })
+                merged = dict(existing or {})
 
-                    # REST 视为权威数据来源，可覆盖旧的资金费率/结算时间
-                    rest_funding = new_data.get('funding_rate')
-                    normalized_funding = normalize_funding_rate(rest_funding)
-                    if normalized_funding is not None:
-                        merged['funding_rate'] = normalized_funding
+                # REST 视为权威数据来源：资金费率/结算时间/周期可随时覆盖（即使WS价格很新）
+                rest_funding = new_data.get('funding_rate')
+                normalized_funding = normalize_funding_rate(rest_funding)
+                if normalized_funding is not None:
+                    merged['funding_rate'] = normalized_funding
 
-                    rest_next_ft = normalize_next_funding_time(new_data.get('next_funding_time'))
-                    if rest_next_ft:
-                        merged['next_funding_time'] = rest_next_ft
+                rest_next_ft = normalize_next_funding_time(new_data.get('next_funding_time'))
+                if rest_next_ft:
+                    merged['next_funding_time'] = rest_next_ft
 
-                    rest_interval = derive_funding_interval_hours(
-                        exchange, new_data.get('funding_interval_hours'), fallback=False
+                rest_interval = derive_funding_interval_hours(
+                    exchange, new_data.get('funding_interval_hours'), fallback=False
+                )
+                if rest_interval:
+                    merged['funding_interval_hours'] = rest_interval
+
+                # 若 next_funding_time 已过期但 interval 已知，则推进到下一个结算点
+                if kind == 'futures':
+                    nft, interval = normalize_and_advance_next_funding_time(
+                        now=datetime.now(timezone.utc),
+                        next_funding_time=merged.get('next_funding_time'),
+                        interval_hours=merged.get('funding_interval_hours'),
+                        allow_past_seconds=60.0,
                     )
-                    if rest_interval:
-                        merged['funding_interval_hours'] = rest_interval
+                    if nft:
+                        merged['next_funding_time'] = nft
+                    if interval:
+                        merged['funding_interval_hours'] = interval
 
-                    self.data[exchange][symbol][kind] = merged
+                if not is_fresh:
+                    merged['price'] = new_data.get('price', 0)
+                    merged['timestamp'] = synced_at
+                    merged['symbol'] = new_data.get('symbol')
+
+                self.data[exchange][symbol][kind] = merged
 
         # 标记该交易所合并时刻为最后同步时间（用于前端展示）
         self.rest_last_sync[exchange] = synced_at
@@ -677,12 +694,15 @@ class ExchangeDataCollector:
                                                 self.data['okx'][symbol]['futures'] = {}
                                             funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
                                             next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                            interval_hint = derive_interval_hours_from_times(
+                                                item.get('fundingTime'), item.get('nextFundingTime')
+                                            )
                                             updates = {
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                             }
                                             if next_time:
                                                 updates['next_funding_time'] = next_time
-                                            interval = derive_funding_interval_hours('okx')
+                                            interval = interval_hint or derive_funding_interval_hours('okx')
                                             if interval:
                                                 updates['funding_interval_hours'] = interval
                                             if funding_rate_value is not None:
@@ -836,17 +856,16 @@ class ExchangeDataCollector:
                         for symbol in self.supported_symbols:
                             if symbol_name == f"{symbol}USDT":
                                 funding_rate_value = normalize_funding_rate(stream_data.get('r'))
-                                futures_entry = {
+                                existing = self.data['binance'][symbol].get('futures', {})
+                                futures_entry = dict(existing or {})
+                                futures_entry.update({
                                     'price': float(stream_data['p']),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
-                                }
+                                })
                                 next_time = normalize_next_funding_time(stream_data.get('T'))
                                 if next_time:
                                     futures_entry['next_funding_time'] = next_time
-                                interval = derive_funding_interval_hours('binance')
-                                if interval:
-                                    futures_entry['funding_interval_hours'] = interval
                                 if funding_rate_value is not None:
                                     futures_entry['funding_rate'] = funding_rate_value
                                 self.data['binance'][symbol]['futures'] = futures_entry
@@ -857,17 +876,16 @@ class ExchangeDataCollector:
                     for symbol in self.supported_symbols:
                         if symbol_name == f"{symbol}USDT":
                             funding_rate_value = normalize_funding_rate(data.get('r'))
-                            futures_entry = {
+                            existing = self.data['binance'][symbol].get('futures', {})
+                            futures_entry = dict(existing or {})
+                            futures_entry.update({
                                 'price': float(data['p']),
                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                 'symbol': symbol_name
-                            }
+                            })
                             next_time = normalize_next_funding_time(data.get('T'))
                             if next_time:
                                 futures_entry['next_funding_time'] = next_time
-                            interval = derive_funding_interval_hours('binance')
-                            if interval:
-                                futures_entry['funding_interval_hours'] = interval
                             if funding_rate_value is not None:
                                 futures_entry['funding_rate'] = funding_rate_value
                             self.data['binance'][symbol]['futures'] = futures_entry
@@ -1037,26 +1055,22 @@ class ExchangeDataCollector:
                             raw_funding = item.get('fundingRate')
                             funding_rate_value = normalize_funding_rate(raw_funding)
                             if 'lastPrice' in item:
-                                # 完整更新包括价格
-                                current_funding_rate = None
-                                if self.data['bybit'][coin]['futures']:
-                                    current_funding_rate = self.data['bybit'][coin]['futures'].get('funding_rate')
-                                final_funding_rate = funding_rate_value if funding_rate_value is not None else current_funding_rate
-                                futures_snapshot = {
+                                current_data = dict(self.data['bybit'][coin].get('futures', {}) or {})
+                                current_data.update({
                                     'price': float(item.get('lastPrice', 0) or 0),
                                     'volume': float(item.get('volume24h', 0) or 0),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
                                     'symbol': symbol_name
-                                }
+                                })
                                 next_time = normalize_next_funding_time(item.get('nextFundingTime'))
                                 if next_time:
-                                    futures_snapshot['next_funding_time'] = next_time
-                                interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'))
+                                    current_data['next_funding_time'] = next_time
+                                interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'), fallback=False)
                                 if interval:
-                                    futures_snapshot['funding_interval_hours'] = interval
-                                if final_funding_rate is not None:
-                                    futures_snapshot['funding_rate'] = final_funding_rate
-                                self.data['bybit'][coin]['futures'] = futures_snapshot
+                                    current_data['funding_interval_hours'] = interval
+                                if funding_rate_value is not None:
+                                    current_data['funding_rate'] = funding_rate_value
+                                self.data['bybit'][coin]['futures'] = current_data
                                 print(f"Bybit {coin} 合约价格: {item.get('lastPrice', 0)}, 资金费率: {self.data['bybit'][coin]['futures'].get('funding_rate', 0)} (源:{base})")
                             else:
                                 # 增量更新：只更新有提供的字段
@@ -1064,13 +1078,12 @@ class ExchangeDataCollector:
                                     current_data = self.data['bybit'][coin]['futures'].copy()
                                     if funding_rate_value is not None:
                                         current_data['funding_rate'] = funding_rate_value
-                                    if 'nextFundingTime' in item:
-                                        next_time = normalize_next_funding_time(item.get('nextFundingTime'))
-                                        if next_time:
-                                            current_data['next_funding_time'] = next_time
-                                        interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'))
-                                        if interval:
-                                            current_data['funding_interval_hours'] = interval
+                                    next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                    if next_time:
+                                        current_data['next_funding_time'] = next_time
+                                    interval = derive_funding_interval_hours('bybit', item.get('fundingIntervalHour'), fallback=False)
+                                    if interval:
+                                        current_data['funding_interval_hours'] = interval
                                     if 'volume24h' in item:
                                         current_data['volume'] = float(item.get('volume24h', 0) or 0)
                                     current_data['timestamp'] = datetime.now(timezone.utc).isoformat()
@@ -1333,19 +1346,18 @@ class ExchangeDataCollector:
                                         funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
 
                                         if price > 0:  # 只在有有效价格时更新
-                                            futures_snapshot = {
+                                            existing = self.data['bitget'][symbol].get('futures', {})
+                                            futures_snapshot = dict(existing or {})
+                                            futures_snapshot.update({
                                                 'price': price,
-                                                'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else 0,
-                                                'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else 0,
+                                                'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else futures_snapshot.get('mark_price', 0),
+                                                'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else futures_snapshot.get('index_price', 0),
                                                 'timestamp': datetime.now(timezone.utc).isoformat(),
                                                 'symbol': inst_id
-                                            }
+                                            })
                                             next_time = normalize_next_funding_time(item.get('nextFundingTime'))
                                             if next_time:
                                                 futures_snapshot['next_funding_time'] = next_time
-                                            interval = derive_funding_interval_hours('bitget')
-                                            if interval:
-                                                futures_snapshot['funding_interval_hours'] = interval
                                             if funding_rate_value is not None:
                                                 futures_snapshot['funding_rate'] = funding_rate_value
                                             self.data['bitget'][symbol]['futures'] = futures_snapshot
@@ -1444,21 +1456,28 @@ class ExchangeDataCollector:
             market_type = payload.get('market_type', 'futures')
             target_kind = 'spot' if market_type == 'spot' else 'futures'
 
-            snapshot = {
+            existing = self.data['grvt'][symbol].get(target_kind, {})
+            snapshot = dict(existing or {})
+            snapshot.update({
                 'price': float(payload.get('price', 0) or 0),
                 'timestamp': payload.get('timestamp') or datetime.now(timezone.utc).isoformat(),
                 'symbol': payload.get('instrument', f"{symbol}USDT")
-            }
+            })
 
             funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
             if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
-            next_ft = normalize_next_funding_time(payload.get('next_funding_time'))
-            if next_ft:
-                snapshot['next_funding_time'] = next_ft
             interval = derive_funding_interval_hours('grvt')
             if interval:
                 snapshot['funding_interval_hours'] = interval
+            nft, _ = normalize_and_advance_next_funding_time(
+                now=datetime.now(timezone.utc),
+                next_funding_time=payload.get('next_funding_time') or snapshot.get('next_funding_time'),
+                interval_hours=snapshot.get('funding_interval_hours'),
+                allow_past_seconds=60.0,
+            )
+            if nft:
+                snapshot['next_funding_time'] = nft
 
             if snapshot['price'] > 0:
                 self.data['grvt'][symbol][target_kind] = snapshot
@@ -1510,12 +1529,18 @@ class ExchangeDataCollector:
             funding_rate = normalize_funding_rate(payload.get('funding_rate'), assume_percent=True)
             if funding_rate is not None:
                 snapshot['funding_rate'] = funding_rate
-            next_time = normalize_next_funding_time(payload.get('next_funding_time') or payload.get('funding_timestamp'))
-            if next_time:
-                snapshot['next_funding_time'] = next_time
             interval = derive_funding_interval_hours('lighter')
             if interval:
                 snapshot['funding_interval_hours'] = interval
+            raw_next = payload.get('next_funding_time') or payload.get('funding_timestamp')
+            nft, _ = normalize_and_advance_next_funding_time(
+                now=datetime.now(timezone.utc),
+                next_funding_time=raw_next,
+                interval_hours=snapshot.get('funding_interval_hours'),
+                allow_past_seconds=60.0,
+            )
+            if nft:
+                snapshot['next_funding_time'] = nft
 
             self.data['lighter'][symbol]['futures'] = snapshot
             print(f"Lighter {symbol} 永续价格: {snapshot['price']}")
@@ -1554,11 +1579,13 @@ class ExchangeDataCollector:
             if price_value <= 0:
                 return
 
-            snapshot = {
+            existing = self.data['hyperliquid'][symbol].get('futures', {})
+            snapshot = dict(existing or {})
+            snapshot.update({
                 'price': price_value,
                 'timestamp': payload.get('timestamp') or datetime.now(timezone.utc).isoformat(),
                 'symbol': payload.get('instrument', f"{symbol}-PERP"),
-            }
+            })
             self.data['hyperliquid'][symbol]['futures'] = snapshot
             print(f"Hyperliquid {symbol} 永续价格: {snapshot['price']}")
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional, Tuple
 
 DEFAULT_FUNDING_INTERVALS = {
     # Major CEX perpetuals settle every 8 hours unless documented otherwise.
@@ -148,3 +148,61 @@ def derive_funding_interval_hours(exchange: str, interval_hint: Any = None, *, f
 
     return DEFAULT_FUNDING_INTERVALS.get((exchange or '').lower())
 
+
+def derive_interval_hours_from_times(funding_time: Any, next_funding_time: Any) -> Optional[float]:
+    """Derive interval hours from (funding_time, next_funding_time)."""
+    ft = _normalize_datetime(funding_time)
+    nft = _normalize_datetime(next_funding_time)
+    if not ft or not nft:
+        return None
+    delta_seconds = (nft - ft).total_seconds()
+    if delta_seconds <= 0:
+        return None
+    hours = delta_seconds / 3600.0
+    if hours <= 0 or hours > 48:
+        return None
+    # Snap to common whole-hour intervals when close enough.
+    for candidate in (1.0, 2.0, 4.0, 8.0, 12.0, 24.0):
+        if abs(hours - candidate) <= (60.0 / 3600.0):  # within 60 seconds
+            return candidate
+    return round(hours, 6)
+
+
+def normalize_and_advance_next_funding_time(
+    *,
+    now: datetime,
+    next_funding_time: Any,
+    interval_hours: Optional[float],
+    allow_past_seconds: float = 60.0,
+) -> Tuple[Optional[str], Optional[float]]:
+    """Normalize schedule fields and ensure next_funding_time is in the future.
+
+    If next_funding_time is in the past and interval_hours is known, advance it by
+    multiples of interval_hours until it is strictly after (now - allow_past_seconds).
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+
+    interval = _to_float(interval_hours) if interval_hours is not None else None
+    if interval is not None and interval <= 0:
+        interval = None
+
+    nft = _normalize_datetime(next_funding_time)
+    if not nft:
+        return None, interval
+
+    nft = nft.astimezone(timezone.utc)
+    cutoff = now - timedelta(seconds=float(allow_past_seconds))
+
+    if interval is None or nft > cutoff:
+        return nft.isoformat(), interval
+
+    step_seconds = interval * 3600.0
+    if step_seconds <= 0:
+        return nft.isoformat(), interval
+
+    diff_seconds = (cutoff - nft).total_seconds()
+    steps = int(diff_seconds // step_seconds) + 1
+    advanced = nft + timedelta(seconds=steps * step_seconds)
+    return advanced.isoformat(), interval
