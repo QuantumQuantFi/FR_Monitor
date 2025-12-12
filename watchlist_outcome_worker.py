@@ -23,7 +23,7 @@ import config
 
 HORIZONS_MIN = [15, 30, 60, 240, 480, 1440, 2880, 5760]  # 15m,30m,1h,4h,8h,24h,48h,96h
 MAX_TASKS = 1000  # 每次运行最多处理的 event-horizon 组合，防止扫全表
-MAX_REST_CALLS = 50  # 每轮允许的 REST 调用上限，防止过载
+MAX_REST_CALLS = 500  # 每轮允许的 REST 调用上限，防止过载
 
 
 def _utcnow() -> datetime:
@@ -50,7 +50,7 @@ def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
     min_horizon = min(HORIZONS_MIN)
     sql = """
     WITH need AS (
-        SELECT e.id, e.exchange, e.symbol, e.start_ts,
+        SELECT e.id, e.exchange, e.symbol, e.signal_type, e.start_ts,
                e.leg_a_exchange, e.leg_a_symbol, e.leg_a_kind, e.leg_a_price_first, e.leg_a_price_last, e.leg_a_funding_rate_first, e.leg_a_funding_rate_last,
                e.leg_b_exchange, e.leg_b_symbol, e.leg_b_kind, e.leg_b_price_first, e.leg_b_price_last, e.leg_b_funding_rate_first, e.leg_b_funding_rate_last
         FROM watchlist.watch_signal_event e
@@ -83,21 +83,22 @@ def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
                     "id": r[0],
                     "exchange": r[1],
                     "symbol": r[2],
-                    "start_ts": r[3],
-                    "leg_a_exchange": r[4],
-                    "leg_a_symbol": r[5],
-                    "leg_a_kind": r[6],
-                    "leg_a_price_first": r[7],
-                    "leg_a_price_last": r[8],
-                    "leg_a_funding_rate_first": r[9],
-                    "leg_a_funding_rate_last": r[10],
-                    "leg_b_exchange": r[11],
-                    "leg_b_symbol": r[12],
-                    "leg_b_kind": r[13],
-                    "leg_b_price_first": r[14],
-                    "leg_b_price_last": r[15],
-                    "leg_b_funding_rate_first": r[16],
-                    "leg_b_funding_rate_last": r[17],
+                    "signal_type": r[3],
+                    "start_ts": r[4],
+                    "leg_a_exchange": r[5],
+                    "leg_a_symbol": r[6],
+                    "leg_a_kind": r[7],
+                    "leg_a_price_first": r[8],
+                    "leg_a_price_last": r[9],
+                    "leg_a_funding_rate_first": r[10],
+                    "leg_a_funding_rate_last": r[11],
+                    "leg_b_exchange": r[12],
+                    "leg_b_symbol": r[13],
+                    "leg_b_kind": r[14],
+                    "leg_b_price_first": r[15],
+                    "leg_b_price_last": r[16],
+                    "leg_b_funding_rate_first": r[17],
+                    "leg_b_funding_rate_last": r[18],
                 }
             )
     return out
@@ -233,31 +234,53 @@ class FundingHistoryFetcher:
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "watchlist-outcome-worker/1.0"})
-        self._cache: Dict[Tuple[str, str, int, int], List[Tuple[datetime, float]]] = {}
+        # Cache by day bucket to reuse results across many events in the same day.
+        # key=(exchange, symbol, day_bucket_start_ts)
+        self._cache_day: Dict[Tuple[str, str, int], List[Tuple[datetime, float]]] = {}
         self._calls = 0
 
     def fetch(self, exchange: str, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
         if self._calls >= MAX_REST_CALLS:
             return []
-        key = (exchange, symbol, int(start_ts.timestamp()), int(end_ts.timestamp()))
-        if key in self._cache:
-            return self._cache[key]
+        ex = exchange.lower()
+        start_ts = start_ts.astimezone(timezone.utc)
+        end_ts = end_ts.astimezone(timezone.utc)
+
+        def _day_floor(dt: datetime) -> datetime:
+            return dt.astimezone(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+
         out: List[Tuple[datetime, float]] = []
-        try:
-            if exchange.lower() == "binance":
-                out = self._fetch_binance(symbol, start_ts, end_ts)
-            elif exchange.lower() == "okx":
-                out = self._fetch_okx(symbol, start_ts, end_ts)
-            elif exchange.lower() == "bybit":
-                out = self._fetch_bybit(symbol, start_ts, end_ts)
-            elif exchange.lower() == "bitget":
-                out = self._fetch_bitget(symbol, start_ts, end_ts)
-            # 其他交易所可按需扩展
-        except Exception:
-            out = []
-        self._cache[key] = out
-        if out:
-            self._calls += 1
+        day = _day_floor(start_ts)
+        end_day = _day_floor(end_ts)
+        while day <= end_day and self._calls < MAX_REST_CALLS:
+            key = (ex, symbol, int(day.timestamp()))
+            if key not in self._cache_day:
+                day_start = day
+                day_end = day + timedelta(days=1)
+                # Widen the query start slightly so we don't miss boundary points, then filter back to the day range.
+                query_start = day_start - timedelta(seconds=1)
+                query_end = day_end
+                points: List[Tuple[datetime, float]] = []
+                try:
+                    if ex == "binance":
+                        points = self._fetch_binance(symbol, query_start, query_end)
+                    elif ex == "okx":
+                        points = self._fetch_okx(symbol, query_start, query_end)
+                    elif ex == "bybit":
+                        points = self._fetch_bybit(symbol, query_start, query_end)
+                    elif ex == "bitget":
+                        points = self._fetch_bitget(symbol, query_start, query_end)
+                except Exception:
+                    points = []
+                # Keep only points within [day_start, day_end)
+                self._cache_day[key] = [(ts, rate) for ts, rate in points if day_start <= ts < day_end]
+
+            for ts, rate in self._cache_day.get(key) or []:
+                if start_ts < ts <= end_ts:
+                    out.append((ts, rate))
+            day = day + timedelta(days=1)
+
+        out.sort(key=lambda x: x[0])
         return out
 
     def _fetch_binance(self, symbol: str, start_ts: datetime, end_ts: datetime) -> List[Tuple[datetime, float]]:
@@ -286,7 +309,8 @@ class FundingHistoryFetcher:
                     if ts > end_ts:
                         reached_end = True
                         break
-                    if ts < start_ts or ts > end_ts:
+                    # Only include points in (start_ts, end_ts]
+                    if ts <= start_ts or ts > end_ts:
                         continue
                     rate = float(item["fundingRate"])
                     chunk.append((ts, rate))
@@ -322,7 +346,7 @@ class FundingHistoryFetcher:
                     ts = datetime.fromtimestamp(int(item.get("fundingTime")) / 1000, tz=timezone.utc)
                     rate_raw = item.get("realizedRate") or item.get("fundingRate")
                     rate = float(rate_raw)
-                    if start_ts <= ts <= end_ts:
+                    if start_ts < ts <= end_ts:
                         out_local.append((ts, rate))
                 except Exception:
                     continue
@@ -370,7 +394,7 @@ class FundingHistoryFetcher:
                 try:
                     ts = datetime.fromtimestamp(int(item["fundingRateTimestamp"]) / 1000, tz=timezone.utc)
                     rate = float(item["fundingRate"])
-                    if start_ts <= ts <= end_ts:
+                    if start_ts < ts <= end_ts:
                         out.append((ts, rate))
                 except Exception:
                     continue
@@ -393,7 +417,7 @@ class FundingHistoryFetcher:
                     ts_raw = item.get("fundingTime") or item.get("timestamp")
                     ts = datetime.fromtimestamp(int(ts_raw) / 1000, tz=timezone.utc)
                     rate = float(item.get("fundingRate"))
-                    if start_ts <= ts <= end_ts:
+                    if start_ts < ts <= end_ts:
                         out_local.append((ts, rate))
                 except Exception:
                     continue
@@ -438,7 +462,7 @@ class FundingHistoryFetcher:
                         try:
                             ts = datetime.fromtimestamp(int(item["fundingTime"]) / 1000, tz=timezone.utc)
                             rate = float(item["fundingRate"])
-                            if start_ts <= ts <= end_ts:
+                            if start_ts < ts <= end_ts:
                                 out.append((ts, rate))
                         except Exception:
                             continue
@@ -482,10 +506,10 @@ def _build_funding_schedule(
             break
     interval_h = interval_h or 8.0
 
-    # 首个结算点：选第一个在 start_ts 之后的 next_funding_time，若无则 start+interval
+    # 首个结算点：选第一个在 start_ts 之后的 next_funding_time（严格大于），若无则 start+interval
     next_ft = None
     for _, _, _, nft in series_sorted:
-        if nft and nft >= start_ts:
+        if nft and nft > start_ts:
             next_ft = nft
             break
     if next_ft is None:
@@ -560,15 +584,9 @@ def compute_outcome(
     leg_b = _leg_from_event(event_row, "leg_b")
     if not leg_a or not leg_b:
         return None
-    exchange = event_row.get("exchange")
-    symbol = event_row.get("symbol")
+    signal_type = str(event_row.get("signal_type") or "").strip()
     start_ts: datetime = event_row.get("start_ts")
     end_ts = start_ts + timedelta(minutes=horizon_min)
-    # 起终点价：按腿类型取 spot/perp
-    snap_a_start = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], start_ts)
-    snap_b_start = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], start_ts)
-    snap_a_end = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], end_ts)
-    snap_b_end = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], end_ts)
 
     def leg_price(kind: str, snap: Optional[Snapshot]) -> Optional[float]:
         if not snap:
@@ -577,6 +595,12 @@ def compute_outcome(
             return snap.spot
         return snap.perp
 
+    # 起终点价：按腿类型取 spot/perp（用于确定 long/short 方向与 label）
+    snap_a_start = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], start_ts)
+    snap_b_start = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], start_ts)
+    snap_a_end = load_snapshot(sqlite_conn, leg_a["exchange"], leg_a["symbol"], end_ts)
+    snap_b_end = load_snapshot(sqlite_conn, leg_b["exchange"], leg_b["symbol"], end_ts)
+
     a_start_price = leg_price(leg_a.get("kind"), snap_a_start)
     b_start_price = leg_price(leg_b.get("kind"), snap_b_start)
     a_end_price = leg_price(leg_a.get("kind"), snap_a_end)
@@ -584,83 +608,209 @@ def compute_outcome(
     if None in (a_start_price, b_start_price, a_end_price, b_end_price):
         return None
 
-    def rel_spread(a_price: float, b_price: float) -> float:
-        return (a_price - b_price) / a_price if a_price else 0.0
+    # Canonical trade definition:
+    # - Always produce a deterministic "long leg" and "short leg".
+    # - Spread PnL uses log ratio: pnl_spread = log(short/long)_start - log(short/long)_end.
+    # - Funding PnL applies position sign: long pays +rate, short receives +rate.
+    legs = {
+        "a": {
+            "label": "a",
+            "exchange": leg_a["exchange"],
+            "symbol": leg_a["symbol"],
+            "kind": leg_a["kind"],
+            "funding_rate_first": leg_a.get("funding_first"),
+            "price_start": float(a_start_price),
+            "price_end": float(a_end_price),
+        },
+        "b": {
+            "label": "b",
+            "exchange": leg_b["exchange"],
+            "symbol": leg_b["symbol"],
+            "kind": leg_b["kind"],
+            "funding_rate_first": leg_b.get("funding_first"),
+            "price_start": float(b_start_price),
+            "price_end": float(b_end_price),
+        },
+    }
 
-    spread_start = rel_spread(a_start_price, b_start_price)
-    spread_end = rel_spread(a_end_price, b_end_price)
+    def _log_ratio(short_p: float, long_p: float) -> float:
+        return math.log(short_p / long_p)
 
-    # 构造 spread 时间序列（对齐两腿时间）
-    series_a = load_leg_price_series(sqlite_conn, leg_a["exchange"], leg_a["symbol"], leg_a["kind"], start_ts, end_ts)
-    series_b = load_leg_price_series(sqlite_conn, leg_b["exchange"], leg_b["symbol"], leg_b["kind"], start_ts, end_ts)
-    spread_series: List[Tuple[datetime, float]] = []
-    for ts, pa in series_a.items():
-        pb = series_b.get(ts)
-        if pb:
-            spread_series.append((ts, rel_spread(pa, pb)))
-    spread_series.sort(key=lambda x: x[0])
+    def _choose_long_short() -> Tuple[Dict[str, Any], Dict[str, Any], str, Dict[str, Any]]:
+        a = legs["a"]
+        b = legs["b"]
+        meta: Dict[str, Any] = {}
+        position_mode = "price"
+        if signal_type == "C":
+            # spot vs perp，Type C 语义：现货低于永续 -> long spot, short perp
+            if a["kind"] == "spot" and b["kind"] == "perp":
+                return a, b, "type_c_spot_long_perp_short", meta
+            if b["kind"] == "spot" and a["kind"] == "perp":
+                return b, a, "type_c_spot_long_perp_short", meta
+        if signal_type == "A":
+            # Binance spot/perp：优先按“收资金费”方向定义持仓（为资金费累计回测服务）。
+            # funding > 0: longs pay shorts -> short perp long spot
+            # funding < 0: shorts pay longs -> long perp short spot（需要可做空现货/借币；仅用于回测口径）
+            spot = a if a["kind"] == "spot" else (b if b["kind"] == "spot" else None)
+            perp = a if a["kind"] == "perp" else (b if b["kind"] == "perp" else None)
+            fr = None
+            if perp:
+                try:
+                    fr = float(perp.get("funding_rate_first")) if perp.get("funding_rate_first") is not None else None
+                except Exception:
+                    fr = None
+            if spot and perp and fr is not None:
+                position_mode = "receive_funding"
+                if fr >= 0:
+                    return spot, perp, "type_a_receive_funding_short_perp_long_spot", meta
+                meta["assumption_spot_short_allowed"] = True
+                return perp, spot, "type_a_receive_funding_long_perp_short_spot", meta
+            # fallback: treat like Type C (long spot short perp if available)
+            if spot and perp:
+                return spot, perp, "type_a_default_spot_long_perp_short", meta
+        if signal_type == "B":
+            # perp-perp：short 高价腿，long 低价腿（价差收敛为正收益）
+            if a["price_start"] >= b["price_start"]:
+                return b, a, "type_b_long_low_short_high", meta
+            return a, b, "type_b_long_low_short_high", meta
+
+        # Generic fallback: long low, short high
+        if a["price_start"] >= b["price_start"]:
+            return b, a, f"fallback_long_low_short_high_{position_mode}", meta
+        return a, b, f"fallback_long_low_short_high_{position_mode}", meta
+
+    long_leg, short_leg, position_rule, position_meta = _choose_long_short()
+
+    spread_metric_start = _log_ratio(short_leg["price_start"], long_leg["price_start"])
+    spread_metric_end = _log_ratio(short_leg["price_end"], long_leg["price_end"])
+    pnl_spread = spread_metric_start - spread_metric_end
+
+    # Spread PnL path for risk metrics (align timestamps across legs)
+    long_series = load_leg_price_series(
+        sqlite_conn, long_leg["exchange"], long_leg["symbol"], long_leg["kind"], start_ts, end_ts
+    )
+    short_series = load_leg_price_series(
+        sqlite_conn, short_leg["exchange"], short_leg["symbol"], short_leg["kind"], start_ts, end_ts
+    )
+    pnl_series: List[Tuple[datetime, float]] = []
+    for ts, short_p in short_series.items():
+        long_p = long_series.get(ts)
+        if long_p and short_p and long_p > 0 and short_p > 0:
+            metric_t = _log_ratio(float(short_p), float(long_p))
+            pnl_t = spread_metric_start - metric_t
+            pnl_series.append((ts, pnl_t))
+    pnl_series.sort(key=lambda x: x[0])
 
     max_dd = None
     vol = None
-    if spread_series:
-        peak = spread_series[0][1]
+    if pnl_series:
+        peak = pnl_series[0][1]
         dd = 0.0
-        for _, v in spread_series:
+        for _, v in pnl_series:
             peak = max(peak, v)
             dd = min(dd, v - peak)
         max_dd = dd
-        vals = [v for _, v in spread_series]
+        vals = [v for _, v in pnl_series]
         if len(vals) > 1:
             mean = sum(vals) / len(vals)
             var = sum((v - mean) ** 2 for v in vals) / (len(vals) - 1)
             vol = math.sqrt(var)
 
-    funding_change_total = 0.0
+    # Funding: apply position sign (long pays +rate, short receives +rate).
+    # pos_sign: +1 for long leg, -1 for short leg.
+    funding_pnl_total = 0.0
     funding_applied: Dict[str, Any] = {}
     funding_hist: Dict[str, Any] = {}
+
+    def _pos_sign(leg: Dict[str, Any]) -> int:
+        if leg["label"] == long_leg["label"]:
+            return 1
+        if leg["label"] == short_leg["label"]:
+            return -1
+        return 0
+
     legs_info = [("a", leg_a), ("b", leg_b)]
     for label, leg in legs_info:
-        if leg.get("kind") != "perp":
+        kind = leg.get("kind")
+        if kind != "perp":
             continue
-        fc = None
         used_points: List[Tuple[datetime, float]] = []
+        raw_sum_rate: Optional[float] = None
         if rest_fetcher:
-            rest_points = rest_fetcher.fetch(leg["exchange"], leg["symbol"], start_ts, end_ts)
-            if rest_points:
-                fc = sum(rate for _, rate in rest_points)
-                used_points = rest_points
-        if fc is None:
+            used_points = rest_fetcher.fetch(leg["exchange"], leg["symbol"], start_ts, end_ts)
+            if used_points:
+                raw_sum_rate = sum(rate for _, rate in used_points)
+        if raw_sum_rate is None:
             funding_series = load_funding_series(sqlite_conn, leg["exchange"], leg["symbol"], start_ts, end_ts)
-            fc, used_points = _build_funding_schedule(funding_series, start_ts, end_ts)
-        if fc is not None:
-            funding_change_total += fc
+            raw_sum_rate, used_points = _build_funding_schedule(funding_series, start_ts, end_ts)
+
+        pos = _pos_sign(legs[label])
+        pnl_leg = None
+        if raw_sum_rate is not None and pos != 0:
+            pnl_leg = -float(pos) * float(raw_sum_rate)
+            funding_pnl_total += pnl_leg
+
         funding_applied[label] = {
             "exchange": leg["exchange"],
             "symbol": leg["symbol"],
+            "position": "long" if pos == 1 else ("short" if pos == -1 else "flat"),
+            "pos_sign": pos,
+            "raw_sum_rate": raw_sum_rate,
+            "pnl": pnl_leg,
             "used_points": [(ts.isoformat(), rate) for ts, rate in used_points],
             "source": "rest" if rest_fetcher and used_points else "local",
         }
         if used_points:
-            # 仅保留近 50 条，计算基础统计 + 动量，便于事件层持久化
             tail = used_points[-50:]
             funding_hist[label] = {
                 "stats": _funding_stats(tail),
                 "tail": [(ts.isoformat(), rate) for ts, rate in tail],
             }
 
-    pnl_spread = spread_end - spread_start
-    pnl_funding = funding_change_total
-    pnl_total = pnl_spread + pnl_funding
+    pnl_total = pnl_spread + (funding_pnl_total if funding_applied else 0.0)
+
+    label = {
+        "canonical": True,
+        "signal_type": signal_type,
+        "position_rule": position_rule,
+        **(position_meta or {}),
+        "spread_metric": "log(short_price/long_price)",
+        "long_leg": {k: long_leg[k] for k in ("label", "exchange", "symbol", "kind")},
+        "short_leg": {k: short_leg[k] for k in ("label", "exchange", "symbol", "kind")},
+        "funding_rate_long_first": (
+            float(long_leg.get("funding_rate_first")) if long_leg.get("kind") == "perp" and long_leg.get("funding_rate_first") is not None else 0.0
+        ),
+        "funding_rate_short_first": (
+            float(short_leg.get("funding_rate_first")) if short_leg.get("kind") == "perp" and short_leg.get("funding_rate_first") is not None else 0.0
+        ),
+        "funding_edge_short_minus_long_first": (
+            (
+                float(short_leg.get("funding_rate_first")) if short_leg.get("kind") == "perp" and short_leg.get("funding_rate_first") is not None else 0.0
+            )
+            - (
+                float(long_leg.get("funding_rate_first")) if long_leg.get("kind") == "perp" and long_leg.get("funding_rate_first") is not None else 0.0
+            )
+        ),
+        "spread_metric_start": spread_metric_start,
+        "spread_metric_end": spread_metric_end,
+        "spread_metric_change": (spread_metric_end - spread_metric_start),
+        "pnl_spread": pnl_spread,
+        "pnl_funding": funding_pnl_total if funding_applied else None,
+        "pnl_total": pnl_total,
+    }
 
     return {
         "horizon_min": horizon_min,
+        # Canonical: positive means the chosen spread converged in our favor.
         "spread_change": pnl_spread,
-        "funding_change": funding_change_total if funding_applied else None,
+        # Canonical: signed funding contribution for the chosen position.
+        "funding_change": funding_pnl_total if funding_applied else None,
         "pnl": pnl_total,
         "max_drawdown": max_dd,
         "volatility": vol,
         "funding_applied": funding_applied or None,
         "funding_hist": funding_hist or None,
+        "label": label,
     }
 
 
@@ -672,11 +822,13 @@ def upsert_outcome(conn_pg, event_id: int, outcome: Dict[str, object]) -> None:
     params = {**outcome, "event_id": event_id}
     if Json and outcome.get("funding_applied") is not None:
         params["funding_applied"] = Json(outcome["funding_applied"])
+    if Json and outcome.get("label") is not None:
+        params["label"] = Json(outcome["label"])
     conn_pg.execute(
         """
         INSERT INTO watchlist.future_outcome
-          (event_id, horizon_min, pnl, spread_change, funding_change, max_drawdown, volatility, funding_applied)
-        VALUES (%(event_id)s, %(horizon_min)s, %(pnl)s, %(spread_change)s, %(funding_change)s, %(max_drawdown)s, %(volatility)s, %(funding_applied)s)
+          (event_id, horizon_min, pnl, spread_change, funding_change, max_drawdown, volatility, funding_applied, label)
+        VALUES (%(event_id)s, %(horizon_min)s, %(pnl)s, %(spread_change)s, %(funding_change)s, %(max_drawdown)s, %(volatility)s, %(funding_applied)s, %(label)s)
         ON CONFLICT (event_id, horizon_min)
         DO UPDATE SET
           pnl = EXCLUDED.pnl,
@@ -684,7 +836,8 @@ def upsert_outcome(conn_pg, event_id: int, outcome: Dict[str, object]) -> None:
           funding_change = EXCLUDED.funding_change,
           max_drawdown = EXCLUDED.max_drawdown,
           volatility = EXCLUDED.volatility,
-          funding_applied = EXCLUDED.funding_applied;
+          funding_applied = EXCLUDED.funding_applied,
+          label = EXCLUDED.label;
         """,
         params,
     )
@@ -732,15 +885,110 @@ def main(loop_once: bool = True) -> None:
     logger = logging.getLogger("outcome_worker")
     pg_dsn = config.WATCHLIST_PG_CONFIG["dsn"]
     sqlite_path = config.WATCHLIST_CONFIG.get("db_path", "market_data.db")
-    fetcher = FundingHistoryFetcher()
+
+    def _parse_iso(text: str) -> datetime:
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _load_events_in_range(conn_pg, since: datetime, until: datetime, limit: int) -> List[Dict[str, Any]]:
+        sql = """
+        SELECT
+            e.id, e.exchange, e.symbol, e.signal_type, e.start_ts,
+            e.leg_a_exchange, e.leg_a_symbol, e.leg_a_kind, e.leg_a_price_first, e.leg_a_price_last, e.leg_a_funding_rate_first, e.leg_a_funding_rate_last,
+            e.leg_b_exchange, e.leg_b_symbol, e.leg_b_kind, e.leg_b_price_first, e.leg_b_price_last, e.leg_b_funding_rate_first, e.leg_b_funding_rate_last
+        FROM watchlist.watch_signal_event e
+        WHERE e.start_ts >= %(since)s
+          AND e.start_ts < %(until)s
+          AND e.leg_a_exchange IS NOT NULL
+          AND e.leg_b_exchange IS NOT NULL
+        ORDER BY e.start_ts DESC
+        LIMIT %(limit)s;
+        """
+        rows = conn_pg.execute(sql, {"since": since, "until": until, "limit": int(limit)}).fetchall()
+        cols = [desc.name for desc in conn_pg.description] if hasattr(conn_pg, "description") else None
+        out: List[Dict[str, Any]] = []
+        for r in rows:
+            if cols:
+                out.append(dict(zip(cols, r)))
+            else:
+                out.append(
+                    {
+                        "id": r[0],
+                        "exchange": r[1],
+                        "symbol": r[2],
+                        "signal_type": r[3],
+                        "start_ts": r[4],
+                        "leg_a_exchange": r[5],
+                        "leg_a_symbol": r[6],
+                        "leg_a_kind": r[7],
+                        "leg_a_price_first": r[8],
+                        "leg_a_price_last": r[9],
+                        "leg_a_funding_rate_first": r[10],
+                        "leg_a_funding_rate_last": r[11],
+                        "leg_b_exchange": r[12],
+                        "leg_b_symbol": r[13],
+                        "leg_b_kind": r[14],
+                        "leg_b_price_first": r[15],
+                        "leg_b_price_last": r[16],
+                        "leg_b_funding_rate_first": r[17],
+                        "leg_b_funding_rate_last": r[18],
+                    }
+                )
+        return out
+
+    fetcher: Optional[FundingHistoryFetcher] = FundingHistoryFetcher()
+
     with sqlite3.connect(sqlite_path) as sqlite_conn, psycopg.connect(pg_dsn, autocommit=True) as pg_conn:
         ensure_unique_index(pg_conn)
+        now_ts = _utcnow()
+        max_tasks = int(getattr(loop_once, "max_tasks", MAX_TASKS))  # type: ignore[attr-defined]
+        processed = 0
+
+        # Recompute mode: overwrite existing outcomes in a time window (for backfill/canonicalization fixes).
+        recompute_since = getattr(loop_once, "recompute_since", None)  # type: ignore[attr-defined]
+        if recompute_since:
+            since = _parse_iso(str(recompute_since))
+            until_raw = getattr(loop_once, "recompute_until", None)  # type: ignore[attr-defined]
+            until = _parse_iso(str(until_raw)) if until_raw else now_ts
+            horizons_raw = getattr(loop_once, "recompute_horizons", "")  # type: ignore[attr-defined]
+            if horizons_raw:
+                if str(horizons_raw).strip().lower() == "all":
+                    horizons = list(HORIZONS_MIN)
+                else:
+                    horizons = [int(x.strip()) for x in str(horizons_raw).split(",") if x.strip()]
+            else:
+                horizons = list(HORIZONS_MIN)
+            limit = int(getattr(loop_once, "recompute_limit", 5000))  # type: ignore[attr-defined]
+            no_rest = bool(getattr(loop_once, "no_rest", False))  # type: ignore[attr-defined]
+            fetcher = None if no_rest else fetcher
+            events = _load_events_in_range(pg_conn, since, until, limit=limit)
+            if not events:
+                logger.info("no events to recompute")
+                return
+            for row in events:
+                for h in horizons:
+                    if row["start_ts"] + timedelta(minutes=h) > now_ts:
+                        continue
+                    out = compute_outcome(sqlite_conn, row, h, rest_fetcher=fetcher)
+                    if not out:
+                        continue
+                    upsert_outcome(pg_conn, row["id"], out)
+                    update_event_funding_hist(pg_conn, row["id"], out.get("funding_hist"))
+                    processed += 1
+                    if processed >= max_tasks:
+                        break
+                if processed >= max_tasks:
+                    break
+            logger.info("recomputed outcomes: %s", processed)
+            return
+
+        # Default mode: only compute missing outcomes for matured events.
         tasks = load_event_tasks(pg_conn)
         if not tasks:
             logger.info("no pending events")
             return
-        now_ts = _utcnow()
-        processed = 0
         for row in tasks:
             missing = [
                 h
@@ -758,7 +1006,7 @@ def main(loop_once: bool = True) -> None:
                 upsert_outcome(pg_conn, row["id"], out)
                 update_event_funding_hist(pg_conn, row["id"], out.get("funding_hist"))
                 processed += 1
-            if processed >= MAX_TASKS:
+            if processed >= max_tasks:
                 break
         logger.info("processed outcomes: %s", processed)
 
@@ -766,5 +1014,12 @@ def main(loop_once: bool = True) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute future outcomes for watchlist events")
     parser.add_argument("--loop-once", action="store_true", help="run once and exit (default)")
+    parser.add_argument("--recompute-since", type=str, default="", help="ISO8601 UTC, recompute outcomes in window")
+    parser.add_argument("--recompute-until", type=str, default="", help="ISO8601 UTC, exclusive end (default now)")
+    parser.add_argument("--recompute-horizons", type=str, default="", help="Comma list minutes or 'all' (default all)")
+    parser.add_argument("--recompute-limit", type=int, default=5000, help="Max events to scan in recompute mode")
+    parser.add_argument("--max-tasks", type=int, default=MAX_TASKS, help="Max event-horizon computations per run")
+    parser.add_argument("--no-rest", action="store_true", help="Disable REST funding history (use local fallback only)")
     args = parser.parse_args()
-    main(loop_once=args.loop_once)
+    # Hack: keep backward compatible main() signature; pass args as loop_once container.
+    main(loop_once=args)
