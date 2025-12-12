@@ -22,7 +22,7 @@ import requests
 import config
 
 HORIZONS_MIN = [15, 30, 60, 240, 480, 1440, 2880, 5760]  # 15m,30m,1h,4h,8h,24h,48h,96h
-MAX_TASKS = 200  # 每次运行最多处理的 event-horizon 组合，防止扫全表
+MAX_TASKS = 1000  # 每次运行最多处理的 event-horizon 组合，防止扫全表
 MAX_REST_CALLS = 50  # 每轮允许的 REST 调用上限，防止过载
 
 
@@ -45,7 +45,7 @@ class Snapshot:
 def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
     """
     返回需要计算 outcome 的事件，包含双腿信息。
-    规则：事件 start_ts 已超过最小 horizon，且某些 horizon 尚未写入 outcome。
+    规则：事件 start_ts 已超过最小 horizon，且至少有一个“已到期”的 horizon 尚未写入 outcome。
     """
     min_horizon = min(HORIZONS_MIN)
     sql = """
@@ -62,10 +62,11 @@ def load_event_tasks(conn_pg) -> List[Dict[str, Any]]:
     FROM need n
     WHERE EXISTS (
         SELECT 1 FROM unnest(%s::int[]) h
-        WHERE NOT EXISTS (
-            SELECT 1 FROM watchlist.future_outcome o
-            WHERE o.event_id = n.id AND o.horizon_min = h
-        )
+        WHERE n.start_ts + make_interval(mins := h) <= now()
+          AND NOT EXISTS (
+              SELECT 1 FROM watchlist.future_outcome o
+               WHERE o.event_id = n.id AND o.horizon_min = h
+          )
     )
     ORDER BY n.start_ts
     LIMIT %s;
@@ -112,6 +113,16 @@ def _parse_ts(ts_str: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def _sqlite_ts(dt: datetime) -> str:
+    """
+    格式化为 SQLite 文本时间戳（与 price_data_1min 中的存储一致，形如 '2025-12-09 10:37:00'）。
+    - 统一使用 UTC，无时区后缀，避免字符串比较因 'T'/'+' 混入导致过滤失效。
+    """
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def load_snapshot(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, target_ts: datetime) -> Optional[Snapshot]:
     """
     取目标时间点之前最近的一条 1min K（聚合数据）。
@@ -124,7 +135,7 @@ def load_snapshot(sqlite_conn: sqlite3.Connection, exchange: str, symbol: str, t
         ORDER BY timestamp DESC
         LIMIT 1;
         """,
-        (exchange, symbol, target_ts.isoformat()),
+        (exchange, symbol, _sqlite_ts(target_ts)),
     )
     row = cursor.fetchone()
     if not row:
@@ -152,7 +163,7 @@ def load_spread_series(sqlite_conn: sqlite3.Connection, exchange: str, symbol: s
         WHERE exchange = ? AND symbol = ? AND timestamp >= ? AND timestamp <= ?
         ORDER BY timestamp ASC;
         """,
-        (exchange, symbol, start.isoformat(), end.isoformat()),
+        (exchange, symbol, _sqlite_ts(start), _sqlite_ts(end)),
     )
     out = []
     for ts_str, spot, perp in cursor.fetchall():
@@ -177,7 +188,7 @@ def load_leg_price_series(
         WHERE exchange = ? AND symbol = ? AND timestamp >= ? AND timestamp <= ?
         ORDER BY timestamp ASC;
         """,
-        (exchange, symbol, start.isoformat(), end.isoformat()),
+        (exchange, symbol, _sqlite_ts(start), _sqlite_ts(end)),
     )
     out: Dict[datetime, float] = {}
     for ts_str, spot, perp in cursor.fetchall():
@@ -203,7 +214,7 @@ def load_funding_series(
         WHERE exchange = ? AND symbol = ? AND timestamp >= ? AND timestamp <= ?
         ORDER BY timestamp ASC;
         """,
-        (exchange, symbol, start.isoformat(), end.isoformat()),
+        (exchange, symbol, _sqlite_ts(start), _sqlite_ts(end)),
     )
     out = []
     for ts_str, fr, interval_h, nft in cursor.fetchall():

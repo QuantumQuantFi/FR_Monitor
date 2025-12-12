@@ -9,7 +9,7 @@
 - 新约束：关注币种通常 <20 个；可接受 1~5 分钟落库一次（watchlist 及因子）。
 - 量级重估（按 20 个符号，每 1 分钟）：20 * 60/h ≈ 1.2k 行/小时，≈ 28.8k 行/天；行尺寸 ~200B/行，则日增 ~6MB，7 天 ~42MB。
 - 若 5 分钟落库：日增 ~1.2MB，基本可忽略。触发事件行数更低（<千级/天）。
-- 实测（2025-12-09）：两天 raw 分区合计 ~27MB（含订单簿精简数据）；全库 ~29MB。推算 30 天约 0.6GB 上下（含索引/WAL 预留 <1GB）。  
+- 实测（2025-12-09 07:40 UTC）：两天 raw 分区合计 ~27MB（含订单簿精简数据）；全库 ~29MB。推算 30 天约 0.6GB 上下（含索引/WAL 预留 <1GB）。  
 - 结论：在 20 符号、1~5m 频率下，存储占用极小，保留期可拉长（raw 30 天，event/outcome 180 天），仍保持分区与周期清理以防膨胀。
 
 ## 与现有 watchlist 页面/接口的对应
@@ -99,6 +99,7 @@
   }
   ```
 - 订单簿/矩阵落库（已上线）：在 raw.meta.orderbook 存 sweep 价格与前 5 对跨所价差（forward/reverse），字段：legs[exchange,type,buy,sell,mid,error]，forward_spread/reverse_spread，cross_pairs[top5]，带快照 ts/stale_reason，控制宽度。
+- 双腿字段（已上线）：raw/event 现已写入 `leg_a_*`、`leg_b_*`（exchange/symbol/kind/price/funding/next_funding_time）；老数据缺腿信息，outcome worker 会跳过。
 - 事件表（event.features_agg）：保留首/末/均/极值的核心标量（同上），再附带 `pairs_top` 与 `funding_diff_top` 的首末快照，以便回溯。
 - 序列表（`watchlist_series_agg`）：继续按 5m 聚合开列 `spot_price`、`futures_price`、`spread_rel`、`funding_rate`、`funding_interval_hours`、`next_funding_time`，其余如矩阵/跨所资金费差保持在 `series_meta jsonb`（最多存当时 top1 跨所价差与 top1 资金费差，控制行宽）。
 
@@ -207,18 +208,19 @@
 - PG 占用：~29MB，总体含两日 raw 分区（20.27MB / 7.17MB）+ event ~0.8MB + outcome ~0.17MB；推算 30 天约 0.6GB。
 - 进程：simple_app + outcome worker 已常驻（nohup），outcome 每 600s 轮询。
 - 新功能：raw.meta.orderbook 持久化扫单价与跨所矩阵；/watchlist/db 浏览页上线。
+- 数据量（当前）：raw 27,101 行，event 462 行，future_outcome 93 行；新增事件已带双腿信息，老事件缺腿且被 worker 自动跳过。
 
 ## 下一步（短期）
-- 补齐非 Binance 资金费历史 fetch（OKX/Bybit/Bitget 已在计划，继续扩展并加强缓存）。
-- 对旧事件缺腿信息的情况：worker 已跳过；新增事件保持双腿完整。必要时考虑重放新事件以覆盖样本。
+- 补齐非 Binance 资金费历史 fetch（OKX/Bybit/Bitget 仍未上线），并加缓存/调用上限。
+- 对旧事件缺腿信息：worker 已跳过；如需样本可重放。新增事件已写双腿。
 - 监控：每周查看分区大小与 outcome 覆盖率；确保 funding_applied/funding_hist 持续写入。
 - 下一步改进：
   - 接入其他交易所 funding 历史 REST（OKX `/api/v5/public/funding-rate-history`、Bybit `/derivatives/v3/public/funding/history`、Bitget `/api/mix/v1/market/history-fundRate` 等），并加小缓存/调用上限。
-  - 如果 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
+  - 若 REST 失败且本地无 next_funding_time，则标记 outcome 缺失（label.missing=true），避免推算。
   - 在 outcome 中写入 `funding_applied`（包含结算时间、费率、来源 rest/local）。
-  - 增加 cron（每 10 分钟）或后台线程自动跑 worker。
+  - 增加 cron（每 10 分钟）或后台线程自动跑 worker（已以 nohup 600s 跑，但可独立 cron 化）。
   - 监控/日志：统计缺数据比例、REST 命中率、调用次数，便于调优。
-  - 开始落地双腿写入：raw/event 写入 leg_a/leg_b（交易所/品种/价格/资金费/next_funding_time），outcome 用两腿价差与两腿资金费累加；未来资金费按两腿分别累加，现货腿资金费=0。
+  - 资金费/订单簿/双腿字段已写入 raw/event；outcome 用两腿价差与两腿资金费累加，现货腿资金费=0（继续验证）。
 
 ## 当前资源快照（阶段 0 执行）
 - 磁盘：`/` 232G，总用 141G，可用 ~92G（61% 已用）；短期可预留 10GB 给 PG，需保持 <80%。
@@ -259,5 +261,12 @@
 
 ## 下一步（短期可执行）
 - 补数据源并填值：检查 SQLite `price_data_1min` 是否写入 `premium_percent_avg`、`volume_24h_avg`；若缺，采集端补全以消除 NULL；若有盘口/OI 数据，扩展快照填 `bid_ask_spread`/`depth_imbalance`/`book_imbalance`/`oi_trend`。
-- 运行验证：跑 24h 观察 `meta.factors` 覆盖度与磁盘增量，检查事件是否生成；必要时临时调事件归并 N=1 观测；已修复 PG event 更新 jsonb 类型冲突与 datetime 序列化问题。
-- 健康与回退：给 PG writer 增加写失败降级（文件/SQLite）与日志；启动 `watchlist_series_agg` 写入（5m 聚合）及 outcome worker（多 horizon）为回测/IC 产出标签。
+- 运行验证：当前已跑 >24h，raw/event 持续增长；可继续观察 `meta.factors` 覆盖度与磁盘增量，必要时临时调事件归并 N=1 观测。
+- 健康与回退：PG writer 已常驻；仍需写失败降级（文件/SQLite）与日志。`watchlist_series_agg` 分区已创建但尚未大量写入，后续补 5m 聚合；outcome worker 已以 nohup 每 600s 跑一轮，多 horizon 标签已写入 93 条，仍需提高覆盖率。
+
+## 审计对照（2025-12-09 07:40 UTC）
+- 运行状态：simple_app + outcome worker 正在运行（nohup）；PG 双写开启，raw 08/09 分区活跃。
+- 数据质量：最新 raw/event 含双腿与订单簿快照；旧事件缺腿，outcome 跳过。资金费历史仅 Binance REST 覆盖，其他交易所多为空；`funding_applied` 未落库，需补。
+- 覆盖度：raw 27,101 行，event 462 行，future_outcome 93 行；outcome 样本仍偏少，主要因资金费/行情缺口与旧事件跳过。
+- 前端：/watchlist 因子弹窗可见 `meta.factors`；新增 /watchlist/db 浏览页可分页查看 raw/event/outcome。
+- 存储：总占用 ~29MB；日分区滚动脚本已运行，保留周期未达上限。
