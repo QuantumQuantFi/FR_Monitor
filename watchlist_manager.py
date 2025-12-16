@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -12,6 +13,7 @@ from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
 from precision_utils import funding_rate_to_float
 from watchlist_pg_writer import PgWriter, PgWriterConfig
 from watchlist_metrics import compute_metrics_for_symbols, compute_metrics_for_legs
+from watchlist_pnl_regression_model import predict_bc
 
 
 def _utcnow() -> datetime:
@@ -649,6 +651,49 @@ class WatchlistManager:
                     else None
                 ),
             }
+            # 为 Type B 事件补齐 pnl_regression.pred(240) 写入，供自动实盘/回溯统计读取。
+            if entry.entry_type == 'B' and isinstance(row.get('meta'), dict):
+                try:
+                    meta_obj: Dict[str, Any] = row['meta']  # type: ignore[assignment]
+                    factors = meta_obj.get('factors') or {}
+                    if isinstance(factors, dict):
+                        factors2 = dict(factors)
+                        # pnl_regression 线性模型需要的 5 个关键 raw_* 因子：
+                        # - raw_slope_3m / raw_drift_ratio / raw_crossings_1h 来自本地 metrics 计算
+                        # - spread_log_short_over_long / raw_best_buy_high_sell_low 尽量用触发时刻的价格补齐
+                        slope_3m = row.get('slope_3m')
+                        drift_ratio = row.get('drift_ratio')
+                        crossings_1h = row.get('crossings_1h')
+                        if slope_3m is not None:
+                            factors2.setdefault('raw_slope_3m', float(slope_3m))
+                        if drift_ratio is not None:
+                            factors2.setdefault('raw_drift_ratio', float(drift_ratio))
+                        if crossings_1h is not None:
+                            factors2.setdefault('raw_crossings_1h', float(crossings_1h))
+                        td = entry.trigger_details or {}
+                        pair = td.get('pair') or []
+                        prices = td.get('prices') or {}
+                        if isinstance(pair, list) and len(pair) == 2 and isinstance(prices, dict):
+                            p1 = float(prices.get(pair[0]) or 0.0)
+                            p2 = float(prices.get(pair[1]) or 0.0)
+                            if p1 > 0 and p2 > 0:
+                                high = max(p1, p2)
+                                low = min(p1, p2)
+                                factors2.setdefault('spread_log_short_over_long', float(math.log(high / low)))
+                                if low:
+                                    factors2.setdefault('raw_best_buy_high_sell_low', float((high - low) / low))
+                        pred = predict_bc(signal_type='B', factors=factors2, horizons=(240,))
+                        pred_240 = ((pred or {}).get('pred') or {}).get('240') if isinstance(pred, dict) else None
+                        if (
+                            isinstance(pred, dict)
+                            and isinstance(pred_240, dict)
+                            and pred_240.get('pnl_hat') is not None
+                            and pred_240.get('win_prob') is not None
+                        ):
+                            meta_obj['pnl_regression'] = pred
+                            meta_obj['factors'] = factors2
+                except Exception:
+                    pass
             rows.append(row)
         if rows:
             try:
