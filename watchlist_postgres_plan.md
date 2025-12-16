@@ -1,4 +1,167 @@
-# Watchlist 数据库（PostgreSQL）建设规划（结合现有页面/接口）
+# Watchlist → 实盘交易系统研发计划（含 PostgreSQL 记录方案）
+
+本文目标：基于现有 watchlist（预计 PnL / 胜率）+ 现有实盘交易组件，规划并落地一个“自动开仓 + 监控止盈/强平 + 手动交易 + 页面展示 + 全链路审计落库”的实盘系统。
+
+---
+
+## 0. 当前代码现状（已具备的组件）
+- Watchlist 信号与预测：`watchlist_manager.py` 生成 `trigger_details` + `pnl_regression`（含 `pnl_hat` / `win_prob`，展示在 `templates/watchlist.html`）。
+- Watchlist 落库：`watchlist_pg_writer.py` 双写到 PostgreSQL（schema=`watchlist`），核心表：`watch_signal_raw` / `watch_signal_event` / `future_outcome` / `watchlist_series_agg` / `watchlist_outcome`。
+- 实盘交易接口封装：`trading/trade_executor.py` 支持 `binance/okx/bybit/bitget` 的永续市价单、部分杠杆设置与持仓查询。
+- Web 侧交易入口：`simple_app.py` 已有 `/api/trade/options` + `/api/trade/dual`（多腿、USDT金额换算、reduceOnly/closeAll），`templates/chart_index.html` 已有“对冲交易执行”面板。
+- 订单簿价差工具：`orderbook_utils.py` 已有 REST 拉取与扫单价差计算，可用来做 1min 频率监听。
+
+结论：我们不需要从 0 写“交易所 SDK / 下单 / 基础 UI”，主要工作是把 watchlist 信号“可靠地”转成交易任务，并补齐去重、记录、监控与页面展示。
+
+---
+
+## 1. 信号规则与过去 24h 频次校准（你提出的第 1 条）
+
+### 1.1 规则定义（建议先参数化）
+- 触发条件（最终确认）：`horizon=240m`，且 **同时满足**：
+  - `pnl_hat > 1.3%`（0.013）
+  - `win_prob > 94%`（0.94）
+- 关键参数：信号只做 **Type B（perp-perp 跨所）**；Type C 后续引入现货交易后再做自动化（文档中保留 TODO）。
+- 下单前二次验算：用“订单簿扫单价”（与实际下单名义一致，默认 20U/腿）重新计算 `spread_log_short_over_long` 等关键因子，并重新运行 `predict_bc(signal_type='B', horizon=240)`；若验算后仍不满足阈值才允许下单。
+
+### 1.2 数据库实测：过去 24h 有多少次？
+我们已连接本机 PostgreSQL（DSN 见 `config.py:WATCHLIST_PG_CONFIG`），从 `watchlist.watch_signal_event.features_agg.meta_last.pnl_regression` 统计：
+- 以 `240m` 为准：`pnl_hat>1% & win_prob>92%` => **80** 次（distinct symbol 51）
+- 以 `60m` 为准：**67** 次
+- 以 `480m` 为准：**81** 次
+- 任一 horizon 满足（60/240/480 任一）：**88** 次
+
+因此：该阈值在过去 24h **远大于 2 次**，不需要降低；反而对“实盘频率/风控/稳定性”来说可能偏频繁，需要我们用“去重 + 冷静期 + 最大并发 + 每日上限”来控制风险。
+
+### 1.2.1 你的最新阈值（1.3%/94%）对频率的影响（待你上线后复测）
+因为你刚刚提升了阈值，我们会在落地代码后补一条 SQL 统计脚本，持续观察 24h 频率与成交成功率，并据此微调（主要靠冷静期与 max-concurrent 控制风险）。
+
+### 1.3 如果你希望减少交易频率（可选的更“实盘友好”阈值）
+仍以 `240m` 为例（仅建议，不改你原始目标）：
+- `pnl_hat>1.5% & win_prob>92%` => 13 次/24h
+- `pnl_hat>2.0% & win_prob>92%` => 2 次/24h
+- `pnl_hat>1.0% & win_prob>97%` => 19 次/24h
+
+---
+
+## 2. 总体架构（信号 → 执行 → 监控 → 展示 → 审计）
+
+### 2.1 组件划分（推荐）
+- `SignalGate`：从 PG 或内存 watchlist 读取候选信号；按阈值/交易所支持/流动性等过滤；产出“交易信号”。
+- `TradeCoordinator`：幂等去重（同币种/同腿组合/同方向）；落库信号；把任务派发给执行器。
+- `TradeExecutor`：复用 `simple_app.py:_execute_multi_leg_trade()` 或 `trading/trade_executor.py:execute_perp_market_batch()`，执行两腿市价单（1x、20U/腿），产出订单回执。
+- `PositionMonitor`：每 1min 用 REST 同时拉两家订单簿（同一时刻），计算当前价差/估算可平仓 PnL；满足止盈或超时则触发平仓。
+- `Web UI`：新增一个“实盘页面”展示：最近信号、执行状态、当前持仓、当前委托（至少展示我们下过的单/最近回执）、监控状态；并提供手动交易按钮。
+- `Postgres`：全链路记录（信号、执行、两腿订单、价差采样、平仓原因/结果），便于复盘与改进阈值。
+
+### 2.2 落地路径（尽量不破坏现有主流程）
+- 自动交易逻辑作为 `simple_app.py` 内的后台线程（类似现有 orderbook snapshot/metrics snapshot），先跑起来验证；后续如果你想独立进程再抽出来。
+
+---
+
+## 3. 自动开仓流程（你提出的第 2 条：去重 + 双腿下单）
+
+### 3.1 信号对象（建议字段）
+- 来源：`watch_signal_event.id`（event_id）+ `symbol` + `signal_type` + `features_agg.meta_last.trigger_details` + `features_agg.meta_last.pnl_regression`。
+- 交易腿：`leg_long` / `leg_short`，每条包含 `exchange`、`symbol`、`market_type`（先只做 perpetual）、`notional_usdt=20`、`leverage=1`。
+- 目标：两腿同时下单（尽量并发，但要考虑 API 限频与失败回滚策略）。
+
+### 3.2 方向判定（如何从 watchlist 得到 long/short）
+- Type B（跨交易所永续）：从 `trigger_details.prices` 找到“高价交易所/低价交易所”：
+  - `short` 高价 perp（价差收敛时盈利）
+  - `long` 低价 perp
+- Type C（现货 vs 永续）：一期 **不自动交易**（当前交易模块未实现 spot 下单）。后续加入现货交易后，再实现 Type C 自动开仓与平仓。
+- Type A（同所现货 vs 永续、资金费逻辑）：同样受限于 spot 下单与策略口径，建议先不自动化，先做记录与展示。
+
+### 3.3 幂等去重（必须做，否则会被连续信号刷爆）
+规则：实盘系统收到开仓信号后，先检查同币种是否已开仓或正在开仓；如果是重复信号则丢弃。
+推荐实现：
+- DB 层：为“活跃交易”建立唯一约束/幂等键（例如 `(symbol, leg_long_exchange, leg_short_exchange, status in ('opening','open'))`）。
+- 进程内：再加一层内存锁（`symbol` 级别 mutex），避免并发线程重复触发。
+- 冷静期：信号即便关闭，也建议对同 `symbol+pair` 设置 30~120 分钟 cooldown（参数化），避免短周期反复进出。
+- 多交易所多配对：同一 `symbol` 可能同时出现多组交易所配对触发；系统应在单周期内对同一 `symbol` 只选择 **验算后 pnl_hat/win_prob 最优** 的一组配对尝试开仓。
+- 同时持仓上限：系统全局最多允许 **10 对腿**（10 笔对冲交易）处于 `opening/open/closing` 状态；超出则忽略新信号并记录原因。
+
+---
+
+## 4. 交易执行细节（你提出的第 2 条：市价、1x、20U/腿）
+- 市价单：统一走现有 `/api/trade/dual` 的 legs 协议或直接调用 `execute_perp_market_batch()`。
+- 杠杆：对 OKX/Bybit/Bitget 先调用 `set_*_leverage(symbol, 1)`（失败可降级继续，但要记录）；Binance 目前可先不显式设置（或二期补）。
+- 金额：每腿 `50 USDT`（避免部分交易所最小下单数量/名义额导致拒单）；由现有换算逻辑 `_convert_notional_to_quantity()` 完成。
+- client order id：建议用 `signal_id` 派生（便于串联审计），例如：`wl{event_id}-{symbol}-{ts}-L01`。
+- 异常与回滚：
+  - 若一腿下单成功、另一腿失败：立刻尝试把已下单腿“反向 reduceOnly 市价平掉”（需要可靠的成交数量与交易所支持），并标记该次执行为 `partial_failed`。
+- 错误记录（你提出的第 5 点）：所有阶段错误（验算失败/下单拒绝/网络超时/最小数量不足/杠杆设置失败）必须写入 PG 的 `live_trade_error`，用于后续迭代稳定性。
+
+---
+
+## 5. 页面展示（你提出的第 3 条：委托单/持仓简要展示）
+建议在 `simple_app.py` 增加一个页面（例如 `/live_trading`）：
+- 当前活跃交易列表：symbol、pair、开仓时间、预计 pnl/win、当前价差、止盈目标、已持有时长、状态。
+- 当前持仓：优先展示我们系统“正在跟踪的 symbol+exchange” 的持仓（通过 `get_*_positions()` 拉取）。
+- 当前委托：交易模块目前未实现“open orders”查询；一期先展示“我们提交的订单回执 + 最新一次查询结果”，二期再补齐各所 open orders API。
+
+---
+
+## 6. 交易记录落库（你提出的第 4 条）
+建议：继续使用 **现有 PostgreSQL（schema=`watchlist`）**，新增几张“实盘交易表”，避免把实盘细节塞进 `watchlist_outcome`（语义不同）。
+
+推荐最小表（一期）：
+1) `watchlist.live_trade_signal`
+   - `id bigserial pk`, `created_at timestamptz`, `event_id bigint`, `symbol text`, `signal_type char(1)`
+   - `horizon_min int`, `pnl_hat double precision`, `win_prob double precision`, `threshold jsonb`
+   - `leg_long_exchange text`, `leg_short_exchange text`, `status text`（new/ignored/opening/open/closing/closed/failed）
+   - `reason text`, `payload jsonb`（保存 trigger_details/pnl_regression 快照）
+2) `watchlist.live_trade_order`
+   - `id bigserial pk`, `signal_id bigint`, `leg text`（long/short）, `exchange text`, `client_order_id text`
+   - `submitted_at timestamptz`, `order_resp jsonb`, `normalized_qty text`, `status text`
+3) `watchlist.live_trade_spread_sample`
+   - `id bigserial pk`, `signal_id bigint`, `ts timestamptz`, `bidask jsonb`, `spread double precision`, `pnl_est double precision`
+
+二期再加：
+- `live_trade_fill`（成交明细/均价）、`live_trade_exit`（平仓原因、最终 pnl）、`live_trade_error`（异常）。
+
+---
+
+## 7. 价差监听与止盈/强平（你提出的第 5 条）
+- 频率：1min（可配置）；每次同时拉两家订单簿（并发），用同一时间窗计算价差，避免“时序错位”。
+- 数据源：优先 REST（你要求的实时性与一致性），复用 `orderbook_utils.fetch_orderbook_prices()`；扫单名义建议用 `20~50 USDT`，更贴近我们实际平仓滑点。
+- 止盈：当“实时可平仓 pnl_est”达到 `0.8 * pnl_hat`（同一 horizon 的预测）触发平仓。
+- 强平：持有时间超过 7 天强制平仓（不管 pnl）。
+- 额外风控（建议）：
+  - 最大同时持仓数（例如 3~10）
+  - 单币种单方向只允许 1 笔活跃交易
+  - 交易所 API 错误时退避（指数 backoff）并告警/打日志
+
+---
+
+## 8. 手动交易按钮与测试（你提出的第 6 条）
+你要求“手动开多/开空/平多/平空”，并且每次测试可用 `BTC 20 USDT`（如果交易所最小下单限制导致失败，则提升到 `50 USDT`）：
+- 一期：复用 `templates/chart_index.html` 的交易面板逻辑，抽成可复用组件放到新 `/live_trading` 页面，并增加快捷按钮：
+  - `BTC 开多 20U`、`BTC 开空 20U`、`BTC 平多 20U`、`BTC 平空 20U`
+- 交易正确性以 **交易所 API 返回 + 实盘持仓变化** 为准（不是页面展示），每次测试后在页面上刷新持仓确认。
+
+---
+
+## 9. 分阶段实施路线图（逐步带你实现）
+Phase 1（最小可用，先跑通）：
+1) 定义“自动开仓信号”的数据结构与阈值配置（horizon/阈值/冷静期/每日上限）。
+2) 新增 PG 表：`live_trade_signal` / `live_trade_order` / `live_trade_spread_sample`。
+3) 实现 `SignalGate`：从 `watch_signal_event` 拉取候选，过滤并写入 `live_trade_signal`（先不下单）。
+4) 接入下单：用 `/api/trade/dual` 执行两腿 20U、1x；并写 `live_trade_order`。
+5) UI：增加 `/live_trading` 页面展示信号与执行状态；加 BTC 20U 手动按钮（复用现有交易面板）。
+
+Phase 2（监控与平仓闭环）：
+6) 1min 订单簿监听与 pnl_est 计算；达到 0.8*pnl_hat 止盈；>7d 强平。
+7) 完善失败回滚、重试、告警日志；补齐 open orders 查询（若确实需要展示委托）。
+
+Phase 3（策略与质量）：
+8) Type C/A 的自动化策略口径定稿（是否引入 spot，或仅做 perp-perp 替代）。
+9) 与 `future_outcome` 对齐口径，做“预测 vs 实盘结果”偏差分析，迭代阈值/因子。
+
+---
+
+下面保留现有的“Watchlist PG 建设规划”原文，作为 watchlist 数据层与 outcome 计算的背景与附录。
 
 ## 目标与约束
 - 目的：记录 watchlist 的触发信号、执行/结果、回测特征输入，支撑因子迭代，并支撑现有前端页面的展示与图表。
