@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>实盘交易（Type B）</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: Arial, sans-serif; padding: 16px; background: #0d1421; color: #e6edf3; }
+    a { color: #58a6ff; text-decoration: none; }
+    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+    .card { background: #111a2a; border: 1px solid #263040; border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+    .muted { color: #8b949e; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #263040; }
+    .pill.ok { background: rgba(35,134,54,0.2); border-color: rgba(35,134,54,0.6); }
+    .pill.warn { background: rgba(227,179,65,0.18); border-color: rgba(227,179,65,0.6); }
+    .pill.bad { background: rgba(248,81,73,0.18); border-color: rgba(248,81,73,0.6); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid #263040; vertical-align: top; }
+    th { text-align: left; position: sticky; top: 0; background: #111a2a; z-index: 1; }
+    .table-wrap { overflow: auto; max-height: 60vh; border: 1px solid #263040; border-radius: 10px; }
+    button { background: #1f6feb; border: 1px solid #2f81f7; color: #fff; border-radius: 8px; padding: 6px 10px; cursor: pointer; }
+    button.secondary { background: #21262d; border-color: #30363d; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    input { background: #0b1220; border: 1px solid #263040; color: #e6edf3; border-radius: 8px; padding: 6px 10px; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #0b1220; border: 1px solid #263040; border-radius: 10px; padding: 10px; max-height: 35vh; overflow: auto; }
+    .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
+    @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+  <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
+    <div>
+      <div style="font-size: 18px; font-weight: 700;">实盘交易（Type B）</div>
+      <div class="muted" style="margin-top: 4px;">订单簿 1min 监听 → 达到 0.8*pnl_hat 止盈 / 7 天强平 → 平仓下单 → 落库</div>
+    </div>
+    <div class="row">
+      <a href="/watchlist">Watchlist</a>
+      <a href="/watchlist/db">PG DB</a>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 12px;">
+    <div class="row">
+      <span id="enabledPill" class="pill">loading</span>
+      <span class="muted">更新时间：</span><span id="ts" class="muted">-</span>
+      <span class="muted" style="margin-left: 12px;">配置：</span><span id="cfg" class="muted">-</span>
+      <span class="muted" style="margin-left: 12px;">刷新间隔(s)：</span>
+      <input id="refreshSec" type="number" min="2" max="300" value="10" style="width: 90px;" />
+      <span class="muted" style="margin-left: 12px;">信号条数：</span>
+      <input id="signalsLimit" type="number" min="10" max="2000" value="500" style="width: 90px;" />
+      <span class="muted" style="margin-left: 12px;">筛选：</span>
+      <input id="filterSymbol" placeholder="symbol(可选)" style="width: 120px;" />
+      <input id="filterStatus" placeholder="status(可选)" style="width: 140px;" />
+      <button id="refreshBtn" class="secondary">立即刷新</button>
+      <button id="posBtn" class="secondary">刷新持仓(私有API)</button>
+    </div>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+        <div style="font-weight: 700;">交易信号 / 状态</div>
+        <div class="muted">点击 Details 查看 orders/samples</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 64px;">ID</th>
+              <th style="width: 90px;">event_id</th>
+              <th style="width: 90px;">Symbol</th>
+              <th style="width: 90px;">Type</th>
+              <th style="width: 200px;">Exchanges</th>
+              <th style="width: 90px;">Status</th>
+              <th style="width: 110px;">pnl_hat_ob</th>
+              <th style="width: 110px;">tp_pnl</th>
+              <th style="width: 110px;">last_pnl</th>
+              <th style="width: 170px;">created_at</th>
+              <th style="width: 170px;">opened_at</th>
+              <th style="width: 170px;">close_req_at</th>
+              <th style="width: 170px;">closed_at</th>
+              <th style="width: 170px;">force_close_at</th>
+              <th style="width: 140px;">close_reason</th>
+              <th style="width: 200px;">reason</th>
+              <th style="width: 90px;">Details</th>
+            </tr>
+          </thead>
+          <tbody id="signalsBody">
+            <tr><td colspan="17" class="muted">loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="font-weight: 700; margin-bottom: 8px;">最近错误</div>
+      <pre id="errorsPre" class="muted">loading...</pre>
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 12px;">
+    <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+      <div style="font-weight: 700;">Details</div>
+      <div class="muted">orders / samples / positions（按需加载）</div>
+    </div>
+    <pre id="detailsPre" class="muted">点击某个 signal 的 Details 按钮</pre>
+  </div>
+
+  <script>
+    let refreshTimer = null;
+
+    function fmt(v, nd=6) {
+      if (v === null || v === undefined) return '-';
+      const n = Number(v);
+      if (!Number.isFinite(n)) return String(v);
+      return n.toFixed(nd);
+    }
+
+    function pillForStatus(status) {
+      const s = (status || '').toLowerCase();
+      if (s === 'open') return ['open', 'ok'];
+      if (s === 'opening' || s === 'closing') return [s, 'warn'];
+      if (s === 'closed') return ['closed', 'ok'];
+      if (s === 'failed') return ['failed', 'bad'];
+      return [status || '-', ''];
+    }
+
+    async function fetchJson(url) {
+      const resp = await fetch(url, {cache: 'no-store'});
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+      return data;
+    }
+
+    async function refresh() {
+      const overview = await fetchJson('/api/live_trading/overview?limit=80');
+      const limit = Math.max(10, Math.min(2000, Number(document.getElementById('signalsLimit').value || 500)));
+      const symbol = (document.getElementById('filterSymbol').value || '').trim();
+      const status = (document.getElementById('filterStatus').value || '').trim();
+      const qs = new URLSearchParams({limit: String(limit)});
+      if (symbol) qs.set('symbol', symbol);
+      if (status) qs.set('status', status);
+      const signalsResp = await fetchJson(`/api/live_trading/signals?${qs.toString()}`);
+      document.getElementById('ts').textContent = overview.timestamp || '-';
+      const cfg = overview.live_trading_config || {};
+      document.getElementById('cfg').textContent = `per_leg=${cfg.per_leg_notional_usdt || '-'} horizon=${cfg.horizon_min || '-'} pnl>=${cfg.pnl_threshold || '-'} prob>=${cfg.win_prob_threshold || '-'} lookback=${cfg.event_lookback_minutes || '-'}m ex=${cfg.allowed_exchanges || '-'}`;
+
+      const enabled = !!overview.live_trading_enabled;
+      const pill = document.getElementById('enabledPill');
+      pill.textContent = enabled ? 'LIVE_TRADING_ENABLED=1' : 'LIVE_TRADING_ENABLED=0';
+      pill.className = 'pill ' + (enabled ? 'ok' : 'warn');
+
+      const errors = (overview.errors || []).slice(0, 30);
+      document.getElementById('errorsPre').textContent = JSON.stringify(errors, null, 2);
+
+      const body = document.getElementById('signalsBody');
+      const signals = signalsResp.signals || [];
+      if (!signals.length) {
+        body.innerHTML = '<tr><td colspan="17" class="muted">暂无数据</td></tr>';
+        return;
+      }
+
+      body.innerHTML = signals.map(s => {
+        const [stText, stCls] = pillForStatus(s.status);
+        const ex = `${s.leg_long_exchange || '-'}(long) / ${s.leg_short_exchange || '-'}(short)`;
+        const createdAt = s.created_at || '-';
+        const openAt = s.opened_at || '-';
+        const closeReqAt = s.close_requested_at || '-';
+        const closedAt = s.closed_at || '-';
+        const forceAt = s.force_close_at || '-';
+        const closeReason = s.close_reason || '-';
+        const reason = s.reason || '-';
+        return `
+          <tr>
+            <td>${s.id}</td>
+            <td class="muted">${s.event_id || '-'}</td>
+            <td>${s.symbol || '-'}</td>
+            <td class="muted">${s.signal_type || '-'}</td>
+            <td class="muted">${ex}</td>
+            <td><span class="pill ${stCls}">${stText}</span></td>
+            <td>${fmt(s.pnl_hat_ob, 6)}</td>
+            <td>${fmt(s.take_profit_pnl, 6)}</td>
+            <td>${fmt(s.last_pnl_spread, 6)}</td>
+            <td class="muted">${createdAt}</td>
+            <td class="muted">${openAt}</td>
+            <td class="muted">${closeReqAt}</td>
+            <td class="muted">${closedAt}</td>
+            <td class="muted">${forceAt}</td>
+            <td class="muted">${closeReason}</td>
+            <td class="muted">${reason}</td>
+            <td><button class="secondary" onclick="loadDetails(${s.id})">Details</button></td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    async function loadDetails(signalId) {
+      const detailsPre = document.getElementById('detailsPre');
+      detailsPre.textContent = 'loading...';
+      try {
+        const [orders, samples] = await Promise.all([
+          fetchJson(`/api/live_trading/orders?signal_id=${signalId}&limit=200`),
+          fetchJson(`/api/live_trading/samples?signal_id=${signalId}&limit=200`),
+        ]);
+        detailsPre.textContent = JSON.stringify({signal_id: signalId, orders: orders.orders, samples: samples.samples}, null, 2);
+      } catch (e) {
+        detailsPre.textContent = String(e);
+      }
+    }
+
+    async function refreshPositions() {
+      const detailsPre = document.getElementById('detailsPre');
+      detailsPre.textContent = 'loading positions...';
+      try {
+        const pos = await fetchJson('/api/live_trading/positions?limit=30');
+        detailsPre.textContent = JSON.stringify(pos, null, 2);
+      } catch (e) {
+        detailsPre.textContent = String(e);
+      }
+    }
+
+    function schedule() {
+      const sec = Math.max(2, Math.min(300, Number(document.getElementById('refreshSec').value || 10)));
+      if (refreshTimer) clearInterval(refreshTimer);
+      refreshTimer = setInterval(() => refresh().catch(err => console.error(err)), sec * 1000);
+    }
+
+    document.getElementById('refreshBtn').addEventListener('click', () => refresh().catch(err => console.error(err)));
+    document.getElementById('posBtn').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
+    document.getElementById('refreshSec').addEventListener('change', () => schedule());
+    document.getElementById('signalsLimit').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterSymbol').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterStatus').addEventListener('change', () => refresh().catch(err => console.error(err)));
+
+    refresh().catch(err => console.error(err));
+    schedule();
+  </script>
+</body>
+</html>

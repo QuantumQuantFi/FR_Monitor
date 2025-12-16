@@ -26,6 +26,7 @@ from config import (
     DB_WRITE_INTERVAL_SECONDS,
     WATCHLIST_CONFIG,
     WATCHLIST_PG_CONFIG,
+    LIVE_TRADING_CONFIG,
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
@@ -35,9 +36,13 @@ from trading.trade_executor import (
     execute_dual_perp_market_order,
     execute_perp_market_batch,
     get_supported_trading_backends,
+    get_binance_perp_positions,
+    get_okx_swap_positions,
     get_bybit_linear_positions,
     get_bitget_usdt_perp_positions,
+    get_hyperliquid_perp_positions,
 )
+from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
 from watchlist_manager import WatchlistManager
 from watchlist_metrics import (
     compute_series_with_signals,
@@ -674,6 +679,58 @@ def _resolve_close_all_quantity(
     if target_norm not in {"long", "short"}:
         raise TradeRequestValidationError("无法识别需平仓的持仓方向，请检查指令配置")
 
+    if exchange_norm == "binance":
+        recv_window = int(order_context.get("recv_window") or 5000)
+        base_url = order_context.get("base_url") or "https://fapi.binance.com"
+
+        pair = symbol.upper()
+        if not pair.endswith("USDT"):
+            pair = f"{pair}USDT"
+
+        try:
+            positions = get_binance_perp_positions(
+                symbol=pair,
+                recv_window=recv_window,
+                api_key=order_context.get("api_key"),
+                secret_key=order_context.get("secret_key"),
+                base_url=base_url,
+            )
+        except TradeExecutionError as exc:
+            raise TradeRequestValidationError(f"无法查询 Binance 持仓用于全部平仓: {exc}") from exc
+
+        total = Decimal("0")
+        for position in positions:
+            if not isinstance(position, dict):
+                continue
+            if str(position.get("symbol") or "").upper() != pair:
+                continue
+            pos_side = str(position.get("positionSide") or "BOTH").upper()
+            amt_raw = position.get("positionAmt")
+            if amt_raw in (None, "", 0, "0"):
+                continue
+            try:
+                amt = Decimal(str(amt_raw))
+            except (InvalidOperation, TypeError):
+                continue
+
+            if pos_side in {"LONG"} and target_norm == "long" and amt > 0:
+                total += amt
+            elif pos_side in {"SHORT"} and target_norm == "short":
+                if amt < 0:
+                    total += (-amt)
+                elif amt > 0:
+                    total += amt
+            elif pos_side == "BOTH":
+                if target_norm == "long" and amt > 0:
+                    total += amt
+                elif target_norm == "short" and amt < 0:
+                    total += (-amt)
+
+        if total <= 0:
+            raise TradeRequestValidationError("当前 Binance 持仓为空，无需执行全部平仓指令")
+
+        return total.quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
+
     if exchange_norm == "bybit":
         category = str(order_context.get("category") or "linear").lower()
         recv_window = int(order_context.get("recv_window") or 5000)
@@ -866,6 +923,16 @@ def _execute_multi_leg_trade(
         elif reduce_only_flag is False:
             leg_kwargs["reduce_only"] = False
 
+        # Bybit hedge-mode requires explicit positionIdx:
+        # - positionIdx=1 for LONG position
+        # - positionIdx=2 for SHORT position
+        # For reduce-only (close) actions, select by target_position, not by order direction.
+        if exchange_key == "bybit" and "position_idx" not in leg_kwargs and target_position in {"long", "short"}:
+            leg_kwargs["position_idx"] = 1 if target_position == "long" else 2
+        # Binance hedge-mode needs positionSide for reduce-only closes to target the correct leg.
+        if exchange_key == "binance" and "position_side" not in leg_kwargs and target_position in {"long", "short"}:
+            leg_kwargs["position_side"] = "LONG" if target_position == "long" else "SHORT"
+
         specific_client_id = leg.get("client_order_id")
         if specific_client_id:
             leg_kwargs["client_order_id"] = str(specific_client_id)
@@ -986,11 +1053,49 @@ arbitrage_monitor = ArbitrageMonitor(
 # Binance 动态关注列表管理器
 watchlist_manager = WatchlistManager(WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG)
 
-# 启动时尝试用数据库过去窗口内的资金费率预热，避免重启后空窗口
+# 启动时尝试用数据库过去窗口内的资金费率预热，避免重启后空窗口。
+# 注意：SQLite 可能很大（例如 market_data.db），同步预热会阻塞 Flask 启动；因此用后台线程执行。
+def _watchlist_preload_worker() -> None:
+    try:
+        watchlist_manager.preload_from_database(db.db_path)
+    except Exception as exc:
+        logging.getLogger('watchlist').warning("watchlist preload at startup failed: %s", exc)
+
+
+if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"0", "false", "no", "off"}:
+    threading.Thread(target=_watchlist_preload_worker, name="watchlist-preload", daemon=True).start()
+
+# Live trading manager (Phase 1: Type B only). Default disabled via LIVE_TRADING_CONFIG.
+live_trading_manager = LiveTradingManager(
+    LiveTradingConfig(
+        enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
+        dsn=str(WATCHLIST_PG_CONFIG.get('dsn')),
+        allowed_exchanges=tuple(
+            x.strip().lower()
+            for x in str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or '').split(',')
+            if x.strip()
+        ) or ("binance", "bybit"),
+        horizon_min=int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+        pnl_threshold=float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.013)),
+        win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.94)),
+        max_concurrent_trades=int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
+        scan_interval_seconds=float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
+        monitor_interval_seconds=float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
+        take_profit_ratio=float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
+        max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
+        close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
+        event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
+        per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+        candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 200)),
+        per_symbol_top_k=int(LIVE_TRADING_CONFIG.get('per_symbol_top_k', 3)),
+    )
+)
 try:
-    watchlist_manager.preload_from_database(db.db_path)
+    # Create tables even when auto-trading is disabled, so UI/API can inspect status.
+    live_trading_manager.ensure_schema()
+    live_trading_manager.start()
 except Exception as exc:
-    logging.getLogger('watchlist').warning("watchlist preload at startup failed: %s", exc)
+    logging.getLogger('live_trading').warning("live trading start failed: %s", exc)
 
 # 优化的内存数据结构 - 减少内存占用
 class MemoryDataManager:
@@ -1643,6 +1748,12 @@ def watchlist_charts():
     return render_template('watchlist_charts.html')
 
 
+@app.route('/live_trading')
+def live_trading_view():
+    """实盘交易（Type B）状态页：信号、订单、价差监听与平仓状态。"""
+    return render_template('live_trading.html')
+
+
 @app.route('/api/data')
 def get_current_data():
     """获取当前显示币种的实时数据API"""
@@ -2068,7 +2179,423 @@ def get_chart_data(symbol):
         payload = dict(cached_entry['payload'])
         payload['from_cache'] = True
         payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
-        return precision_jsonify(payload)
+    return precision_jsonify(payload)
+
+
+@app.route('/api/live_trading/overview')
+def live_trading_overview():
+    """
+    Minimal live trading status endpoint (Phase 1).
+    Reads PG tables:
+      - watchlist.live_trade_signal
+      - watchlist.live_trade_order
+      - watchlist.live_trade_error
+    """
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    limit = min(max(int(request.args.get('limit', 50) or 50), 1), 200)
+    rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                  FROM watchlist.live_trade_signal
+                 ORDER BY created_at DESC
+                 LIMIT %s;
+                """,
+                (limit,),
+            ).fetchall()
+            errors = conn.execute(
+                """
+                SELECT *
+                  FROM watchlist.live_trade_error
+                 ORDER BY ts DESC
+                 LIMIT %s;
+                """,
+                (min(limit, 200),),
+            ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    def _jsonable(val: Any) -> Any:
+        if isinstance(val, datetime):
+            return val.astimezone(timezone.utc).isoformat()
+        return val
+
+    signals_out = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            signals_out.append({k: _jsonable(v) for k, v in r.items()})
+        else:
+            signals_out.append(r)
+
+    errors_out = []
+    for r in errors or []:
+        if isinstance(r, dict):
+            errors_out.append({k: _jsonable(v) for k, v in r.items()})
+        else:
+            errors_out.append(r)
+
+    return jsonify(
+        {
+            'timestamp': now_utc_iso(),
+            'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
+            'live_trading_config': {
+                'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.013)),
+                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.94)),
+                'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+                'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
+                'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
+                'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
+                'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
+                'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
+                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
+                'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
+            },
+            'signals': signals_out,
+            'errors': errors_out,
+        }
+    )
+
+
+@app.route('/api/live_trading/candidates')
+def live_trading_candidates():
+    """Debug: list top watchlist candidates + orderbook revalidation (no orders placed)."""
+    try:
+        if not live_trading_manager or not getattr(live_trading_manager, "config", None):
+            return jsonify({'candidates': [], 'error': 'live trading manager not initialized', 'timestamp': now_utc_iso()}), 200
+
+        limit_symbols = max(1, min(int(request.args.get('limit_symbols', 10) or 10), 50))
+        per_symbol = max(1, min(int(request.args.get('per_symbol', 1) or 1), 5))
+
+        out: List[Dict[str, Any]] = []
+        with live_trading_manager._conn() as conn:  # type: ignore[attr-defined]
+            candidates = live_trading_manager._fetch_candidates(conn)  # type: ignore[attr-defined]
+            by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+            symbol_order: List[str] = []
+            for row in candidates or []:
+                sym = str(row.get('symbol') or '').upper()
+                if not sym:
+                    continue
+                if sym not in by_symbol:
+                    by_symbol[sym] = []
+                    symbol_order.append(sym)
+                if len(by_symbol[sym]) < per_symbol:
+                    by_symbol[sym].append(row)
+
+            for sym in symbol_order[:limit_symbols]:
+                rows = by_symbol.get(sym) or []
+                for event in rows:
+                    event_id = int(event.get('id') or 0)
+                    high_low = live_trading_manager._pick_high_low(  # type: ignore[attr-defined]
+                        symbol=sym,
+                        trigger_details=event.get('trigger_details'),
+                        leg_a_exchange=event.get('leg_a_exchange'),
+                        leg_b_exchange=event.get('leg_b_exchange'),
+                        leg_a_price_last=event.get('leg_a_price_last'),
+                        leg_b_price_last=event.get('leg_b_price_last'),
+                    )
+                    if not high_low:
+                        out.append({'symbol': sym, 'event_id': event_id, 'ok': False, 'reason': 'missing_pair_prices'})
+                        continue
+                    high_ex, low_ex = high_low
+                    if not (
+                        live_trading_manager._supported_exchange(high_ex)  # type: ignore[attr-defined]
+                        and live_trading_manager._supported_exchange(low_ex)  # type: ignore[attr-defined]
+                    ):
+                        out.append(
+                            {
+                                'symbol': sym,
+                                'event_id': event_id,
+                                'ok': False,
+                                'reason': 'exchange_not_allowed',
+                                'high_ex': high_ex,
+                                'low_ex': low_ex,
+                            }
+                        )
+                        continue
+
+                    factors = event.get('factors') or {}
+                    if not isinstance(factors, dict):
+                        out.append(
+                            {
+                                'symbol': sym,
+                                'event_id': event_id,
+                                'ok': False,
+                                'reason': 'missing_factors',
+                                'high_ex': high_ex,
+                                'low_ex': low_ex,
+                            }
+                        )
+                        continue
+
+                    reval = live_trading_manager._revalidate_with_orderbook(  # type: ignore[attr-defined]
+                        symbol=sym,
+                        high_exchange=high_ex,
+                        low_exchange=low_ex,
+                        base_factors=factors,
+                    )
+                    if isinstance(reval, dict) and not reval.get('ok') and not reval.get('reason') and reval.get('pnl_hat') is not None:
+                        reval = dict(reval)
+                        reval['reason'] = 'below_threshold'
+                    out.append(
+                        {
+                            'symbol': sym,
+                            'event_id': event_id,
+                            'start_ts': str(event.get('start_ts') or ''),
+                            'high_ex': high_ex,
+                            'low_ex': low_ex,
+                            'ok': bool(isinstance(reval, dict) and reval.get('ok')),
+                            'pnl_hat_ob': reval.get('pnl_hat') if isinstance(reval, dict) else None,
+                            'win_prob_ob': reval.get('win_prob') if isinstance(reval, dict) else None,
+                            'reason': reval.get('reason') if isinstance(reval, dict) else 'revalidation_failed',
+                        }
+                    )
+
+        out.sort(key=lambda x: (x.get('ok') is True, x.get('pnl_hat_ob') or -1e9, x.get('win_prob_ob') or -1e9), reverse=True)
+        return jsonify(
+            {
+                'timestamp': now_utc_iso(),
+                'live_trading_config': {
+                    'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+                    'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.013)),
+                    'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.94)),
+                    'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+                    'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
+                    'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
+                },
+                'candidates': out[:200],
+            }
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+
+@app.route('/api/live_trading/signals')
+def live_trading_signals():
+    """Query live trading signals with lightweight filters."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
+    status = request.args.get('status')
+    symbol = request.args.get('symbol')
+
+    where = []
+    params: List[Any] = []
+    if status:
+        where.append("status=%s")
+        params.append(str(status))
+    if symbol:
+        where.append("upper(symbol)=upper(%s)")
+        params.append(str(symbol))
+    where_sql = f"WHERE {' AND '.join(where)}" if where else ""
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                  FROM watchlist.live_trade_signal
+                  {where_sql}
+                 ORDER BY created_at DESC
+                 LIMIT %s;
+                """,
+                (*params, limit),
+            ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    def _jsonable(val: Any) -> Any:
+        if isinstance(val, datetime):
+            return val.astimezone(timezone.utc).isoformat()
+        return val
+
+    out = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            out.append({k: _jsonable(v) for k, v in r.items()})
+        else:
+            out.append(r)
+    return jsonify({'timestamp': now_utc_iso(), 'signals': out})
+
+
+@app.route('/api/live_trading/samples')
+def live_trading_samples():
+    """Return recent spread monitor samples."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    signal_id = request.args.get('signal_id')
+    if not signal_id:
+        return jsonify({'error': 'missing signal_id', 'timestamp': now_utc_iso()}), 400
+    limit = min(max(int(request.args.get('limit', 200) or 200), 1), 1000)
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            rows = conn.execute(
+                """
+                SELECT *
+                  FROM watchlist.live_trade_spread_sample
+                 WHERE signal_id=%s
+                 ORDER BY ts DESC
+                 LIMIT %s;
+                """,
+                (int(signal_id), limit),
+            ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    def _jsonable(val: Any) -> Any:
+        if isinstance(val, datetime):
+            return val.astimezone(timezone.utc).isoformat()
+        return val
+
+    out = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            out.append({k: _jsonable(v) for k, v in r.items()})
+        else:
+            out.append(r)
+    return jsonify({'timestamp': now_utc_iso(), 'samples': out})
+
+
+@app.route('/api/live_trading/positions')
+def live_trading_positions():
+    """
+    Query live positions (REST) for current open/closing signals.
+    Note: this endpoint calls exchange private APIs using config_private credentials.
+    """
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    signal_id = request.args.get('signal_id')
+    limit = min(max(int(request.args.get('limit', 50) or 50), 1), 100)
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            if signal_id:
+                signals = conn.execute(
+                    "SELECT * FROM watchlist.live_trade_signal WHERE id=%s LIMIT 1;",
+                    (int(signal_id),),
+                ).fetchall()
+            else:
+                signals = conn.execute(
+                    """
+                    SELECT *
+                      FROM watchlist.live_trade_signal
+                     WHERE status IN ('open','closing')
+                     ORDER BY opened_at DESC NULLS LAST, created_at DESC
+                     LIMIT %s;
+                    """,
+                    (limit,),
+                ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    targets: List[Dict[str, str]] = []
+    for s in signals or []:
+        if not isinstance(s, dict):
+            continue
+        sym = str(s.get('symbol') or '').upper()
+        if not sym:
+            continue
+        for exch in [s.get('leg_long_exchange'), s.get('leg_short_exchange')]:
+            ex = str(exch or '').lower()
+            if ex:
+                targets.append({'exchange': ex, 'symbol': sym})
+
+    uniq = {(t['exchange'], t['symbol']) for t in targets}
+    results: List[Dict[str, Any]] = []
+    for ex, sym in sorted(uniq):
+        try:
+            if ex == 'binance':
+                pos = get_binance_perp_positions(symbol=f"{sym}USDT")
+            elif ex == 'okx':
+                pos = get_okx_swap_positions(symbol=sym)
+            elif ex == 'bybit':
+                pos = get_bybit_linear_positions(symbol=f"{sym}USDT", category="linear")
+            elif ex == 'bitget':
+                pos = get_bitget_usdt_perp_positions(symbol=f"{sym}USDT")
+            elif ex == 'hyperliquid':
+                pos = get_hyperliquid_perp_positions()
+            else:
+                pos = []
+            results.append({'exchange': ex, 'symbol': sym, 'positions': pos, 'error': None})
+        except TradeExecutionError as exc:
+            results.append({'exchange': ex, 'symbol': sym, 'positions': None, 'error': str(exc)})
+        except Exception as exc:
+            results.append({'exchange': ex, 'symbol': sym, 'positions': None, 'error': f"{type(exc).__name__}: {exc}"})
+
+    return jsonify({'timestamp': now_utc_iso(), 'targets': list(uniq), 'results': results})
+
+
+@app.route('/api/live_trading/orders')
+def live_trading_orders():
+    """Return recent live-trade order records (optionally filter by signal_id)."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
+    signal_id = request.args.get('signal_id')
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            if signal_id:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                      FROM watchlist.live_trade_order
+                     WHERE signal_id=%s
+                     ORDER BY created_at DESC
+                     LIMIT %s;
+                    """,
+                    (int(signal_id), limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT *
+                      FROM watchlist.live_trade_order
+                     ORDER BY created_at DESC
+                     LIMIT %s;
+                    """,
+                    (limit,),
+                ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    def _jsonable(val: Any) -> Any:
+        if isinstance(val, datetime):
+            return val.astimezone(timezone.utc).isoformat()
+        return val
+
+    out = []
+    for r in rows or []:
+        if isinstance(r, dict):
+            out.append({k: _jsonable(v) for k, v in r.items()})
+        else:
+            out.append(r)
+    return jsonify({'timestamp': now_utc_iso(), 'orders': out})
 
     raw_data = None
     last_error = None

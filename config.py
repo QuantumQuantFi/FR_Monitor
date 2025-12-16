@@ -256,6 +256,34 @@ WATCHLIST_METRICS_CONFIG = {
     'funding_exit_minutes': 5,           # 靠近资金费时间的提前平仓窗口
 }
 
+# Live trading (Phase 1: Type B only, perp-perp)
+LIVE_TRADING_CONFIG = {
+    # 默认开启自动实盘；如需关闭请设置 LIVE_TRADING_ENABLED=0
+    'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
+    'horizon_min': int(float(_get_private('LIVE_TRADING_HORIZON_MIN', 'LIVE_TRADING_HORIZON_MIN', '240'))),
+    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.01')),
+    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.91')),
+    'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
+    'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '20')),
+    'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
+    'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
+    'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '7'))),
+    'close_retry_cooldown_seconds': float(
+        _get_private('LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', 'LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', '120')
+    ),
+    'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '30'))),
+    # 注意：不同交易所/合约对存在最小下单名义金额/最小下单数量；默认提升到 50U 以降低拒单概率。
+    'per_leg_notional_usdt': float(_get_private('LIVE_TRADING_PER_LEG_USDT', 'LIVE_TRADING_PER_LEG_USDT', '50')),
+    # 限制自动实盘允许使用的交易所（逗号分隔）；避免因为某个交易所接口变更/余额不足导致全局失败。
+    'allowed_exchanges': _get_private(
+        'LIVE_TRADING_ALLOWED_EXCHANGES',
+        'LIVE_TRADING_ALLOWED_EXCHANGES',
+        'binance,bybit,okx,bitget,hyperliquid',
+    ),
+    'candidate_limit': int(float(_get_private('LIVE_TRADING_CANDIDATE_LIMIT', 'LIVE_TRADING_CANDIDATE_LIMIT', '200'))),
+    'per_symbol_top_k': int(float(_get_private('LIVE_TRADING_PER_SYMBOL_TOPK', 'LIVE_TRADING_PER_SYMBOL_TOPK', '3'))),
+}
+
 # 内存优化配置
 MEMORY_OPTIMIZATION_CONFIG = {
     'max_historical_records': 120,     # 内存中的历史记录数（约6分钟窗口）
