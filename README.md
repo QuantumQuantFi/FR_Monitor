@@ -158,7 +158,14 @@ Hyperliquid 行情/REST 接口可直接访问，如需切换至测试网或调�
 | `HYPERLIQUID_WS_PUBLIC_URL` | 默认为 `wss://api.hyperliquid.xyz/ws` |
 | `HYPERLIQUID_FUNDING_REFRESH_SECONDS` | `metaAndAssetCtxs` 的缓存刷新间隔（秒），默认 60 |
 
-> ✅ WebSocket 订阅使用官方 `allMids` 广播，无需密钥；若需交易权限，请参考官方 SDK 获取签名方式。
+若需在本项目中开启 Hyperliquid 实盘交易，还需提供以下私密字段（仅写入本机 `config_private.py` 或环境变量，切勿提交到仓库）：
+
+| 变量名 | 说明 |
+| --- | --- |
+| `HYPERLIQUID_PRIVATE_KEY` | Hyperliquid 交易私钥（hex 格式），用于下单签名 |
+| `HYPERLIQUID_ADDRESS` | 可选：钱包地址（不填将由私钥推导） |
+
+> ✅ WebSocket 订阅使用官方 `allMids` 广播，无需密钥；交易权限使用官方 SDK 完成签名与下单。
 
 ### 7. 日志与运行目录
 

@@ -11,7 +11,10 @@ import base64
 import hashlib
 import hmac
 import json
+import os
+import re
 import socket
+import threading
 import time
 import logging
 from dataclasses import dataclass
@@ -21,6 +24,18 @@ from typing import Any, Dict, List, Optional, Type, Union
 from urllib.parse import urlencode
 
 import requests
+
+try:
+    from eth_account import Account  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    Account = None  # type: ignore[assignment]
+
+try:
+    from hyperliquid.exchange import Exchange as HyperliquidExchange  # type: ignore[import-not-found]
+    from hyperliquid.info import Info as HyperliquidInfo  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    HyperliquidExchange = None  # type: ignore[assignment]
+    HyperliquidInfo = None  # type: ignore[assignment]
 
 try:  # requests bundles urllib3, but allow user-installed urllib3 fallback
     import urllib3.util.connection as _urllib3_connection  # type: ignore
@@ -33,6 +48,19 @@ CONFIG_PRIVATE = getattr(config, "config_private", None)
 REQUEST_TIMEOUT = config.REST_CONNECTION_CONFIG.get("timeout", 10)
 USER_AGENT = config.REST_CONNECTION_CONFIG.get("user_agent", "CrossExchange-Arb/1.0")
 LOGGER = logging.getLogger(__name__)
+
+_OKX_CLIENT_ID_RE = re.compile(r"[^0-9A-Za-z]")
+
+
+def _sanitize_okx_client_order_id(value: str) -> str:
+    """
+    OKX clOrdId constraints are stricter than other venues; keep only [0-9A-Za-z]
+    and cap to 32 chars.
+    """
+    cleaned = _OKX_CLIENT_ID_RE.sub("", str(value or ""))
+    if not cleaned:
+        return ""
+    return cleaned[-32:]
 
 
 def _configure_ipv4_only() -> None:
@@ -114,6 +142,13 @@ class BitgetCredentials:
     passphrase: str
 
 
+@dataclass(frozen=True)
+class HyperliquidCredentials:
+    private_key: str
+    address: str
+    base_url: str
+
+
 @dataclass
 class _BinanceSymbolFilters:
     min_qty: Decimal
@@ -166,7 +201,7 @@ _BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
 _BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
 
 
-SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget")
+SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid")
 SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ()  # Spot helpers not yet implemented
 
 
@@ -242,6 +277,47 @@ def _resolve_bitget_credentials(
             "passphrase": passphrase,
         },
     )
+
+
+def _resolve_hyperliquid_credentials(
+    private_key: Optional[str],
+    address: Optional[str],
+    *,
+    base_url: Optional[str] = None,
+) -> HyperliquidCredentials:
+    pk = (
+        private_key
+        or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_PRIVATE_KEY", None) if CONFIG_PRIVATE else None)
+        or os.getenv("HYPERLIQUID_PRIVATE_KEY")
+        or ""
+    ).strip()
+    if not pk:
+        raise TradeExecutionError("Hyperliquid requires HYPERLIQUID_PRIVATE_KEY (env or config_private.py)")
+
+    addr = (
+        address
+        or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_ADDRESS", None) if CONFIG_PRIVATE else None)
+        or os.getenv("HYPERLIQUID_ADDRESS")
+        or ""
+    ).strip()
+    if not addr:
+        if Account is None:
+            raise TradeExecutionError("Hyperliquid requires eth-account to derive address from private key")
+        try:
+            acct = Account.from_key(pk)
+        except Exception as exc:
+            raise TradeExecutionError("Invalid Hyperliquid private key") from exc
+        addr = str(acct.address)
+
+    base = (
+        base_url
+        or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_API_BASE_URL", None) if CONFIG_PRIVATE else None)
+        or os.getenv("HYPERLIQUID_API_BASE_URL")
+        or getattr(config, "HYPERLIQUID_API_BASE_URL", None)
+        or ""
+    )
+    base = (base or "https://api.hyperliquid.xyz").rstrip("/")
+    return HyperliquidCredentials(private_key=pk, address=addr, base_url=base)
 
 
 def _utc_millis() -> int:
@@ -448,23 +524,43 @@ def _normalise_binance_quantity(
 
 
 def _normalise_okx_size(symbol: str, size: Any, base_url: str, inst_type: str = "SWAP") -> tuple[str, Decimal]:
-    """Snap ``size`` to OKX lot size increments and enforce minimums."""
+    """
+    Convert base-asset quantity into OKX contract ``sz`` and enforce minimums.
+
+    Note: OKX swap orders use ``sz`` in *contracts*, not base coin units. For
+    consistency with other helpers (Binance/Bybit/Bitget), callers pass base
+    coin size here (e.g. ETH). We convert it using the instrument ``ctVal``
+    (contract value) and then snap to ``lotSz`` / ``minSz`` in contract units.
+    """
     filters = _get_okx_instrument_filters(symbol, base_url, inst_type)
     try:
-        raw_size = Decimal(str(size))
+        raw_base = Decimal(str(size))
     except InvalidOperation as exc:
         raise TradeExecutionError(f"`size` {size!r} is not a valid decimal quantity") from exc
-    lot = filters.lot_size
-    units = (raw_size / lot).to_integral_value(rounding=ROUND_DOWN)
-    normalised = units * lot
+    if raw_base <= 0:
+        raise TradeExecutionError("`size` must be a positive number of contracts")
 
-    if normalised < filters.min_size:
+    ct_val = filters.contract_value
+    if ct_val <= 0:
+        raise TradeExecutionError("OKX instrument metadata invalid: ctVal must be positive")
+
+    raw_contracts = raw_base / ct_val
+    lot = filters.lot_size
+    if lot <= 0:
+        raise TradeExecutionError("OKX instrument metadata invalid: lotSz must be positive")
+
+    units = (raw_contracts / lot).to_integral_value(rounding=ROUND_DOWN)
+    normalised_contracts = units * lot
+
+    if normalised_contracts < filters.min_size:
+        min_base = filters.min_size * ct_val
         raise TradeExecutionError(
-            f"`size` {raw_size} is below OKX minimum {filters.min_size} for {symbol}; increase the order size"
+            f"`size` {raw_base} is below OKX minimum {min_base} base units "
+            f"(minSz={filters.min_size} contracts, ctVal={ct_val}) for {symbol}; increase the order size"
         )
 
-    size_str = format(normalised.normalize(), "f")
-    return size_str, normalised
+    size_str = format(normalised_contracts.normalize(), "f")
+    return size_str, normalised_contracts
 
 
 def _binance_get_order(
@@ -565,41 +661,82 @@ def place_binance_perp_market_order(
     if quantity is None:
         raise TradeExecutionError("`quantity` must be provided in base asset units")
 
-    quantity_str, _ = _normalise_binance_quantity(pair, quantity, base_url)
-    params.append(("quantity", quantity_str))
-    if reduce_only is not None:
-        params.append(("reduceOnly", "true" if reduce_only else "false"))
-    if client_order_id:
-        params.append(("newClientOrderId", client_order_id))
-    if position_side:
-        params.append(("positionSide", position_side.upper()))
+    quantity_str, normalised_qty = _normalise_binance_quantity(pair, quantity, base_url)
 
-    query = urlencode(params)
-    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
-    params.append(("signature", signature))
+    def _effective_step() -> Decimal:
+        filters = _get_binance_symbol_filters(pair, base_url)
+        step = filters.step_size
+        precision = filters.quantity_precision
+        if precision is not None:
+            precision_step = Decimal(1).scaleb(-precision) if precision > 0 else Decimal(1)
+            if precision_step > step:
+                step = precision_step
+        return step
 
-    headers = {
-        "X-MBX-APIKEY": creds.api_key,
-        "User-Agent": USER_AGENT,
-    }
+    def _submit(qty_str: str) -> tuple[requests.Response, Dict[str, Any], List[tuple[str, str]]]:
+        submit_params = [
+            ("symbol", pair),
+            ("side", side.upper()),
+            ("type", "MARKET"),
+            ("timestamp", _utc_millis_str()),
+            ("recvWindow", str(recv_window)),
+            ("newOrderRespType", "RESULT"),
+            ("quantity", qty_str),
+        ]
+        if reduce_only is not None:
+            submit_params.append(("reduceOnly", "true" if reduce_only else "false"))
+        if client_order_id:
+            submit_params.append(("newClientOrderId", client_order_id))
+        if position_side:
+            submit_params.append(("positionSide", position_side.upper()))
 
-    url = f"{base_url}/fapi/v1/order"
-    LOGGER.info(
-        "binance_order_submit symbol=%s side=%s quantity=%s params=%s",
-        pair,
-        side,
-        quantity_str,
-        params,
-    )
-    response = _send_request("POST", url, params=params, headers=headers)
-    data = _json_or_error(response)
-    if response.status_code != 200:
-        LOGGER.warning(
-            "binance_order_http_error status=%s payload=%s",
-            response.status_code,
-            data,
+        query = urlencode(submit_params)
+        signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+        submit_params.append(("signature", signature))
+
+        headers = {
+            "X-MBX-APIKEY": creds.api_key,
+            "User-Agent": USER_AGENT,
+        }
+
+        url = f"{base_url}/fapi/v1/order"
+        LOGGER.info(
+            "binance_order_submit symbol=%s side=%s quantity=%s params=%s",
+            pair,
+            side,
+            qty_str,
+            submit_params,
         )
-        raise TradeExecutionError(f"Binance error {response.status_code}: {data}")
+        resp = _send_request("POST", url, params=submit_params, headers=headers)
+        payload = _json_or_error(resp)
+        return resp, payload, submit_params
+
+    response, data, signed_params = _submit(quantity_str)
+    if response.status_code != 200:
+        # Common case: quantity snapped down to step size makes notional slightly below exchange minimum.
+        if (
+            isinstance(data, dict)
+            and data.get("code") == -4164
+            and reduce_only is not True
+            and normalised_qty is not None
+        ):
+            step = _effective_step()
+            bumped_qty = Decimal(str(normalised_qty)) + step
+            bumped_str = _format_decimal_for_step(bumped_qty, step)
+            response2, data2, signed_params2 = _submit(bumped_str)
+            if response2.status_code == 200:
+                response, data, signed_params = response2, data2, signed_params2
+            else:
+                data = data2
+                response = response2
+
+        if response.status_code != 200:
+            LOGGER.warning(
+                "binance_order_http_error status=%s payload=%s",
+                response.status_code,
+                data,
+            )
+            raise TradeExecutionError(f"Binance error {response.status_code}: {data}")
     if "code" in data and data["code"] != 0:
         LOGGER.warning(
             "binance_order_reject payload=%s",
@@ -694,6 +831,55 @@ def get_binance_perp_price(
     if response.status_code != 200 or "price" not in data:
         raise TradeExecutionError(f"Binance price query failed: {data}")
     return float(data["price"])
+
+
+def set_binance_perp_leverage(
+    symbol: str,
+    leverage: Union[int, float, str],
+    *,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> Dict[str, Any]:
+    """Set leverage for a Binance USDT-margined perpetual symbol."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+
+    try:
+        leverage_val = int(float(leverage))
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid leverage value: {leverage}") from exc
+    if leverage_val <= 0:
+        raise TradeExecutionError("Leverage must be greater than zero")
+
+    params: List[tuple[str, str]] = [
+        ("symbol", pair),
+        ("leverage", str(leverage_val)),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+    ]
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {
+        "X-MBX-APIKEY": creds.api_key,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}/fapi/v1/leverage"
+    response = _send_request("POST", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance leverage error {response.status_code}: {data}")
+    if "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance leverage reject: {data}")
+    return data
 
 
 def get_okx_swap_positions(
@@ -998,7 +1184,7 @@ def get_bybit_linear_positions(
 def get_bitget_usdt_perp_positions(
     *,
     symbol: Optional[str] = None,
-    product_type: str = "umcbl",
+    product_type: str = "USDT-FUTURES",
     margin_coin: Optional[str] = "USDT",
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
@@ -1007,10 +1193,10 @@ def get_bitget_usdt_perp_positions(
 ) -> List[Dict[str, Any]]:
     """Fetch Bitget USDT-margined perpetual positions.
 
-    Bitget retired ``/position/list`` and now exposes consolidated snapshots via
-    ``/position/allPosition-v2``. The response contains every position for the
-    requested ``productType``, so callers can optionally filter the payload by
-    ``symbol``.
+    Bitget V1 endpoints were decommissioned; this uses the V2 private endpoint
+    ``/api/v2/mix/position/all-position``. The response contains every position
+    for the requested ``productType``, so callers can optionally filter the
+    payload by ``symbol``.
     """
     creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
 
@@ -1018,8 +1204,8 @@ def get_bitget_usdt_perp_positions(
     if symbol:
         inst_filter = _normalise_bitget_symbol(symbol)
 
-    request_path = "/api/mix/v1/position/allPosition-v2"
-    params: List[tuple[str, str]] = [("productType", product_type)]
+    request_path = "/api/v2/mix/position/all-position"
+    params: List[tuple[str, str]] = [("productType", _normalise_bitget_product_type(product_type))]
     if margin_coin:
         params.append(("marginCoin", margin_coin.upper()))
 
@@ -1055,27 +1241,39 @@ def get_bitget_usdt_perp_positions(
 def _normalise_bitget_symbol(symbol: str) -> str:
     inst = symbol.upper()
     if inst.endswith("_UMCBL"):
-        return inst
+        inst = inst[: -len("_UMCBL")]
     if inst.endswith("USDT"):
-        return f"{inst}_UMCBL"
-    return f"{inst}USDT_UMCBL"
+        return inst
+    return f"{inst}USDT"
+
+
+def _normalise_bitget_product_type(product_type: str) -> str:
+    raw = (product_type or "").strip()
+    if not raw:
+        return "USDT-FUTURES"
+    raw_upper = raw.upper()
+    # Legacy v1 aliases.
+    if raw_upper in {"UMCBL", "USDT_PERP", "USDT-PERP"}:
+        return "USDT-FUTURES"
+    return raw_upper
 
 
 def _get_bitget_contract_filters(
     symbol: str,
     *,
     base_url: str,
-    product_type: str = "umcbl",
+    product_type: str = "USDT-FUTURES",
 ) -> _BitgetContractFilters:
     key_symbol = _normalise_bitget_symbol(symbol)
-    cache_key = (base_url, product_type.lower(), key_symbol)
+    normalized_product = _normalise_bitget_product_type(product_type)
+    cache_key = (base_url, normalized_product.lower(), key_symbol)
     now = time.time()
     cached = _BITGET_CONTRACT_CACHE.get(cache_key)
     if cached and now - cached.fetched_at < _BITGET_CONTRACT_CACHE_TTL:
         return cached
 
-    request_path = "/api/mix/v1/market/contracts"
-    params: List[tuple[str, str]] = [("productType", product_type)]
+    request_path = "/api/v2/mix/market/contracts"
+    params: List[tuple[str, str]] = [("productType", normalized_product)]
     url = f"{base_url}{request_path}"
     response = _send_request("GET", url, params=params)
     data = _json_or_error(response)
@@ -1121,7 +1319,7 @@ def _normalise_bitget_size(
     size: Any,
     *,
     base_url: str,
-    product_type: str = "umcbl",
+    product_type: str = "USDT-FUTURES",
 ) -> tuple[str, Decimal]:
     filters = _get_bitget_contract_filters(symbol, base_url=base_url, product_type=product_type)
 
@@ -1155,14 +1353,15 @@ def get_bitget_usdt_perp_price(
     base_url: str = "https://api.bitget.com",
 ) -> float:
     inst = _normalise_bitget_symbol(symbol)
-    url = f"{base_url}/api/mix/v1/market/ticker"
-    response = _send_request("GET", url, params=[("symbol", inst)])
+    url = f"{base_url}/api/v2/mix/market/ticker"
+    response = _send_request("GET", url, params=[("symbol", inst), ("productType", "USDT-FUTURES")])
     data = _json_or_error(response)
     if response.status_code != 200 or data.get("code") != "00000":
         raise TradeExecutionError(f"Bitget price query failed: {data}")
 
-    payload = data.get("data") or {}
-    price_raw = payload.get("last")
+    payload_list = data.get("data") or []
+    payload = payload_list[0] if isinstance(payload_list, list) and payload_list else {}
+    price_raw = payload.get("lastPr")
     if price_raw is None:
         raise TradeExecutionError(f"Bitget ticker missing last price: {payload}")
 
@@ -1178,7 +1377,7 @@ def derive_bitget_usdt_perp_size_from_usdt(
     *,
     price: Optional[float] = None,
     base_url: str = "https://api.bitget.com",
-    product_type: str = "umcbl",
+    product_type: str = "USDT-FUTURES",
 ) -> str:
     if notional_usdt is None or notional_usdt <= 0:
         raise TradeExecutionError("`notional_usdt` must be a positive value")
@@ -1203,6 +1402,7 @@ def set_bitget_usdt_perp_leverage(
     symbol: str,
     leverage: Union[int, float, str],
     *,
+    product_type: str = "USDT-FUTURES",
     margin_coin: str = "USDT",
     hold_side: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -1223,13 +1423,14 @@ def set_bitget_usdt_perp_leverage(
 
     payload: Dict[str, Any] = {
         "symbol": inst,
+        "productType": _normalise_bitget_product_type(product_type),
         "marginCoin": margin_coin.upper(),
         "leverage": format(leverage_value.normalize(), "f"),
     }
     if hold_side:
         payload["holdSide"] = hold_side
 
-    request_path = "/api/mix/v1/account/setLeverage"
+    request_path = "/api/v2/mix/account/set-leverage"
     timestamp = _iso_timestamp()
     body_str = _compact_json(payload)
     message = f"{timestamp}POST{request_path}{body_str}"
@@ -1290,7 +1491,9 @@ def place_okx_swap_market_order(
     if reduce_only is not None:
         payload["reduceOnly"] = "true" if reduce_only else "false"
     if client_order_id:
-        payload["clOrdId"] = client_order_id
+        sanitized = _sanitize_okx_client_order_id(client_order_id)
+        if sanitized:
+            payload["clOrdId"] = sanitized
 
     request_path = "/api/v5/trade/order"
     timestamp = _iso_timestamp()
@@ -1360,14 +1563,8 @@ def derive_okx_swap_size_from_usdt(
     if price is None:
         price = get_okx_swap_price(symbol, base_url=base_url)
 
-    filters = _get_okx_instrument_filters(symbol, base_url)
-    if filters.contract_value <= 0:
-        raise TradeExecutionError("OKX contract value metadata invalid")
-
     base_amount = Decimal(str(notional_usdt)) / Decimal(str(price))
-    approximate_size = base_amount / filters.contract_value
-
-    size_str, _ = _normalise_okx_size(symbol, approximate_size, base_url)
+    size_str, _ = _normalise_okx_size(symbol, base_amount, base_url)
     return size_str
 
 
@@ -1649,8 +1846,12 @@ def place_bitget_usdt_perp_market_order(
     side: str,
     size: Union[str, float, Decimal],
     *,
+    product_type: str = "USDT-FUTURES",
     margin_coin: str = "USDT",
+    margin_mode: str = "crossed",
     reduce_only: Optional[bool] = None,
+    trade_side: Optional[str] = None,
+    pos_side: Optional[str] = None,
     client_order_id: Optional[str] = None,
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
@@ -1667,30 +1868,49 @@ def place_bitget_usdt_perp_market_order(
 
     inst = _normalise_bitget_symbol(symbol)
 
-    size_str, _ = _normalise_bitget_size(inst, size, base_url=base_url)
+    size_str, _ = _normalise_bitget_size(inst, size, base_url=base_url, product_type=product_type)
 
-    normalized_side = side.lower()
-    if normalized_side in {"buy", "sell"}:
-        if reduce_only:
-            normalized_side = "close_long" if normalized_side == "sell" else "close_short"
-        else:
-            normalized_side = "open_long" if normalized_side == "buy" else "open_short"
-    elif normalized_side not in {"open_long", "open_short", "close_long", "close_short"}:
-        raise TradeExecutionError("Bitget side must be buy/sell or explicit open_/close_ value")
+    normalized_side = side.lower().strip()
+    if normalized_side in {"long", "buy", "b"}:
+        normalized_side = "buy"
+    elif normalized_side in {"short", "sell", "s"}:
+        normalized_side = "sell"
+    elif normalized_side not in {"buy", "sell"}:
+        raise TradeExecutionError("Bitget side must be BUY/LONG or SELL/SHORT")
+
+    def _unilateral_trade_side(reduce_only_flag: Optional[bool]) -> str:
+        if reduce_only_flag is None:
+            return "open"
+        return "close" if reduce_only_flag else "open"
+
+    def _hedge_trade_side(side_value: str, reduce_only_flag: Optional[bool]) -> str:
+        closing = bool(reduce_only_flag)
+        if side_value == "buy":
+            return "close_short" if closing else "open_long"
+        return "close_long" if closing else "open_short"
+
+    chosen_trade_side = (trade_side or "").strip().lower() if trade_side else ""
+    if not chosen_trade_side:
+        chosen_trade_side = _unilateral_trade_side(reduce_only)
 
     payload: Dict[str, Any] = {
         "symbol": inst,
+        "productType": _normalise_bitget_product_type(product_type),
         "marginCoin": margin_coin.upper(),
+        "marginMode": str(margin_mode).lower(),
         "size": size_str,
         "orderType": "market",
         "side": normalized_side,
+        "tradeSide": chosen_trade_side,
     }
-    if reduce_only is not None:
-        payload["reduceOnly"] = str(bool(reduce_only)).lower()
+    if pos_side:
+        payload["posSide"] = str(pos_side).lower()
+    # Bitget V2 mix order uses `tradeSide` (open/close or open_long/close_short, etc).
+    # Some accounts reject `reduceOnly` for this endpoint; keep the payload minimal.
     if client_order_id:
         payload["clientOid"] = client_order_id
 
-    request_path = "/api/mix/v1/order/placeOrder"
+    request_path = "/api/v2/mix/order/place-order"
     timestamp = _iso_timestamp()
     body_str = _compact_json(payload)
     message = f"{timestamp}POST{request_path}{body_str}"
@@ -1709,7 +1929,26 @@ def place_bitget_usdt_perp_market_order(
     response = _send_request("POST", url, data=body_str, headers=headers)
     data = _json_or_error(response)
     if response.status_code != 200 or data.get("code") != "00000":
-        raise TradeExecutionError(f"Bitget reject: {data}")
+        retryable_codes = {"40774", "22002"}
+        if isinstance(data, dict) and data.get("code") in retryable_codes and not trade_side:
+            # Position mode mismatch (40774) or close semantics mismatch (22002); retry once with hedge tradeSide.
+            fallback_trade_side = _hedge_trade_side(normalized_side, reduce_only)
+            if fallback_trade_side != chosen_trade_side:
+                payload["tradeSide"] = fallback_trade_side
+                body_str = _compact_json(payload)
+                message = f"{timestamp}POST{request_path}{body_str}"
+                signature = _hmac_sha256_base64(creds.secret_key, message)
+                headers["ACCESS-SIGN"] = signature
+                response = _send_request("POST", url, data=body_str, headers=headers)
+                data = _json_or_error(response)
+                if response.status_code == 200 and isinstance(data, dict) and data.get("code") == "00000":
+                    pass
+                else:
+                    raise TradeExecutionError(f"Bitget reject: {data}")
+            else:
+                raise TradeExecutionError(f"Bitget reject: {data}")
+        else:
+            raise TradeExecutionError(f"Bitget reject: {data}")
     result_payload = data.get("data")
     if isinstance(result_payload, dict):
         result_payload.setdefault("symbol", inst)
@@ -1718,6 +1957,163 @@ def place_bitget_usdt_perp_market_order(
         # Preserve the original buy/sell intent for downstream logging.
         result_payload.setdefault("side", normalized_side)
     return data
+
+
+def get_hyperliquid_user_state(
+    *,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Fetch Hyperliquid user state (public endpoint, but requires an address)."""
+    if HyperliquidInfo is None:
+        raise TradeExecutionError("hyperliquid-python-sdk is required for Hyperliquid trading/position APIs")
+    creds = _resolve_hyperliquid_credentials(private_key, address, base_url=base_url)
+    info = HyperliquidInfo(base_url=creds.base_url, skip_ws=True, timeout=timeout)
+    state = info.user_state(creds.address)
+    if not isinstance(state, dict):
+        raise TradeExecutionError(f"Hyperliquid user_state payload malformed: {state!r}")
+    return state
+
+
+def get_hyperliquid_perp_positions(
+    *,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> List[Dict[str, Any]]:
+    """Return Hyperliquid perp positions as a normalized list."""
+    state = get_hyperliquid_user_state(address=address, private_key=private_key, base_url=base_url, timeout=timeout)
+    positions = state.get("assetPositions") or []
+    return positions if isinstance(positions, list) else []
+
+
+_HYPERLIQUID_META_AT = 0.0
+_HYPERLIQUID_SZ_DECIMALS: Dict[str, int] = {}
+_HYPERLIQUID_META_LOCK = threading.Lock()
+_HYPERLIQUID_META_TTL_SECONDS = 300.0
+
+
+def _get_hyperliquid_sz_decimals(
+    symbol: str,
+    *,
+    base_url: str,
+    timeout: float,
+) -> int:
+    global _HYPERLIQUID_META_AT
+    if HyperliquidInfo is None:
+        raise TradeExecutionError("hyperliquid-python-sdk is required for Hyperliquid trading/position APIs")
+
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise TradeExecutionError("Hyperliquid symbol is required")
+
+    now = time.time()
+    with _HYPERLIQUID_META_LOCK:
+        if _HYPERLIQUID_SZ_DECIMALS and (now - _HYPERLIQUID_META_AT) < _HYPERLIQUID_META_TTL_SECONDS:
+            if sym in _HYPERLIQUID_SZ_DECIMALS:
+                return _HYPERLIQUID_SZ_DECIMALS[sym]
+
+    info = HyperliquidInfo(base_url=base_url, skip_ws=True, timeout=timeout)
+    meta = info.meta()
+    if not isinstance(meta, dict):
+        raise TradeExecutionError(f"Hyperliquid meta payload malformed: {meta!r}")
+    universe = meta.get("universe") or []
+    if not isinstance(universe, list):
+        raise TradeExecutionError(f"Hyperliquid meta universe malformed: {meta!r}")
+
+    mapping: Dict[str, int] = {}
+    for entry in universe:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").upper()
+        if not name:
+            continue
+        raw_decimals = entry.get("szDecimals")
+        try:
+            decimals = int(raw_decimals)
+        except Exception:
+            continue
+        mapping[name] = decimals
+
+    with _HYPERLIQUID_META_LOCK:
+        if mapping:
+            _HYPERLIQUID_SZ_DECIMALS.clear()
+            _HYPERLIQUID_SZ_DECIMALS.update(mapping)
+            _HYPERLIQUID_META_AT = now
+
+    if sym not in mapping:
+        raise TradeExecutionError(f"Hyperliquid meta missing symbol {sym}")
+    return mapping[sym]
+
+
+def place_hyperliquid_perp_market_order(
+    symbol: str,
+    side: str,
+    size: Union[str, float, Decimal],
+    *,
+    reduce_only: Optional[bool] = None,
+    client_order_id: Optional[str] = None,
+    slippage: float = 0.01,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Submit a market order on Hyperliquid perpetuals via the official SDK."""
+    if HyperliquidExchange is None or Account is None:
+        raise TradeExecutionError("hyperliquid-python-sdk and eth-account are required for Hyperliquid trading")
+
+    creds = _resolve_hyperliquid_credentials(private_key, address, base_url=base_url)
+    try:
+        wallet = Account.from_key(creds.private_key)
+    except Exception as exc:
+        raise TradeExecutionError("Invalid Hyperliquid private key") from exc
+
+    exchange = HyperliquidExchange(wallet, base_url=creds.base_url, account_address=creds.address, timeout=timeout)
+
+    try:
+        size_dec = Decimal(str(size))
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid Hyperliquid size: {size!r}") from exc
+    if size_dec <= 0:
+        raise TradeExecutionError("Hyperliquid size must be positive")
+
+    side_key = (side or "").strip().lower()
+    if side_key in {"long", "buy", "b"}:
+        is_buy = True
+    elif side_key in {"short", "sell", "s"}:
+        is_buy = False
+    else:
+        raise TradeExecutionError("Hyperliquid side must be BUY/LONG or SELL/SHORT")
+
+    cloid = None
+    if client_order_id:
+        try:
+            from hyperliquid.utils.types import Cloid  # type: ignore[import-not-found]
+
+            # Hyperliquid expects a Cloid type (string wrapper); keep it short and deterministic.
+            cloid = Cloid.from_str(str(client_order_id)[-32:])
+        except Exception:
+            cloid = None
+
+    sz_decimals = _get_hyperliquid_sz_decimals(symbol, base_url=creds.base_url, timeout=timeout)
+    step = Decimal("1").scaleb(-sz_decimals)
+    size_dec = size_dec.quantize(step, rounding=ROUND_DOWN)
+    if size_dec <= 0:
+        raise TradeExecutionError(f"Hyperliquid size too small after rounding ({sz_decimals} dp): {size!r}")
+    raw_size = float(size_dec)
+
+    if reduce_only:
+        resp = exchange.market_close(symbol.upper(), sz=raw_size, slippage=float(slippage), cloid=cloid)
+    else:
+        resp = exchange.market_open(symbol.upper(), is_buy=is_buy, sz=raw_size, slippage=float(slippage), cloid=cloid)
+
+    if not isinstance(resp, dict):
+        return {"result": resp}
+    return resp
 
 
 def get_supported_trading_backends() -> Dict[str, List[str]]:
@@ -1769,8 +2165,9 @@ def execute_perp_market_order(
     direction = _normalise_perp_side(side)
     quantity_dec = _coerce_positive_quantity(quantity)
     kwargs = dict(order_kwargs or {})
-    for blocked in ("side", "pos_side", "position_side"):
+    for blocked in ("side", "pos_side"):
         kwargs.pop(blocked, None)
+    binance_position_side_override = kwargs.pop("position_side", None)
     bybit_position_idx = kwargs.pop("position_idx", None)
 
     LOGGER.info(
@@ -1782,13 +2179,37 @@ def execute_perp_market_order(
     )
 
     if exchange_key == "binance":
-        order = place_binance_perp_market_order(
-            symbol,
-            "BUY" if direction == "long" else "SELL",
-            quantity_dec,
-            position_side="LONG" if direction == "long" else "SHORT",
-            **kwargs,
-        )
+        binance_kwargs = dict(kwargs)
+        reduce_only = binance_kwargs.pop("reduce_only", None)
+        client_order_id = binance_kwargs.pop("client_order_id", None)
+
+        if binance_position_side_override is not None:
+            position_side = str(binance_position_side_override).upper()
+        else:
+            position_side = "LONG" if direction == "long" else "SHORT"
+
+        def _submit(*, position_side_val: Optional[str], reduce_only_val: Optional[bool]) -> Dict[str, Any]:
+            return place_binance_perp_market_order(
+                symbol,
+                "BUY" if direction == "long" else "SELL",
+                quantity_dec,
+                reduce_only=reduce_only_val,
+                client_order_id=client_order_id,
+                position_side=position_side_val,
+                **binance_kwargs,
+            )
+
+        try:
+            order = _submit(position_side_val=position_side, reduce_only_val=reduce_only)
+        except TradeExecutionError as exc:
+            # Some Binance accounts run in one-way mode and reject positionSide.
+            msg = str(exc).lower()
+            if reduce_only is True and "reduceonly" in msg and "not required" in msg:
+                order = _submit(position_side_val=position_side, reduce_only_val=None)
+            elif "positionside" in msg or "dual-side position" in msg:
+                order = _submit(position_side_val=None, reduce_only_val=reduce_only)
+            else:
+                raise
     elif exchange_key == "okx":
         order = place_okx_swap_market_order(
             symbol,
@@ -1798,35 +2219,63 @@ def execute_perp_market_order(
             **kwargs,
         )
     elif exchange_key == "bybit":
-        bybit_position_idx_resolved = bybit_position_idx if bybit_position_idx is not None else 0
         bybit_category = kwargs.get("category", "linear")
         receiver_window = kwargs.get("recv_window", 5000)
-        # 为了兼容默认的单向持仓策略，下单前强制校准杠杆至1倍；
-        # 若 Bybit 返回 110043（leverage not modified，通常表示已是目标杠杆或受限），
-        # 会在辅助函数中进一步确认并给出明确反馈。
-        _ensure_bybit_leverage_target(
-            symbol,
-            target_leverage=1,
-            category=bybit_category,
-            position_idx=bybit_position_idx_resolved,
-            recv_window=receiver_window,
-            api_key=kwargs.get("api_key"),
-            secret_key=kwargs.get("secret_key"),
-            base_url=kwargs.get("base_url", "https://api.bybit.com"),
-        )
-        order = place_bybit_linear_market_order(
-            symbol,
-            "buy" if direction == "long" else "sell",
-            str(quantity_dec),
-            position_idx=bybit_position_idx_resolved,
-            **kwargs,
-        )
+        base_url = kwargs.get("base_url", "https://api.bybit.com")
+
+        def _submit(position_idx: int) -> Dict[str, Any]:
+            _ensure_bybit_leverage_target(
+                symbol,
+                target_leverage=1,
+                category=bybit_category,
+                position_idx=position_idx,
+                recv_window=receiver_window,
+                api_key=kwargs.get("api_key"),
+                secret_key=kwargs.get("secret_key"),
+                base_url=base_url,
+            )
+            return place_bybit_linear_market_order(
+                symbol,
+                "buy" if direction == "long" else "sell",
+                str(quantity_dec),
+                position_idx=position_idx,
+                **kwargs,
+            )
+
+        bybit_position_idx_resolved = bybit_position_idx if bybit_position_idx is not None else 0
+        try:
+            order = _submit(int(bybit_position_idx_resolved))
+        except TradeExecutionError as exc:
+            # Some accounts use hedge-mode (positionIdx=1 long / 2 short).
+            msg = str(exc).lower()
+            if bybit_position_idx is None and "position idx not match position mode" in msg:
+                hedge_idx = 1 if direction == "long" else 2
+                order = _submit(int(hedge_idx))
+            else:
+                raise
     elif exchange_key == "bitget":
         order = place_bitget_usdt_perp_market_order(
             symbol,
             "buy" if direction == "long" else "sell",
             str(quantity_dec),
             **kwargs,
+        )
+    elif exchange_key == "hyperliquid":
+        hl_kwargs = dict(kwargs)
+        reduce_only = hl_kwargs.pop("reduce_only", None)
+        client_order_id = hl_kwargs.pop("client_order_id", None)
+        slippage = hl_kwargs.pop("slippage", 0.01)
+        order = place_hyperliquid_perp_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+            slippage=float(slippage),
+            address=hl_kwargs.pop("address", None),
+            private_key=hl_kwargs.pop("private_key", None),
+            base_url=hl_kwargs.pop("base_url", None),
+            timeout=float(hl_kwargs.pop("timeout", 10.0)),
         )
     else:  # pragma: no cover - guarded above but keeps mypy happy
         raise TradeExecutionError(f"Unhandled exchange `{exchange}`")
