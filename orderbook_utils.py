@@ -9,6 +9,7 @@ LIGHTER_BASE_URL = config.LIGHTER_REST_BASE_URL.rstrip("/")
 
 DEFAULT_SWEEP_NOTIONAL = 100.0  # USD notional to simulate across orderbooks
 REQUEST_TIMEOUT = 4
+BITGET_USDT_PRODUCT_TYPE = "USDT-FUTURES"
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -144,7 +145,8 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
         if market_type == 'perp':
             data = _req_json(
                 "https://api.bitget.com/api/v2/mix/market/merge-depth",
-                params={'symbol': inst, 'limit': 50, 'productType': 'usdt-futures'},
+                # 与交易/持仓接口使用的 productType 保持一致，避免拿到不同市场的深度导致监控/验算失真。
+                params={'symbol': inst, 'limit': 50, 'productType': BITGET_USDT_PRODUCT_TYPE},
             )
         else:
             data = _req_json(
