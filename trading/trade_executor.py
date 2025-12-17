@@ -294,10 +294,18 @@ def _resolve_hyperliquid_credentials(
     if not pk:
         raise TradeExecutionError("Hyperliquid requires HYPERLIQUID_PRIVATE_KEY (env or config_private.py)")
 
+    # Hyperliquid commonly uses an "API wallet" (agent key) that is authorized to trade on behalf of a different
+    # main trading address. In that setup:
+    # - private_key: API wallet key (agent)
+    # - address: main trading address (user) used for user_state / positions / orderStatus queries
     addr = (
         address
         or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_ADDRESS", None) if CONFIG_PRIVATE else None)
+        or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_USER_ADDRESS", None) if CONFIG_PRIVATE else None)
+        or (getattr(CONFIG_PRIVATE, "HYPERLIQUID_WALLET_ADDRESS", None) if CONFIG_PRIVATE else None)
         or os.getenv("HYPERLIQUID_ADDRESS")
+        or os.getenv("HYPERLIQUID_USER_ADDRESS")
+        or os.getenv("HYPERLIQUID_WALLET_ADDRESS")
         or ""
     ).strip()
     if not addr:
@@ -833,6 +841,55 @@ def get_binance_perp_price(
     return float(data["price"])
 
 
+def get_binance_perp_order(
+    symbol: str,
+    *,
+    order_id: Optional[Union[int, str]] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> Dict[str, Any]:
+    """Fetch a Binance USDT perpetual order snapshot via GET /fapi/v1/order."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+
+    if order_id is None and not client_order_id:
+        raise TradeExecutionError("Either `order_id` or `client_order_id` is required")
+
+    params: List[tuple[str, str]] = [
+        ("symbol", pair),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+    ]
+    if order_id is not None:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("origClientOrderId", str(client_order_id)))
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {
+        "X-MBX-APIKEY": creds.api_key,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}/fapi/v1/order"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance order query failed {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance order query reject: {data}")
+    return data if isinstance(data, dict) else {"data": data}
+
+
 def set_binance_perp_leverage(
     symbol: str,
     leverage: Union[int, float, str],
@@ -1181,6 +1238,66 @@ def get_bybit_linear_positions(
     return result.get("list", []) if isinstance(result, dict) else []
 
 
+def get_bybit_linear_order(
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    category: str = "linear",
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Fetch a Bybit order status/fill snapshot via `/v5/order/realtime`."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    if not order_id and not client_order_id:
+        raise TradeExecutionError("Either `order_id` or `client_order_id` is required")
+
+    request_path = "/v5/order/realtime"
+    params: List[tuple[str, str]] = [
+        ("category", str(category).lower()),
+        ("symbol", symbol_id),
+    ]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("orderLinkId", str(client_order_id)))
+
+    params_sorted = sorted(params, key=lambda item: item[0])
+    query_str = urlencode(params_sorted)
+
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{query_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params_sorted, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit order query reject: {data}")
+    result = data.get("result") or {}
+    order_list = result.get("list") if isinstance(result, dict) else None
+    if isinstance(order_list, list) and order_list:
+        first = order_list[0]
+        return first if isinstance(first, dict) else {"data": first}
+    return data
+
+
 def get_bitget_usdt_perp_positions(
     *,
     symbol: Optional[str] = None,
@@ -1515,6 +1632,60 @@ def place_okx_swap_market_order(
     data = _json_or_error(response)
     if response.status_code != 200 or data.get("code") != "0":
         raise TradeExecutionError(f"OKX reject: {data}")
+    return data
+
+
+def get_okx_swap_order(
+    symbol: str,
+    *,
+    ord_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Fetch an OKX swap order by `ordId` or `clOrdId`."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        inst_id = f"{inst_id}-USDT-SWAP"
+
+    if not ord_id and not client_order_id:
+        raise TradeExecutionError("Either `ord_id` or `client_order_id` is required")
+
+    request_path = "/api/v5/trade/order"
+    params: List[tuple[str, str]] = [("instId", inst_id)]
+    if ord_id:
+        params.append(("ordId", str(ord_id)))
+    if client_order_id:
+        sanitized = _sanitize_okx_client_order_id(client_order_id)
+        if sanitized:
+            params.append(("clOrdId", sanitized))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX order query reject: {data}")
+    payload = data.get("data") or []
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
     return data
 
 
@@ -1959,6 +2130,61 @@ def place_bitget_usdt_perp_market_order(
     return data
 
 
+def get_bitget_usdt_perp_order_detail(
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    product_type: str = "USDT-FUTURES",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Fetch Bitget USDT perpetual order detail (best-effort, V2 endpoint)."""
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+
+    inst = _normalise_bitget_symbol(symbol)
+    if not order_id and not client_order_id:
+        raise TradeExecutionError("Either `order_id` or `client_order_id` is required")
+
+    request_path = "/api/v2/mix/order/detail"
+    params: List[tuple[str, str]] = [
+        ("symbol", inst),
+        ("productType", _normalise_bitget_product_type(product_type)),
+    ]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("clientOid", str(client_order_id)))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget order detail reject: {data}")
+    payload = data.get("data")
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
+    if isinstance(payload, dict):
+        return payload
+    return data
+
+
 def get_hyperliquid_user_state(
     *,
     address: Optional[str] = None,
@@ -2094,8 +2320,9 @@ def place_hyperliquid_perp_market_order(
         try:
             from hyperliquid.utils.types import Cloid  # type: ignore[import-not-found]
 
-            # Hyperliquid expects a Cloid type (string wrapper); keep it short and deterministic.
-            cloid = Cloid.from_str(str(client_order_id)[-32:])
+            # Hyperliquid Cloid must be a hex string; derive a stable hex id from the arbitrary client_order_id.
+            digest = hashlib.sha256(str(client_order_id).encode("utf-8")).hexdigest()[:32]
+            cloid = Cloid.from_str(digest)
         except Exception:
             cloid = None
 
@@ -2107,7 +2334,26 @@ def place_hyperliquid_perp_market_order(
     raw_size = float(size_dec)
 
     if reduce_only:
-        resp = exchange.market_close(symbol.upper(), sz=raw_size, slippage=float(slippage), cloid=cloid)
+        # The SDK's market_close() returns None when it cannot find an existing position via user_state().
+        # For our live trading we already know the close direction; submit an aggressive reduce-only IOC limit instead
+        # so we always get a response payload for logging/backfill.
+        close_side = (side or "").strip().lower()
+        if close_side in {"long", "buy", "b"}:
+            is_buy_close = True
+        elif close_side in {"short", "sell", "s"}:
+            is_buy_close = False
+        else:
+            raise TradeExecutionError("Hyperliquid close side must be BUY/LONG or SELL/SHORT")
+        px = exchange._slippage_price(symbol.upper(), is_buy_close, float(slippage), None)  # type: ignore[attr-defined]
+        resp = exchange.order(
+            symbol.upper(),
+            is_buy_close,
+            raw_size,
+            float(px),
+            order_type={"limit": {"tif": "Ioc"}},
+            reduce_only=True,
+            cloid=cloid,
+        )
     else:
         resp = exchange.market_open(symbol.upper(), is_buy=is_buy, sz=raw_size, slippage=float(slippage), cloid=cloid)
 

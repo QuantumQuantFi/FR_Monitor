@@ -25,10 +25,15 @@ from trading.trade_executor import (
     TradeExecutionError,
     execute_perp_market_order,
     place_binance_perp_market_order,
+    get_binance_perp_order,
+    get_bybit_linear_order,
+    get_bitget_usdt_perp_order_detail,
     get_bitget_usdt_perp_positions,
+    get_hyperliquid_perp_positions,
     place_bitget_usdt_perp_market_order,
     place_bybit_linear_market_order,
     place_hyperliquid_perp_market_order,
+    get_okx_swap_order,
     place_okx_swap_market_order,
     set_binance_perp_leverage,
     set_bybit_linear_leverage,
@@ -66,6 +71,8 @@ class LiveTradingConfig:
     per_symbol_top_k: int = 3
     monitor_interval_seconds: float = 60.0
     take_profit_ratio: float = 0.8
+    orderbook_confirm_samples: int = 3
+    orderbook_confirm_sleep_seconds: float = 0.7
     max_hold_days: int = 7
     close_retry_cooldown_seconds: float = 120.0
 
@@ -196,6 +203,10 @@ class LiveTradingManager:
           market_type text NOT NULL DEFAULT 'perp',
           notional_usdt double precision,
           quantity text,
+          filled_qty double precision,
+          avg_price double precision,
+          cum_quote double precision,
+          exchange_order_id text,
           client_order_id text,
           submitted_at timestamptz,
           order_resp jsonb,
@@ -255,9 +266,269 @@ class LiveTradingManager:
 
         ALTER TABLE watchlist.live_trade_order
           ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'open';
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS filled_qty double precision;
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS avg_price double precision;
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS cum_quote double precision;
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS exchange_order_id text;
         """
         with psycopg.connect(self.config.dsn, autocommit=True) as conn:
             conn.execute(ddl)
+            try:
+                self._apply_runtime_config_migrations(conn)
+            except Exception as exc:
+                self.logger.warning("apply runtime config migrations failed: %s", exc)
+
+    def _parse_fill_fields(self, exchange: str, symbol: str, order: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Best-effort extraction of actual fill metrics for storage/UI.
+
+        Returns subset of:
+        - filled_qty (base qty when available)
+        - avg_price
+        - cum_quote (USDT notional when available)
+        - exchange_order_id
+        - status (exchange-reported)
+        """
+        if not isinstance(order, dict):
+            return {}
+
+        ex = (exchange or "").lower().strip()
+
+        def _float_or_none(val: Any) -> Optional[float]:
+            if val is None:
+                return None
+            try:
+                f = float(val)
+            except Exception:
+                return None
+            if not math.isfinite(f):
+                return None
+            return f
+
+        def _first_dict(val: Any) -> Dict[str, Any]:
+            if isinstance(val, dict):
+                return val
+            if isinstance(val, list) and val and isinstance(val[0], dict):
+                return val[0]
+            return {}
+
+        info: Dict[str, Any] = {}
+
+        if ex == "binance":
+            info["exchange_order_id"] = str(order.get("orderId") or "") or None
+            info["filled_qty"] = _float_or_none(order.get("executedQty"))
+            info["avg_price"] = _float_or_none(order.get("avgPrice"))
+            info["cum_quote"] = _float_or_none(order.get("cumQuote"))
+            status = order.get("status")
+            info["status"] = str(status) if status is not None else None
+            if info.get("exchange_order_id") and (
+                info.get("filled_qty") is None
+                or info.get("avg_price") is None
+                or float(info.get("filled_qty") or 0.0) <= 0.0
+            ):
+                detail = None
+                for _ in range(3):
+                    try:
+                        detail = get_binance_perp_order(symbol, order_id=info["exchange_order_id"])
+                    except Exception:
+                        detail = None
+                    if isinstance(detail, dict):
+                        filled = _float_or_none(detail.get("executedQty"))
+                        avg_px = _float_or_none(detail.get("avgPrice"))
+                        if filled and filled > 0 and avg_px and avg_px > 0:
+                            break
+                    time.sleep(0.25)
+                if isinstance(detail, dict):
+                    info["filled_qty"] = info.get("filled_qty") if info.get("filled_qty") is not None else _float_or_none(detail.get("executedQty"))
+                    info["avg_price"] = info.get("avg_price") if info.get("avg_price") is not None else _float_or_none(detail.get("avgPrice"))
+                    info["cum_quote"] = info.get("cum_quote") if info.get("cum_quote") is not None else _float_or_none(detail.get("cumQuote"))
+                    st = detail.get("status")
+                    if st is not None:
+                        info["status"] = str(st)
+            return {k: v for k, v in info.items() if v is not None}
+
+        if ex == "okx":
+            base = _first_dict(order.get("data"))
+            ord_id = base.get("ordId")
+            cl_id = base.get("clOrdId") or base.get("clientOid")
+            info["exchange_order_id"] = str(ord_id or "") or None
+            detail = None
+            for _ in range(3):
+                try:
+                    detail = get_okx_swap_order(
+                        symbol,
+                        ord_id=str(ord_id) if ord_id else None,
+                        client_order_id=str(cl_id) if cl_id else None,
+                    )
+                except Exception:
+                    detail = None
+                if isinstance(detail, dict):
+                    avg_px = _float_or_none(detail.get("avgPx") or detail.get("fillPx"))
+                    acc_fill = _float_or_none(detail.get("accFillSz") or detail.get("fillSz"))
+                    if avg_px and acc_fill and acc_fill > 0:
+                        break
+                time.sleep(0.25)
+            if isinstance(detail, dict):
+                info["avg_price"] = _float_or_none(detail.get("avgPx") or detail.get("fillPx"))
+                info["filled_qty"] = _float_or_none(detail.get("accFillSz") or detail.get("fillSz") or detail.get("sz"))
+                info["cum_quote"] = _float_or_none(detail.get("accFillNotional") or detail.get("fillNotional"))
+                status = detail.get("state") or detail.get("status")
+                info["status"] = str(status) if status is not None else None
+            return {k: v for k, v in info.items() if v is not None}
+
+        if ex == "bitget":
+            base = _first_dict(order.get("data"))
+            order_id = base.get("orderId") or base.get("order_id")
+            cl_id = base.get("clientOid") or base.get("client_oid")
+            info["exchange_order_id"] = str(order_id or "") or None
+            detail = None
+            for _ in range(3):
+                try:
+                    detail = get_bitget_usdt_perp_order_detail(
+                        symbol,
+                        order_id=str(order_id) if order_id else None,
+                        client_order_id=str(cl_id) if cl_id else None,
+                    )
+                except Exception:
+                    detail = None
+                if isinstance(detail, dict):
+                    avg_px = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice") or detail.get("avgPx"))
+                    filled_sz = _float_or_none(detail.get("filledQty") or detail.get("filledSize") or detail.get("baseVolume"))
+                    if avg_px and filled_sz and filled_sz > 0:
+                        break
+                time.sleep(0.25)
+            if isinstance(detail, dict):
+                info["avg_price"] = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice") or detail.get("avgPx"))
+                info["filled_qty"] = _float_or_none(
+                    detail.get("filledQty")
+                    or detail.get("filledSize")
+                    or detail.get("baseVolume")
+                    or detail.get("size")
+                )
+                info["cum_quote"] = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
+                status = detail.get("state") or detail.get("status")
+                info["status"] = str(status) if status is not None else None
+            return {k: v for k, v in info.items() if v is not None}
+
+        if ex == "hyperliquid":
+            info["exchange_order_id"] = str(order.get("oid") or order.get("orderId") or "") or None
+            status = order.get("status")
+            if status is not None:
+                info["status"] = str(status)
+            resp = order.get("response") if isinstance(order.get("response"), dict) else None
+            data = resp.get("data") if resp and isinstance(resp.get("data"), dict) else None
+            statuses = data.get("statuses") if data and isinstance(data.get("statuses"), list) else None
+            first = statuses[0] if statuses and isinstance(statuses[0], dict) else None
+            if first and first.get("error"):
+                info["status"] = str(first.get("error"))
+            filled = first.get("filled") if first and isinstance(first.get("filled"), dict) else None
+            if filled:
+                info["avg_price"] = _float_or_none(filled.get("avgPx") or filled.get("avgPrice"))
+                info["filled_qty"] = _float_or_none(filled.get("totalSz") or filled.get("sz"))
+                if info.get("exchange_order_id") is None:
+                    info["exchange_order_id"] = str(filled.get("oid") or "") or None
+            return {k: v for k, v in info.items() if v is not None}
+
+        if ex == "bybit":
+            base = order.get("result") if isinstance(order.get("result"), dict) else {}
+            order_id = base.get("orderId") or order.get("orderId")
+            cl_id = base.get("orderLinkId") or base.get("orderLinkID") or order.get("orderLinkId")
+            info["exchange_order_id"] = str(order_id or "") or None
+            detail = None
+            for _ in range(3):
+                try:
+                    detail = get_bybit_linear_order(
+                        symbol,
+                        order_id=str(order_id) if order_id else None,
+                        client_order_id=str(cl_id) if cl_id else None,
+                        category="linear",
+                    )
+                except Exception:
+                    detail = None
+                if isinstance(detail, dict):
+                    avg_px = _float_or_none(detail.get("avgPrice"))
+                    filled_qty = _float_or_none(detail.get("cumExecQty"))
+                    if avg_px and filled_qty and filled_qty > 0:
+                        break
+                time.sleep(0.25)
+            if isinstance(detail, dict):
+                info["avg_price"] = _float_or_none(detail.get("avgPrice"))
+                info["filled_qty"] = _float_or_none(detail.get("cumExecQty"))
+                info["cum_quote"] = _float_or_none(detail.get("cumExecValue"))
+                status = detail.get("orderStatus") or detail.get("orderStatus")
+                if status is not None:
+                    info["status"] = str(status)
+            return {k: v for k, v in info.items() if v is not None}
+
+        return {}
+
+    def _get_hyperliquid_position_szi(self, symbol: str) -> float:
+        sym = str(symbol or "").upper()
+        if not sym:
+            return 0.0
+        positions = get_hyperliquid_perp_positions()
+        for item in positions or []:
+            if not isinstance(item, dict):
+                continue
+            position = item.get("position") if isinstance(item.get("position"), dict) else None
+            if not position:
+                continue
+            if str(position.get("coin") or "").upper() != sym:
+                continue
+            try:
+                return float(position.get("szi") or 0.0)
+            except Exception:
+                return 0.0
+        return 0.0
+
+    def _verify_hyperliquid_position_after_open(self, symbol: str, side: str, requested_qty: float) -> None:
+        """
+        Hyperliquid SDK order response can be misleading; confirm the position exists before we consider the leg opened.
+        """
+        side_key = (side or "").strip().lower()
+        expected_sign = 1.0 if side_key == "long" else -1.0
+        min_abs = max(1e-12, abs(float(requested_qty or 0.0)) * 0.2)
+        for _ in range(5):
+            try:
+                szi = float(self._get_hyperliquid_position_szi(symbol))
+            except Exception:
+                szi = 0.0
+            if szi * expected_sign > 0 and abs(szi) >= min_abs:
+                return
+            time.sleep(0.4)
+        raise TradeExecutionError(
+            f"Hyperliquid position not detected after open: symbol={symbol} side={side_key} requested_qty={requested_qty}"
+        )
+
+    def _apply_runtime_config_migrations(self, conn) -> None:
+        """
+        Apply safe, best-effort migrations driven by runtime config changes.
+
+        Currently:
+        - When max_hold_days changes, shorten force_close_at for already-open trades so the monitor
+          enforces the new policy even for positions opened under older settings.
+        """
+        max_hold_days = int(self.config.max_hold_days)
+        if max_hold_days <= 0:
+            return
+
+        conn.execute(
+            """
+            UPDATE watchlist.live_trade_signal
+               SET force_close_at = (COALESCE(opened_at, created_at) + make_interval(days := %s))
+             WHERE status IN ('opening','open')
+               AND COALESCE(opened_at, created_at) IS NOT NULL
+               AND (
+                   force_close_at IS NULL
+                   OR force_close_at > (COALESCE(opened_at, created_at) + make_interval(days := %s))
+               );
+            """,
+            (max_hold_days, max_hold_days),
+        )
 
     def _conn(self):
         if psycopg is None:
@@ -445,64 +716,172 @@ class LiveTradingManager:
         low_exchange: str,
         base_factors: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
-        ob_high = fetch_orderbook_prices(
-            high_exchange,
+        # 注意：watchlist 的触发信息里 “高/低交易所” 可能来自 last/mark 等价格口径；
+        # 这里必须以可成交的 bid/ask（按同名义金额扫盘）来重新选择开仓方向，
+        # 否则会出现“long 更贵、short 更便宜”的反向开仓，进而导致止盈判断与实际收益口径错位。
+        ex_a = str(high_exchange)
+        ex_b = str(low_exchange)
+
+        ob_a = fetch_orderbook_prices(
+            ex_a,
             symbol,
             self.config.orderbook_market_type,
             notional=float(self.config.per_leg_notional_usdt),
         )
-        ob_low = fetch_orderbook_prices(
-            low_exchange,
+        ob_b = fetch_orderbook_prices(
+            ex_b,
             symbol,
             self.config.orderbook_market_type,
             notional=float(self.config.per_leg_notional_usdt),
         )
-        if not ob_high or ob_high.get("error") or not ob_low or ob_low.get("error"):
+        if not ob_a or ob_a.get("error") or not ob_b or ob_b.get("error"):
             return {
                 "ok": False,
                 "reason": "orderbook_unavailable",
-                "orderbook": {"high": ob_high, "low": ob_low},
+                "orderbook": {"a": ob_a, "b": ob_b},
             }
 
-        short_px = ob_high.get("sell")
-        long_px = ob_low.get("buy")
-        if not short_px or not long_px or float(short_px) <= 0 or float(long_px) <= 0:
+        candidates = [
+            # short on A, long on B
+            {"short_ex": ex_a, "long_ex": ex_b, "short_px": ob_a.get("sell"), "long_px": ob_b.get("buy")},
+            # short on B, long on A (swap)
+            {"short_ex": ex_b, "long_ex": ex_a, "short_px": ob_b.get("sell"), "long_px": ob_a.get("buy")},
+        ]
+
+        best: Optional[Dict[str, Any]] = None
+        best_score: Tuple[float, float] = (-1e9, -1e9)
+
+        for cand in candidates:
+            short_px = cand.get("short_px")
+            long_px = cand.get("long_px")
+            if short_px is None or long_px is None:
+                continue
+            try:
+                short_f = float(short_px)
+                long_f = float(long_px)
+            except Exception:
+                continue
+            if short_f <= 0 or long_f <= 0:
+                continue
+            tradable_spread = (short_f - long_f) / long_f
+            # 必须可成交价差为正，否则这个方向“买贵卖便宜”，不符合本策略的开仓定义。
+            if tradable_spread <= 0:
+                continue
+
+            factors = dict(base_factors or {})
+            factors["spread_log_short_over_long"] = float(math.log(short_f / long_f))
+            factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
+
+            pred = predict_bc(signal_type="B", factors=factors, horizons=(int(self.config.horizon_min),))
+            pred_map = (pred or {}).get("pred") or {}
+            hpred = pred_map.get(str(int(self.config.horizon_min))) or {}
+            pnl_hat = hpred.get("pnl_hat")
+            win_prob = hpred.get("win_prob")
+            if pnl_hat is None or win_prob is None:
+                continue
+            score = (float(pnl_hat), float(win_prob))
+            if score > best_score:
+                best_score = score
+                best = {
+                    "short_exchange": str(cand["short_ex"]),
+                    "long_exchange": str(cand["long_ex"]),
+                    "pnl_hat": float(pnl_hat),
+                    "win_prob": float(win_prob),
+                    "tradable_spread": float(tradable_spread),
+                    "orderbook": {"a": ob_a, "b": ob_b},
+                    "factors": factors,
+                }
+
+        if not best:
             return {
                 "ok": False,
-                "reason": "orderbook_missing_prices",
-                "orderbook": {"high": ob_high, "low": ob_low},
+                "reason": "no_tradable_direction",
+                "orderbook": {"a": ob_a, "b": ob_b},
             }
 
-        forward_spread = None
-        if ob_high.get("buy") and ob_low.get("sell"):
-            base = min(float(ob_high["buy"]), float(ob_low["sell"]))
-            if base:
-                forward_spread = (float(ob_high["buy"]) - float(ob_low["sell"])) / base
+        best["ok"] = bool(
+            float(best["pnl_hat"]) > self.config.pnl_threshold and float(best["win_prob"]) > self.config.win_prob_threshold
+        )
+        return best
 
-        factors = dict(base_factors or {})
-        factors["spread_log_short_over_long"] = float(math.log(float(short_px) / float(long_px)))
-        if forward_spread is not None:
-            factors["raw_best_buy_high_sell_low"] = float(forward_spread)
+    def _confirm_open_signal_with_orderbook(
+        self,
+        *,
+        symbol: str,
+        ex_a: str,
+        ex_b: str,
+        base_factors: Dict[str, Any],
+        initial_reval: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        samples = max(1, int(self.config.orderbook_confirm_samples or 1))
+        sleep_s = float(self.config.orderbook_confirm_sleep_seconds or 0.0)
 
-        pred = predict_bc(signal_type="B", factors=factors, horizons=(int(self.config.horizon_min),))
-        pred_map = (pred or {}).get("pred") or {}
-        hpred = pred_map.get(str(int(self.config.horizon_min))) or {}
-        pnl_hat = hpred.get("pnl_hat")
-        win_prob = hpred.get("win_prob")
-        if pnl_hat is None or win_prob is None:
-            return {
-                "ok": False,
-                "reason": "prediction_failed",
-                "orderbook": {"high": ob_high, "low": ob_low},
-                "factors": factors,
-            }
+        series: List[Dict[str, Any]] = []
+        chosen_long: Optional[str] = None
+        chosen_short: Optional[str] = None
+        ok_all = True
+        fail_reason: Optional[str] = None
+
+        for i in range(samples):
+            if i == 0 and initial_reval is not None:
+                reval = dict(initial_reval)
+            else:
+                reval = self._revalidate_with_orderbook(
+                    symbol=symbol,
+                    high_exchange=ex_a,
+                    low_exchange=ex_b,
+                    base_factors=base_factors,
+                )
+            if not reval:
+                ok_all = False
+                fail_reason = fail_reason or "revalidate_none"
+                series.append({"i": i, "ts": _utcnow().isoformat(), "ok": False, "reason": "revalidate_none"})
+            else:
+                long_ex = str(reval.get("long_exchange") or "")
+                short_ex = str(reval.get("short_exchange") or "")
+                ok = bool(reval.get("ok"))
+                reason = str(reval.get("reason") or "")
+                pnl_hat = reval.get("pnl_hat")
+                win_prob = reval.get("win_prob")
+                tradable_spread = reval.get("tradable_spread")
+
+                if not (long_ex and short_ex):
+                    ok = False
+                    reason = reason or "missing_direction"
+
+                if chosen_long is None and chosen_short is None and long_ex and short_ex:
+                    chosen_long, chosen_short = long_ex, short_ex
+                elif chosen_long and chosen_short and (long_ex != chosen_long or short_ex != chosen_short):
+                    ok = False
+                    reason = reason or "direction_flap"
+
+                if not ok:
+                    ok_all = False
+                    fail_reason = fail_reason or (reason or "not_ok")
+
+                series.append(
+                    {
+                        "i": i,
+                        "ts": _utcnow().isoformat(),
+                        "ok": bool(ok),
+                        "reason": reason or None,
+                        "long_exchange": long_ex or None,
+                        "short_exchange": short_ex or None,
+                        "pnl_hat": float(pnl_hat) if pnl_hat is not None else None,
+                        "win_prob": float(win_prob) if win_prob is not None else None,
+                        "tradable_spread": float(tradable_spread) if tradable_spread is not None else None,
+                    }
+                )
+
+            if i < samples - 1 and sleep_s > 0:
+                time.sleep(sleep_s)
 
         return {
-            "ok": bool(float(pnl_hat) > self.config.pnl_threshold and float(win_prob) > self.config.win_prob_threshold),
-            "pnl_hat": float(pnl_hat),
-            "win_prob": float(win_prob),
-            "orderbook": {"high": ob_high, "low": ob_low},
-            "factors": factors,
+            "ok": bool(ok_all and chosen_long and chosen_short),
+            "reason": None if ok_all else (fail_reason or "orderbook_unstable"),
+            "long_exchange": chosen_long,
+            "short_exchange": chosen_short,
+            "series": series,
         }
 
     def process_once(self) -> None:
@@ -588,8 +967,8 @@ class LiveTradingManager:
                     best_score = score
                     best = {
                         "event": event,
-                        "high_ex": high_ex,
-                        "low_ex": low_ex,
+                        "short_ex": str(reval.get("short_exchange") or high_ex),
+                        "long_ex": str(reval.get("long_exchange") or low_ex),
                         "reval": reval,
                     }
             except Exception:
@@ -599,9 +978,68 @@ class LiveTradingManager:
             return
 
         event = best["event"]
-        high_ex = best["high_ex"]
-        low_ex = best["low_ex"]
+        high_ex = best["short_ex"]
+        low_ex = best["long_ex"]
         reval = best["reval"]
+
+        confirm = self._confirm_open_signal_with_orderbook(
+            symbol=symbol,
+            ex_a=str(high_ex),
+            ex_b=str(low_ex),
+            base_factors=event.get("factors") or {},
+            initial_reval=reval if isinstance(reval, dict) else None,
+        )
+        if not confirm.get("ok"):
+            client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+            payload = {
+                "event": {
+                    "id": int(event["id"]),
+                    "start_ts": str(event.get("start_ts")),
+                    "symbol": symbol,
+                    "signal_type": event.get("signal_type"),
+                    "trigger_details": event.get("trigger_details"),
+                },
+                "threshold": {
+                    "horizon_min": int(self.config.horizon_min),
+                    "pnl_threshold": float(self.config.pnl_threshold),
+                    "win_prob_threshold": float(self.config.win_prob_threshold),
+                    "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
+                },
+                "orderbook_revalidation": {
+                    "pnl_hat": reval.get("pnl_hat"),
+                    "win_prob": reval.get("win_prob"),
+                    "orderbook": reval.get("orderbook"),
+                },
+                "orderbook_confirm_open": confirm,
+            }
+            signal_id = self._insert_signal(
+                conn,
+                event=event,
+                leg_long_exchange=str(confirm.get("long_exchange") or low_ex),
+                leg_short_exchange=str(confirm.get("short_exchange") or high_ex),
+                pnl_hat=float(event.get("pnl_hat_240") or 0.0),
+                win_prob=float(event.get("win_prob_240") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+                win_prob_ob=float(reval.get("win_prob") or 0.0),
+                payload=payload,
+                status="skipped",
+                reason=str(confirm.get("reason") or "orderbook_unstable"),
+                client_order_id_base=client_base,
+            )
+            if signal_id:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="orderbook_confirm_open",
+                    error_type="unstable",
+                    message=str(confirm.get("reason") or "orderbook_unstable"),
+                    context={"symbol": symbol, "event_id": int(event["id"]), "confirm": confirm},
+                )
+            return
+
+        # Confirm passed; lock in direction to avoid "flapping".
+        high_ex = str(confirm.get("short_exchange") or high_ex)
+        low_ex = str(confirm.get("long_exchange") or low_ex)
 
         client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
         payload = {
@@ -623,6 +1061,7 @@ class LiveTradingManager:
                 "win_prob": reval.get("win_prob"),
                 "orderbook": reval.get("orderbook"),
             },
+            "orderbook_confirm_open": confirm,
         }
 
         signal_id = self._insert_signal(
@@ -696,6 +1135,16 @@ class LiveTradingManager:
         *,
         pnl_hat_ob: float,
     ) -> None:
+        # Safety: avoid mixing with manual/external positions (especially Hyperliquid one-way positions).
+        if str(long_ex).lower() == "hyperliquid":
+            szi = float(self._get_hyperliquid_position_szi(symbol))
+            if abs(szi) > 1e-9:
+                raise TradeExecutionError(f"Hyperliquid {symbol} position not flat before open (szi={szi}); abort")
+        if str(short_ex).lower() == "hyperliquid":
+            szi = float(self._get_hyperliquid_position_szi(symbol))
+            if abs(szi) > 1e-9:
+                raise TradeExecutionError(f"Hyperliquid {symbol} position not flat before open (szi={szi}); abort")
+
         # Best-effort leverage=1
         for ex in {long_ex, short_ex}:
             try:
@@ -723,6 +1172,11 @@ class LiveTradingManager:
         short_px = ob_short.get("sell")
         if not long_px or not short_px:
             raise TradeExecutionError("Orderbook missing buy/sell prices for execution")
+        if float(short_px) <= float(long_px):
+            raise TradeExecutionError(
+                f"Non-tradable entry spread: short_sell_px={short_px} <= long_buy_px={long_px} (symbol={symbol} "
+                f"long_ex={long_ex} short_ex={short_ex})"
+            )
 
         entry_spread_metric = float(math.log(float(short_px) / float(long_px)))
         long_qty = float(self.config.per_leg_notional_usdt) / float(long_px)
@@ -801,12 +1255,15 @@ class LiveTradingManager:
                 opened.append(result)
 
                 order_resp_param = _jsonb(order) if order is not None else None
+                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order)
                 conn.execute(
                     """
                     INSERT INTO watchlist.live_trade_order(
-                        signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity, client_order_id, submitted_at, order_resp, status
+                        signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                        filled_qty, avg_price, cum_quote, exchange_order_id,
+                        client_order_id, submitted_at, order_resp, status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                     """,
                     (
                         int(signal_id),
@@ -817,12 +1274,18 @@ class LiveTradingManager:
                         "perp",
                         float(self.config.per_leg_notional_usdt),
                         str(leg["quantity"]),
+                        float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                        float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                        float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                        str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                         str((leg.get("order_kwargs") or {}).get("client_order_id") or ""),
                         _utcnow(),
                         order_resp_param,
-                        "submitted",
+                        str(fill.get("status") or "submitted"),
                     ),
                 )
+                if str(leg["exchange"]).lower() == "hyperliquid":
+                    self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
         except Exception as exc:
             # Best-effort rollback: close any legs that were opened before a failure.
             rollback_base = f"wl{signal_id}R{int(time.time())}"
@@ -842,13 +1305,15 @@ class LiveTradingManager:
                         client_order_id=close_client_id,
                     )
                     close_order_param = _jsonb(close_order) if close_order is not None else None
+                    fill = self._parse_fill_fields(exchange, symbol, close_order)
                     conn.execute(
                         """
                         INSERT INTO watchlist.live_trade_order(
                             signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                            filled_qty, avg_price, cum_quote, exchange_order_id,
                             client_order_id, submitted_at, order_resp, status
                         )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                         """,
                         (
                             int(signal_id),
@@ -859,10 +1324,14 @@ class LiveTradingManager:
                             "perp",
                             None,
                             str(qty),
+                            float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                            float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                            float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                            str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                             close_client_id,
                             _utcnow(),
                             close_order_param,
-                            "submitted",
+                            str(fill.get("status") or "submitted"),
                         ),
                     )
                 except Exception as rb_exc:
@@ -872,7 +1341,11 @@ class LiveTradingManager:
                         stage="rollback_close",
                         error_type=type(rb_exc).__name__,
                         message=str(rb_exc),
-                        context={"symbol": symbol, "exchange": opened_leg.get("exchange"), "quantity": opened_leg.get("quantity")},
+                        context={
+                            "symbol": symbol,
+                            "exchange": opened_leg.get("exchange"),
+                            "quantity": opened_leg.get("quantity"),
+                        },
                     )
             raise TradeExecutionError(str(exc)) from exc
 
@@ -1033,14 +1506,47 @@ class LiveTradingManager:
         if take_profit_pnl_f is None and pnl_hat_ob_f is not None:
             take_profit_pnl_f = float(self.config.take_profit_ratio) * float(pnl_hat_ob_f)
 
+        confirm_take_profit: Optional[Dict[str, Any]] = None
         if (
             close_reason is None
             and take_profit_pnl_f is not None
             and float(take_profit_pnl_f) > 0
             and pnl_spread_now >= float(take_profit_pnl_f)
         ):
-            decision = "take_profit"
-            close_reason = "take_profit"
+            confirm_take_profit = self._confirm_take_profit_with_orderbook(
+                symbol=symbol,
+                long_ex=long_ex,
+                short_ex=short_ex,
+                qty_long=float(qty_long),
+                qty_short=float(qty_short),
+                entry_spread_metric=float(entry_spread_metric_f),
+                take_profit_pnl=float(take_profit_pnl_f),
+                initial_ob_long=ob_long if isinstance(ob_long, dict) else None,
+                initial_ob_short=ob_short if isinstance(ob_short, dict) else None,
+            )
+            if confirm_take_profit.get("ok"):
+                decision = "take_profit"
+                close_reason = "take_profit"
+            else:
+                decision = "take_profit_rejected"
+                try:
+                    self._record_error(
+                        conn,
+                        signal_id=signal_id,
+                        stage="orderbook_confirm_take_profit",
+                        error_type="unstable",
+                        message="take_profit_rejected_by_confirm",
+                        context={
+                            "symbol": symbol,
+                            "long_ex": long_ex,
+                            "short_ex": short_ex,
+                            "take_profit_pnl": float(take_profit_pnl_f),
+                            "pnl_spread_now": float(pnl_spread_now),
+                            "confirm": confirm_take_profit,
+                        },
+                    )
+                except Exception:
+                    pass
 
         conn.execute(
             """
@@ -1070,6 +1576,7 @@ class LiveTradingManager:
                         "ob_short": ob_short,
                         "opened_at": opened_at.isoformat(),
                         "force_close_at": force_close_at.isoformat(),
+                        "confirm_take_profit": confirm_take_profit,
                     }
                 ),
             ),
@@ -1107,6 +1614,76 @@ class LiveTradingManager:
                 qty_long=qty_long,
                 qty_short=qty_short,
             )
+
+    def _confirm_take_profit_with_orderbook(
+        self,
+        *,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        qty_long: float,
+        qty_short: float,
+        entry_spread_metric: float,
+        take_profit_pnl: float,
+        initial_ob_long: Optional[Dict[str, Any]] = None,
+        initial_ob_short: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        samples = max(1, int(self.config.orderbook_confirm_samples or 1))
+        sleep_s = float(self.config.orderbook_confirm_sleep_seconds or 0.0)
+
+        series: List[Dict[str, Any]] = []
+        ok_all = True
+
+        for i in range(samples):
+            if i == 0 and initial_ob_long is not None and initial_ob_short is not None:
+                ob_l, ob_s = dict(initial_ob_long), dict(initial_ob_short)
+            else:
+                ob_l, ob_s = self._fetch_pair_orderbooks_for_close(symbol, long_ex, short_ex, qty_long, qty_short)
+            long_sell = ob_l.get("sell")
+            short_buy = ob_s.get("buy")
+
+            ok = True
+            reason = None
+            pnl_spread = None
+            spread_metric = None
+
+            if ob_l.get("error") or ob_s.get("error") or not long_sell or not short_buy:
+                ok = False
+                reason = f"orderbook_error long={ob_l.get('error')} short={ob_s.get('error')}"
+            else:
+                try:
+                    spread_metric = float(math.log(float(short_buy) / float(long_sell)))
+                    pnl_spread = float(entry_spread_metric) - float(spread_metric)
+                    if pnl_spread < float(take_profit_pnl):
+                        ok = False
+                        reason = "below_threshold"
+                except Exception:
+                    ok = False
+                    reason = "calc_error"
+
+            if not ok:
+                ok_all = False
+
+            series.append(
+                {
+                    "i": i,
+                    "ts": _utcnow().isoformat(),
+                    "ok": bool(ok),
+                    "reason": reason,
+                    "long_sell_px": float(long_sell) if long_sell is not None else None,
+                    "short_buy_px": float(short_buy) if short_buy is not None else None,
+                    "spread_metric": float(spread_metric) if spread_metric is not None else None,
+                    "pnl_spread": float(pnl_spread) if pnl_spread is not None else None,
+                    "take_profit_pnl": float(take_profit_pnl),
+                    "ob_long": ob_l,
+                    "ob_short": ob_s,
+                }
+            )
+
+            if i < samples - 1 and sleep_s > 0:
+                time.sleep(sleep_s)
+
+        return {"ok": bool(ok_all), "series": series}
 
     def _fetch_pair_orderbooks_for_close(
         self, symbol: str, long_ex: str, short_ex: str, qty_long: float, qty_short: float
@@ -1212,13 +1789,15 @@ class LiveTradingManager:
                 client_order_id=f"{close_base}-L",
             )
             long_order_param = _jsonb(long_order) if long_order is not None else None
+            long_fill = self._parse_fill_fields(long_ex, symbol, long_order)
             conn.execute(
                 """
                 INSERT INTO watchlist.live_trade_order(
                     signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                    filled_qty, avg_price, cum_quote, exchange_order_id,
                     client_order_id, submitted_at, order_resp, status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                 """,
                 (
                     int(signal_id),
@@ -1229,10 +1808,14 @@ class LiveTradingManager:
                     "perp",
                     None,
                     str(qty_long),
+                    float(long_fill.get("filled_qty")) if long_fill.get("filled_qty") is not None else None,
+                    float(long_fill.get("avg_price")) if long_fill.get("avg_price") is not None else None,
+                    float(long_fill.get("cum_quote")) if long_fill.get("cum_quote") is not None else None,
+                    str(long_fill.get("exchange_order_id")) if long_fill.get("exchange_order_id") is not None else None,
                     f"{close_base}-L",
                     _utcnow(),
                     long_order_param,
-                    "submitted",
+                    str(long_fill.get("status") or "submitted"),
                 ),
             )
         except Exception as exc:
@@ -1255,13 +1838,15 @@ class LiveTradingManager:
                 client_order_id=f"{close_base}-S",
             )
             short_order_param = _jsonb(short_order) if short_order is not None else None
+            short_fill = self._parse_fill_fields(short_ex, symbol, short_order)
             conn.execute(
                 """
                 INSERT INTO watchlist.live_trade_order(
                     signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                    filled_qty, avg_price, cum_quote, exchange_order_id,
                     client_order_id, submitted_at, order_resp, status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                 """,
                 (
                     int(signal_id),
@@ -1272,10 +1857,14 @@ class LiveTradingManager:
                     "perp",
                     None,
                     str(qty_short),
+                    float(short_fill.get("filled_qty")) if short_fill.get("filled_qty") is not None else None,
+                    float(short_fill.get("avg_price")) if short_fill.get("avg_price") is not None else None,
+                    float(short_fill.get("cum_quote")) if short_fill.get("cum_quote") is not None else None,
+                    str(short_fill.get("exchange_order_id")) if short_fill.get("exchange_order_id") is not None else None,
                     f"{close_base}-S",
                     _utcnow(),
                     short_order_param,
-                    "submitted",
+                    str(short_fill.get("status") or "submitted"),
                 ),
             )
         except Exception as exc:
@@ -1415,10 +2004,11 @@ class LiveTradingManager:
                     )
                 raise
         if ex == "hyperliquid":
-            # Hyperliquid SDK uses market_close for reduce-only semantics; side is ignored on close.
+            # Hyperliquid close should be reduce-only IOC with explicit side to avoid SDK market_close() returning None.
+            close_side = "sell" if pos == "long" else "buy"
             return place_hyperliquid_perp_market_order(
                 symbol,
-                "buy",
+                close_side,
                 quantity,
                 reduce_only=True,
                 client_order_id=client_order_id,

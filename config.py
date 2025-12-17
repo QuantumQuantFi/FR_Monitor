@@ -261,13 +261,19 @@ LIVE_TRADING_CONFIG = {
     # 默认开启自动实盘；如需关闭请设置 LIVE_TRADING_ENABLED=0
     'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
     'horizon_min': int(float(_get_private('LIVE_TRADING_HORIZON_MIN', 'LIVE_TRADING_HORIZON_MIN', '240'))),
-    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.01')),
-    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.91')),
+    # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
+    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.012')),
+    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.93')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
     'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '20')),
     'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
     'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
-    'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '7'))),
+    # 订单簿快速复核：在“决定开仓/止盈平仓”前做多次短间隔验算，避免瞬时价差假信号。
+    # 注意：每次验算会同时请求两家交易所的订单簿（REST），请结合限频调整。
+    'orderbook_confirm_samples': int(float(_get_private('LIVE_TRADING_OB_CONFIRM_SAMPLES', 'LIVE_TRADING_OB_CONFIRM_SAMPLES', '3'))),
+    'orderbook_confirm_sleep_seconds': float(_get_private('LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', 'LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', '0.7')),
+    # 强制平仓：开仓后最大持仓天数（默认 1 天）
+    'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '1'))),
     'close_retry_cooldown_seconds': float(
         _get_private('LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', 'LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', '120')
     ),

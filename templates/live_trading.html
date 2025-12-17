@@ -26,13 +26,14 @@
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #0b1220; border: 1px solid #263040; border-radius: 10px; padding: 10px; max-height: 35vh; overflow: auto; }
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
     @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+    .hint { border-bottom: 1px dotted #8b949e; cursor: help; }
   </style>
 </head>
 <body>
   <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
     <div>
       <div style="font-size: 18px; font-weight: 700;">实盘交易（Type B）</div>
-      <div class="muted" style="margin-top: 4px;">订单簿 1min 监听 → 达到 0.8*pnl_hat 止盈 / 7 天强平 → 平仓下单 → 落库</div>
+      <div class="muted" style="margin-top: 4px;">订单簿 1min 监听 → 达到 0.8*pnl_hat 止盈 / 1 天强平 → 平仓下单 → 落库</div>
     </div>
     <div class="row">
       <a href="/watchlist">Watchlist</a>
@@ -61,7 +62,7 @@
     <div class="card">
       <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
         <div style="font-weight: 700;">交易信号 / 状态</div>
-        <div class="muted">点击 Details 查看 orders/samples</div>
+        <div class="muted">点击 Details 查看 orders/samples（含成交均价/数量摘要）</div>
       </div>
       <div class="table-wrap">
         <table>
@@ -73,9 +74,15 @@
               <th style="width: 90px;">Type</th>
               <th style="width: 200px;">Exchanges</th>
               <th style="width: 90px;">Status</th>
-              <th style="width: 110px;">pnl_hat_ob</th>
-              <th style="width: 110px;">tp_pnl</th>
-              <th style="width: 110px;">last_pnl</th>
+              <th style="width: 110px;">
+                <span class="hint" title="pnl_hat_ob：下单前用两家交易所订单簿“扫单成交价”（按每腿名义金额）重新计算关键因子，并在 horizon=240min 上回归预测得到的预计收益（小数，如 0.012=1.2%）。">pnl_hat_ob</span>
+              </th>
+              <th style="width: 110px;">
+                <span class="hint" title="tp_pnl：止盈阈值（小数），默认 tp_pnl = take_profit_ratio * pnl_hat_ob（当前 take_profit_ratio=0.8）。当 last_pnl >= tp_pnl 时会进入“止盈候选”，系统会在几秒内再做两次订单簿复核（共3次）确认价差仍满足，才真正发起平仓；否则本次止盈作废，等待下一次监控判定。">tp_pnl</span>
+              </th>
+              <th style="width: 110px;">
+                <span class="hint" title="last_pnl：最近一次 1min 监控样本计算的“订单簿估算PnL指标”（小数，口径为价差变化而非账户真实收益）。计算：last_pnl = entry_spread_metric - now_spread_metric，其中 entry_spread_metric=log(short_sell_entry/long_buy_entry)，now_spread_metric=log(short_buy_now/long_sell_now)。注意：不包含手续费/资金费/滑点/成交延迟，且若订单簿/合约口径与实际下单不一致，可能与 realized_pnl_usdt 显著偏离。">last_pnl</span>
+              </th>
               <th style="width: 170px;">created_at</th>
               <th style="width: 170px;">opened_at</th>
               <th style="width: 170px;">close_req_at</th>
@@ -104,7 +111,8 @@
       <div style="font-weight: 700;">Details</div>
       <div class="muted">orders / samples / positions（按需加载）</div>
     </div>
-    <pre id="detailsPre" class="muted">点击某个 signal 的 Details 按钮</pre>
+    <pre id="detailsSummary" class="muted" style="margin-bottom: 8px;">点击某个 signal 的 Details 按钮</pre>
+    <pre id="detailsPre" class="muted">-</pre>
   </div>
 
   <script>
@@ -197,15 +205,69 @@
 
     async function loadDetails(signalId) {
       const detailsPre = document.getElementById('detailsPre');
+      const detailsSummary = document.getElementById('detailsSummary');
       detailsPre.textContent = 'loading...';
+      detailsSummary.textContent = 'loading...';
       try {
         const [orders, samples] = await Promise.all([
           fetchJson(`/api/live_trading/orders?signal_id=${signalId}&limit=200`),
           fetchJson(`/api/live_trading/samples?signal_id=${signalId}&limit=200`),
         ]);
+
+        const os = (orders.orders || []).slice().reverse(); // chronological
+        const pick = (action, leg) => os.filter(o => o.action === action && o.leg === leg).slice(-1)[0];
+        const openLong = pick('open', 'long');
+        const openShort = pick('open', 'short');
+        const closeLong = pick('close', 'long');
+        const closeShort = pick('close', 'short');
+
+        function fnum(v, nd=6) {
+          if (v === null || v === undefined) return null;
+          const n = Number(v);
+          if (!Number.isFinite(n)) return null;
+          return Number(n.toFixed(nd));
+        }
+
+        function legSummary(o) {
+          if (!o) return null;
+          return {
+            exchange: o.exchange,
+            side: o.side,
+            quantity_req: o.quantity ?? null,
+            filled_qty: fnum(o.filled_qty),
+            avg_price: fnum(o.avg_price),
+            exchange_order_id: o.exchange_order_id || null,
+            status: o.status || null,
+          };
+        }
+
+        let realized = null;
+        try {
+          const qL = Math.min(Number(openLong?.filled_qty || 0), Number(closeLong?.filled_qty || 0));
+          const qS = Math.min(Number(openShort?.filled_qty || 0), Number(closeShort?.filled_qty || 0));
+          const okL = qL > 0 && Number.isFinite(Number(openLong?.avg_price)) && Number.isFinite(Number(closeLong?.avg_price));
+          const okS = qS > 0 && Number.isFinite(Number(openShort?.avg_price)) && Number.isFinite(Number(closeShort?.avg_price));
+          if (okL || okS) {
+            const pnlL = okL ? (Number(closeLong.avg_price) - Number(openLong.avg_price)) * qL : 0;
+            const pnlS = okS ? (Number(openShort.avg_price) - Number(closeShort.avg_price)) * qS : 0;
+            realized = fnum(pnlL + pnlS, 6);
+          }
+        } catch (e) {
+          realized = null;
+        }
+
+        detailsSummary.textContent = JSON.stringify({
+          signal_id: signalId,
+          open: { long: legSummary(openLong), short: legSummary(openShort) },
+          close: { long: legSummary(closeLong), short: legSummary(closeShort) },
+          realized_pnl_usdt: realized,
+          note: 'filled_qty/avg_price 为 best-effort：若交易所回执不含成交信息，会尝试查询订单详情；仍可能为空。',
+        }, null, 2);
+
         detailsPre.textContent = JSON.stringify({signal_id: signalId, orders: orders.orders, samples: samples.samples}, null, 2);
       } catch (e) {
         detailsPre.textContent = String(e);
+        detailsSummary.textContent = String(e);
       }
     }
 

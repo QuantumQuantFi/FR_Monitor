@@ -1076,13 +1076,15 @@ live_trading_manager = LiveTradingManager(
             if x.strip()
         ) or ("binance", "bybit"),
         horizon_min=int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
-        pnl_threshold=float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.013)),
-        win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.94)),
+        pnl_threshold=float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.012)),
+        win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.93)),
         max_concurrent_trades=int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
         scan_interval_seconds=float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
         monitor_interval_seconds=float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
         take_profit_ratio=float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
-        max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
+        orderbook_confirm_samples=int(LIVE_TRADING_CONFIG.get('orderbook_confirm_samples', 3)),
+        orderbook_confirm_sleep_seconds=float(LIVE_TRADING_CONFIG.get('orderbook_confirm_sleep_seconds', 0.7)),
+        max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 1)),
         close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
         per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
@@ -1472,18 +1474,48 @@ def background_data_collection():
     # 批处理缓冲区与写入节流
     batch_buffer = []
     last_db_write = {}
+    last_premium_calc = {}
     batch_size = MEMORY_OPTIMIZATION_CONFIG['batch_size']
+    premium_refresh_seconds = float(MEMORY_OPTIMIZATION_CONFIG.get('premium_refresh_seconds', 300))
+    # 默认全量落库（全币种/全交易所）；如需仅持久化核心+watchlist，可将其设为 'priority'
+    persist_mode = str(MEMORY_OPTIMIZATION_CONFIG.get('persist_symbols_mode', 'all')).strip().lower()
 
     while True:
         try:
             # 获取所有数据（包含所有币种）
             all_data = data_collector.get_all_data()
-            observed_at = datetime.now(timezone.utc)
-            timestamp = observed_at.isoformat()
+            # 注意：下面的循环可能超过 60s；因此 observed_at/timestamp 不应只在外层取一次，
+            # 否则会导致 1min 聚合出现系统性“少分钟/错分钟”。
             
             # 为每个币种保存历史数据 - 使用动态支持列表，兼容LINEA等新币
-            for idx, symbol in enumerate(data_collector.supported_symbols):
-                premium_data = data_collector.calculate_premium(symbol)
+            # 落库范围：
+            # - all：全币种/全交易所（默认，保证数据完整性）
+            # - priority：仅 核心币种 + 当前 watchlist active + 当前前端币种（节省 IO/体积）
+            if persist_mode == 'all':
+                symbols = list(data_collector.supported_symbols or [])
+            else:
+                persist_set = set(CURRENT_SUPPORTED_SYMBOLS or [])
+                try:
+                    persist_set.update(watchlist_manager.active_symbols())
+                except Exception:
+                    pass
+                try:
+                    if data_collector.current_symbol:
+                        persist_set.add(str(data_collector.current_symbol).upper())
+                except Exception:
+                    pass
+                symbols = sorted(persist_set)
+
+            for idx, symbol in enumerate(symbols):
+                observed_at = datetime.now(timezone.utc)
+                timestamp = observed_at.isoformat()
+
+                # premium 计算对全市场较重，降频缓存（仍可通过前端查询实时计算）
+                premium_data = {}
+                last_p = last_premium_calc.get(symbol)
+                if (not last_p) or (observed_at - last_p).total_seconds() >= premium_refresh_seconds:
+                    premium_data = data_collector.calculate_premium(symbol)
+                    last_premium_calc[symbol] = observed_at
                 futures_prices = {}
                 
                 for exchange in all_data:
@@ -1523,13 +1555,7 @@ def background_data_collection():
                             # 当批处理缓冲区满时，批量写入数据库
                             if len(batch_buffer) >= batch_size:
                                 try:
-                                    for batch_item in batch_buffer:
-                                        db.save_price_data(
-                                            batch_item['symbol'],
-                                            batch_item['exchange'],
-                                            batch_item['symbol_data'],
-                                            batch_item['premium_data']
-                                        )
+                                    db.save_price_data_batch(batch_buffer)
                                     batch_buffer.clear()
                                     print(f"批量写入数据库完成: {batch_size} 条记录")
                                 except Exception as e:
@@ -1547,8 +1573,9 @@ def background_data_collection():
                             f"spread={signal.spread_percent:.2f}%",
                         )
 
-                # 每个币种处理后短暂让出 GIL，避免长时间占用导致接口阻塞
-                time.sleep(0.01)
+                # 每 N 个币种让出一次 GIL，避免长时间占用导致接口阻塞
+                if idx and idx % 100 == 0:
+                    time.sleep(0)
             
             # 定期维护任务（每5分钟执行一次）
             current_time = datetime.now()
@@ -1559,13 +1586,7 @@ def background_data_collection():
                     # 写入剩余的批处理数据
                     if batch_buffer:
                         print(f"写入剩余批处理数据: {len(batch_buffer)} 条记录")
-                        for batch_item in batch_buffer:
-                            db.save_price_data(
-                                batch_item['symbol'],
-                                batch_item['exchange'],
-                                batch_item['symbol_data'],
-                                batch_item['premium_data']
-                            )
+                        db.save_price_data_batch(batch_buffer)
                         batch_buffer.clear()
                     
                     # 内存清理
