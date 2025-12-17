@@ -73,6 +73,21 @@
               <th style="width: 90px;">Symbol</th>
               <th style="width: 90px;">Type</th>
               <th style="width: 200px;">Exchanges</th>
+              <th style="width: 120px;">
+                <span class="hint" title="交易所A（Long腿）开仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">A Long 开仓价</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="交易所A（Long腿）平仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">A Long 平仓价</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="交易所B（Short腿）开仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">B Short 开仓价</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="交易所B（Short腿）平仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">B Short 平仓价</span>
+              </th>
+              <th style="width: 130px;">
+                <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
+              </th>
               <th style="width: 90px;">Status</th>
               <th style="width: 110px;">
                 <span class="hint" title="pnl_hat_ob：下单前用两家交易所订单簿“扫单成交价”（按每腿名义金额）重新计算关键因子，并在 horizon=240min 上回归预测得到的预计收益（小数，如 0.012=1.2%）。">pnl_hat_ob</span>
@@ -94,7 +109,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="17" class="muted">loading...</td></tr>
+            <tr><td colspan="22" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -141,6 +156,18 @@
       return data;
     }
 
+    async function postJson(url, body) {
+      const resp = await fetch(url, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(body || {}),
+        cache: 'no-store',
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || resp.statusText);
+      return data;
+    }
+
     async function refresh() {
       const overview = await fetchJson('/api/live_trading/overview?limit=80');
       const limit = Math.max(10, Math.min(2000, Number(document.getElementById('signalsLimit').value || 500)));
@@ -165,13 +192,20 @@
       const body = document.getElementById('signalsBody');
       const signals = signalsResp.signals || [];
       if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="17" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="22" class="muted">暂无数据</td></tr>';
         return;
       }
 
       body.innerHTML = signals.map(s => {
         const [stText, stCls] = pillForStatus(s.status);
         const ex = `${s.leg_long_exchange || '-'}(long) / ${s.leg_short_exchange || '-'}(short)`;
+        const aOpen = fmt(s.open_long_avg_price, 8);
+        const aClose = fmt(s.close_long_avg_price, 8);
+        const bOpen = fmt(s.open_short_avg_price, 8);
+        const bClose = fmt(s.close_short_avg_price, 8);
+        const realized = fmt(s.realized_pnl_usdt, 6);
+        const stKey = String(s.status || '').toLowerCase();
+        const canForceClose = stKey !== 'closed';
         const createdAt = s.created_at || '-';
         const openAt = s.opened_at || '-';
         const closeReqAt = s.close_requested_at || '-';
@@ -186,6 +220,11 @@
             <td>${s.symbol || '-'}</td>
             <td class="muted">${s.signal_type || '-'}</td>
             <td class="muted">${ex}</td>
+            <td class="muted">${aOpen}</td>
+            <td class="muted">${aClose}</td>
+            <td class="muted">${bOpen}</td>
+            <td class="muted">${bClose}</td>
+            <td class="muted">${realized}</td>
             <td><span class="pill ${stCls}">${stText}</span></td>
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
@@ -197,10 +236,30 @@
             <td class="muted">${forceAt}</td>
             <td class="muted">${closeReason}</td>
             <td class="muted">${reason}</td>
-            <td><button class="secondary" onclick="loadDetails(${s.id})">Details</button></td>
+            <td>
+              <button class="secondary" onclick="loadDetails(${s.id})">Details</button>
+              <button class="secondary" ${canForceClose ? '' : 'disabled'} onclick="forceClose(${s.id})">一键平仓</button>
+            </td>
           </tr>
         `;
       }).join('');
+    }
+
+    async function forceClose(signalId) {
+      if (!confirm(`确认一键平仓 signal_id=${signalId} ?\\n\\n将同时查询两交易所持仓并以 reduce-only 市价打平。`)) return;
+      const detailsPre = document.getElementById('detailsPre');
+      const detailsSummary = document.getElementById('detailsSummary');
+      detailsSummary.textContent = `force closing signal_id=${signalId} ...`;
+      detailsPre.textContent = '...';
+      try {
+        const resp = await postJson('/api/live_trading/force_close', {signal_id: signalId});
+        detailsSummary.textContent = JSON.stringify(resp.result || resp, null, 2);
+        detailsPre.textContent = JSON.stringify(resp, null, 2);
+        await refresh();
+      } catch (e) {
+        detailsSummary.textContent = String(e);
+        detailsPre.textContent = String(e);
+      }
     }
 
     async function loadDetails(signalId) {
@@ -247,9 +306,9 @@
           const qS = Math.min(Number(openShort?.filled_qty || 0), Number(closeShort?.filled_qty || 0));
           const okL = qL > 0 && Number.isFinite(Number(openLong?.avg_price)) && Number.isFinite(Number(closeLong?.avg_price));
           const okS = qS > 0 && Number.isFinite(Number(openShort?.avg_price)) && Number.isFinite(Number(closeShort?.avg_price));
-          if (okL || okS) {
-            const pnlL = okL ? (Number(closeLong.avg_price) - Number(openLong.avg_price)) * qL : 0;
-            const pnlS = okS ? (Number(openShort.avg_price) - Number(closeShort.avg_price)) * qS : 0;
+          if (okL && okS) {
+            const pnlL = (Number(closeLong.avg_price) - Number(openLong.avg_price)) * qL;
+            const pnlS = (Number(openShort.avg_price) - Number(closeShort.avg_price)) * qS;
             realized = fnum(pnlL + pnlS, 6);
           }
         } catch (e) {

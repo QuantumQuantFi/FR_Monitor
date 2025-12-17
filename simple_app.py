@@ -2408,6 +2408,7 @@ def live_trading_signals():
     limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
     status = request.args.get('status')
     symbol = request.args.get('symbol')
+    include_prices = str(request.args.get('include_prices', '1') or '1').lower() not in ('0', 'false', 'no')
 
     where = []
     params: List[Any] = []
@@ -2434,6 +2435,41 @@ def live_trading_signals():
                 """,
                 (*params, limit),
             ).fetchall()
+
+            price_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+            if include_prices and rows:
+                signal_ids: List[int] = []
+                for r in rows:
+                    if isinstance(r, dict) and r.get('id') is not None:
+                        try:
+                            signal_ids.append(int(r['id']))
+                        except Exception:
+                            continue
+                if signal_ids:
+                    order_rows = conn.execute(
+                        """
+                        SELECT DISTINCT ON (signal_id, action, leg)
+                               signal_id, action, leg, avg_price, filled_qty, exchange, status, created_at, id
+                          FROM watchlist.live_trade_order
+                         WHERE signal_id = ANY(%s)
+                         ORDER BY signal_id, action, leg, created_at DESC, id DESC;
+                        """,
+                        (signal_ids,),
+                    ).fetchall()
+                    for orow in order_rows or []:
+                        if isinstance(orow, dict):
+                            try:
+                                sid = int(orow.get('signal_id'))
+                            except Exception:
+                                continue
+                            key = (sid, str(orow.get('action') or ''), str(orow.get('leg') or ''))
+                            price_map[key] = {
+                                'avg_price': orow.get('avg_price'),
+                                'filled_qty': orow.get('filled_qty'),
+                                'exchange': orow.get('exchange'),
+                                'status': orow.get('status'),
+                                'created_at': orow.get('created_at'),
+                            }
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
@@ -2445,7 +2481,53 @@ def live_trading_signals():
     out = []
     for r in rows or []:
         if isinstance(r, dict):
-            out.append({k: _jsonable(v) for k, v in r.items()})
+            item = {k: _jsonable(v) for k, v in r.items()}
+            if include_prices:
+                try:
+                    sid = int(r.get('id'))  # type: ignore[arg-type]
+                except Exception:
+                    sid = None
+                if sid is not None:
+                    def _get_px(action: str, leg: str) -> Any:
+                        got = price_map.get((sid, action, leg)) or {}
+                        return _jsonable(got.get('avg_price'))
+
+                    def _get_filled(action: str, leg: str) -> Any:
+                        got = price_map.get((sid, action, leg)) or {}
+                        return got.get('filled_qty')
+
+                    item['open_long_avg_price'] = _get_px('open', 'long')
+                    item['close_long_avg_price'] = _get_px('close', 'long')
+                    item['open_short_avg_price'] = _get_px('open', 'short')
+                    item['close_short_avg_price'] = _get_px('close', 'short')
+
+                    item['open_long_filled_qty'] = _get_filled('open', 'long')
+                    item['close_long_filled_qty'] = _get_filled('close', 'long')
+                    item['open_short_filled_qty'] = _get_filled('open', 'short')
+                    item['close_short_filled_qty'] = _get_filled('close', 'short')
+
+                    realized_pnl = None
+                    try:
+                        olp = item.get('open_long_avg_price')
+                        clp = item.get('close_long_avg_price')
+                        osp = item.get('open_short_avg_price')
+                        csp = item.get('close_short_avg_price')
+                        ql = min(float(item.get('open_long_filled_qty') or 0), float(item.get('close_long_filled_qty') or 0))
+                        qs = min(float(item.get('open_short_filled_qty') or 0), float(item.get('close_short_filled_qty') or 0))
+                        pnl_l = 0.0
+                        pnl_s = 0.0
+                        ok_l = ql > 0 and olp is not None and clp is not None
+                        ok_s = qs > 0 and osp is not None and csp is not None
+                        # Only compute realized PnL when both legs have a completed open+close,
+                        # otherwise the "realized" value is misleading (still holding exposure).
+                        if ok_l and ok_s:
+                            pnl_l = (float(clp) - float(olp)) * ql
+                            pnl_s = (float(osp) - float(csp)) * qs
+                            realized_pnl = pnl_l + pnl_s
+                    except Exception:
+                        realized_pnl = None
+                    item['realized_pnl_usdt'] = realized_pnl
+            out.append(item)
         else:
             out.append(r)
     return jsonify({'timestamp': now_utc_iso(), 'signals': out})
@@ -2565,6 +2647,28 @@ def live_trading_positions():
             results.append({'exchange': ex, 'symbol': sym, 'positions': None, 'error': f"{type(exc).__name__}: {exc}"})
 
     return jsonify({'timestamp': now_utc_iso(), 'targets': list(uniq), 'results': results})
+
+
+@app.route('/api/live_trading/force_close', methods=['POST'])
+def live_trading_force_close():
+    """Manual one-click flatten for a live trade signal (best-effort)."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    payload = request.get_json(silent=True) or {}
+    signal_id = payload.get('signal_id') or request.args.get('signal_id')
+    try:
+        signal_id_i = int(signal_id)
+    except Exception:
+        return jsonify({'error': 'invalid signal_id', 'timestamp': now_utc_iso()}), 400
+
+    try:
+        result = live_trading_manager.manual_force_close(signal_id_i)
+        if not result.get('ok'):
+            return jsonify({'error': result.get('error') or 'force_close failed', 'result': result, 'timestamp': now_utc_iso()}), 400
+        return jsonify({'timestamp': now_utc_iso(), 'result': result})
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
 
 @app.route('/api/live_trading/orders')

@@ -25,11 +25,14 @@ from trading.trade_executor import (
     TradeExecutionError,
     execute_perp_market_order,
     place_binance_perp_market_order,
+    get_binance_perp_positions,
     get_binance_perp_order,
     get_bybit_linear_order,
+    get_bybit_linear_positions,
     get_bitget_usdt_perp_order_detail,
     get_bitget_usdt_perp_positions,
     get_hyperliquid_perp_positions,
+    get_okx_swap_positions,
     place_bitget_usdt_perp_market_order,
     place_bybit_linear_market_order,
     place_hyperliquid_perp_market_order,
@@ -123,6 +126,185 @@ class LiveTradingManager:
         self._stop.set()
         self._thread.join(timeout=5)
         self._thread = None
+
+    def manual_force_close(self, signal_id: int) -> Dict[str, Any]:
+        """One-click manual flatten for a signal.
+
+        - Query both exchanges' current positions for the signal symbol.
+        - Submit reduce-only market orders to flatten any residual exposure.
+        - Update signal status to closing/closed accordingly and record orders/errors in PG.
+        """
+        if psycopg is None:
+            return {"ok": False, "error": "psycopg not installed"}
+        sid = int(signal_id or 0)
+        if sid <= 0:
+            return {"ok": False, "error": "invalid signal_id"}
+
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+
+        with psycopg.connect(self.config.dsn, **conn_kwargs) as conn:
+            row = conn.execute(
+                "SELECT * FROM watchlist.live_trade_signal WHERE id=%s LIMIT 1;",
+                (sid,),
+            ).fetchone()
+            if not row or not isinstance(row, dict):
+                return {"ok": False, "error": "signal not found", "signal_id": sid}
+
+            symbol = str(row.get("symbol") or "").upper()
+            long_ex = str(row.get("leg_long_exchange") or "").lower()
+            short_ex = str(row.get("leg_short_exchange") or "").lower()
+            status = str(row.get("status") or "").lower()
+
+            if not symbol or not long_ex or not short_ex:
+                return {
+                    "ok": False,
+                    "error": "signal missing symbol/exchanges",
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "long_ex": long_ex,
+                    "short_ex": short_ex,
+                }
+
+            lock = self._get_symbol_lock(symbol)
+            with lock:
+                # Mark closing to prevent concurrent monitor/open logic from racing.
+                conn.execute(
+                    """
+                    UPDATE watchlist.live_trade_signal
+                       SET status='closing',
+                           close_reason=COALESCE(close_reason, 'manual'),
+                           close_requested_at=now(),
+                           close_pnl_spread=COALESCE(close_pnl_spread, last_pnl_spread),
+                           updated_at=now()
+                     WHERE id=%s
+                       AND status <> 'closed';
+                    """,
+                    (sid,),
+                )
+
+                # Query positions concurrently.
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_a = pool.submit(self._get_exchange_position_size, long_ex, symbol)
+                    fut_b = pool.submit(self._get_exchange_position_size, short_ex, symbol)
+                    pos_a = fut_a.result()
+                    pos_b = fut_b.result()
+
+                before = {"long_exchange": pos_a, "short_exchange": pos_b}
+
+                # Place reduce-only close orders for any non-flat exposure.
+                orders: List[Dict[str, Any]] = []
+                close_base = f"wl{sid}M{int(time.time())}"
+                for leg_name, ex, size, client_suffix in (
+                    ("long", long_ex, pos_a, "L"),
+                    ("short", short_ex, pos_b, "S"),
+                ):
+                    if size is None:
+                        self._record_error(
+                            conn,
+                            signal_id=sid,
+                            stage="manual_close_position_query",
+                            error_type="PositionQueryError",
+                            message="position query failed or returned None",
+                            context={"exchange": ex, "symbol": symbol, "leg": leg_name},
+                        )
+                        continue
+                    if abs(float(size)) <= 1e-9:
+                        continue
+
+                    pos_leg = "long" if float(size) > 0 else "short"
+                    qty = abs(float(size))
+                    client_id = f"{close_base}-{client_suffix}"
+                    try:
+                        resp = self._place_close_order(
+                            exchange=ex,
+                            symbol=symbol,
+                            position_leg=pos_leg,
+                            quantity=qty,
+                            client_order_id=client_id,
+                        )
+                        fill = self._parse_fill_fields(ex, symbol, resp)
+                        order_param = _jsonb(resp) if resp is not None else None
+                        side = "short" if pos_leg == "long" else "long"
+                        conn.execute(
+                            """
+                            INSERT INTO watchlist.live_trade_order(
+                                signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                                filled_qty, avg_price, cum_quote, exchange_order_id,
+                                client_order_id, submitted_at, order_resp, status
+                            )
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                            """,
+                            (
+                                sid,
+                                "close",
+                                leg_name,
+                                ex,
+                                side,
+                                "perp",
+                                None,
+                                str(qty),
+                                float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                                float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                                float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                                str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
+                                client_id,
+                                _utcnow(),
+                                order_param,
+                                str(fill.get("status") or "submitted"),
+                            ),
+                        )
+                        orders.append(
+                            {
+                                "leg": leg_name,
+                                "exchange": ex,
+                                "position_leg_closed": pos_leg,
+                                "quantity": qty,
+                                "client_order_id": client_id,
+                                "fill": fill,
+                                "raw": resp,
+                            }
+                        )
+                    except Exception as exc:
+                        self._record_error(
+                            conn,
+                            signal_id=sid,
+                            stage="manual_close_order",
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                            context={"exchange": ex, "symbol": symbol, "leg": leg_name, "pos_leg": pos_leg, "qty": qty},
+                        )
+
+                # Wait a short time for positions to flatten, then update status if flat.
+                after = {"long_exchange": None, "short_exchange": None}
+                flat = None
+                for _ in range(6):
+                    time.sleep(0.6)
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        fut_a2 = pool.submit(self._get_exchange_position_size, long_ex, symbol)
+                        fut_b2 = pool.submit(self._get_exchange_position_size, short_ex, symbol)
+                        a2 = fut_a2.result()
+                        b2 = fut_b2.result()
+                    after = {"long_exchange": a2, "short_exchange": b2}
+                    if a2 is not None and b2 is not None and abs(float(a2)) <= 1e-9 and abs(float(b2)) <= 1e-9:
+                        flat = True
+                        break
+                    flat = False
+
+                if flat:
+                    self._update_signal_status(conn, sid, "closed")
+
+                return {
+                    "ok": True,
+                    "signal_id": sid,
+                    "symbol": symbol,
+                    "status_before": status,
+                    "positions_before": before,
+                    "orders": orders,
+                    "positions_after": after,
+                    "closed": bool(flat),
+                }
 
     def _get_symbol_lock(self, symbol: str) -> threading.Lock:
         key = (symbol or "").upper()
@@ -503,6 +685,149 @@ class LiveTradingManager:
         raise TradeExecutionError(
             f"Hyperliquid position not detected after open: symbol={symbol} side={side_key} requested_qty={requested_qty}"
         )
+
+    def _get_exchange_position_size(self, exchange: str, symbol: str) -> Optional[float]:
+        """Best-effort signed position size for a single symbol on an exchange (perp only).
+
+        Positive -> long exposure, negative -> short exposure.
+        """
+        ex = (exchange or "").lower()
+        sym = (symbol or "").upper()
+        if not ex or not sym:
+            return None
+        try:
+            if ex == "hyperliquid":
+                return float(self._get_hyperliquid_position_szi(sym))
+            if ex == "binance":
+                rows = get_binance_perp_positions(symbol=f"{sym}USDT")
+                if not rows:
+                    return 0.0
+                if isinstance(rows[0], dict):
+                    return float(rows[0].get("positionAmt") or 0)
+                return 0.0
+            if ex == "okx":
+                rows = get_okx_swap_positions(symbol=sym)
+                total = 0.0
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    pos_side = str(r.get("posSide") or r.get("side") or "").lower()
+                    pos_raw = r.get("pos") or r.get("sz") or 0
+                    try:
+                        pos = float(pos_raw or 0)
+                    except Exception:
+                        pos = 0.0
+                    if pos_side == "short":
+                        total -= abs(pos)
+                    elif pos_side == "long":
+                        total += abs(pos)
+                    elif pos_side == "net":
+                        total += pos
+                return total
+            if ex == "bybit":
+                rows = get_bybit_linear_positions(symbol=f"{sym}USDT", category="linear")
+                total = 0.0
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    size_raw = r.get("size") or r.get("qty") or 0
+                    try:
+                        size = float(size_raw or 0)
+                    except Exception:
+                        size = 0.0
+                    side = str(r.get("side") or "").lower()  # Buy/Sell
+                    if side == "sell":
+                        total -= abs(size)
+                    elif side == "buy":
+                        total += abs(size)
+                return total
+            if ex == "bitget":
+                rows = get_bitget_usdt_perp_positions(symbol=f"{sym}USDT")
+                total = 0.0
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    hold = str(r.get("holdSide") or "").lower()
+                    qty_raw = r.get("available") or r.get("total") or r.get("openQty") or r.get("pos") or 0
+                    try:
+                        qty = float(qty_raw or 0)
+                    except Exception:
+                        qty = 0.0
+                    if hold == "short":
+                        total -= abs(qty)
+                    elif hold == "long":
+                        total += abs(qty)
+                return total
+        except Exception:
+            return None
+        return None
+
+    def _post_fail_safety_flatten(self, conn, signal_id: int, symbol: str, exchange: str) -> None:
+        """After an open failure, ensure the exchange-side symbol position is flat (best-effort)."""
+        size = self._get_exchange_position_size(exchange, symbol)
+        if size is None:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="post_fail_position_check",
+                error_type="PositionQueryError",
+                message="position query failed or returned None",
+                context={"symbol": symbol, "exchange": exchange},
+            )
+            return
+        if abs(float(size)) <= 1e-9:
+            return
+
+        pos_leg = "long" if float(size) > 0 else "short"
+        qty = abs(float(size))
+        client_id = f"wl{signal_id}F{int(time.time())}-{'L' if pos_leg=='long' else 'S'}"
+        try:
+            close_order = self._place_close_order(
+                exchange=exchange,
+                symbol=symbol,
+                position_leg=pos_leg,
+                quantity=qty,
+                client_order_id=client_id,
+            )
+            close_order_param = _jsonb(close_order) if close_order is not None else None
+            fill = self._parse_fill_fields(exchange, symbol, close_order)
+            conn.execute(
+                """
+                INSERT INTO watchlist.live_trade_order(
+                    signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                    filled_qty, avg_price, cum_quote, exchange_order_id,
+                    client_order_id, submitted_at, order_resp, status
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                """,
+                (
+                    int(signal_id),
+                    "close",
+                    "long" if pos_leg == "long" else "short",
+                    str(exchange),
+                    "short" if pos_leg == "long" else "long",
+                    "perp",
+                    None,
+                    str(qty),
+                    float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                    float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                    float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                    str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
+                    client_id,
+                    _utcnow(),
+                    close_order_param,
+                    str(fill.get("status") or "submitted"),
+                ),
+            )
+        except Exception as exc:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="post_fail_safety_close",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"symbol": symbol, "exchange": exchange, "size": size},
+            )
 
     def _apply_runtime_config_migrations(self, conn) -> None:
         """
@@ -1347,6 +1672,10 @@ class LiveTradingManager:
                             "quantity": opened_leg.get("quantity"),
                         },
                     )
+            # Post-failure safety: verify and flatten any residual exposure on both exchanges.
+            for ex in {str(long_ex), str(short_ex)}:
+                if ex:
+                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex)
             raise TradeExecutionError(str(exc)) from exc
 
     def monitor_open_trades_once(self) -> None:
