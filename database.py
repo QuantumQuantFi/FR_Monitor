@@ -158,6 +158,94 @@ class PriceDatabase:
                     
         except Exception as e:
             print(f"数据库保存错误: {e}")
+
+    def save_price_data_batch(self, items):
+        """
+        批量写入 price_data（单事务），用于提升多币种落库吞吐。
+        items: list[{'symbol':..., 'exchange':..., 'symbol_data':..., 'premium_data':...}]
+        """
+        if not items:
+            return
+        try:
+            with self.lock:
+                timestamp = datetime.now()
+
+                def _positive_or_none(value):
+                    try:
+                        v = float(value)
+                        return v if v > 0 else None
+                    except (TypeError, ValueError):
+                        return None
+
+                def _float_or_none(value):
+                    try:
+                        return float(value)
+                    except (TypeError, ValueError):
+                        return None
+
+                rows = []
+                for it in items:
+                    symbol = it.get('symbol')
+                    exchange = it.get('exchange')
+                    data = it.get('symbol_data') or {}
+                    premium_data = it.get('premium_data') or {}
+                    if not symbol or not exchange:
+                        continue
+
+                    spot_price = _positive_or_none(data.get('spot', {}).get('price')) if data.get('spot') else None
+                    futures_payload = data.get('futures') or {}
+                    futures_price = _positive_or_none(futures_payload.get('price'))
+                    funding_rate_raw = futures_payload.get('funding_rate')
+                    funding_rate = funding_rate_to_float(funding_rate_raw) if funding_rate_raw is not None else None
+                    interval_raw = futures_payload.get('funding_interval_hours')
+                    try:
+                        funding_interval = float(interval_raw) if interval_raw not in (None, '') else None
+                    except (TypeError, ValueError):
+                        funding_interval = None
+                    next_funding_time = normalize_next_funding_time(futures_payload.get('next_funding_time'))
+                    mark_price = _positive_or_none(futures_payload.get('mark_price')) if data.get('futures') else None
+                    index_price = _positive_or_none(futures_payload.get('index_price')) if data.get('futures') else None
+                    volume_24h = _positive_or_none(data.get('spot', {}).get('volume')) if data.get('spot') else None
+
+                    premium_percent = None
+                    if premium_data and exchange in premium_data:
+                        premium_percent = _float_or_none(premium_data[exchange].get('premium_percent'))
+
+                    rows.append(
+                        (
+                            timestamp,
+                            symbol,
+                            exchange,
+                            spot_price,
+                            futures_price,
+                            funding_rate,
+                            funding_interval,
+                            next_funding_time,
+                            mark_price,
+                            index_price,
+                            premium_percent,
+                            volume_24h,
+                        )
+                    )
+
+                if not rows:
+                    return
+
+                with self._get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.executemany(
+                        '''
+                        INSERT INTO price_data
+                        (timestamp, symbol, exchange, spot_price, futures_price, funding_rate,
+                         funding_interval_hours, next_funding_time, mark_price, index_price,
+                         premium_percent, volume_24h)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ''',
+                        rows,
+                    )
+                    conn.commit()
+        except Exception as e:
+            print(f"数据库批量写入错误: {e}")
     
     def get_historical_data(self, symbol, exchange=None, hours=24, interval='1min', raise_on_error=False):
         """获取历史数据"""

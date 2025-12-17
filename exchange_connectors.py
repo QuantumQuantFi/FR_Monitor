@@ -793,28 +793,25 @@ class ExchangeDataCollector:
                     # 组合流数据格式
                     stream_data = data['data']
                     if 'c' in stream_data:  # 24小时价格变动统计
-                        symbol_name = stream_data['s']
-                        # 解析币种名称
-                        for symbol in self.supported_symbols:
-                            if symbol_name == f"{symbol}USDT":
-                                self.data['binance'][symbol]['spot'] = {
-                                    'price': float(stream_data['c']),
+                        symbol_name = stream_data.get('s') or ''
+                        if symbol_name.endswith('USDT'):
+                            coin = symbol_name[:-4]
+                            if coin in self.data.get('binance', {}):
+                                self.data['binance'][coin]['spot'] = {
+                                    'price': float(stream_data.get('c', 0) or 0),
                                     'timestamp': datetime.now(timezone.utc).isoformat(),
-                                    'symbol': symbol_name
+                                    'symbol': symbol_name,
                                 }
-                                print(f"Binance {symbol} 现货价格: {stream_data['c']}")
-                                break
                 elif 'c' in data:  # 单一流数据格式
-                    symbol_name = data['s']
-                    for symbol in self.supported_symbols:
-                        if symbol_name == f"{symbol}USDT":
-                            self.data['binance'][symbol]['spot'] = {
-                                'price': float(data['c']),
+                    symbol_name = data.get('s') or ''
+                    if symbol_name.endswith('USDT'):
+                        coin = symbol_name[:-4]
+                        if coin in self.data.get('binance', {}):
+                            self.data['binance'][coin]['spot'] = {
+                                'price': float(data.get('c', 0) or 0),
                                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                                'symbol': symbol_name
+                                'symbol': symbol_name,
                             }
-                            print(f"Binance {symbol} 现货价格: {data['c']}")
-                            break
             except Exception as e:
                 print(f"Binance现货解析错误: {e}")
 
@@ -852,45 +849,47 @@ class ExchangeDataCollector:
                     # 组合流数据格式
                     stream_data = data['data']
                     if 'r' in stream_data:  # 标记价格和资金费率
-                        symbol_name = stream_data['s']
-                        for symbol in self.supported_symbols:
-                            if symbol_name == f"{symbol}USDT":
+                        symbol_name = stream_data.get('s') or ''
+                        if symbol_name.endswith('USDT'):
+                            coin = symbol_name[:-4]
+                            if coin in self.data.get('binance', {}):
                                 funding_rate_value = normalize_funding_rate(stream_data.get('r'))
-                                existing = self.data['binance'][symbol].get('futures', {})
+                                existing = self.data['binance'][coin].get('futures', {})
                                 futures_entry = dict(existing or {})
-                                futures_entry.update({
-                                    'price': float(stream_data['p']),
-                                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                                    'symbol': symbol_name
-                                })
+                                futures_entry.update(
+                                    {
+                                        'price': float(stream_data.get('p', 0) or 0),
+                                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                                        'symbol': symbol_name,
+                                    }
+                                )
                                 next_time = normalize_next_funding_time(stream_data.get('T'))
                                 if next_time:
                                     futures_entry['next_funding_time'] = next_time
                                 if funding_rate_value is not None:
                                     futures_entry['funding_rate'] = funding_rate_value
-                                self.data['binance'][symbol]['futures'] = futures_entry
-                                print(f"Binance {symbol} 合约价格: {stream_data['p']}, 资金费率: {funding_rate_value}")
-                                break
+                                self.data['binance'][coin]['futures'] = futures_entry
                 elif 'r' in data:  # 单一流数据格式
-                    symbol_name = data['s']
-                    for symbol in self.supported_symbols:
-                        if symbol_name == f"{symbol}USDT":
+                    symbol_name = data.get('s') or ''
+                    if symbol_name.endswith('USDT'):
+                        coin = symbol_name[:-4]
+                        if coin in self.data.get('binance', {}):
                             funding_rate_value = normalize_funding_rate(data.get('r'))
-                            existing = self.data['binance'][symbol].get('futures', {})
+                            existing = self.data['binance'][coin].get('futures', {})
                             futures_entry = dict(existing or {})
-                            futures_entry.update({
-                                'price': float(data['p']),
-                                'timestamp': datetime.now(timezone.utc).isoformat(),
-                                'symbol': symbol_name
-                            })
+                            futures_entry.update(
+                                {
+                                    'price': float(data.get('p', 0) or 0),
+                                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                                    'symbol': symbol_name,
+                                }
+                            )
                             next_time = normalize_next_funding_time(data.get('T'))
                             if next_time:
                                 futures_entry['next_funding_time'] = next_time
                             if funding_rate_value is not None:
                                 futures_entry['funding_rate'] = funding_rate_value
-                            self.data['binance'][symbol]['futures'] = futures_entry
-                            print(f"Binance {symbol} 合约价格: {data['p']}, 资金费率: {funding_rate_value}")
-                            break
+                            self.data['binance'][coin]['futures'] = futures_entry
             except Exception as e:
                 print(f"Binance合约解析错误: {e}")
 
@@ -1333,49 +1332,44 @@ class ExchangeDataCollector:
                     inst_id = arg_info.get('instId', '')
                     
                     if channel == 'ticker':
+                        coin = None
+                        if isinstance(inst_id, str) and inst_id.endswith('USDT'):
+                            coin = inst_id[:-4]
                         for item in data['data']:
-                            print(f"Bitget接收到数据: {inst_id} ({inst_type}) - lastPr: {item.get('lastPr', 0)}")
-                            
-                            # 解析币种名称
-                            for symbol in self.supported_symbols:
-                                # 对于现货：BTCUSDT
-                                # 对于期货：BTCUSDT (不是BTCUSDT_UMCBL)
-                                if inst_id == f"{symbol}USDT":
-                                    if inst_type == 'USDT-FUTURES':  # 期货合约
-                                        price = float(item.get('lastPr', 0)) if item.get('lastPr') and str(item.get('lastPr')) != '0' else 0
-                                        funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
-
-                                        if price > 0:  # 只在有有效价格时更新
-                                            existing = self.data['bitget'][symbol].get('futures', {})
-                                            futures_snapshot = dict(existing or {})
-                                            futures_snapshot.update({
-                                                'price': price,
-                                                'mark_price': float(item.get('markPrice', 0)) if item.get('markPrice') else futures_snapshot.get('mark_price', 0),
-                                                'index_price': float(item.get('indexPrice', 0)) if item.get('indexPrice') else futures_snapshot.get('index_price', 0),
-                                                'timestamp': datetime.now(timezone.utc).isoformat(),
-                                                'symbol': inst_id
-                                            })
-                                            next_time = normalize_next_funding_time(item.get('nextFundingTime'))
-                                            if next_time:
-                                                futures_snapshot['next_funding_time'] = next_time
-                                            if funding_rate_value is not None:
-                                                futures_snapshot['funding_rate'] = funding_rate_value
-                                            self.data['bitget'][symbol]['futures'] = futures_snapshot
-                                            print(f"Bitget {symbol} 合约价格: {price}, 资金费率: {funding_rate_value}")
-                                    elif inst_type == 'SPOT':  # 现货
-                                        price = float(item.get('lastPr', 0)) if item.get('lastPr') and str(item.get('lastPr')) != '0' else 0
-                                        
-                                        # 只在有有效价格时更新，避免把占位数据写入面板
-                                        if price > 0:
-                                            self.data['bitget'][symbol]['spot'] = {
-                                                'price': price,
-                                                'volume': float(item.get('baseVolume', 0)) if item.get('baseVolume') else 0,
-                                                'timestamp': datetime.now(timezone.utc).isoformat(),
-                                                'symbol': inst_id,
-                                                'is_active': price > 0  # 标记是否有实际价格
-                                            }
-                                            print(f"Bitget {symbol} 现货价格: {price}")
-                                    break
+                            if not coin:
+                                continue
+                            self.data['bitget'].setdefault(coin, {'spot': {}, 'futures': {}, 'funding_rate': {}})
+                            if inst_type == 'USDT-FUTURES':  # 期货合约
+                                price = float(item.get('lastPr', 0) or 0)
+                                funding_rate_value = normalize_funding_rate(item.get('fundingRate'))
+                                if price > 0:  # 只在有有效价格时更新
+                                    existing = self.data['bitget'][coin].get('futures', {})
+                                    futures_snapshot = dict(existing or {})
+                                    futures_snapshot.update(
+                                        {
+                                            'price': price,
+                                            'mark_price': float(item.get('markPrice', 0) or 0) or futures_snapshot.get('mark_price', 0),
+                                            'index_price': float(item.get('indexPrice', 0) or 0) or futures_snapshot.get('index_price', 0),
+                                            'timestamp': datetime.now(timezone.utc).isoformat(),
+                                            'symbol': inst_id,
+                                        }
+                                    )
+                                    next_time = normalize_next_funding_time(item.get('nextFundingTime'))
+                                    if next_time:
+                                        futures_snapshot['next_funding_time'] = next_time
+                                    if funding_rate_value is not None:
+                                        futures_snapshot['funding_rate'] = funding_rate_value
+                                    self.data['bitget'][coin]['futures'] = futures_snapshot
+                            elif inst_type == 'SPOT':  # 现货
+                                price = float(item.get('lastPr', 0) or 0)
+                                if price > 0:
+                                    self.data['bitget'][coin]['spot'] = {
+                                        'price': price,
+                                        'volume': float(item.get('baseVolume', 0) or 0),
+                                        'timestamp': datetime.now(timezone.utc).isoformat(),
+                                        'symbol': inst_id,
+                                        'is_active': True,
+                                    }
             except Exception as e:
                 print(f"Bitget解析错误: {e}, 原始数据: {message}")
 
