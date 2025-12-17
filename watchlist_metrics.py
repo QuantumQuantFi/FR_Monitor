@@ -477,8 +477,10 @@ def fetch_spread_series_for_legs(
     except Exception:
         return points
 
-    def _load_leg_series(exchange: str, symbol: str, kind: str) -> Dict[datetime, Tuple[float, Optional[float], Optional[float], Optional[datetime]]]:
-        out: Dict[datetime, Tuple[float, Optional[float], Optional[float], Optional[datetime]]] = {}
+    def _load_leg_series_1min(
+        exchange: str, symbol: str, kind: str
+    ) -> List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]]:
+        out: List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]] = []
         try:
             cursor.execute(
                 """
@@ -504,8 +506,70 @@ def fetch_spread_series_for_legs(
             fr_val = float(fr) if fr not in (None, 0, "") else None
             interval_val = float(interval_hours) if interval_hours not in (None, 0, "") else None
             next_val = _parse_ts(next_ft)
-            out[ts] = (float(price), fr_val, interval_val, next_val)
+            out.append((ts, float(price), fr_val, interval_val, next_val))
         return out
+
+    def _load_leg_series_raw(
+        exchange: str, symbol: str, kind: str
+    ) -> List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]]:
+        out: List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]] = []
+        try:
+            cursor.execute(
+                """
+                SELECT timestamp, spot_price, futures_price,
+                       funding_rate, funding_interval_hours, next_funding_time
+                FROM price_data
+                WHERE symbol = ? AND exchange = ?
+                  AND timestamp >= datetime('now', ?)
+                ORDER BY timestamp ASC
+                """,
+                (symbol, exchange, cutoff_sql),
+            )
+            rows = cursor.fetchall()
+        except Exception:
+            rows = []
+        for ts_raw, spot, fut, fr, interval_hours, next_ft in rows:
+            ts = _parse_ts(ts_raw)
+            if ts is None:
+                continue
+            price = spot if kind == "spot" else fut
+            if price is None or price <= 0:
+                continue
+            fr_val = float(fr) if fr not in (None, 0, "") else None
+            interval_val = float(interval_hours) if interval_hours not in (None, 0, "") else None
+            next_val = _parse_ts(next_ft)
+            out.append((ts, float(price), fr_val, interval_val, next_val))
+        return out
+
+    def _pick_nearest(
+        series: List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]],
+        target: datetime,
+        max_gap_seconds: int,
+    ) -> Optional[Tuple[float, Optional[float], Optional[float], Optional[datetime]]]:
+        # series is sorted ASC
+        if not series:
+            return None
+        from bisect import bisect_left
+
+        ts_list = [t for (t, _, _, _, _) in series]
+        i = bisect_left(ts_list, target)
+        candidates = []
+        if 0 <= i < len(series):
+            candidates.append(series[i])
+        if i - 1 >= 0:
+            candidates.append(series[i - 1])
+        best = None
+        best_dt = None
+        for t, price, fr, iv, nft in candidates:
+            dt = abs((t - target).total_seconds())
+            if best is None or dt < best_dt:
+                best = (price, fr, iv, nft)
+                best_dt = dt
+        if best is None or best_dt is None:
+            return None
+        if best_dt > max_gap_seconds:
+            return None
+        return best
 
     ex_a = str(leg_a.get("exchange") or "").lower()
     ex_b = str(leg_b.get("exchange") or "").lower()
@@ -514,41 +578,111 @@ def fetch_spread_series_for_legs(
     kind_a = str(leg_a.get("kind") or "perp").lower()
     kind_b = str(leg_b.get("kind") or "perp").lower()
 
+    max_gap_seconds = int(WATCHLIST_METRICS_CONFIG.get("legs_nearest_max_gap_seconds", 120))
+
     try:
-        series_a = _load_leg_series(ex_a, sym_a, kind_a)
-        series_b = _load_leg_series(ex_b, sym_b, kind_b)
+        # 优先使用 1min 聚合；如果两腿“同分钟交集”太少，则用 raw 最近邻按分钟网格对齐（允许低于 1min 的实际采样频率）。
+        s1_a = _load_leg_series_1min(ex_a, sym_a, kind_a)
+        s1_b = _load_leg_series_1min(ex_b, sym_b, kind_b)
+        d1_a = {t: (price, fr, iv, nft) for (t, price, fr, iv, nft) in s1_a}
+        d1_b = {t: (price, fr, iv, nft) for (t, price, fr, iv, nft) in s1_b}
+        common = set(d1_a.keys()) & set(d1_b.keys())
+        if len(common) >= 20:
+            for ts in sorted(common):
+                pa, fr_a, interval_a, next_a = d1_a[ts]
+                pb, fr_b, interval_b, next_b = d1_b[ts]
+                interval_hint = None
+                for iv in (interval_a, interval_b):
+                    if iv and iv > 0:
+                        interval_hint = iv if interval_hint is None else min(interval_hint, iv)
+                next_candidates = [n for n in (next_a, next_b) if n]
+                next_hint = min(next_candidates) if next_candidates else None
+                funding_hint = fr_a if fr_a is not None else fr_b
+                points.append(
+                    SpreadPoint(
+                        ts=ts,
+                        spot=pa,
+                        futures=pb,
+                        funding_rate=funding_hint,
+                        funding_interval_hours=interval_hint,
+                        next_funding_time=next_hint,
+                        abs_spread=abs_spread,
+                    )
+                )
+            return points
+
+        s2_a = _load_leg_series_raw(ex_a, sym_a, kind_a)
+        s2_b = _load_leg_series_raw(ex_b, sym_b, kind_b)
+        if not s2_a or not s2_b:
+            return points
+
+        # build timestamp index for bisect
+        ts2_a = [t for (t, *_rest) in s2_a]
+        ts2_b = [t for (t, *_rest) in s2_b]
+
+        def _pick_nearest_indexed(
+            series: List[Tuple[datetime, float, Optional[float], Optional[float], Optional[datetime]]],
+            ts_list: List[datetime],
+            target: datetime,
+            max_gap_seconds: int,
+        ) -> Optional[Tuple[float, Optional[float], Optional[float], Optional[datetime]]]:
+            from bisect import bisect_left
+
+            i = bisect_left(ts_list, target)
+            candidates = []
+            if 0 <= i < len(series):
+                candidates.append(series[i])
+            if i - 1 >= 0:
+                candidates.append(series[i - 1])
+            best = None
+            best_dt = None
+            for t, price, fr, iv, nft in candidates:
+                dt = abs((t - target).total_seconds())
+                if best is None or dt < best_dt:
+                    best = (price, fr, iv, nft)
+                    best_dt = dt
+            if best is None or best_dt is None or best_dt > max_gap_seconds:
+                return None
+            return best
+
+        start = max(s2_a[0][0], s2_b[0][0]).replace(second=0, microsecond=0)
+        end = min(s2_a[-1][0], s2_b[-1][0]).replace(second=0, microsecond=0)
+        if start >= end:
+            return points
+
+        ts = start
+        while ts <= end:
+            a = _pick_nearest_indexed(s2_a, ts2_a, ts, max_gap_seconds)
+            b = _pick_nearest_indexed(s2_b, ts2_b, ts, max_gap_seconds)
+            if a and b:
+                pa, fr_a, interval_a, next_a = a
+                pb, fr_b, interval_b, next_b = b
+                interval_hint = None
+                for iv in (interval_a, interval_b):
+                    if iv and iv > 0:
+                        interval_hint = iv if interval_hint is None else min(interval_hint, iv)
+                next_candidates = [n for n in (next_a, next_b) if n]
+                next_hint = min(next_candidates) if next_candidates else None
+                funding_hint = fr_a if fr_a is not None else fr_b
+                points.append(
+                    SpreadPoint(
+                        ts=ts,
+                        spot=pa,
+                        futures=pb,
+                        funding_rate=funding_hint,
+                        funding_interval_hours=interval_hint,
+                        next_funding_time=next_hint,
+                        abs_spread=abs_spread,
+                    )
+                )
+            ts = ts + timedelta(minutes=1)
+
+        return points
     finally:
         try:
             conn.close()
         except Exception:
             pass
-    if not series_a or not series_b:
-        return points
-
-    common_ts = sorted(set(series_a.keys()) & set(series_b.keys()))
-    for ts in common_ts:
-        pa, fr_a, interval_a, next_a = series_a[ts]
-        pb, fr_b, interval_b, next_b = series_b[ts]
-        interval_hint = None
-        for iv in (interval_a, interval_b):
-            if iv and iv > 0:
-                interval_hint = iv if interval_hint is None else min(interval_hint, iv)
-        next_candidates = [n for n in (next_a, next_b) if n]
-        next_hint = min(next_candidates) if next_candidates else None
-        funding_hint = fr_a if fr_a is not None else fr_b
-        points.append(
-            SpreadPoint(
-                ts=ts,
-                spot=pa,
-                futures=pb,
-                funding_rate=funding_hint,
-                funding_interval_hours=interval_hint,
-                next_funding_time=next_hint,
-                abs_spread=abs_spread,
-            )
-        )
-
-    return points
 
 
 def compute_metrics_for_legs(

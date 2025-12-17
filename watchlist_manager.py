@@ -682,6 +682,18 @@ class WatchlistManager:
                                 factors2.setdefault('spread_log_short_over_long', float(math.log(high / low)))
                                 if low:
                                     factors2.setdefault('raw_best_buy_high_sell_low', float((high - low) / low))
+                        # 若 trigger_details 缺失价格（或结构变化），退化到 snapshot 的 best_buy_high_sell_low
+                        # 以避免 factors 不齐导致 pnl_regression 计算失败。
+                        if 'spread_log_short_over_long' not in factors2 or 'raw_best_buy_high_sell_low' not in factors2:
+                            try:
+                                fallback_spread = row.get('best_buy_high_sell_low')
+                                if fallback_spread is not None and math.isfinite(float(fallback_spread)):
+                                    fb = float(fallback_spread)
+                                    factors2.setdefault('raw_best_buy_high_sell_low', fb)
+                                    if fb > -0.9:
+                                        factors2.setdefault('spread_log_short_over_long', float(math.log(1.0 + fb)))
+                            except Exception:
+                                pass
                         pred = predict_bc(signal_type='B', factors=factors2, horizons=(240,))
                         pred_240 = ((pred or {}).get('pred') or {}).get('240') if isinstance(pred, dict) else None
                         if (

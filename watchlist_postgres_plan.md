@@ -15,6 +15,31 @@
 
 ---
 
+## 0.1 回归预测审计（潜在失败点/不准确来源）
+
+### 0.1.1 计算失败（`pnl_hat/win_prob` 为空）的常见原因
+- **因子缺失**：线性模型必须同时拿到 5 个因子 `raw_slope_3m/raw_drift_ratio/spread_log_short_over_long/raw_crossings_1h/raw_best_buy_high_sell_low`，任一缺失会导致 `predict_bc()` 返回 `None`。
+  - 典型触发：跨所腿的历史分钟序列在本地 SQLite 不完整（某交易所/某币种未持续入库）→ `compute_metrics_for_legs()` 退化为 `no_data` → `slope_3m/drift_ratio/crossings_1h` 为空。
+  - 典型触发：Type B 触发明细 `trigger_details.prices` 缺失/结构变化 → 无法补齐 `spread_log_short_over_long/raw_best_buy_high_sell_low`。
+- **采样频率不一致**：`watchlist_metrics.py` 的部分窗口指标默认按“点数≈分钟”计算；当分钟点不是严格 1min（掉点/稀疏/重采样）时，`raw_slope_3m/raw_crossings_1h/raw_drift_ratio` 会产生偏差，进而影响预测。
+
+### 0.1.2 不准确（预测偏乐观/偏悲观）的主要来源
+- **价格口径差异**：watchlist 侧用于补齐 `spread_log_short_over_long/raw_best_buy_high_sell_low` 的价格可能来自 last/mark（而非 bid/ask + 扫单滑点），会偏离“可成交价差”；实盘侧必须用订单簿按名义金额扫单复算。
+- **胜率定义口径**：当前 `win_prob` 的定义为 `P(pnl > fee_threshold)`，默认 `fee_threshold=0.001(10bps)`；这不等同于“净利润>0”（更不含开/平四笔手续费+滑点）。实盘阈值解释与 fee 假设需要对齐，并建议后续把 `fee_threshold` 参数化到策略配置。
+- **统计假设**：`win_prob` 通过残差 `Normal(resid_std)` 近似得到，且报告为 in-sample；真实分布可能重尾/异方差，容易导致概率失真。建议后续做滚动时间切分 OOS 验证与概率校准（例如按 `pnl_hat` 分箱的经验胜率校准）。
+
+### 0.1.3 已做的防护/修复（与本计划强相关）
+- **watchlist 侧缺失回退**：当 `trigger_details` 无法提供价格时，允许用 snapshot 的 `best_buy_high_sell_low` 退化补齐 `raw_best_buy_high_sell_low`，并用 `log(1+spread)` 补 `spread_log_short_over_long`，避免因子不齐导致预测直接失败（仍建议以订单簿复算为准）。
+- **实盘侧方向一致性**：订单簿复算时，必须使用“高所 bid(sell) / 低所 ask(buy)”计算 `spread_log_short_over_long` 与 `raw_best_buy_high_sell_low`，确保与开仓方向一致。
+
+### 0.1.4 下一步建议（不影响现有功能，但提升稳定性/准确性）
+- 增加“预测覆盖率”监控：`watch_signal_event` 中 `meta_last.factors`/`pnl_regression` 的缺失占比、缺失原因分布（按交易所/币种/时间）。
+- 将 `watchlist_metrics.py` 的关键窗口（`3m slope/1h crossings/rolling mean/std`）改为**按时间戳截取窗口**，而不是按点数，降低掉点/稀疏导致的偏差。
+- 将 `fee_threshold` 与交易所费率/预估滑点联动：为不同交易所/腿组合动态估算“净胜阈值”，并落库到 `live_trade_signal.threshold` 方便回放。
+- 对“分钟数据不完整”的现实做策略适配：仍保持 **全币种全交易所落库**，但在因子计算（尤其 Type B/C 跨所两腿）阶段允许用 `price_data` 的最近邻数据按分钟网格对齐（配置 `WATCHLIST_METRICS_CONFIG.legs_nearest_max_gap_seconds`），避免因 `price_data_1min` 的同分钟交集太少导致预测失败。
+
+---
+
 ## 1. 信号规则与过去 24h 频次校准（你提出的第 1 条）
 
 ### 1.1 规则定义（建议先参数化）
