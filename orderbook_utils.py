@@ -268,34 +268,47 @@ def compute_orderbook_spread(legs: List[Dict[str, Any]]) -> Optional[Dict[str, A
     legs: [{'exchange':..., 'market_type':..., 'price': {'buy':..., 'sell':..., 'mid':...}}]
     返回 forward（高买 / 低卖）与 reverse（高卖 / 低买）价差。
     """
-    usable = [leg for leg in legs if leg.get('price') and leg['price'].get('mid') is not None]
+    # Use executable sweep prices (buy=asks, sell=bids). Do NOT rely on mid ordering:
+    # a venue can have a slightly lower mid but a better bid/ask, and arbitrage direction must
+    # be evaluated using bid-vs-ask pairs.
+    usable = [leg for leg in legs if isinstance(leg.get("price"), dict)]
     if len(usable) < 2:
         return None
-    high = max(usable, key=lambda l: l['price']['mid'])
-    low = min(usable, key=lambda l: l['price']['mid'])
 
     forward_spread = None
-    if high['price'].get('buy') and low['price'].get('sell'):
-        base = min(high['price']['buy'], low['price']['sell'])
+    forward_high = None
+    forward_low = None
+    buy_legs = [l for l in usable if l["price"].get("buy") is not None]
+    sell_legs = [l for l in usable if l["price"].get("sell") is not None]
+    if buy_legs and sell_legs:
+        forward_high = max(buy_legs, key=lambda l: float(l["price"]["buy"]))
+        forward_low = min(sell_legs, key=lambda l: float(l["price"]["sell"]))
+    if forward_high and forward_low and forward_high["price"].get("buy") and forward_low["price"].get("sell"):
+        base = min(forward_high["price"]["buy"], forward_low["price"]["sell"])
         if base:
-            forward_spread = (high['price']['buy'] - low['price']['sell']) / base
+            forward_spread = (forward_high["price"]["buy"] - forward_low["price"]["sell"]) / base
 
     reverse_spread = None
-    if high['price'].get('sell') and low['price'].get('buy'):
-        base = min(high['price']['sell'], low['price']['buy'])
+    reverse_high = None
+    reverse_low = None
+    if sell_legs and buy_legs:
+        reverse_high = max(sell_legs, key=lambda l: float(l["price"]["sell"]))
+        reverse_low = min(buy_legs, key=lambda l: float(l["price"]["buy"]))
+    if reverse_high and reverse_low and reverse_high["price"].get("sell") and reverse_low["price"].get("buy"):
+        base = min(reverse_high["price"]["sell"], reverse_low["price"]["buy"])
         if base:
-            reverse_spread = (high['price']['sell'] - low['price']['buy']) / base
+            reverse_spread = (reverse_high["price"]["sell"] - reverse_low["price"]["buy"]) / base
 
     return {
         'legs': usable,
         'forward': {
-            'high': high,
-            'low': low,
+            'high': forward_high,
+            'low': forward_low,
             'spread': forward_spread,
         },
         'reverse': {
-            'high': high,
-            'low': low,
+            'high': reverse_high,
+            'low': reverse_low,
             'spread': reverse_spread,
         },
     }
