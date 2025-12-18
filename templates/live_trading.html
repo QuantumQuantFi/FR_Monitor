@@ -123,6 +123,67 @@
 
   <div class="card" style="margin-top: 12px;">
     <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+      <div style="font-weight: 700;">持仓 / 余额（私有 API）</div>
+      <div class="muted">用于排查“残留持仓/余额不足”；可对无 open 信号的持仓手动一键平仓</div>
+    </div>
+    <div class="row" style="margin-bottom: 8px;">
+      <button id="posBtn2" class="secondary">查询全部交易所持仓/余额</button>
+      <label class="muted" style="display:flex;align-items:center;gap:6px;">
+        <input id="posNonzeroOnly" type="checkbox" checked />
+        仅显示非零持仓
+      </label>
+      <span id="posTs" class="muted">-</span>
+    </div>
+    <div class="row" style="gap: 12px; align-items: stretch;">
+      <div style="flex: 1; min-width: 340px;">
+        <div class="muted" style="margin-bottom: 6px;">余额摘要</div>
+        <div class="table-wrap" style="max-height: 260px;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 120px;">Exchange</th>
+                <th style="width: 100px;">Currency</th>
+                <th style="width: 140px;">Available</th>
+                <th style="width: 140px;">Wallet/Equity</th>
+                <th style="width: 200px;">Error</th>
+              </tr>
+            </thead>
+            <tbody id="balancesBody">
+              <tr><td colspan="5" class="muted">点击“查询全部交易所持仓/余额”</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div style="flex: 2; min-width: 520px;">
+        <div class="muted" style="margin-bottom: 6px;">当前持仓（永续）</div>
+        <div class="table-wrap" style="max-height: 260px;">
+          <table>
+            <thead>
+              <tr>
+                <th style="width: 120px;">Exchange</th>
+                <th style="width: 120px;">Symbol</th>
+                <th style="width: 90px;">Side</th>
+                <th style="width: 140px;">Size</th>
+                <th style="width: 160px;">Value(USDT)</th>
+                <th style="width: 140px;">Entry</th>
+                <th style="width: 140px;">UPnL(USDT)</th>
+                <th style="width: 120px;">Action</th>
+              </tr>
+            </thead>
+            <tbody id="positionsBody">
+              <tr><td colspan="7" class="muted">点击“查询全部交易所持仓/余额”</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+    <div class="muted" style="margin-top: 8px;">
+      说明：一键平仓会先检查该币种是否存在 open/opening/closing 的信号；若存在则拒绝（避免干扰自动策略）。
+    </div>
+  </div>
+
+  <div class="card" style="margin-top: 12px;">
+    <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
       <div style="font-weight: 700;">Details</div>
       <div class="muted">orders / samples / positions（按需加载）</div>
     </div>
@@ -204,8 +265,7 @@
         const bOpen = fmt(s.open_short_avg_price, 8);
         const bClose = fmt(s.close_short_avg_price, 8);
         const realized = fmt(s.realized_pnl_usdt, 6);
-        const stKey = String(s.status || '').toLowerCase();
-        const canForceClose = stKey !== 'closed';
+        const canForceClose = true;
         const createdAt = s.created_at || '-';
         const openAt = s.opened_at || '-';
         const closeReqAt = s.close_requested_at || '-';
@@ -246,7 +306,7 @@
     }
 
     async function forceClose(signalId) {
-      if (!confirm(`确认一键平仓 signal_id=${signalId} ?\\n\\n将同时查询两交易所持仓并以 reduce-only 市价打平。`)) return;
+      if (!confirm(`确认一键平仓 signal_id=${signalId} ?\\n\\n将同时查询两交易所持仓并以 reduce-only 市价打平。\\n若该 symbol 存在其他 open/opening/closing 信号，将拒绝执行。`)) return;
       const detailsPre = document.getElementById('detailsPre');
       const detailsSummary = document.getElementById('detailsSummary');
       detailsSummary.textContent = `force closing signal_id=${signalId} ...`;
@@ -255,6 +315,151 @@
         const resp = await postJson('/api/live_trading/force_close', {signal_id: signalId});
         detailsSummary.textContent = JSON.stringify(resp.result || resp, null, 2);
         detailsPre.textContent = JSON.stringify(resp, null, 2);
+        await refresh();
+      } catch (e) {
+        detailsSummary.textContent = String(e);
+        detailsPre.textContent = String(e);
+      }
+    }
+
+    function renderPositionsAndBalances(payload) {
+      const rows = payload?.results || [];
+      const balancesBody = document.getElementById('balancesBody');
+      const positionsBody = document.getElementById('positionsBody');
+
+      function pickBalanceFields(bal) {
+        if (!bal || typeof bal !== 'object') return {currency: '-', avail: '-', wallet: '-'};
+        const currency = bal.currency || '-';
+        const avail = bal.available_balance ?? bal.avail_bal ?? bal.withdrawable ?? '-';
+        const wallet = bal.wallet_balance ?? bal.equity ?? bal.account_value ?? bal.eq ?? bal.cash_bal ?? '-';
+        return {currency, avail, wallet};
+      }
+
+      function normalizePosition(exchange, raw) {
+        const ex = (exchange || '').toLowerCase();
+        if (!raw || typeof raw !== 'object') return null;
+        try {
+          if (ex === 'binance') {
+            const amt = Number(raw.positionAmt || 0);
+            const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
+            const mark = Number(raw.markPrice || 0);
+            const notional = (raw.notional !== undefined && raw.notional !== null) ? Number(raw.notional) : (Math.abs(amt) * mark);
+            return {exchange: ex, symbol: sym, side: amt >= 0 ? 'long' : 'short', size: Math.abs(amt), value_usdt: notional, entry: raw.entryPrice, upnl_usdt: raw.unRealizedProfit};
+          }
+          if (ex === 'okx') {
+            const sz = Number(raw._base_size ?? raw.pos ?? raw.sz ?? 0);
+            const posSide = String(raw.posSide || raw.side || 'net').toLowerCase();
+            const sym = String(raw.instId || raw.symbol || '').split('-')[0] || '-';
+            const signed = posSide === 'short' ? -Math.abs(sz) : Math.abs(sz);
+            const mark = Number(raw.markPx || raw.last || 0);
+            const notional = Math.abs(Number(raw.notionalUsd || 0)) || (Math.abs(signed) * mark);
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPx, upnl_usdt: raw.upl};
+          }
+          if (ex === 'bybit') {
+            const sz = Number(raw.size || raw.qty || 0);
+            const side = String(raw.side || '').toLowerCase(); // Buy/Sell
+            const signed = side === 'sell' ? -Math.abs(sz) : Math.abs(sz);
+            const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
+            const mark = Number(raw.markPrice || 0);
+            const notional = Number(raw.positionValue || 0) || (Math.abs(signed) * mark);
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPrice || raw.entryPrice, upnl_usdt: raw.unrealisedPnl || raw.unrealisedProfit};
+          }
+          if (ex === 'bitget') {
+            const hold = String(raw.holdSide || '').toLowerCase();
+            const q = Number(raw.available || raw.total || raw.openQty || raw.pos || 0);
+            const signed = hold === 'short' ? -Math.abs(q) : Math.abs(q);
+            const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
+            const mark = Number(raw.marketPrice || raw.markPrice || 0);
+            const notional = Number(raw.totalUSDT || raw.usdtValue || 0) || (Math.abs(signed) * mark);
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.openPriceAvg || raw.avgOpenPrice, upnl_usdt: raw.unrealizedPL || raw.unrealisedPnl};
+          }
+          if (ex === 'hyperliquid') {
+            const p = (raw.position && typeof raw.position === 'object') ? raw.position : raw;
+            const szi = Number(p.szi || 0);
+            const sym = String(p.coin || raw.coin || '-');
+            const mark = Number(p.markPx || 0);
+            const notional = Number(p.positionValue || 0) || (Math.abs(szi) * mark);
+            return {exchange: ex, symbol: sym, side: szi >= 0 ? 'long' : 'short', size: Math.abs(szi), value_usdt: notional, entry: p.entryPx, upnl_usdt: p.unrealizedPnl};
+          }
+        } catch (e) {
+          return null;
+        }
+        return null;
+      }
+
+      // Balances
+      if (!rows.length) {
+        balancesBody.innerHTML = '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
+      } else {
+        balancesBody.innerHTML = rows.map(r => {
+          const ex = r.exchange || '-';
+          const err = r.error || '';
+          const b = pickBalanceFields(r.balance);
+          return `
+            <tr>
+              <td>${ex}</td>
+              <td class="muted">${b.currency}</td>
+              <td class="muted">${b.avail}</td>
+              <td class="muted">${b.wallet}</td>
+              <td class="muted">${err || '-'}</td>
+            </tr>
+          `;
+        }).join('');
+      }
+
+      // Positions
+      const posRows = [];
+      for (const r of rows) {
+        const ex = r.exchange;
+        const err = r.error;
+        if (err) continue;
+        const ps = Array.isArray(r.positions) ? r.positions : [];
+        for (const p of ps) {
+          const n = normalizePosition(ex, p);
+          if (!n) continue;
+          if (!n.symbol || n.symbol === '-') continue;
+          if (!Number.isFinite(Number(n.size)) || Number(n.size) <= 0) continue;
+          posRows.push(n);
+        }
+      }
+
+      if (!posRows.length) {
+        positionsBody.innerHTML = '<tr><td colspan="8" class="muted">暂无持仓（或查询失败）</td></tr>';
+      } else {
+        positionsBody.innerHTML = posRows.map(p => {
+          const entry = fmt(p.entry, 8);
+          const value = fmt(p.value_usdt, 4);
+          const upnl = fmt(p.upnl_usdt, 6);
+          const size = fmt(p.size, 8);
+          return `
+            <tr>
+              <td>${p.exchange}</td>
+              <td>${p.symbol}</td>
+              <td class="muted">${p.side}</td>
+              <td class="muted">${size}</td>
+              <td class="muted">${value}</td>
+              <td class="muted">${entry}</td>
+              <td class="muted">${upnl}</td>
+              <td>
+                <button class="secondary" onclick="flattenPosition('${p.exchange}','${p.symbol}')">一键平仓</button>
+              </td>
+            </tr>
+          `;
+        }).join('');
+      }
+    }
+
+    async function flattenPosition(exchange, symbol) {
+      if (!confirm(`确认一键平仓：${exchange} ${symbol}?\\n\\n将查询该交易所该币种持仓并 reduce-only 市价打平。\\n若存在 open/opening/closing 信号，将拒绝执行。`)) return;
+      const detailsSummary = document.getElementById('detailsSummary');
+      const detailsPre = document.getElementById('detailsPre');
+      detailsSummary.textContent = `flatten ${exchange} ${symbol} ...`;
+      detailsPre.textContent = '...';
+      try {
+        const resp = await postJson('/api/live_trading/flatten_position', {exchange, symbol});
+        detailsSummary.textContent = JSON.stringify(resp.result || resp, null, 2);
+        detailsPre.textContent = JSON.stringify(resp, null, 2);
+        await refreshPositions();
         await refresh();
       } catch (e) {
         detailsSummary.textContent = String(e);
@@ -331,13 +536,17 @@
     }
 
     async function refreshPositions() {
-      const detailsPre = document.getElementById('detailsPre');
-      detailsPre.textContent = 'loading positions...';
+      const nonzero = document.getElementById('posNonzeroOnly')?.checked ? '1' : '0';
+      document.getElementById('balancesBody').innerHTML = '<tr><td colspan="5" class="muted">loading...</td></tr>';
+      document.getElementById('positionsBody').innerHTML = '<tr><td colspan="7" class="muted">loading...</td></tr>';
       try {
-        const pos = await fetchJson('/api/live_trading/positions?limit=30');
-        detailsPre.textContent = JSON.stringify(pos, null, 2);
+        const pos = await fetchJson(`/api/live_trading/positions?all=1&nonzero=${encodeURIComponent(nonzero)}`);
+        document.getElementById('posTs').textContent = `更新时间：${pos.timestamp || '-'}`;
+        renderPositionsAndBalances(pos);
       } catch (e) {
-        detailsPre.textContent = String(e);
+        document.getElementById('posTs').textContent = String(e);
+        document.getElementById('balancesBody').innerHTML = `<tr><td colspan="5" class="muted">${String(e)}</td></tr>`;
+        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="7" class="muted">${String(e)}</td></tr>`;
       }
     }
 
@@ -349,6 +558,8 @@
 
     document.getElementById('refreshBtn').addEventListener('click', () => refresh().catch(err => console.error(err)));
     document.getElementById('posBtn').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
+    document.getElementById('posBtn2').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
+    document.getElementById('posNonzeroOnly').addEventListener('change', () => refreshPositions().catch(err => console.error(err)));
     document.getElementById('refreshSec').addEventListener('change', () => schedule());
     document.getElementById('signalsLimit').addEventListener('change', () => refresh().catch(err => console.error(err)));
     document.getElementById('filterSymbol').addEventListener('change', () => refresh().catch(err => console.error(err)));

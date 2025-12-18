@@ -37,10 +37,16 @@ from trading.trade_executor import (
     execute_perp_market_batch,
     get_supported_trading_backends,
     get_binance_perp_positions,
+    get_binance_perp_usdt_balance,
     get_okx_swap_positions,
+    get_okx_swap_contract_value,
+    get_okx_account_balance,
     get_bybit_linear_positions,
+    get_bybit_wallet_balance,
     get_bitget_usdt_perp_positions,
+    get_bitget_usdt_balance,
     get_hyperliquid_perp_positions,
+    get_hyperliquid_balance_summary,
 )
 from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
 from watchlist_manager import WatchlistManager
@@ -2579,7 +2585,7 @@ def live_trading_samples():
 @app.route('/api/live_trading/positions')
 def live_trading_positions():
     """
-    Query live positions (REST) for current open/closing signals.
+    Query live positions/balances (REST) for exchanges.
     Note: this endpoint calls exchange private APIs using config_private credentials.
     """
     if psycopg is None:
@@ -2587,6 +2593,8 @@ def live_trading_positions():
 
     signal_id = request.args.get('signal_id')
     limit = min(max(int(request.args.get('limit', 50) or 50), 1), 100)
+    query_all = str(request.args.get('all') or '').lower() in {'1', 'true', 'yes', 'y'}
+    only_nonzero = str(request.args.get('nonzero') or '1').lower() not in {'0', 'false', 'no', 'n'}
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
@@ -2612,41 +2620,110 @@ def live_trading_positions():
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
+    def _pos_nonzero(exchange: str, row: Any) -> bool:
+        if not only_nonzero:
+            return True
+        if not isinstance(row, dict):
+            return False
+        ex = (exchange or '').lower()
+        try:
+            if ex == 'binance':
+                return abs(float(row.get('positionAmt') or 0.0)) > 1e-12
+            if ex == 'okx':
+                return abs(float(row.get('pos') or row.get('sz') or 0.0)) > 1e-12
+            if ex == 'bybit':
+                return abs(float(row.get('size') or row.get('qty') or 0.0)) > 1e-12
+            if ex == 'bitget':
+                raw = row.get('available') or row.get('total') or row.get('openQty') or row.get('pos') or 0.0
+                return abs(float(raw or 0.0)) > 1e-12
+            if ex == 'hyperliquid':
+                p = row.get('position') if isinstance(row.get('position'), dict) else row
+                return abs(float(p.get('szi') or 0.0)) > 1e-12
+        except Exception:
+            return True
+        return True
+
+    supported = set()
+    try:
+        backends = get_supported_trading_backends() if callable(get_supported_trading_backends) else None
+        if isinstance(backends, dict):
+            supported = set([str(x).lower() for x in (backends.get("perpetual") or [])])
+        elif isinstance(backends, (list, tuple, set)):
+            supported = set([str(x).lower() for x in backends])
+    except Exception:
+        supported = set()
+    default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid']
+    exchanges = [ex for ex in default_exchanges if not supported or ex in supported]
+
     targets: List[Dict[str, str]] = []
-    for s in signals or []:
-        if not isinstance(s, dict):
-            continue
-        sym = str(s.get('symbol') or '').upper()
-        if not sym:
-            continue
-        for exch in [s.get('leg_long_exchange'), s.get('leg_short_exchange')]:
-            ex = str(exch or '').lower()
-            if ex:
-                targets.append({'exchange': ex, 'symbol': sym})
+    if query_all:
+        for ex in exchanges:
+            targets.append({'exchange': ex, 'symbol': ''})
+    else:
+        for s in signals or []:
+            if not isinstance(s, dict):
+                continue
+            sym = str(s.get('symbol') or '').upper()
+            if not sym:
+                continue
+            for exch in [s.get('leg_long_exchange'), s.get('leg_short_exchange')]:
+                ex = str(exch or '').lower()
+                if ex:
+                    targets.append({'exchange': ex, 'symbol': sym})
 
     uniq = {(t['exchange'], t['symbol']) for t in targets}
     results: List[Dict[str, Any]] = []
     for ex, sym in sorted(uniq):
         try:
+            balance = None
+            positions: Any = []
             if ex == 'binance':
-                pos = get_binance_perp_positions(symbol=f"{sym}USDT")
+                balance = get_binance_perp_usdt_balance()
+                positions = get_binance_perp_positions(symbol=f"{sym}USDT") if sym else get_binance_perp_positions()
             elif ex == 'okx':
-                pos = get_okx_swap_positions(symbol=sym)
+                balance = get_okx_account_balance(ccy="USDT")
+                positions = get_okx_swap_positions(symbol=sym) if sym else get_okx_swap_positions()
+                if isinstance(positions, list) and positions:
+                    for p in positions:
+                        if not isinstance(p, dict):
+                            continue
+                        try:
+                            inst = str(p.get("instId") or "")
+                            base_sym = inst.split("-")[0].upper() if inst else (sym or "")
+                            if base_sym:
+                                ct_val = float(get_okx_swap_contract_value(base_sym))
+                                raw_pos = p.get("pos") or p.get("sz") or 0
+                                base_size = float(raw_pos or 0) * ct_val
+                                p["_ctVal"] = ct_val
+                                p["_base_size"] = base_size
+                        except Exception:
+                            continue
             elif ex == 'bybit':
-                pos = get_bybit_linear_positions(symbol=f"{sym}USDT", category="linear")
+                balance = get_bybit_wallet_balance(coin="USDT", account_type="UNIFIED")
+                positions = (
+                    get_bybit_linear_positions(symbol=f"{sym}USDT", category="linear")
+                    if sym
+                    else get_bybit_linear_positions(category="linear", settle_coin="USDT")
+                )
             elif ex == 'bitget':
-                pos = get_bitget_usdt_perp_positions(symbol=f"{sym}USDT")
+                balance = get_bitget_usdt_balance(margin_coin="USDT")
+                positions = get_bitget_usdt_perp_positions(symbol=f"{sym}USDT") if sym else get_bitget_usdt_perp_positions()
             elif ex == 'hyperliquid':
-                pos = get_hyperliquid_perp_positions()
+                balance = get_hyperliquid_balance_summary()
+                positions = get_hyperliquid_perp_positions()
             else:
-                pos = []
-            results.append({'exchange': ex, 'symbol': sym, 'positions': pos, 'error': None})
-        except TradeExecutionError as exc:
-            results.append({'exchange': ex, 'symbol': sym, 'positions': None, 'error': str(exc)})
-        except Exception as exc:
-            results.append({'exchange': ex, 'symbol': sym, 'positions': None, 'error': f"{type(exc).__name__}: {exc}"})
+                balance = None
+                positions = []
 
-    return jsonify({'timestamp': now_utc_iso(), 'targets': list(uniq), 'results': results})
+            if isinstance(positions, list):
+                positions = [p for p in positions if _pos_nonzero(ex, p)]
+            results.append({'exchange': ex, 'symbol': sym or None, 'balance': balance, 'positions': positions, 'error': None})
+        except TradeExecutionError as exc:
+            results.append({'exchange': ex, 'symbol': sym or None, 'balance': None, 'positions': None, 'error': str(exc)})
+        except Exception as exc:
+            results.append({'exchange': ex, 'symbol': sym or None, 'balance': None, 'positions': None, 'error': f"{type(exc).__name__}: {exc}"})
+
+    return jsonify({'timestamp': now_utc_iso(), 'mode': 'all' if query_all else 'active', 'only_nonzero': only_nonzero, 'targets': list(uniq), 'results': results})
 
 
 @app.route('/api/live_trading/force_close', methods=['POST'])
@@ -2666,6 +2743,27 @@ def live_trading_force_close():
         result = live_trading_manager.manual_force_close(signal_id_i)
         if not result.get('ok'):
             return jsonify({'error': result.get('error') or 'force_close failed', 'result': result, 'timestamp': now_utc_iso()}), 400
+        return jsonify({'timestamp': now_utc_iso(), 'result': result})
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+
+@app.route('/api/live_trading/flatten_position', methods=['POST'])
+def live_trading_flatten_position():
+    """Manual flatten a single exchange+symbol position (best-effort, safe)."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    payload = request.get_json(silent=True) or {}
+    exchange = (payload.get('exchange') or '').strip().lower()
+    symbol = (payload.get('symbol') or '').strip().upper()
+    if not exchange or not symbol:
+        return jsonify({'error': 'missing exchange/symbol', 'timestamp': now_utc_iso()}), 400
+
+    try:
+        result = live_trading_manager.manual_flatten_position(exchange=exchange, symbol=symbol)
+        if not result.get('ok'):
+            return jsonify({'error': result.get('error') or 'flatten failed', 'result': result, 'timestamp': now_utc_iso()}), 400
         return jsonify({'timestamp': now_utc_iso(), 'result': result})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
