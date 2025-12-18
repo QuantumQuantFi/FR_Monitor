@@ -270,7 +270,8 @@ LIVE_TRADING_CONFIG = {
     'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
     # 订单簿快速复核：在“决定开仓/止盈平仓”前做多次短间隔验算，避免瞬时价差假信号。
     # 注意：每次验算会同时请求两家交易所的订单簿（REST），请结合限频调整。
-    'orderbook_confirm_samples': int(float(_get_private('LIVE_TRADING_OB_CONFIRM_SAMPLES', 'LIVE_TRADING_OB_CONFIRM_SAMPLES', '3'))),
+    # 临时策略：仅保留 i0（单次）复核，降低 skipped（后续可再改回 3 次复核）。
+    'orderbook_confirm_samples': int(float(_get_private('LIVE_TRADING_OB_CONFIRM_SAMPLES', 'LIVE_TRADING_OB_CONFIRM_SAMPLES', '1'))),
     'orderbook_confirm_sleep_seconds': float(_get_private('LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', 'LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', '0.7')),
     # 强制平仓：开仓后最大持仓天数（默认 1 天）
     'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '1'))),
