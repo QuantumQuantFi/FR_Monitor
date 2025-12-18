@@ -2352,7 +2352,7 @@ class LiveTradingManager:
     def _load_open_quantities(self, conn, signal_id: int) -> Tuple[Optional[float], Optional[float]]:
         rows = conn.execute(
             """
-            SELECT leg, quantity
+            SELECT leg, quantity, filled_qty
               FROM watchlist.live_trade_order
              WHERE signal_id=%s
                AND action='open'
@@ -2366,11 +2366,22 @@ class LiveTradingManager:
             if not isinstance(r, dict):
                 continue
             leg = str(r.get("leg") or "")
-            qty_raw = r.get("quantity")
-            try:
-                qty_val = float(qty_raw)
-            except Exception:
-                continue
+            qty_val: Optional[float] = None
+            filled_qty = r.get("filled_qty")
+            if filled_qty is not None:
+                try:
+                    filled_f = float(filled_qty)
+                except Exception:
+                    filled_f = 0.0
+                if filled_f > 0:
+                    qty_val = filled_f
+
+            if qty_val is None:
+                qty_raw = r.get("quantity")
+                try:
+                    qty_val = float(qty_raw)
+                except Exception:
+                    continue
             if leg == "long" and qty_long is None:
                 qty_long = qty_val
             elif leg == "short" and qty_short is None:
@@ -2520,6 +2531,46 @@ class LiveTradingManager:
             )
             return
 
+        # Post-close verify: ensure both legs are flat (Hyperliquid is netted/one-way so we must query actual szi).
+        # If not flat, try a best-effort flatten and keep status=closing so the monitor loop can retry.
+        try:
+            for ex in {str(long_ex), str(short_ex)}:
+                if ex:
+                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex)
+
+            pos_long = self._get_exchange_position_size(str(long_ex), symbol)
+            pos_short = self._get_exchange_position_size(str(short_ex), symbol)
+            if (pos_long is not None and abs(float(pos_long)) > 1e-9) or (
+                pos_short is not None and abs(float(pos_short)) > 1e-9
+            ):
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="close_verify",
+                    error_type="PositionNotFlat",
+                    message="position not flat after close; keeping status=closing",
+                    context={
+                        "symbol": symbol,
+                        "long_ex": long_ex,
+                        "short_ex": short_ex,
+                        "pos_long": pos_long,
+                        "pos_short": pos_short,
+                    },
+                )
+                self._update_signal_status(conn, signal_id, "closing", reason="position_not_flat_after_close")
+                return
+        except Exception as exc:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="close_verify",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex},
+            )
+            self._update_signal_status(conn, signal_id, "closing", reason="close_verify_error")
+            return
+
         self._update_signal_status(conn, signal_id, "closed")
 
     def _place_close_order(
@@ -2654,12 +2705,17 @@ class LiveTradingManager:
                     )
                 raise
         if ex == "hyperliquid":
-            # Hyperliquid close should be reduce-only IOC with explicit side to avoid SDK market_close() returning None.
-            close_side = "sell" if pos == "long" else "buy"
+            # Hyperliquid is one-way/netted; close by the *current* position size (szi) to avoid mismatches between
+            # requested qty vs actual filled qty (and to recover from historical partial-close bugs).
+            szi = float(self._get_hyperliquid_position_szi(symbol))
+            if abs(szi) <= 1e-9:
+                raise TradeExecutionError(f"Hyperliquid {symbol} position already flat; skip close")
+            close_side = "buy" if szi < 0 else "sell"
+            close_qty = abs(szi)
             return place_hyperliquid_perp_market_order(
                 symbol,
                 close_side,
-                quantity,
+                close_qty,
                 reduce_only=True,
                 client_order_id=client_order_id,
             )
