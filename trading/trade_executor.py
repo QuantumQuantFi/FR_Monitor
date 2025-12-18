@@ -818,6 +818,77 @@ def get_binance_perp_positions(
     return data if isinstance(data, list) else [data]
 
 
+def get_binance_perp_account(
+    *,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> Dict[str, Any]:
+    """Fetch Binance USDT-margined futures account snapshot via GET /fapi/v2/account."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+
+    params: List[tuple[str, str]] = [
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+    ]
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {
+        "X-MBX-APIKEY": creds.api_key,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}/fapi/v2/account"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance account error {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance account reject: {data}")
+    if not isinstance(data, dict):
+        raise TradeExecutionError(f"Binance account payload malformed: {data!r}")
+    return data
+
+
+def get_binance_perp_usdt_balance(
+    *,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> Dict[str, Any]:
+    """Return a normalized USDT balance snapshot for Binance futures."""
+    account = get_binance_perp_account(
+        recv_window=recv_window,
+        api_key=api_key,
+        secret_key=secret_key,
+        base_url=base_url,
+    )
+    assets = account.get("assets") or []
+    usdt = None
+    if isinstance(assets, list):
+        for item in assets:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("asset") or "").upper() == "USDT":
+                usdt = item
+                break
+    out: Dict[str, Any] = {"currency": "USDT"}
+    if isinstance(usdt, dict):
+        out.update(
+            {
+                "wallet_balance": usdt.get("walletBalance"),
+                "available_balance": usdt.get("availableBalance"),
+                "margin_balance": usdt.get("marginBalance"),
+                "unrealized_pnl": usdt.get("unrealizedProfit"),
+            }
+        )
+    return out
+
+
 def get_binance_perp_price(
     symbol: str,
     *,
@@ -981,6 +1052,67 @@ def get_okx_swap_positions(
     return data.get("data", [])
 
 
+def get_okx_account_balance(
+    *,
+    ccy: Optional[str] = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Fetch OKX account balance snapshot via GET /api/v5/account/balance."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    request_path = "/api/v5/account/balance"
+    params: List[tuple[str, str]] = []
+    if ccy:
+        params.append(("ccy", str(ccy).upper()))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX balance reject: {data}")
+    payload = data.get("data") or []
+    first = payload[0] if isinstance(payload, list) and payload else None
+    if not isinstance(first, dict):
+        return {"currency": (ccy or "").upper() or None, "raw": payload}
+    details = first.get("details") or []
+    cur = (ccy or "").upper() if ccy else None
+    item = None
+    if isinstance(details, list) and cur:
+        for d in details:
+            if not isinstance(d, dict):
+                continue
+            if str(d.get("ccy") or "").upper() == cur:
+                item = d
+                break
+    if not isinstance(item, dict):
+        item = first
+    return {
+        "currency": cur,
+        "cash_bal": item.get("cashBal"),
+        "avail_bal": item.get("availBal"),
+        "eq": item.get("eq"),
+        "u_time": first.get("uTime"),
+        "raw": item,
+    }
+
+
 def set_okx_swap_leverage(
     symbol: str,
     leverage: Union[int, str],
@@ -1086,6 +1218,20 @@ def _get_okx_instrument_filters(
     )
     _OKX_INSTRUMENT_CACHE[cache_key] = filters
     return filters
+
+
+def get_okx_swap_contract_value(
+    symbol: str,
+    *,
+    base_url: str = "https://www.okx.com",
+    inst_type: str = "SWAP",
+) -> float:
+    """Return OKX SWAP contract value (ctVal) for `symbol` (base units per contract)."""
+    filters = _get_okx_instrument_filters(symbol, base_url, inst_type=inst_type)
+    try:
+        return float(filters.contract_value)
+    except Exception as exc:
+        raise TradeExecutionError(f"OKX ctVal invalid for {symbol}: {filters.contract_value}") from exc
 
 
 def _get_bybit_symbol_filters(
@@ -1238,6 +1384,81 @@ def get_bybit_linear_positions(
     return result.get("list", []) if isinstance(result, dict) else []
 
 
+def get_bybit_wallet_balance(
+    *,
+    account_type: str = "UNIFIED",
+    coin: Optional[str] = "USDT",
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Fetch Bybit wallet balance via GET /v5/account/wallet-balance."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+    request_path = "/v5/account/wallet-balance"
+    params: List[tuple[str, str]] = [("accountType", str(account_type).upper())]
+    if coin:
+        params.append(("coin", str(coin).upper()))
+
+    params_sorted = sorted(params, key=lambda item: item[0])
+    query_str = urlencode(params_sorted)
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{query_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params_sorted, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit wallet balance reject: {data}")
+
+    result = data.get("result") or {}
+    rows = result.get("list") if isinstance(result, dict) else None
+    first = rows[0] if isinstance(rows, list) and rows else None
+    if not isinstance(first, dict):
+        return {"currency": (coin or "").upper() or None, "raw": data}
+    coins = first.get("coin") or []
+    cur = (coin or "").upper() if coin else None
+    item = None
+    if isinstance(coins, list) and cur:
+        for c in coins:
+            if not isinstance(c, dict):
+                continue
+            if str(c.get("coin") or "").upper() == cur:
+                item = c
+                break
+    if not isinstance(item, dict):
+        item = first
+    available = item.get("availableToWithdraw") or item.get("availableBalance")
+    if available in ("", None):
+        try:
+            equity = float(item.get("equity") or 0.0)
+            pos_im = float(item.get("totalPositionIM") or 0.0)
+            order_im = float(item.get("totalOrderIM") or 0.0)
+            est = equity - pos_im - order_im
+            if est < 0:
+                est = 0.0
+            available = f"{est:.8f}"
+        except Exception:
+            available = None
+    return {
+        "currency": cur,
+        "wallet_balance": item.get("walletBalance") or item.get("equity"),
+        "available_balance": available,
+        "equity": item.get("equity"),
+        "raw": item,
+    }
+
+
 def get_bybit_linear_order(
     symbol: str,
     *,
@@ -1353,6 +1574,76 @@ def get_bitget_usdt_perp_positions(
     if inst_filter:
         payload = [item for item in payload if (item.get("symbol") or "").upper() == inst_filter]
     return payload
+
+
+def get_bitget_usdt_perp_account(
+    *,
+    product_type: str = "USDT-FUTURES",
+    margin_coin: str = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Fetch Bitget mix account snapshot (best-effort V2 endpoint)."""
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+    request_path = "/api/v2/mix/account/accounts"
+    params: List[tuple[str, str]] = [
+        ("productType", _normalise_bitget_product_type(product_type)),
+        ("marginCoin", str(margin_coin).upper()),
+    ]
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget account reject: {data}")
+    payload = data.get("data")
+    if isinstance(payload, list) and payload:
+        first = payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
+        return first
+    if isinstance(payload, dict):
+        return payload
+    return data
+
+
+def get_bitget_usdt_balance(
+    *,
+    product_type: str = "USDT-FUTURES",
+    margin_coin: str = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Return a normalized USDT balance snapshot for Bitget (best-effort)."""
+    data = get_bitget_usdt_perp_account(
+        product_type=product_type,
+        margin_coin=margin_coin,
+        api_key=api_key,
+        secret_key=secret_key,
+        passphrase=passphrase,
+        base_url=base_url,
+    )
+    return {
+        "currency": str(margin_coin).upper(),
+        "available_balance": data.get("available"),
+        "equity": data.get("equity") or data.get("accountEquity") or data.get("usdtEquity"),
+        "raw": data,
+    }
 
 
 def _normalise_bitget_symbol(symbol: str) -> str:
@@ -2214,6 +2505,32 @@ def get_hyperliquid_perp_positions(
     state = get_hyperliquid_user_state(address=address, private_key=private_key, base_url=base_url, timeout=timeout)
     positions = state.get("assetPositions") or []
     return positions if isinstance(positions, list) else []
+
+
+def get_hyperliquid_balance_summary(
+    *,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return a normalized account balance summary for Hyperliquid (USDC-margined)."""
+    state = get_hyperliquid_user_state(address=address, private_key=private_key, base_url=base_url, timeout=timeout)
+    summary = state.get("marginSummary") or {}
+    cross = state.get("crossMarginSummary") or {}
+    withdrawable = summary.get("withdrawable")
+    if withdrawable in (None, "", "null"):
+        withdrawable = state.get("withdrawable")
+    return {
+        "currency": "USDC",
+        "account_value": summary.get("accountValue"),
+        "total_margin_used": summary.get("totalMarginUsed"),
+        "total_ntl_pos": summary.get("totalNtlPos"),
+        "withdrawable": withdrawable,
+        "available_balance": withdrawable,
+        "raw_margin_summary": summary,
+        "raw_cross_margin_summary": cross,
+    }
 
 
 _HYPERLIQUID_META_AT = 0.0
