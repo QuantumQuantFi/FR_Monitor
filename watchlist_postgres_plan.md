@@ -131,17 +131,27 @@
 ## 6. 交易记录落库（你提出的第 4 条）
 建议：继续使用 **现有 PostgreSQL（schema=`watchlist`）**，新增几张“实盘交易表”，避免把实盘细节塞进 `watchlist_outcome`（语义不同）。
 
-推荐最小表（一期）：
+推荐最小表（一期，已落地并持续迭代）：
 1) `watchlist.live_trade_signal`
    - `id bigserial pk`, `created_at timestamptz`, `event_id bigint`, `symbol text`, `signal_type char(1)`
    - `horizon_min int`, `pnl_hat double precision`, `win_prob double precision`, `threshold jsonb`
-   - `leg_long_exchange text`, `leg_short_exchange text`, `status text`（new/ignored/opening/open/closing/closed/failed）
-   - `reason text`, `payload jsonb`（保存 trigger_details/pnl_regression 快照）
+   - `leg_long_exchange text`, `leg_short_exchange text`, `status text`（new/ignored/skipped/opening/open/closing/closed/failed）
+   - 关键风控/复盘字段（建议重点关注）：
+     - `entry_spread_metric`：Type B 的“入场可成交价差口径”（按实际下单名义金额扫盘得到的 log 指标），用于后续实时监控与出场判定基准
+     - `pnl_hat_ob`：开仓前用订单簿复核后的预测值（同一 horizon；用于 TP 阈值）
+     - `take_profit_pnl`：止盈阈值（默认 `take_profit_ratio * pnl_hat_ob`，例如 0.8×）
+     - `last_spread_metric / last_pnl_spread`：持仓期间每 ~1min 计算并刷新（页面 `last_pnl` 展示的就是 `last_pnl_spread`，不是回归预测）
+     - `opened_at / close_requested_at / closed_at / force_close_at`：开仓/平仓请求/完成/强平时间点（开仓与平仓是两个不同时间点，必须分别记录）
+   - `reason text`, `payload jsonb`（保存 trigger_details/pnl_regression + 订单簿复核与执行的关键快照，便于复盘）
 2) `watchlist.live_trade_order`
    - `id bigserial pk`, `signal_id bigint`, `leg text`（long/short）, `exchange text`, `client_order_id text`
-   - `submitted_at timestamptz`, `order_resp jsonb`, `normalized_qty text`, `status text`
+   - `submitted_at timestamptz`, `order_resp jsonb`, `status text`
+   - 成交回填（best-effort）：`filled_qty / avg_price / cum_quote / exchange_order_id`
+     - 说明：部分交易所“下单回执”不含成交信息，需要二次查询订单/成交回填；因此允许为空，但原始 `order_resp` 必须保留以便后续回填/审计
 3) `watchlist.live_trade_spread_sample`
-   - `id bigserial pk`, `signal_id bigint`, `ts timestamptz`, `bidask jsonb`, `spread double precision`, `pnl_est double precision`
+   - `id bigserial pk`, `signal_id bigint`, `ts timestamptz`
+   - `long_sell_px / short_buy_px`（按当前持仓数量扫盘得到的“可平仓价格口径”）
+   - `spread_metric / pnl_spread / pnl_hat_ob / take_profit_pnl / decision / context(jsonb)`（保存每次监控的原始订单簿摘要与决策依据）
 
 二期再加：
 - `live_trade_fill`（成交明细/均价）、`live_trade_exit`（平仓原因、最终 pnl）、`live_trade_error`（异常）。
@@ -149,14 +159,24 @@
 ---
 
 ## 7. 价差监听与止盈/强平（你提出的第 5 条）
-- 频率：1min（可配置）；每次同时拉两家订单簿（并发），用同一时间窗计算价差，避免“时序错位”。
-- 数据源：优先 REST（你要求的实时性与一致性），复用 `orderbook_utils.fetch_orderbook_prices()`；扫单名义建议用 `20~50 USDT`，更贴近我们实际平仓滑点。
-- 止盈：当“实时可平仓 pnl_est”达到 `0.8 * pnl_hat`（同一 horizon 的预测）触发平仓。
-- 强平：持有时间超过 7 天强制平仓（不管 pnl）。
-- 额外风控（建议）：
-  - 最大同时持仓数（例如 3~10）
-  - 单币种单方向只允许 1 笔活跃交易
-  - 交易所 API 错误时退避（指数 backoff）并告警/打日志
+- 频率：约 1min（可配置）；每次 **同时** 拉两家订单簿（并发），避免“时序错位”导致假价差。
+- 数据源：优先 REST（你要求的实时性与一致性），用 `orderbook_utils.fetch_orderbook_prices_for_quantity()` 按“当前持仓数量”扫盘，口径尽可能贴近市价单可成交均价。
+- `last_pnl` 的含义（页面展示列）：它对应 `last_pnl_spread`，不是回归输出；是“如果现在立刻平仓，按两边订单簿扫盘可成交价格估算的价差收益指标”。
+  - 计算口径（Type B）：
+    - `spread_now = ln(short_buy / long_sell)`，其中 `long_sell`=卖出平多的扫盘均价、`short_buy`=买入平空的扫盘均价
+    - `pnl_spread_now = entry_spread_metric - spread_now`
+    - 持仓期间每次监控都会把 `last_spread_metric/last_pnl_spread` 刷新到 `live_trade_signal`，并同时把一条样本写入 `live_trade_spread_sample` 便于复盘
+- 止盈：当 `pnl_spread_now >= take_profit_pnl` 触发“平仓候选”，其中：
+  - `take_profit_pnl` 默认 `take_profit_ratio * pnl_hat_ob`（例如 0.8×）
+  - 为防止盘口瞬时跳变导致“触发即打回”，会做短间隔多次确认（默认 3 次、间隔约 0.7s），全部通过才真正进入平仓下单
+- 强平：持有时间超过 `max_hold_days` 强制平仓（不依赖 pnl）。当前业务要求为 **1 天**；如果配置从 7 天缩短到 1 天，已开仓的单也应同步缩短其 `force_close_at`（避免旧仓位继续按 7 天滞留）。
+
+### 7.1 开仓前订单簿复核（避免假信号；已落地）
+- watchlist 侧的 `pnl_hat/win_prob` 可能基于 last/mark 等口径，不等于“可成交价差”；因此开仓前必须用订单簿按名义金额扫盘复算并复核。
+- 当前实现为“三次复核”（默认 3 次、间隔约 0.7s），要求每次都通过阈值且方向一致，否则写入 `live_trade_signal` 为 `skipped` 并记录原因：
+  - `no_tradable_direction`：两种方向都无法得到正的“可成交价差”（扫盘后满足不了 `short_sell > long_buy`）
+  - `not_ok`：存在方向，但至少一次复核样本的 `pnl_hat_ob/win_prob_ob` 掉出阈值（或复核过程出现无法细分的失败）
+- 为便于复盘，复核阶段会把每一次采样的订单簿结果、HTTP meta（含可能的 rate-limit 线索）与扫盘摘要写入 `payload.orderbook_confirm_open.series[]`，用于解释“为什么 skipped”。
 
 ---
 
@@ -177,7 +197,7 @@ Phase 1（最小可用，先跑通）：
 5) UI：增加 `/live_trading` 页面展示信号与执行状态；加 BTC 20U 手动按钮（复用现有交易面板）。
 
 Phase 2（监控与平仓闭环）：
-6) 1min 订单簿监听与 pnl_est 计算；达到 0.8*pnl_hat 止盈；>7d 强平。
+6) 1min 订单簿监听与 `last_pnl_spread` 计算；达到 `take_profit_ratio * pnl_hat_ob` 止盈（默认 0.8×）；>`max_hold_days` 强平（当前 1 天）。
 7) 完善失败回滚、重试、告警日志；补齐 open orders 查询（若确实需要展示委托）。
 
 Phase 3（策略与质量）：
