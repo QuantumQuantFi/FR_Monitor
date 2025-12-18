@@ -386,9 +386,32 @@ def _okx_fetch_schedule(base: str) -> Optional[Dict[str, Any]]:
     entry = data[0]
 
     schedule: Dict[str, Any] = {'timestamp': _now_iso()}
-    next_ft = normalize_next_funding_time(entry.get('nextFundingTime'))
-    if next_ft:
-        schedule['next_funding_time'] = next_ft
+    # OKX 有时会把 fundingTime 设为“下一次结算时间”（而不是上一期结算），
+    # 因此取 (fundingTime, nextFundingTime) 中“最早且在未来”的那个作为 next。
+    ft = normalize_next_funding_time(entry.get('fundingTime'))
+    nft = normalize_next_funding_time(entry.get('nextFundingTime'))
+    try:
+        now = datetime.now(timezone.utc)
+        cand = []
+        for x in (ft, nft):
+            if not x:
+                continue
+            dt = datetime.fromisoformat(str(x).replace('Z', '+00:00'))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            if dt > (now - timedelta(seconds=60)):
+                cand.append(dt.astimezone(timezone.utc))
+        if cand:
+            schedule['next_funding_time'] = min(cand).isoformat()
+        elif nft:
+            schedule['next_funding_time'] = nft
+        elif ft:
+            schedule['next_funding_time'] = ft
+    except Exception:
+        if nft:
+            schedule['next_funding_time'] = nft
+        elif ft:
+            schedule['next_funding_time'] = ft
     interval = derive_interval_hours_from_times(entry.get('fundingTime'), entry.get('nextFundingTime'))
     if interval:
         schedule['funding_interval_hours'] = float(interval)

@@ -853,6 +853,58 @@ def get_binance_perp_account(
     return data
 
 
+def get_binance_funding_fee_income(
+    *,
+    symbol: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 1000,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> List[Dict[str, Any]]:
+    """Return Binance futures funding fee income records via GET /fapi/v1/income.
+
+    Notes
+    - Uses `incomeType=FUNDING_FEE`.
+    - Amount is returned in `income` (typically USDT) with its own sign.
+    """
+    creds = _resolve_binance_credentials(api_key, secret_key)
+
+    params: List[tuple[str, str]] = [
+        ("incomeType", "FUNDING_FEE"),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+        ("limit", str(min(max(int(limit or 1000), 1), 1000))),
+    ]
+    if symbol:
+        pair = symbol.upper()
+        if not pair.endswith("USDT"):
+            pair = f"{pair}USDT"
+        params.append(("symbol", pair))
+    if start_time_ms is not None:
+        params.append(("startTime", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("endTime", str(int(end_time_ms))))
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {"X-MBX-APIKEY": creds.api_key, "User-Agent": USER_AGENT}
+    url = f"{base_url}/fapi/v1/income"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance income query failed {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance income reject: {data}")
+    if not isinstance(data, list):
+        raise TradeExecutionError(f"Binance income payload malformed: {data!r}")
+    return data
+
+
 def get_binance_perp_usdt_balance(
     *,
     recv_window: int = 5000,
@@ -1111,6 +1163,73 @@ def get_okx_account_balance(
         "u_time": first.get("uTime"),
         "raw": item,
     }
+
+
+def get_okx_funding_fee_bills(
+    *,
+    symbol: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    inst_type: str = "SWAP",
+    limit: int = 100,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> List[Dict[str, Any]]:
+    """Return OKX funding fee bills (best-effort) via GET /api/v5/account/bills.
+
+    We try server-side filtering with `type=8` first (funding fees on most OKX
+    accounts). When that returns empty, we fall back to fetching without the
+    `type` filter and then filter client-side.
+    """
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        inst_id = f"{inst_id}-USDT-SWAP"
+
+    request_path = "/api/v5/account/bills"
+
+    def _do_query(type_filter: Optional[str]) -> List[Dict[str, Any]]:
+        params: List[tuple[str, str]] = [("instType", inst_type.upper()), ("instId", inst_id)]
+        if type_filter:
+            params.append(("type", str(type_filter)))
+        if start_time_ms is not None:
+            params.append(("begin", str(int(start_time_ms))))
+        if end_time_ms is not None:
+            params.append(("end", str(int(end_time_ms))))
+        params.append(("limit", str(min(max(int(limit or 100), 1), 100))))
+
+        query_str = urlencode(params)
+        timestamp = _iso_timestamp()
+        target = f"{request_path}?{query_str}" if query_str else request_path
+        message = f"{timestamp}GET{target}"
+        signature = _hmac_sha256_base64(creds.secret_key, message)
+
+        headers = {
+            "OK-ACCESS-KEY": creds.api_key,
+            "OK-ACCESS-SIGN": signature,
+            "OK-ACCESS-TIMESTAMP": timestamp,
+            "OK-ACCESS-PASSPHRASE": creds.passphrase,
+            "User-Agent": USER_AGENT,
+        }
+
+        url = f"{base_url}{request_path}"
+        response = _send_request("GET", url, params=params, headers=headers)
+        data = _json_or_error(response)
+        if response.status_code != 200 or data.get("code") != "0":
+            raise TradeExecutionError(f"OKX bills reject: {data}")
+        payload = data.get("data") or []
+        if not isinstance(payload, list):
+            raise TradeExecutionError(f"OKX bills payload malformed: {data!r}")
+        return payload
+
+    rows = _do_query("8")
+    if rows:
+        return rows
+    rows = _do_query(None)
+    return [r for r in rows if str(r.get("type") or "").strip() == "8"]
 
 
 def set_okx_swap_leverage(
@@ -1459,6 +1578,63 @@ def get_bybit_wallet_balance(
     }
 
 
+def get_bybit_funding_fee_transactions(
+    *,
+    symbol: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    category: str = "linear",
+    limit: int = 50,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> List[Dict[str, Any]]:
+    """Return Bybit funding fee transaction logs via GET /v5/account/transaction-log."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    request_path = "/v5/account/transaction-log"
+    params: List[tuple[str, str]] = [
+        ("category", str(category).lower()),
+        ("symbol", symbol_id),
+        ("type", "FUNDING"),
+        ("limit", str(min(max(int(limit or 50), 1), 50))),
+    ]
+    if start_time_ms is not None:
+        params.append(("startTime", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("endTime", str(int(end_time_ms))))
+
+    params_sorted = sorted(params, key=lambda item: item[0])
+    query_str = urlencode(params_sorted)
+
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{query_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params_sorted, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit transaction-log reject: {data}")
+    result = data.get("result") or {}
+    rows = result.get("list") if isinstance(result, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
 def get_bybit_linear_order(
     symbol: str,
     *,
@@ -1644,6 +1820,101 @@ def get_bitget_usdt_balance(
         "equity": data.get("equity") or data.get("accountEquity") or data.get("usdtEquity"),
         "raw": data,
     }
+
+
+def get_bitget_funding_fee_bills(
+    *,
+    symbol: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    product_type: str = "USDT-FUTURES",
+    margin_coin: str = "USDT",
+    limit: int = 100,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> List[Dict[str, Any]]:
+    """Return Bitget funding fee bill rows (best-effort).
+
+    Bitget OpenAPI V2 has seen multiple bill endpoints across versions.
+    We try a short list of known paths and return the first successful response.
+    """
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+
+    params: List[tuple[str, str]] = [
+        ("productType", _normalise_bitget_product_type(product_type)),
+        ("marginCoin", str(margin_coin).upper()),
+        ("symbol", _normalise_bitget_symbol(symbol)),
+        ("limit", str(min(max(int(limit or 100), 1), 100))),
+    ]
+    if start_time_ms is not None:
+        params.append(("startTime", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("endTime", str(int(end_time_ms))))
+
+    candidate_paths = (
+        "/api/v2/mix/account/account-bill",
+        "/api/v2/mix/account/accountBill",
+        "/api/v2/mix/account/bill",
+    )
+
+    last_error: Optional[str] = None
+    for request_path in candidate_paths:
+        query_str = urlencode(params)
+        timestamp = _iso_timestamp()
+        target = f"{request_path}?{query_str}" if query_str else request_path
+        message = f"{timestamp}GET{target}"
+        signature = _hmac_sha256_base64(creds.secret_key, message)
+
+        headers = {
+            "ACCESS-KEY": creds.api_key,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": creds.passphrase,
+            "User-Agent": USER_AGENT,
+        }
+
+        url = f"{base_url}{request_path}"
+        response = _send_request("GET", url, params=params, headers=headers)
+        data = _json_or_error(response)
+
+        # 404/40404: path likely not present in this deployment.
+        if response.status_code == 404 or str(data.get("code") or "") == "40404":
+            last_error = f"{request_path} not found: {data}"
+            continue
+        if response.status_code != 200 or data.get("code") != "00000":
+            last_error = f"{request_path} reject: {data}"
+            continue
+
+        payload = data.get("data")
+        if isinstance(payload, dict):
+            rows = payload.get("list") or payload.get("dataList") or payload.get("rows")
+            if isinstance(rows, list):
+                return _filter_bitget_funding_rows(rows)
+        if isinstance(payload, list):
+            return _filter_bitget_funding_rows(payload)
+        return []
+
+    raise TradeExecutionError(f"Bitget account bill reject: {last_error or 'no valid endpoint'}")
+
+
+def _filter_bitget_funding_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Best-effort client-side filter for Bitget funding fee bill rows."""
+    out: List[Dict[str, Any]] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        raw_type = str(r.get("businessType") or r.get("bizType") or r.get("type") or "").lower()
+        raw_sub = str(r.get("subType") or r.get("subBizType") or "").lower()
+        if "fund" in raw_type or "fund" in raw_sub:
+            out.append(r)
+            continue
+        # Some payloads use numeric enums; keep those too when we can detect.
+        if raw_type in {"8", "fundingfee", "funding_fee", "funding"}:
+            out.append(r)
+            continue
+    return out
 
 
 def _normalise_bitget_symbol(symbol: str) -> str:
@@ -2531,6 +2802,30 @@ def get_hyperliquid_balance_summary(
         "raw_margin_summary": summary,
         "raw_cross_margin_summary": cross,
     }
+
+
+def get_hyperliquid_user_funding_history(
+    *,
+    start_time_ms: int,
+    end_time_ms: Optional[int] = None,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> List[Dict[str, Any]]:
+    """Return Hyperliquid user funding history via Info.user_funding_history."""
+    if HyperliquidInfo is None:
+        raise TradeExecutionError("hyperliquid-python-sdk is required for Hyperliquid funding history")
+    creds = _resolve_hyperliquid_credentials(private_key, address, base_url=base_url)
+    info = HyperliquidInfo(base_url=creds.base_url, skip_ws=True, timeout=timeout)
+    payload = info.user_funding_history(
+        creds.address,
+        int(start_time_ms),
+        int(end_time_ms) if end_time_ms is not None else None,
+    )
+    if not isinstance(payload, list):
+        raise TradeExecutionError(f"Hyperliquid user_funding_history payload malformed: {payload!r}")
+    return payload
 
 
 _HYPERLIQUID_META_AT = 0.0

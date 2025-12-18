@@ -27,6 +27,9 @@
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
     @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
     .hint { border-bottom: 1px dotted #8b949e; cursor: help; }
+    .sort-btn { display: inline-block; padding: 0 4px; margin-left: 4px; border: 1px solid #263040; border-radius: 6px; color: #8b949e; cursor: pointer; user-select: none; font-size: 11px; line-height: 16px; }
+    .sort-btn:hover { color: #e6edf3; border-color: #3b4a60; }
+    .sort-btn.active { color: #e6edf3; border-color: #58a6ff; }
   </style>
 </head>
 <body>
@@ -88,6 +91,9 @@
               <th style="width: 130px;">
                 <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
               </th>
+              <th style="width: 140px;">
+                <span class="hint" title="FundingPnL(USDT)：从 opened_at 起，按交易所账户“已收/已付”资金费明细累加（两条腿叠加，best-effort；不同交易所回执字段不同，可能为空/延迟）。每小时整点后的首次刷新会更新一次（其余时间使用缓存）。">FundingPnL</span>
+              </th>
               <th style="width: 90px;">Status</th>
               <th style="width: 110px;">
                 <span class="hint" title="pnl_hat_ob：下单前用两家交易所订单簿“扫单成交价”（按每腿名义金额）重新计算关键因子，并在 horizon=240min 上回归预测得到的预计收益（小数，如 0.012=1.2%）。">pnl_hat_ob</span>
@@ -109,7 +115,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="22" class="muted">loading...</td></tr>
+            <tr><td colspan="23" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -160,18 +166,44 @@
           <table>
             <thead>
               <tr>
-                <th style="width: 120px;">Exchange</th>
-                <th style="width: 120px;">Symbol</th>
+                <th style="width: 140px;">
+                  Exchange
+                  <span class="sort-btn" id="sortExAsc" onclick="setPositionsSort('exchange','asc')">▲</span>
+                  <span class="sort-btn" id="sortExDesc" onclick="setPositionsSort('exchange','desc')">▼</span>
+                </th>
+                <th style="width: 140px;">
+                  Symbol
+                  <span class="sort-btn" id="sortSymAsc" onclick="setPositionsSort('symbol','asc')">▲</span>
+                  <span class="sort-btn" id="sortSymDesc" onclick="setPositionsSort('symbol','desc')">▼</span>
+                </th>
                 <th style="width: 90px;">Side</th>
                 <th style="width: 140px;">Size</th>
                 <th style="width: 160px;">Value(USDT)</th>
                 <th style="width: 140px;">Entry</th>
+                <th style="width: 140px;">
+                  <span class="hint" title="标记价格：用于估值/UPnL 的参考价格（best-effort，从公开接口获取；不同交易所口径略有差异）。">Mark</span>
+                </th>
+                <th style="width: 140px;">
+                  <span class="hint" title="当前资金费率（每个 funding 周期的费率，正值多付空收/负值多收空付，具体以交易所定义为准）。">Funding</span>
+                </th>
+                <th style="width: 120px;">
+                  <span class="hint" title="资金费结算周期（小时）。例如多数 CEX perp 为 8h，Hyperliquid 为 1h。">Interval(h)</span>
+                </th>
+                <th style="width: 140px;">
+                  <span class="hint" title="距离下一次资金费结算剩余时间（按公开接口 next_funding_time 计算）。">Next</span>
+                </th>
+                <th style="width: 140px;">
+                  <span class="hint" title="FundingPnL(USDT)：若该持仓能匹配到我们系统的 open 信号，则按 opened_at 起累计该币种资金费（best-effort，来自交易所账户资金费明细）。否则为空。">FundingPnL</span>
+                </th>
+                <th style="width: 140px;">
+                  <span class="hint" title="LastFee(USDT)：最近一次资金费入账/扣款金额（best-effort），hover 可查看 opened_at/last_time 等。">LastFee</span>
+                </th>
                 <th style="width: 140px;">UPnL(USDT)</th>
                 <th style="width: 120px;">Action</th>
               </tr>
             </thead>
             <tbody id="positionsBody">
-              <tr><td colspan="7" class="muted">点击“查询全部交易所持仓/余额”</td></tr>
+              <tr><td colspan="14" class="muted">点击“查询全部交易所持仓/余额”</td></tr>
             </tbody>
           </table>
         </div>
@@ -193,12 +225,48 @@
 
   <script>
     let refreshTimer = null;
+    let positionsCache = [];
+    let positionsSort = {key: null, dir: null};
 
     function fmt(v, nd=6) {
       if (v === null || v === undefined) return '-';
       const n = Number(v);
       if (!Number.isFinite(n)) return String(v);
       return n.toFixed(nd);
+    }
+
+    function fmtPct(v, nd=4) {
+      if (v === null || v === undefined) return '-';
+      const n = Number(v);
+      if (!Number.isFinite(n)) return String(v);
+      return (n * 100).toFixed(nd) + '%';
+    }
+
+    function fmtCountdown(iso) {
+      if (!iso) return '-';
+      const t = Date.parse(String(iso));
+      if (!Number.isFinite(t)) return '-';
+      const now = Date.now();
+      let diff = Math.floor((t - now) / 1000);
+      if (diff < 0) diff = 0;
+      const d = Math.floor(diff / 86400);
+      diff -= d * 86400;
+      const h = Math.floor(diff / 3600);
+      diff -= h * 3600;
+      const m = Math.floor(diff / 60);
+      const s = diff - m * 60;
+      if (d > 0) return `${d}d${h}h`;
+      if (h > 0) return `${h}h${String(m).padStart(2, '0')}m`;
+      return `${m}m${String(s).padStart(2, '0')}s`;
+    }
+
+    function escapeHtml(s) {
+      return String(s || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
     }
 
     function pillForStatus(status) {
@@ -253,7 +321,7 @@
       const body = document.getElementById('signalsBody');
       const signals = signalsResp.signals || [];
       if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="22" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="23" class="muted">暂无数据</td></tr>';
         return;
       }
 
@@ -265,6 +333,18 @@
         const bOpen = fmt(s.open_short_avg_price, 8);
         const bClose = fmt(s.close_short_avg_price, 8);
         const realized = fmt(s.realized_pnl_usdt, 6);
+        const src = s.funding_source || {};
+        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate');
+        const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
+        const schedL = s.funding_schedule_long || {};
+        const schedS = s.funding_schedule_short || {};
+        const fundingTitle = [
+          `funding_pnl_usdt_total=${s.funding_pnl_usdt ?? '-'}`,
+          `source_long=${src.long ?? '-'} source_short=${src.short ?? '-'}`,
+          `long(${s.leg_long_exchange || '-'}) pnl=${s.funding_long_pnl_usdt ?? '-'} last_fee=${s.funding_long_last_fee_usdt ?? '-'} last_time=${s.funding_long_last_fee_time ?? '-'} rate=${schedL.funding_rate ?? '-'} interval_h=${schedL.funding_interval_hours ?? '-'} next=${schedL.next_funding_time ?? '-'}`,
+          `short(${s.leg_short_exchange || '-'}) pnl=${s.funding_short_pnl_usdt ?? '-'} last_fee=${s.funding_short_last_fee_usdt ?? '-'} last_time=${s.funding_short_last_fee_time ?? '-'} rate=${schedS.funding_rate ?? '-'} interval_h=${schedS.funding_interval_hours ?? '-'} next=${schedS.next_funding_time ?? '-'}`,
+          s.funding_error ? `error=${JSON.stringify(s.funding_error)}` : '',
+        ].filter(Boolean).join('\n');
         const canForceClose = true;
         const createdAt = s.created_at || '-';
         const openAt = s.opened_at || '-';
@@ -285,6 +365,7 @@
             <td class="muted">${bOpen}</td>
             <td class="muted">${bClose}</td>
             <td class="muted">${realized}</td>
+            <td class="muted"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
             <td><span class="pill ${stCls}">${stText}</span></td>
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
@@ -299,6 +380,80 @@
             <td>
               <button class="secondary" onclick="loadDetails(${s.id})">Details</button>
               <button class="secondary" ${canForceClose ? '' : 'disabled'} onclick="forceClose(${s.id})">一键平仓</button>
+            </td>
+          </tr>
+        `;
+      }).join('');
+    }
+
+    function setPositionsSort(key, dir) {
+      positionsSort = {key, dir};
+      const btns = ['sortExAsc', 'sortExDesc', 'sortSymAsc', 'sortSymDesc'];
+      for (const id of btns) document.getElementById(id)?.classList.remove('active');
+      if (key === 'exchange' && dir === 'asc') document.getElementById('sortExAsc')?.classList.add('active');
+      if (key === 'exchange' && dir === 'desc') document.getElementById('sortExDesc')?.classList.add('active');
+      if (key === 'symbol' && dir === 'asc') document.getElementById('sortSymAsc')?.classList.add('active');
+      if (key === 'symbol' && dir === 'desc') document.getElementById('sortSymDesc')?.classList.add('active');
+      renderPositionsTable();
+    }
+
+    function renderPositionsTable() {
+      const positionsBody = document.getElementById('positionsBody');
+      const rows = (positionsCache || []).slice();
+
+      if (positionsSort?.key) {
+        const key = positionsSort.key;
+        const dir = positionsSort.dir === 'desc' ? -1 : 1;
+        rows.sort((a, b) => {
+          const av = (a?.[key] ?? '').toString();
+          const bv = (b?.[key] ?? '').toString();
+          return av.localeCompare(bv) * dir;
+        });
+      }
+
+      if (!rows.length) {
+        positionsBody.innerHTML = '<tr><td colspan="14" class="muted">暂无持仓（或查询失败）</td></tr>';
+        return;
+      }
+
+      positionsBody.innerHTML = rows.map(p => {
+        const entry = fmt(p.entry, 8);
+        const value = fmt(p.value_usdt, 4);
+        const upnl = fmt(p.upnl_usdt, 6);
+        const size = fmt(p.size, 8);
+        const mark = fmt(p.mark_price, 8);
+        const fr = fmtPct(p.funding_rate, 4);
+        const interval = fmt(p.funding_interval_hours, 2);
+        const next = fmtCountdown(p.next_funding_time);
+        const nextTitle = p.next_funding_time ? `next_funding_time=${p.next_funding_time}` : '';
+        const feeSrc = p.funding_source || null;
+        const feePnl = (feeSrc === 'rate_estimate' ? '~' : '') + fmt(p.funding_pnl_usdt, 6);
+        const lastFee = fmt(p.funding_last_fee_usdt, 6);
+        const feeTitle = [
+          `opened_at=${p.funding_opened_at || '-'}`,
+          `funding_pnl_usdt=${p.funding_pnl_usdt ?? '-'}`,
+          `last_fee_usdt=${p.funding_last_fee_usdt ?? '-'}`,
+          `last_fee_time=${p.funding_last_fee_time || '-'}`,
+          `source=${feeSrc || '-'}`,
+          p.funding_fee_error ? `error=${p.funding_fee_error}` : '',
+        ].filter(Boolean).join('\n');
+        return `
+          <tr>
+            <td>${p.exchange}</td>
+            <td>${p.symbol}</td>
+            <td class="muted">${p.side}</td>
+            <td class="muted">${size}</td>
+            <td class="muted">${value}</td>
+            <td class="muted">${entry}</td>
+            <td class="muted">${mark}</td>
+            <td class="muted">${fr}</td>
+            <td class="muted">${interval}</td>
+            <td class="muted" title="${nextTitle}">${next}</td>
+            <td class="muted"><span class="hint" title="${escapeHtml(feeTitle)}">${feePnl}</span></td>
+            <td class="muted"><span class="hint" title="${escapeHtml(feeTitle)}">${lastFee}</span></td>
+            <td class="muted">${upnl}</td>
+            <td>
+              <button class="secondary" onclick="flattenPosition('${p.exchange}','${p.symbol}')">一键平仓</button>
             </td>
           </tr>
         `;
@@ -338,13 +493,23 @@
       function normalizePosition(exchange, raw) {
         const ex = (exchange || '').toLowerCase();
         if (!raw || typeof raw !== 'object') return null;
+        const markPrice = raw.mark_price ?? raw.markPrice ?? raw.markPx ?? raw.marketPrice ?? null;
+        const fundingRate = raw.funding_rate ?? raw.fundingRate ?? null;
+        const fundingInterval = raw.funding_interval_hours ?? raw.fundingIntervalHours ?? raw.fundingIntervalHour ?? null;
+        const nextFunding = raw.next_funding_time ?? raw.nextFundingTime ?? raw.nextUpdate ?? null;
+        const fundingPnl = raw.funding_pnl_usdt ?? null;
+        const fundingLastFee = raw.funding_last_fee_usdt ?? null;
+        const fundingLastTime = raw.funding_last_fee_time ?? null;
+        const fundingOpenedAt = raw.funding_opened_at ?? null;
+        const fundingSource = raw.funding_source ?? raw.fundingSource ?? null;
+        const fundingFeeError = raw.funding_fee_error ?? raw.fundingFeeError ?? null;
         try {
           if (ex === 'binance') {
             const amt = Number(raw.positionAmt || 0);
             const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
             const mark = Number(raw.markPrice || 0);
             const notional = (raw.notional !== undefined && raw.notional !== null) ? Number(raw.notional) : (Math.abs(amt) * mark);
-            return {exchange: ex, symbol: sym, side: amt >= 0 ? 'long' : 'short', size: Math.abs(amt), value_usdt: notional, entry: raw.entryPrice, upnl_usdt: raw.unRealizedProfit};
+            return {exchange: ex, symbol: sym, side: amt >= 0 ? 'long' : 'short', size: Math.abs(amt), value_usdt: notional, entry: raw.entryPrice, upnl_usdt: raw.unRealizedProfit, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
           if (ex === 'okx') {
             const sz = Number(raw._base_size ?? raw.pos ?? raw.sz ?? 0);
@@ -353,7 +518,7 @@
             const signed = posSide === 'short' ? -Math.abs(sz) : Math.abs(sz);
             const mark = Number(raw.markPx || raw.last || 0);
             const notional = Math.abs(Number(raw.notionalUsd || 0)) || (Math.abs(signed) * mark);
-            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPx, upnl_usdt: raw.upl};
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPx, upnl_usdt: raw.upl, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
           if (ex === 'bybit') {
             const sz = Number(raw.size || raw.qty || 0);
@@ -362,7 +527,7 @@
             const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
             const mark = Number(raw.markPrice || 0);
             const notional = Number(raw.positionValue || 0) || (Math.abs(signed) * mark);
-            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPrice || raw.entryPrice, upnl_usdt: raw.unrealisedPnl || raw.unrealisedProfit};
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.avgPrice || raw.entryPrice, upnl_usdt: raw.unrealisedPnl || raw.unrealisedProfit, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
           if (ex === 'bitget') {
             const hold = String(raw.holdSide || '').toLowerCase();
@@ -371,7 +536,7 @@
             const sym = String(raw.symbol || '').replace(/USDT$/i, '') || '-';
             const mark = Number(raw.marketPrice || raw.markPrice || 0);
             const notional = Number(raw.totalUSDT || raw.usdtValue || 0) || (Math.abs(signed) * mark);
-            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.openPriceAvg || raw.avgOpenPrice, upnl_usdt: raw.unrealizedPL || raw.unrealisedPnl};
+            return {exchange: ex, symbol: sym, side: signed >= 0 ? 'long' : 'short', size: Math.abs(signed), value_usdt: notional, entry: raw.openPriceAvg || raw.avgOpenPrice, upnl_usdt: raw.unrealizedPL || raw.unrealisedPnl, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
           if (ex === 'hyperliquid') {
             const p = (raw.position && typeof raw.position === 'object') ? raw.position : raw;
@@ -379,7 +544,7 @@
             const sym = String(p.coin || raw.coin || '-');
             const mark = Number(p.markPx || 0);
             const notional = Number(p.positionValue || 0) || (Math.abs(szi) * mark);
-            return {exchange: ex, symbol: sym, side: szi >= 0 ? 'long' : 'short', size: Math.abs(szi), value_usdt: notional, entry: p.entryPx, upnl_usdt: p.unrealizedPnl};
+            return {exchange: ex, symbol: sym, side: szi >= 0 ? 'long' : 'short', size: Math.abs(szi), value_usdt: notional, entry: p.entryPx, upnl_usdt: p.unrealizedPnl, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
         } catch (e) {
           return null;
@@ -424,28 +589,11 @@
       }
 
       if (!posRows.length) {
-        positionsBody.innerHTML = '<tr><td colspan="8" class="muted">暂无持仓（或查询失败）</td></tr>';
+        positionsCache = [];
+        renderPositionsTable();
       } else {
-        positionsBody.innerHTML = posRows.map(p => {
-          const entry = fmt(p.entry, 8);
-          const value = fmt(p.value_usdt, 4);
-          const upnl = fmt(p.upnl_usdt, 6);
-          const size = fmt(p.size, 8);
-          return `
-            <tr>
-              <td>${p.exchange}</td>
-              <td>${p.symbol}</td>
-              <td class="muted">${p.side}</td>
-              <td class="muted">${size}</td>
-              <td class="muted">${value}</td>
-              <td class="muted">${entry}</td>
-              <td class="muted">${upnl}</td>
-              <td>
-                <button class="secondary" onclick="flattenPosition('${p.exchange}','${p.symbol}')">一键平仓</button>
-              </td>
-            </tr>
-          `;
-        }).join('');
+        positionsCache = posRows;
+        renderPositionsTable();
       }
     }
 
@@ -538,7 +686,7 @@
     async function refreshPositions() {
       const nonzero = document.getElementById('posNonzeroOnly')?.checked ? '1' : '0';
       document.getElementById('balancesBody').innerHTML = '<tr><td colspan="5" class="muted">loading...</td></tr>';
-      document.getElementById('positionsBody').innerHTML = '<tr><td colspan="7" class="muted">loading...</td></tr>';
+      document.getElementById('positionsBody').innerHTML = '<tr><td colspan="12" class="muted">loading...</td></tr>';
       try {
         const pos = await fetchJson(`/api/live_trading/positions?all=1&nonzero=${encodeURIComponent(nonzero)}`);
         document.getElementById('posTs').textContent = `更新时间：${pos.timestamp || '-'}`;
@@ -546,7 +694,7 @@
       } catch (e) {
         document.getElementById('posTs').textContent = String(e);
         document.getElementById('balancesBody').innerHTML = `<tr><td colspan="5" class="muted">${String(e)}</td></tr>`;
-        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="7" class="muted">${String(e)}</td></tr>`;
+        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="12" class="muted">${String(e)}</td></tr>`;
       }
     }
 

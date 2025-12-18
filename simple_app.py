@@ -23,6 +23,7 @@ from config import (
     MEMORY_OPTIMIZATION_CONFIG,
     WS_UPDATE_INTERVAL,
     WS_CONNECTION_CONFIG,
+    REST_CONNECTION_CONFIG,
     DB_WRITE_INTERVAL_SECONDS,
     WATCHLIST_CONFIG,
     WATCHLIST_PG_CONFIG,
@@ -38,15 +39,20 @@ from trading.trade_executor import (
     get_supported_trading_backends,
     get_binance_perp_positions,
     get_binance_perp_usdt_balance,
+    get_binance_funding_fee_income,
     get_okx_swap_positions,
     get_okx_swap_contract_value,
     get_okx_account_balance,
+    get_okx_funding_fee_bills,
     get_bybit_linear_positions,
     get_bybit_wallet_balance,
+    get_bybit_funding_fee_transactions,
     get_bitget_usdt_perp_positions,
     get_bitget_usdt_balance,
+    get_bitget_funding_fee_bills,
     get_hyperliquid_perp_positions,
     get_hyperliquid_balance_summary,
+    get_hyperliquid_user_funding_history,
 )
 from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
 from watchlist_manager import WatchlistManager
@@ -60,6 +66,13 @@ from orderbook_utils import (
     compute_orderbook_spread,
     DEFAULT_SWEEP_NOTIONAL,
 )
+from funding_utils import (
+    derive_funding_interval_hours,
+    derive_interval_hours_from_times,
+    normalize_next_funding_time,
+)
+from rest_collectors import get_hyperliquid_funding_map
+import requests
 # optional PG browse
 try:
     import psycopg
@@ -1178,6 +1191,434 @@ def now_utc_iso() -> str:
     Example: '2024-09-03T07:00:00.123456+00:00'
     """
     return datetime.now(timezone.utc).isoformat()
+
+
+_FUNDING_HISTORY_CACHE_LOCK = threading.Lock()
+_FUNDING_HISTORY_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_FUNDING_HISTORY_CACHE_TTL_SECONDS = 60.0
+
+
+def _dt_to_ms(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            v = int(value)
+        except Exception:
+            return None
+        return v if v > 10_000_000_000 else v * 1000
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except Exception:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    return None
+
+
+def _funding_fee_summary_since_open(
+    exchange: str,
+    symbol: str,
+    opened_at: Any,
+    *,
+    notional_usdt: Optional[float] = None,
+    pos_sign: Optional[int] = None,
+    now_ms: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Best-effort: query account funding fee history for a single exchange+symbol.
+
+    Returns:
+      - funding_pnl_usdt: float (sum of funding fees, with sign)
+      - last_fee_usdt: float|None
+      - last_fee_time: ISO|None
+      - currency: str|None
+      - n_records: int
+      - source: 'ledger' | 'rate_estimate'
+      - error: str|None
+    """
+    ex = (exchange or "").lower().strip()
+    sym = (symbol or "").upper().strip()
+    start_ms = _dt_to_ms(opened_at)
+    if not ex or not sym or start_ms is None:
+        return {"funding_pnl_usdt": None, "last_fee_usdt": None, "last_fee_time": None, "currency": None, "n_records": 0, "error": "missing exchange/symbol/opened_at"}
+
+    now_ms = int(now_ms or (time.time() * 1000))
+    # Cache key includes current UTC hour bucket to ensure hourly refresh semantics.
+    hour_bucket = int(now_ms // 3_600_000)
+    cache_key = (ex, sym, int(start_ms), hour_bucket)
+    with _FUNDING_HISTORY_CACHE_LOCK:
+        cached = _FUNDING_HISTORY_CACHE.get(cache_key)
+    if cached:
+        try:
+            if float(cached.get("expires_at") or 0) > time.time():
+                return dict(cached.get("value") or {})
+        except Exception:
+            pass
+
+    out: Dict[str, Any] = {
+        "funding_pnl_usdt": 0.0,
+        "last_fee_usdt": None,
+        "last_fee_time": None,
+        "currency": None,
+        "n_records": 0,
+        "source": "ledger",
+        "error": None,
+    }
+
+    def _as_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            v = float(value)
+        except Exception:
+            return None
+        if not (v == v) or v in (float("inf"), float("-inf")):
+            return None
+        return v
+
+    def _as_iso_from_ms(ms: Any) -> Optional[str]:
+        try:
+            msv = int(float(ms))
+        except Exception:
+            return None
+        if msv <= 0:
+            return None
+        return datetime.fromtimestamp(msv / 1000, tz=timezone.utc).isoformat()
+
+    try:
+        rows: List[Dict[str, Any]] = []
+        if ex == "binance":
+            rows = get_binance_funding_fee_income(symbol=sym, start_time_ms=start_ms, end_time_ms=now_ms)
+            # time: ms, income: str
+            for r in rows:
+                fee = _as_float(r.get("income"))
+                ts_ms = r.get("time")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee
+                out["currency"] = str(r.get("asset") or "USDT").upper()
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        elif ex == "okx":
+            rows = get_okx_funding_fee_bills(symbol=sym, start_time_ms=start_ms, end_time_ms=now_ms)
+            for r in rows:
+                fee = _as_float(r.get("balChg") or r.get("balChgQty") or r.get("chgBal"))
+                ts_ms = r.get("ts")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee
+                out["currency"] = str(r.get("ccy") or "USDT").upper()
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        elif ex == "bybit":
+            rows = get_bybit_funding_fee_transactions(symbol=sym, start_time_ms=start_ms, end_time_ms=now_ms)
+            for r in rows:
+                # Ensure per-symbol: some accounts may ignore the symbol filter.
+                try:
+                    sym0 = str(r.get("symbol") or "")
+                    if sym0 and sym0.upper() != f"{sym.upper()}USDT":
+                        continue
+                except Exception:
+                    pass
+                fee = _as_float(r.get("cashFlow") or r.get("cashFlowAmount") or r.get("amount"))
+                ts_ms = r.get("transactionTime") or r.get("transTime") or r.get("execTime")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee
+                out["currency"] = str(r.get("currency") or "USDT").upper()
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        elif ex == "bitget":
+            rows = get_bitget_funding_fee_bills(symbol=sym, start_time_ms=start_ms, end_time_ms=now_ms)
+            for r in rows:
+                try:
+                    sym0 = str(r.get("symbol") or "")
+                    if sym0 and sym0.upper().replace("_UMCBL", "") != f"{sym.upper()}USDT":
+                        continue
+                except Exception:
+                    pass
+                fee = _as_float(
+                    r.get("amount")
+                    or r.get("pnl")
+                    or r.get("profit")
+                    or r.get("value")
+                    or r.get("cashFlow")
+                )
+                ts_ms = r.get("cTime") or r.get("ts") or r.get("createTime") or r.get("uTime")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee
+                out["currency"] = str(r.get("marginCoin") or r.get("ccy") or "USDT").upper()
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        elif ex == "hyperliquid":
+            rows = get_hyperliquid_user_funding_history(start_time_ms=start_ms, end_time_ms=now_ms)
+            for r in rows:
+                # Official SDK payload: {"time": ..., "delta": {"type":"funding","coin":"ETH","usdc":"..."}}
+                delta = r.get("delta")
+                if not isinstance(delta, dict):
+                    continue
+                if str(delta.get("type") or "").lower() != "funding":
+                    continue
+                coin = str(delta.get("coin") or "").upper()
+                if coin and coin != sym.upper():
+                    continue
+                fee = _as_float(delta.get("usdc") or delta.get("amount"))
+                ts_ms = r.get("time") or delta.get("time") or r.get("ts")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee  # treat USDC≈USDT for display
+                out["currency"] = "USDC"
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        else:
+            out["funding_pnl_usdt"] = None
+            out["error"] = f"unsupported exchange: {ex}"
+            rows = []
+
+        out["n_records"] = len(rows) if isinstance(rows, list) else 0
+    except Exception as exc:
+        out["funding_pnl_usdt"] = None
+        out["error"] = f"{type(exc).__name__}: {exc}"
+
+    # Fallback: estimate from public funding-rate history when ledger is unavailable/empty.
+    # This is primarily used for Bybit/Bitget where private bill endpoints are inconsistent.
+    if (
+        (out.get("funding_pnl_usdt") in (0.0, None))
+        and int(out.get("n_records") or 0) == 0
+        and pos_sign in (-1, 1)
+        and notional_usdt is not None
+        and float(notional_usdt or 0.0) > 0
+        and ex in {"bybit", "bitget"}
+    ):
+        try:
+            from watchlist_outcome_worker import FundingHistoryFetcher  # type: ignore
+
+            fetcher = getattr(_funding_fee_summary_since_open, "_RATE_FETCHER", None)
+            if fetcher is None:
+                fetcher = FundingHistoryFetcher()
+                setattr(_funding_fee_summary_since_open, "_RATE_FETCHER", fetcher)
+
+            start_dt = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
+            end_dt = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc)
+            points = fetcher.fetch(ex, sym.upper(), start_dt, end_dt) or []
+            if points:
+                total = 0.0
+                last_fee = None
+                last_time = None
+                for ts, rate in points:
+                    fee = -float(pos_sign) * float(rate) * float(notional_usdt)
+                    total += fee
+                    last_fee = fee
+                    last_time = ts
+                out["funding_pnl_usdt"] = total
+                out["last_fee_usdt"] = last_fee
+                out["last_fee_time"] = last_time.isoformat() if isinstance(last_time, datetime) else None
+                out["currency"] = "USDT"
+                out["n_records"] = len(points)
+                out["source"] = "rate_estimate"
+        except Exception as exc:
+            # keep ledger=0 but attach error for visibility
+            out["error"] = out.get("error") or f"rate_estimate_failed: {type(exc).__name__}: {exc}"
+
+    with _FUNDING_HISTORY_CACHE_LOCK:
+        _FUNDING_HISTORY_CACHE[cache_key] = {"expires_at": time.time() + _FUNDING_HISTORY_CACHE_TTL_SECONDS, "value": dict(out)}
+    return out
+
+
+_PUB_FUNDING_SCHED_CACHE_LOCK = threading.Lock()
+_PUB_FUNDING_SCHED_CACHE: Dict[tuple, Dict[str, Any]] = {}
+
+
+def _public_funding_schedule(exchange: str, base: str) -> Dict[str, Any]:
+    """Public (no-auth) funding schedule snapshot for UI display (best-effort)."""
+    ex = (exchange or "").lower().strip()
+    base_u = (base or "").upper().strip()
+    if not ex or not base_u:
+        return {}
+
+    key = (ex, base_u)
+    with _PUB_FUNDING_SCHED_CACHE_LOCK:
+        cached = _PUB_FUNDING_SCHED_CACHE.get(key)
+    if cached:
+        try:
+            if float(cached.get("expires_at") or 0) > time.time():
+                return dict(cached.get("value") or {})
+        except Exception:
+            pass
+
+    headers = {"User-Agent": (REST_CONNECTION_CONFIG or {}).get("user_agent", "FR-Monitor/1.0"), "Accept": "application/json"}
+    timeout = float((REST_CONNECTION_CONFIG or {}).get("timeout", 6))
+    out: Dict[str, Any] = {}
+    now = datetime.now(timezone.utc)
+
+    def _req_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        try:
+            resp = requests.get(url, params=params, timeout=timeout, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+        except Exception:
+            return None
+        return None
+
+    try:
+        if ex == "binance":
+            sym = f"{base_u}USDT"
+            data = _req_json("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": sym})
+            if isinstance(data, dict):
+                try:
+                    fr = data.get("lastFundingRate")
+                    if fr is not None:
+                        out["funding_rate"] = float(fr)
+                except Exception:
+                    pass
+                nft = normalize_next_funding_time(data.get("nextFundingTime"))
+                if nft:
+                    out["next_funding_time"] = nft
+            interval = derive_funding_interval_hours("binance")
+            if interval:
+                out["funding_interval_hours"] = float(interval)
+
+        elif ex == "bybit":
+            sym = f"{base_u}USDT"
+            data = _req_json("https://api.bybit.com/v5/market/tickers", params={"category": "linear", "symbol": sym})
+            if isinstance(data, dict) and data.get("retCode") == 0:
+                items = ((data.get("result") or {}) or {}).get("list") or []
+                item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else None
+                if item:
+                    try:
+                        if item.get("fundingRate") is not None:
+                            out["funding_rate"] = float(item.get("fundingRate"))
+                    except Exception:
+                        pass
+                    nft = normalize_next_funding_time(item.get("nextFundingTime"))
+                    if nft:
+                        out["next_funding_time"] = nft
+                    interval = derive_funding_interval_hours("bybit", item.get("fundingIntervalHour"))
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+            if "funding_interval_hours" not in out:
+                interval = derive_funding_interval_hours("bybit")
+                if interval:
+                    out["funding_interval_hours"] = float(interval)
+
+        elif ex == "okx":
+            inst_id = f"{base_u}-USDT-SWAP"
+            fr = _req_json("https://www.okx.com/api/v5/public/funding-rate", params={"instId": inst_id})
+            if isinstance(fr, dict) and fr.get("code") == "0":
+                data = fr.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    try:
+                        if entry.get("fundingRate") is not None:
+                            out["funding_rate"] = float(entry.get("fundingRate"))
+                    except Exception:
+                        pass
+                    ft = normalize_next_funding_time(entry.get("fundingTime"))
+                    nft = normalize_next_funding_time(entry.get("nextFundingTime"))
+                    try:
+                        cand = []
+                        for x in (ft, nft):
+                            if not x:
+                                continue
+                            dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt > (now - timedelta(seconds=60)):
+                                cand.append(dt.astimezone(timezone.utc))
+                        if cand:
+                            out["next_funding_time"] = min(cand).isoformat()
+                        elif nft:
+                            out["next_funding_time"] = nft
+                        elif ft:
+                            out["next_funding_time"] = ft
+                    except Exception:
+                        if nft:
+                            out["next_funding_time"] = nft
+                        elif ft:
+                            out["next_funding_time"] = ft
+                    interval = derive_interval_hours_from_times(entry.get("fundingTime"), entry.get("nextFundingTime"))
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+            if "funding_interval_hours" not in out:
+                interval = derive_funding_interval_hours("okx")
+                if interval:
+                    out["funding_interval_hours"] = float(interval)
+
+        elif ex == "bitget":
+            sym = f"{base_u}USDT"
+            sched = _req_json(
+                "https://api.bitget.com/api/v2/mix/market/current-fund-rate",
+                params={"productType": "USDT-FUTURES", "symbol": sym},
+            )
+            if isinstance(sched, dict) and sched.get("code") == "00000":
+                data = sched.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    try:
+                        if entry.get("fundingRate") is not None:
+                            out["funding_rate"] = float(entry.get("fundingRate"))
+                    except Exception:
+                        pass
+                    nft = normalize_next_funding_time(entry.get("nextUpdate"))
+                    if nft:
+                        out["next_funding_time"] = nft
+                    interval = derive_funding_interval_hours("bitget", entry.get("fundingRateInterval"), fallback=True)
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+            if "funding_interval_hours" not in out:
+                interval = derive_funding_interval_hours("bitget")
+                if interval:
+                    out["funding_interval_hours"] = float(interval)
+
+        elif ex == "hyperliquid":
+            interval = derive_funding_interval_hours("hyperliquid")
+            if interval:
+                out["funding_interval_hours"] = float(interval)
+            # next funding time: top-of-hour for 1h (Hyperliquid)
+            step_hours = int(out.get("funding_interval_hours") or 1)
+            floored = now.replace(minute=0, second=0, microsecond=0)
+            next_t = floored + timedelta(hours=1 if step_hours <= 0 else step_hours)
+            if next_t <= now:
+                next_t = next_t + timedelta(hours=1 if step_hours <= 0 else step_hours)
+            out["next_funding_time"] = next_t.isoformat()
+            fmap = get_hyperliquid_funding_map(force_refresh=False) or {}
+            ctx = fmap.get(base_u)
+            if isinstance(ctx, dict) and ctx.get("funding") is not None:
+                try:
+                    out["funding_rate"] = float(ctx.get("funding"))
+                except Exception:
+                    pass
+        else:
+            out = {}
+    except Exception:
+        out = {}
+
+    with _PUB_FUNDING_SCHED_CACHE_LOCK:
+        _PUB_FUNDING_SCHED_CACHE[key] = {"expires_at": time.time() + 10.0, "value": dict(out)}
+    return dict(out)
 
 
 def _orderbook_cache_key(exchange: str, market_type: str, symbol: str) -> tuple:
@@ -2415,6 +2856,7 @@ def live_trading_signals():
     status = request.args.get('status')
     symbol = request.args.get('symbol')
     include_prices = str(request.args.get('include_prices', '1') or '1').lower() not in ('0', 'false', 'no')
+    include_funding = str(request.args.get('include_funding', '1') or '1').lower() not in ('0', 'false', 'no')
 
     where = []
     params: List[Any] = []
@@ -2472,6 +2914,7 @@ def live_trading_signals():
                             price_map[key] = {
                                 'avg_price': orow.get('avg_price'),
                                 'filled_qty': orow.get('filled_qty'),
+                                'notional_usdt': orow.get('notional_usdt'),
                                 'exchange': orow.get('exchange'),
                                 'status': orow.get('status'),
                                 'created_at': orow.get('created_at'),
@@ -2483,6 +2926,22 @@ def live_trading_signals():
         if isinstance(val, datetime):
             return val.astimezone(timezone.utc).isoformat()
         return val
+
+    # Cache funding computation per UTC hour to avoid hammering private APIs.
+    _FUNDING_SIG_LOCK = getattr(live_trading_signals, "_FUNDING_SIG_LOCK", None)
+    _FUNDING_SIG_CACHE = getattr(live_trading_signals, "_FUNDING_SIG_CACHE", None)
+    if _FUNDING_SIG_LOCK is None or _FUNDING_SIG_CACHE is None:
+        _FUNDING_SIG_LOCK = threading.Lock()
+        _FUNDING_SIG_CACHE = {}
+        setattr(live_trading_signals, "_FUNDING_SIG_LOCK", _FUNDING_SIG_LOCK)
+        setattr(live_trading_signals, "_FUNDING_SIG_CACHE", _FUNDING_SIG_CACHE)
+
+    now_ms = int(time.time() * 1000)
+    hour_bucket = int(now_ms // 3_600_000)
+    with _FUNDING_SIG_LOCK:
+        if _FUNDING_SIG_CACHE.get("_hour_bucket") != hour_bucket:
+            _FUNDING_SIG_CACHE.clear()
+            _FUNDING_SIG_CACHE["_hour_bucket"] = hour_bucket
 
     out = []
     for r in rows or []:
@@ -2502,6 +2961,10 @@ def live_trading_signals():
                         got = price_map.get((sid, action, leg)) or {}
                         return got.get('filled_qty')
 
+                    def _get_notional(action: str, leg: str) -> Any:
+                        got = price_map.get((sid, action, leg)) or {}
+                        return got.get('notional_usdt')
+
                     item['open_long_avg_price'] = _get_px('open', 'long')
                     item['close_long_avg_price'] = _get_px('close', 'long')
                     item['open_short_avg_price'] = _get_px('open', 'short')
@@ -2511,6 +2974,8 @@ def live_trading_signals():
                     item['close_long_filled_qty'] = _get_filled('close', 'long')
                     item['open_short_filled_qty'] = _get_filled('open', 'short')
                     item['close_short_filled_qty'] = _get_filled('close', 'short')
+                    item['open_long_notional_usdt'] = _get_notional('open', 'long')
+                    item['open_short_notional_usdt'] = _get_notional('open', 'short')
 
                     realized_pnl = None
                     try:
@@ -2533,6 +2998,74 @@ def live_trading_signals():
                     except Exception:
                         realized_pnl = None
                     item['realized_pnl_usdt'] = realized_pnl
+
+            if include_funding:
+                status_v = str(r.get("status") or "")
+                if status_v in ("opening", "open", "closing") and (r.get("opened_at") or r.get("created_at")):
+                    try:
+                        sid = int(r.get("id")) if r.get("id") is not None else None
+                    except Exception:
+                        sid = None
+                    cache_key = ("sig", sid) if sid is not None else None
+                    cached = None
+                    if cache_key is not None:
+                        with _FUNDING_SIG_LOCK:
+                            cached = _FUNDING_SIG_CACHE.get(cache_key)
+                    if isinstance(cached, dict):
+                        item.update(cached)
+                    else:
+                        sym_u = str(r.get("symbol") or "").upper()
+                        long_ex = str(r.get("leg_long_exchange") or "").lower()
+                        short_ex = str(r.get("leg_short_exchange") or "").lower()
+                        opened_at = r.get("opened_at") or r.get("created_at")
+                        # Prefer actual per-leg notional from order records when available; fallback to configured per-leg.
+                        per_leg = float(LIVE_TRADING_CONFIG.get("per_leg_notional_usdt", 50.0))
+                        try:
+                            long_notional = float(item.get("open_long_notional_usdt") or per_leg)
+                        except Exception:
+                            long_notional = per_leg
+                        try:
+                            short_notional = float(item.get("open_short_notional_usdt") or per_leg)
+                        except Exception:
+                            short_notional = per_leg
+
+                        long_sum = _funding_fee_summary_since_open(
+                            long_ex, sym_u, opened_at, now_ms=now_ms, notional_usdt=long_notional, pos_sign=1
+                        ) if long_ex and sym_u else {}
+                        short_sum = _funding_fee_summary_since_open(
+                            short_ex, sym_u, opened_at, now_ms=now_ms, notional_usdt=short_notional, pos_sign=-1
+                        ) if short_ex and sym_u else {}
+                        total = None
+                        try:
+                            if long_sum.get("funding_pnl_usdt") is not None and short_sum.get("funding_pnl_usdt") is not None:
+                                total = float(long_sum.get("funding_pnl_usdt") or 0.0) + float(short_sum.get("funding_pnl_usdt") or 0.0)
+                        except Exception:
+                            total = None
+
+                        sched_long = _public_funding_schedule(long_ex, sym_u) if long_ex and sym_u else {}
+                        sched_short = _public_funding_schedule(short_ex, sym_u) if short_ex and sym_u else {}
+
+                        funding_payload = {
+                            "funding_pnl_usdt": total,
+                            "funding_long_pnl_usdt": long_sum.get("funding_pnl_usdt"),
+                            "funding_short_pnl_usdt": short_sum.get("funding_pnl_usdt"),
+                            "funding_source": {"long": long_sum.get("source"), "short": short_sum.get("source")},
+                            "funding_last_fee_time": max(
+                                [t for t in [long_sum.get("last_fee_time"), short_sum.get("last_fee_time")] if t], default=None
+                            ),
+                            "funding_long_last_fee_usdt": long_sum.get("last_fee_usdt"),
+                            "funding_short_last_fee_usdt": short_sum.get("last_fee_usdt"),
+                            "funding_long_last_fee_time": long_sum.get("last_fee_time"),
+                            "funding_short_last_fee_time": short_sum.get("last_fee_time"),
+                            "funding_schedule_long": sched_long or None,
+                            "funding_schedule_short": sched_short or None,
+                            "funding_updated_at": datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
+                            "funding_error": {"long": long_sum.get("error"), "short": short_sum.get("error")} if (long_sum.get("error") or short_sum.get("error")) else None,
+                        }
+                        item.update(funding_payload)
+                        if cache_key is not None:
+                            with _FUNDING_SIG_LOCK:
+                                _FUNDING_SIG_CACHE[cache_key] = dict(funding_payload)
             out.append(item)
         else:
             out.append(r)
@@ -2620,6 +3153,19 @@ def live_trading_positions():
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
+    opened_at_map: Dict[tuple, Any] = {}
+    for s in signals or []:
+        if not isinstance(s, dict):
+            continue
+        sym = str(s.get("symbol") or "").upper()
+        if not sym:
+            continue
+        opened_at = s.get("opened_at") or s.get("created_at")
+        for ex in [s.get("leg_long_exchange"), s.get("leg_short_exchange")]:
+            exl = str(ex or "").lower().strip()
+            if exl:
+                opened_at_map[(exl, sym)] = opened_at
+
     def _pos_nonzero(exchange: str, row: Any) -> bool:
         if not only_nonzero:
             return True
@@ -2654,6 +3200,267 @@ def live_trading_positions():
         supported = set()
     default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid']
     exchanges = [ex for ex in default_exchanges if not supported or ex in supported]
+
+    # Public mark price / funding enrichment (best-effort, cached).
+    # This avoids relying on private position payloads which are inconsistent across exchanges.
+    import threading
+    import time
+    import requests
+    from datetime import datetime, timezone, timedelta
+    from typing import Tuple
+    from funding_utils import (
+        derive_funding_interval_hours,
+        derive_interval_hours_from_times,
+        normalize_next_funding_time,
+        normalize_and_advance_next_funding_time,
+    )
+
+    _ua = None
+    try:
+        from config import REST_CONNECTION_CONFIG  # type: ignore
+        _ua = (REST_CONNECTION_CONFIG or {}).get("user_agent")
+        _timeout = float((REST_CONNECTION_CONFIG or {}).get("timeout", 6))
+    except Exception:
+        _timeout = 6.0
+
+    def _now_utc() -> datetime:
+        return datetime.now(timezone.utc)
+
+    def _next_utc_boundary_iso(step_hours: int, now: Optional[datetime] = None) -> str:
+        step_hours = int(step_hours) if int(step_hours) > 0 else 1
+        now = (now or _now_utc()).astimezone(timezone.utc)
+        floored = now.replace(minute=0, second=0, microsecond=0)
+        base_hour = (floored.hour // step_hours) * step_hours
+        base = floored.replace(hour=base_hour)
+        candidate = base + timedelta(hours=step_hours)
+        if candidate <= now:
+            candidate = candidate + timedelta(hours=step_hours)
+        return candidate.isoformat()
+
+    _PUB_CACHE_LOCK = getattr(live_trading_positions, "_PUB_CACHE_LOCK", None)
+    _PUB_CACHE = getattr(live_trading_positions, "_PUB_CACHE", None)
+    if _PUB_CACHE_LOCK is None or _PUB_CACHE is None:
+        _PUB_CACHE_LOCK = threading.Lock()
+        _PUB_CACHE = {}
+        setattr(live_trading_positions, "_PUB_CACHE_LOCK", _PUB_CACHE_LOCK)
+        setattr(live_trading_positions, "_PUB_CACHE", _PUB_CACHE)
+
+    def _cache_get(key: Tuple[str, str]) -> Optional[Dict[str, Any]]:
+        with _PUB_CACHE_LOCK:
+            item = _PUB_CACHE.get(key)
+        if not item:
+            return None
+        try:
+            if float(item.get("expires_at") or 0) < time.time():
+                return None
+        except Exception:
+            return None
+        val = item.get("value")
+        return val if isinstance(val, dict) else None
+
+    def _cache_set(key: Tuple[str, str], value: Dict[str, Any], ttl_s: float = 10.0) -> None:
+        with _PUB_CACHE_LOCK:
+            _PUB_CACHE[key] = {"expires_at": time.time() + float(ttl_s), "value": value}
+
+    def _req_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Any]:
+        headers = {"User-Agent": _ua or "FR-Monitor/1.0", "Accept": "application/json"}
+        try:
+            resp = requests.get(url, params=params, timeout=_timeout, headers=headers)
+            if resp.status_code == 200:
+                return resp.json()
+            return None
+        except Exception:
+            return None
+
+    def _public_funding_mark(exchange: str, base: str) -> Dict[str, Any]:
+        ex = (exchange or "").lower()
+        base_u = (base or "").upper()
+        if not base_u:
+            return {}
+        cached = _cache_get((ex, base_u))
+        if cached is not None:
+            return dict(cached)
+
+        out: Dict[str, Any] = {}
+        now = _now_utc()
+
+        if ex == "binance":
+            sym = f"{base_u}USDT"
+            data = _req_json("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": sym})
+            if isinstance(data, dict):
+                try:
+                    if data.get("markPrice") is not None:
+                        out["mark_price"] = float(data.get("markPrice"))
+                except Exception:
+                    pass
+                try:
+                    fr = data.get("lastFundingRate")
+                    if fr is not None:
+                        out["funding_rate"] = float(fr)
+                except Exception:
+                    pass
+                nft = normalize_next_funding_time(data.get("nextFundingTime"))
+                if nft:
+                    out["next_funding_time"] = nft
+            interval = derive_funding_interval_hours("binance")
+            if interval:
+                out["funding_interval_hours"] = float(interval)
+
+        elif ex == "bybit":
+            sym = f"{base_u}USDT"
+            data = _req_json("https://api.bybit.com/v5/market/tickers", params={"category": "linear", "symbol": sym})
+            if isinstance(data, dict) and data.get("retCode") == 0:
+                items = ((data.get("result") or {}) or {}).get("list") or []
+                item = items[0] if isinstance(items, list) and items and isinstance(items[0], dict) else None
+                if item:
+                    try:
+                        if item.get("markPrice") is not None:
+                            out["mark_price"] = float(item.get("markPrice"))
+                    except Exception:
+                        pass
+                    try:
+                        if item.get("fundingRate") is not None:
+                            out["funding_rate"] = float(item.get("fundingRate"))
+                    except Exception:
+                        pass
+                    nft = normalize_next_funding_time(item.get("nextFundingTime"))
+                    if nft:
+                        out["next_funding_time"] = nft
+                    interval = derive_funding_interval_hours("bybit", item.get("fundingIntervalHour"))
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+
+        elif ex == "okx":
+            inst_id = f"{base_u}-USDT-SWAP"
+            fr = _req_json("https://www.okx.com/api/v5/public/funding-rate", params={"instId": inst_id})
+            if isinstance(fr, dict) and fr.get("code") == "0":
+                data = fr.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    try:
+                        if entry.get("fundingRate") is not None:
+                            out["funding_rate"] = float(entry.get("fundingRate"))
+                    except Exception:
+                        pass
+                    # OKX 的 funding-rate 接口会同时返回 fundingTime 与 nextFundingTime。
+                    # 对于部分合约，fundingTime 可能就是“下一次结算时间”（而不是上一期结算），
+                    # 此时应该取 (fundingTime, nextFundingTime) 中“最早且在未来”的那个作为 next。
+                    ft = normalize_next_funding_time(entry.get("fundingTime"))
+                    nft = normalize_next_funding_time(entry.get("nextFundingTime"))
+                    try:
+                        cand = []
+                        for x in (ft, nft):
+                            if not x:
+                                continue
+                            dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            if dt > (now - timedelta(seconds=60)):
+                                cand.append(dt.astimezone(timezone.utc))
+                        if cand:
+                            out["next_funding_time"] = min(cand).isoformat()
+                        elif nft:
+                            out["next_funding_time"] = nft
+                        elif ft:
+                            out["next_funding_time"] = ft
+                    except Exception:
+                        if nft:
+                            out["next_funding_time"] = nft
+                        elif ft:
+                            out["next_funding_time"] = ft
+                    interval = derive_interval_hours_from_times(entry.get("fundingTime"), entry.get("nextFundingTime"))
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+            mp = _req_json("https://www.okx.com/api/v5/public/mark-price", params={"instType": "SWAP", "instId": inst_id})
+            if isinstance(mp, dict) and mp.get("code") == "0":
+                data = mp.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    try:
+                        if entry.get("markPx") is not None:
+                            out["mark_price"] = float(entry.get("markPx"))
+                    except Exception:
+                        pass
+            if "funding_interval_hours" not in out:
+                interval = derive_funding_interval_hours("okx")
+                if interval:
+                    out["funding_interval_hours"] = float(interval)
+
+        elif ex == "bitget":
+            sym = f"{base_u}USDT"
+            ticker = _req_json(
+                "https://api.bitget.com/api/v2/mix/market/ticker",
+                params={"productType": "USDT-FUTURES", "symbol": sym},
+            )
+            if isinstance(ticker, dict) and ticker.get("code") == "00000":
+                data = ticker.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    try:
+                        if entry.get("markPrice") is not None:
+                            out["mark_price"] = float(entry.get("markPrice"))
+                    except Exception:
+                        pass
+                    try:
+                        if entry.get("fundingRate") is not None:
+                            out["funding_rate"] = float(entry.get("fundingRate"))
+                    except Exception:
+                        pass
+            sched = _req_json(
+                "https://api.bitget.com/api/v2/mix/market/current-fund-rate",
+                params={"productType": "USDT-FUTURES", "symbol": sym},
+            )
+            if isinstance(sched, dict) and sched.get("code") == "00000":
+                data = sched.get("data") or []
+                entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
+                if entry:
+                    nft = normalize_next_funding_time(entry.get("nextUpdate"))
+                    if nft:
+                        out["next_funding_time"] = nft
+                    interval = derive_funding_interval_hours("bitget", entry.get("fundingRateInterval"), fallback=True)
+                    if interval:
+                        out["funding_interval_hours"] = float(interval)
+            if "funding_interval_hours" not in out:
+                interval = derive_funding_interval_hours("bitget")
+                if interval:
+                    out["funding_interval_hours"] = float(interval)
+
+        elif ex == "hyperliquid":
+            try:
+                from rest_collectors import get_hyperliquid_funding_map  # type: ignore
+                fmap = get_hyperliquid_funding_map()
+            except Exception:
+                fmap = {}
+            ctx = fmap.get(base_u) if isinstance(fmap, dict) else None
+            if isinstance(ctx, dict):
+                try:
+                    if ctx.get("markPx") is not None:
+                        out["mark_price"] = float(ctx.get("markPx"))
+                except Exception:
+                    pass
+                try:
+                    if ctx.get("funding") is not None:
+                        out["funding_rate"] = float(ctx.get("funding"))
+                except Exception:
+                    pass
+            interval = derive_funding_interval_hours("hyperliquid")
+            if interval:
+                out["funding_interval_hours"] = float(interval)
+                out["next_funding_time"] = _next_utc_boundary_iso(int(interval or 1), now=now)
+
+        # Normalize next_funding_time and ensure it is in the future (best-effort).
+        next_ft, interval_hours = normalize_and_advance_next_funding_time(
+            now=now,
+            next_funding_time=out.get("next_funding_time"),
+            interval_hours=out.get("funding_interval_hours"),
+        )
+        if next_ft:
+            out["next_funding_time"] = next_ft
+        if interval_hours is not None:
+            out["funding_interval_hours"] = float(interval_hours)
+
+        _cache_set((ex, base_u), out, ttl_s=10.0)
+        return dict(out)
 
     targets: List[Dict[str, str]] = []
     if query_all:
@@ -2717,6 +3524,78 @@ def live_trading_positions():
 
             if isinstance(positions, list):
                 positions = [p for p in positions if _pos_nonzero(ex, p)]
+                # Attach public mark/funding fields for each position row (best-effort).
+                for p in positions:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        base = None
+                        exl = (ex or "").lower()
+                        if exl == "binance":
+                            sym0 = str(p.get("symbol") or "")
+                            base = sym0[:-4] if sym0.upper().endswith("USDT") else sym0
+                        elif exl == "bybit":
+                            sym0 = str(p.get("symbol") or "")
+                            base = sym0[:-4] if sym0.upper().endswith("USDT") else sym0
+                        elif exl == "bitget":
+                            sym0 = str(p.get("symbol") or "")
+                            base = sym0[:-4] if sym0.upper().endswith("USDT") else sym0
+                        elif exl == "okx":
+                            inst = str(p.get("instId") or "")
+                            base = inst.split("-")[0] if inst else None
+                        elif exl == "hyperliquid":
+                            pos = p.get("position") if isinstance(p.get("position"), dict) else p
+                            base = str(pos.get("coin") or "")
+                        base = (base or "").upper()
+                        if base:
+                            extra = _public_funding_mark(exl, base)
+                            if isinstance(extra, dict) and extra:
+                                p["mark_price"] = extra.get("mark_price")
+                                p["funding_rate"] = extra.get("funding_rate")
+                                p["funding_interval_hours"] = extra.get("funding_interval_hours")
+                                p["next_funding_time"] = extra.get("next_funding_time")
+                            opened_at = opened_at_map.get((exl, base))
+                            if opened_at is not None:
+                                pos_sign = None
+                                notional_usdt = None
+                                try:
+                                    if exl == "binance":
+                                        amt = float(p.get("positionAmt") or 0.0)
+                                        pos_sign = 1 if amt >= 0 else -1
+                                        notional_usdt = float(p.get("notional") or 0.0) if p.get("notional") is not None else None
+                                    elif exl == "okx":
+                                        pos_side = str(p.get("posSide") or "").lower()
+                                        if pos_side in {"short"}:
+                                            pos_sign = -1
+                                        elif pos_side in {"long"}:
+                                            pos_sign = 1
+                                        notional_usdt = float(p.get("notionalUsd") or 0.0) if p.get("notionalUsd") is not None else None
+                                    elif exl == "bybit":
+                                        side = str(p.get("side") or "").lower()
+                                        pos_sign = -1 if side == "sell" else 1
+                                        notional_usdt = float(p.get("positionValue") or 0.0) if p.get("positionValue") is not None else None
+                                    elif exl == "bitget":
+                                        hold = str(p.get("holdSide") or "").lower()
+                                        pos_sign = -1 if hold == "short" else 1
+                                        notional_usdt = float(p.get("totalUSDT") or p.get("usdtValue") or 0.0) if (p.get("totalUSDT") is not None or p.get("usdtValue") is not None) else None
+                                    elif exl == "hyperliquid":
+                                        pos = p.get("position") if isinstance(p.get("position"), dict) else p
+                                        szi = float((pos or {}).get("szi") or 0.0)
+                                        pos_sign = 1 if szi >= 0 else -1
+                                        notional_usdt = float((pos or {}).get("positionValue") or 0.0) if (pos or {}).get("positionValue") is not None else None
+                                except Exception:
+                                    pos_sign = None
+                                    notional_usdt = None
+                                fsum = _funding_fee_summary_since_open(exl, base, opened_at, notional_usdt=notional_usdt, pos_sign=pos_sign)
+                                p["funding_pnl_usdt"] = fsum.get("funding_pnl_usdt")
+                                p["funding_last_fee_usdt"] = fsum.get("last_fee_usdt")
+                                p["funding_last_fee_time"] = fsum.get("last_fee_time")
+                                p["funding_source"] = fsum.get("source")
+                                p["funding_opened_at"] = opened_at.astimezone(timezone.utc).isoformat() if isinstance(opened_at, datetime) else str(opened_at)
+                                if fsum.get("error"):
+                                    p["funding_fee_error"] = fsum.get("error")
+                    except Exception:
+                        continue
             results.append({'exchange': ex, 'symbol': sym or None, 'balance': balance, 'positions': positions, 'error': None})
         except TradeExecutionError as exc:
             results.append({'exchange': ex, 'symbol': sym or None, 'balance': None, 'positions': None, 'error': str(exc)})
