@@ -73,14 +73,26 @@ def _sweep_avg_qty(levels: List[Tuple[float, float]], quantity: float, side: str
     return total_cost / total_qty
 
 
-def _req_json(url: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+def _req_json(url: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {"url": url, "params": params}
     try:
         resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
+        meta["status_code"] = int(resp.status_code)
+        meta["headers"] = {
+            k.lower(): v
+            for k, v in resp.headers.items()
+            if k.lower() in {"retry-after", "x-mbx-used-weight-1m", "x-mbx-used-weight", "x-ratelimit-remaining"}
+        }
         if resp.status_code == 200:
-            return resp.json()
-    except Exception:
-        return None
-    return None
+            return resp.json(), meta
+        try:
+            meta["body_json"] = resp.json()
+        except Exception:
+            meta["body_text"] = (resp.text or "")[:300]
+        return None, meta
+    except Exception as exc:
+        meta["error"] = str(exc)
+        return None, meta
 
 
 def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]:
@@ -100,25 +112,32 @@ def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]
     return None
 
 
-def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[Optional[Dict[str, List[Tuple[float, float]]]], Optional[str]]:
+def _fetch_raw_orderbook(
+    exchange: str, symbol: str, market_type: str
+) -> Tuple[Optional[Dict[str, List[Tuple[float, float]]]], Optional[str], Dict[str, Any]]:
     ex = exchange.lower()
     inst = _build_symbol(ex, symbol, market_type)
+    meta: Dict[str, Any] = {"exchange": ex, "symbol": symbol, "inst": inst, "market_type": market_type}
     if not inst and ex != 'hyperliquid':
-        return None, "unsupported_exchange"
+        return None, "unsupported_exchange", meta
     if ex == 'binance':
         path = "https://fapi.binance.com/fapi/v1/depth" if market_type == 'perp' else "https://api.binance.com/api/v3/depth"
-        data = _req_json(path, params={'symbol': inst, 'limit': 50})
+        data, http_meta = _req_json(path, params={'symbol': inst, 'limit': 50})
+        meta.update({"http": http_meta})
         if not isinstance(data, dict):
-            return None, "no_data"
+            err = "rate_limited" if http_meta.get("status_code") == 429 else "no_data"
+            return None, err, meta
         bids = [(_safe_float(p), _safe_float(q)) for p, q in data.get('bids', [])]
         asks = [(_safe_float(p), _safe_float(q)) for p, q in data.get('asks', [])]
     elif ex == 'okx':
-        data = _req_json("https://www.okx.com/api/v5/market/books", params={'instId': inst, 'sz': 200})
+        data, http_meta = _req_json("https://www.okx.com/api/v5/market/books", params={'instId': inst, 'sz': 200})
+        meta.update({"http": http_meta})
         if not isinstance(data, dict) or not data.get('data'):
-            return None, "no_data"
+            err = "rate_limited" if http_meta.get("status_code") == 429 else "no_data"
+            return None, err, meta
         book = data['data'][0] if isinstance(data['data'][0], dict) else None
         if book is None:
-            return None, "no_data"
+            return None, "no_data", meta
         # OKX swaps return sizes in contracts; convert to base-asset qty via ctVal.
         size_multiplier = 1.0
         if market_type == 'perp':
@@ -131,30 +150,42 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
             except Exception:
                 size_multiplier = 1.0
 
-        bids = [(_safe_float(p), (_safe_float(sz) * size_multiplier if _safe_float(sz) is not None else None)) for p, sz, *_ in book.get('bids', [])]
-        asks = [(_safe_float(p), (_safe_float(sz) * size_multiplier if _safe_float(sz) is not None else None)) for p, sz, *_ in book.get('asks', [])]
+        bids = [
+            (_safe_float(p), (_safe_float(sz) * size_multiplier if _safe_float(sz) is not None else None))
+            for p, sz, *_ in book.get('bids', [])
+        ]
+        asks = [
+            (_safe_float(p), (_safe_float(sz) * size_multiplier if _safe_float(sz) is not None else None))
+            for p, sz, *_ in book.get('asks', [])
+        ]
     elif ex == 'bybit':
         category = 'linear' if market_type == 'perp' else 'spot'
-        data = _req_json("https://api.bybit.com/v5/market/orderbook", params={'category': category, 'symbol': inst, 'limit': 50})
+        data, http_meta = _req_json(
+            "https://api.bybit.com/v5/market/orderbook", params={'category': category, 'symbol': inst, 'limit': 50}
+        )
+        meta.update({"http": http_meta})
         if not isinstance(data, dict):
-            return None, "no_data"
+            err = "rate_limited" if http_meta.get("status_code") == 429 else "no_data"
+            return None, err, meta
         result = data.get('result') or {}
         bids = [(_safe_float(p), _safe_float(sz)) for p, sz, *_ in result.get('b', [])]
         asks = [(_safe_float(p), _safe_float(sz)) for p, sz, *_ in result.get('a', [])]
     elif ex == 'bitget':
         if market_type == 'perp':
-            data = _req_json(
+            data, http_meta = _req_json(
                 "https://api.bitget.com/api/v2/mix/market/merge-depth",
                 # 与交易/持仓接口使用的 productType 保持一致，避免拿到不同市场的深度导致监控/验算失真。
                 params={'symbol': inst, 'limit': 50, 'productType': BITGET_USDT_PRODUCT_TYPE},
             )
         else:
-            data = _req_json(
+            data, http_meta = _req_json(
                 "https://api.bitget.com/api/v2/spot/market/merge-depth",
                 params={'symbol': inst, 'limit': 50},
             )
+        meta.update({"http": http_meta})
         if not isinstance(data, dict):
-            return None, "no_data"
+            err = "rate_limited" if http_meta.get("status_code") == 429 else "no_data"
+            return None, err, meta
         book = data.get('data') or {}
         bids = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('bids', [])]
         asks = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('asks', [])]
@@ -163,10 +194,12 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
         try:
             resp = requests.get(f"{LIGHTER_BASE_URL}/exchangeStats", timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
-                return None, f"status_{resp.status_code}"
+                meta.update({"http": {"status_code": int(resp.status_code), "body_text": (resp.text or "")[:300]}})
+                return None, f"status_{resp.status_code}", meta
             data = resp.json()
         except Exception:
-            return None, "http_error"
+            meta.update({"http": {"error": "http_error"}})
+            return None, "http_error", meta
         sym_upper = symbol.upper()
         stats = None
         if isinstance(data, dict):
@@ -175,10 +208,10 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
                     stats = entry
                     break
         if not stats:
-            return None, "no_data"
+            return None, "no_data", meta
         price = _safe_float(stats.get('last_trade_price') or stats.get('mark_price'))
         if not price:
-            return None, "no_data"
+            return None, "no_data", meta
         # 用单档估计买卖均价，标记误差在前端显示 error=None 以参与计算
         bids = [(price, 1.0)]
         asks = [(price, 1.0)]
@@ -187,13 +220,15 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
         try:
             resp = requests.post(f"{HYPERLIQUID_API_BASE_URL}/info", json=payload, timeout=REQUEST_TIMEOUT)
             if resp.status_code != 200:
-                return None, f"status_{resp.status_code}"
+                meta.update({"http": {"status_code": int(resp.status_code), "body_text": (resp.text or "")[:300]}})
+                return None, f"status_{resp.status_code}", meta
             data = resp.json()
         except Exception:
-            return None, "http_error"
+            meta.update({"http": {"error": "http_error"}})
+            return None, "http_error", meta
         levels = data.get('levels') if isinstance(data, dict) else None
         if not levels or not isinstance(levels, list) or len(levels) < 2:
-            return None, "no_data"
+            return None, "no_data", meta
         raw_bids, raw_asks = levels[0], levels[1]
         bids = [(_safe_float(entry.get('px') if isinstance(entry, dict) else entry[0]),
                  _safe_float(entry.get('sz') if isinstance(entry, dict) else entry[1]))
@@ -202,25 +237,34 @@ def _fetch_raw_orderbook(exchange: str, symbol: str, market_type: str) -> Tuple[
                  _safe_float(entry.get('sz') if isinstance(entry, dict) else entry[1]))
                 for entry in raw_asks]
     else:
-        return None, "unsupported_exchange"
+        return None, "unsupported_exchange", meta
 
     bids_clean = [(p, sz) for p, sz in bids if p and sz]
     asks_clean = [(p, sz) for p, sz in asks if p and sz]
     if not bids_clean and not asks_clean:
-        return None, "empty_orderbook"
-    return {'bids': bids_clean, 'asks': asks_clean}, None
+        return None, "empty_orderbook", meta
+    return {'bids': bids_clean, 'asks': asks_clean}, None, meta
 
 
 def fetch_orderbook_prices(exchange: str, symbol: str, market_type: str, *, notional: float = DEFAULT_SWEEP_NOTIONAL) -> Optional[Dict[str, Any]]:
-    raw, err = _fetch_raw_orderbook(exchange, symbol, market_type)
+    raw, err, meta = _fetch_raw_orderbook(exchange, symbol, market_type)
     if not raw:
-        return {'error': err or 'no_data'}
+        return {'error': err or 'no_data', 'meta': meta}
     asks = raw.get('asks') or []
     bids = raw.get('bids') or []
     buy_avg = _sweep_avg(asks, notional, 'buy')
     sell_avg = _sweep_avg(bids, notional, 'sell')
-    if buy_avg is None and sell_avg is None:
-        return {'error': 'insufficient_depth'}
+    raw_summary = {
+        'bids_n': len(bids),
+        'asks_n': len(asks),
+        'best_bid': bids[0] if bids else None,
+        'best_ask': asks[0] if asks else None,
+        'bids_head': bids[:5],
+        'asks_head': asks[:5],
+        'notional': float(notional),
+    }
+    if buy_avg is None or sell_avg is None:
+        return {'buy': buy_avg, 'sell': sell_avg, 'mid': None, 'error': 'missing_buy_or_sell', 'meta': meta, 'raw_summary': raw_summary}
     mid = None
     if buy_avg is not None and sell_avg is not None:
         mid = (buy_avg + sell_avg) / 2
@@ -233,21 +277,32 @@ def fetch_orderbook_prices(exchange: str, symbol: str, market_type: str, *, noti
         'sell': sell_avg,
         'mid': mid,
         'error': None,
+        'meta': meta,
+        'raw_summary': raw_summary,
     }
 
 
 def fetch_orderbook_prices_for_quantity(
     exchange: str, symbol: str, market_type: str, *, quantity: float
 ) -> Optional[Dict[str, Any]]:
-    raw, err = _fetch_raw_orderbook(exchange, symbol, market_type)
+    raw, err, meta = _fetch_raw_orderbook(exchange, symbol, market_type)
     if not raw:
-        return {'error': err or 'no_data'}
+        return {'error': err or 'no_data', 'meta': meta}
     asks = raw.get('asks') or []
     bids = raw.get('bids') or []
     buy_avg = _sweep_avg_qty(asks, float(quantity), 'buy')
     sell_avg = _sweep_avg_qty(bids, float(quantity), 'sell')
-    if buy_avg is None and sell_avg is None:
-        return {'error': 'insufficient_depth'}
+    raw_summary = {
+        'bids_n': len(bids),
+        'asks_n': len(asks),
+        'best_bid': bids[0] if bids else None,
+        'best_ask': asks[0] if asks else None,
+        'bids_head': bids[:5],
+        'asks_head': asks[:5],
+        'quantity': float(quantity),
+    }
+    if buy_avg is None or sell_avg is None:
+        return {'buy': buy_avg, 'sell': sell_avg, 'mid': None, 'error': 'missing_buy_or_sell', 'meta': meta, 'raw_summary': raw_summary}
     mid = None
     if buy_avg is not None and sell_avg is not None:
         mid = (buy_avg + sell_avg) / 2
@@ -260,6 +315,8 @@ def fetch_orderbook_prices_for_quantity(
         'sell': sell_avg,
         'mid': mid,
         'error': None,
+        'meta': meta,
+        'raw_summary': raw_summary,
     }
 
 
