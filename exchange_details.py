@@ -4,6 +4,8 @@ from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
+import config
+
 
 def _get_json(url: str, timeout: float = 4.0):
     try:
@@ -449,6 +451,132 @@ def fetch_lighter(symbol: str):
     return row
 
 
+def _ns_to_ms(value: Any) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return None
+    # Heuristic: GRVT returns unix ns (~1e18)
+    if v > 1e15:
+        return v / 1_000_000.0
+    if v > 1e12:
+        return v
+    return v * 1000.0
+
+
+def _post_json(url: str, payload: Dict[str, Any], timeout: float = 4.0):
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return None
+
+
+def fetch_grvt(symbol: str):
+    base = config.GRVT_REST_BASE_URL.rstrip("/") or "https://market-data.grvt.io"
+    sym_u = symbol.upper()
+    inst = f"{sym_u}_USDT_Perp"
+    now = int(time.time() * 1000)
+
+    ticker = _post_json(f"{base}/full/v1/ticker", {"instrument": inst})
+    instrument = _post_json(f"{base}/full/v1/instrument", {"instrument": inst})
+    history = _post_json(f"{base}/full/v1/funding", {"instrument": inst, "limit": 200})
+
+    row = {
+        "exchange": "grvt",
+        "symbol": symbol,
+        "funding_interval_hours": None,
+        "funding_rate": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "index_diff": None,
+        "open_interest": None,
+        "risk_fund": None,
+        "volume_quote": None,
+        "timestamp": now,
+        "mark_price": None,
+        "index_price": None,
+        "insurance_fund": None,
+        "funding_history": [],
+        "index_components": [],
+        "next_funding_time": None,
+    }
+
+    inst_row = instrument.get("result") if isinstance(instrument, dict) else None
+    if isinstance(inst_row, dict):
+        try:
+            row["funding_interval_hours"] = _fmt_float(inst_row.get("funding_interval_hours"))
+        except Exception:
+            pass
+        try:
+            cap = _fmt_float(inst_row.get("adjusted_funding_rate_cap"))
+            floor = _fmt_float(inst_row.get("adjusted_funding_rate_floor"))
+            # GRVT expresses funding in percentage points; normalize to decimal.
+            row["funding_cap"] = (cap / 100.0) if cap is not None else None
+            row["funding_floor"] = (floor / 100.0) if floor is not None else None
+        except Exception:
+            pass
+
+    tick_row = ticker.get("result") if isinstance(ticker, dict) else None
+    if isinstance(tick_row, dict):
+        try:
+            mark = _fmt_float(tick_row.get("mark_price"))
+            idx = _fmt_float(tick_row.get("index_price"))
+            row["mark_price"] = mark
+            row["index_price"] = idx
+            if mark and idx:
+                base_px = idx or mark
+                row["index_diff"] = (mark - idx) / base_px if base_px else None
+        except Exception:
+            pass
+        try:
+            fr_pp = _fmt_float(tick_row.get("funding_rate") or tick_row.get("funding_rate_8h_curr"))
+            row["funding_rate"] = (fr_pp / 100.0) if fr_pp is not None else None
+        except Exception:
+            pass
+        try:
+            oi = _fmt_float(tick_row.get("open_interest"))
+            row["open_interest"] = oi
+        except Exception:
+            pass
+        try:
+            buy_q = _fmt_float(tick_row.get("buy_volume_24h_q")) or 0.0
+            sell_q = _fmt_float(tick_row.get("sell_volume_24h_q")) or 0.0
+            row["volume_quote"] = (buy_q + sell_q) or None
+        except Exception:
+            pass
+        try:
+            row["next_funding_time"] = _ns_to_ms(tick_row.get("next_funding_time"))
+        except Exception:
+            pass
+
+    if isinstance(history, dict):
+        items = history.get("result") or []
+        if isinstance(items, list):
+            parsed = []
+            for h in items:
+                if not isinstance(h, dict):
+                    continue
+                ft_ms = _ns_to_ms(h.get("funding_time"))
+                fr_pp = _fmt_float(h.get("funding_rate"))
+                parsed.append(
+                    {
+                        "time": ft_ms,
+                        "rate": (fr_pp / 100.0) if fr_pp is not None else None,
+                        "mark_price": _fmt_float(h.get("mark_price")),
+                    }
+                )
+            row["funding_history"] = [x for x in parsed if x.get("rate") is not None]
+
+    derived_interval = _derive_interval_hours(row.get("funding_history", []))
+    if derived_interval:
+        row["funding_interval_hours"] = derived_interval
+    if row.get("funding_interval_hours") is None:
+        row["funding_interval_hours"] = 8.0
+    return row
+
+
 def fetch_okx(symbol: str):
     sym = symbol.upper() + "-USDT-SWAP"
     uly = symbol.upper() + "-USDT"
@@ -643,6 +771,7 @@ FETCHERS = {
     "gate": fetch_gate,
     "bitget": fetch_bitget,
     "lighter": fetch_lighter,
+    "grvt": fetch_grvt,
     "okx": fetch_okx,
     "htx": fetch_htx,
 }

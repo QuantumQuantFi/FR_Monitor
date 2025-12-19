@@ -785,7 +785,12 @@ class ExchangeDataCollector:
         ws.run_forever()
 
     def _connect_binance_spot(self):
-        """连接Binance现货WebSocket - 多币种监听"""
+        """连接Binance现货WebSocket - 多币种监听
+
+        Binance WS 说明
+        - `/ws/<stream>` 只支持单 stream，拼接多个会触发 `Invalid stream name`。
+        - 要订阅 800+ streams，应连接到 `/ws` 后用 SUBSCRIBE 命令分批订阅。
+        """
         def on_message(ws, message):
             try:
                 data = json.loads(message)
@@ -819,17 +824,35 @@ class ExchangeDataCollector:
             print(f"Binance现货WebSocket错误: {error}")
 
         def on_open(ws):
-            print("Binance现货WebSocket连接已建立 - 基于实际币种订阅")
+            print("Binance现货WebSocket连接已建立 - SUBSCRIBE多币种")
+            # Binance /ws 需要通过 SUBSCRIBE 订阅 streams；分批发送避免单包过大
+            try:
+                req_id = 1
+                chunk_size = 200
+                for i in range(0, len(streams), chunk_size):
+                    chunk = streams[i:i + chunk_size]
+                    payload = {"method": "SUBSCRIBE", "params": chunk, "id": req_id}
+                    req_id += 1
+                    ws.send(json.dumps(payload))
+                    time.sleep(0.1)  # 轻微错峰，避免触发限频
+            except Exception as exc:
+                print(f"Binance现货订阅发送失败: {exc}")
 
         # 获取Binance实际支持的现货币种
         binance_symbols = self.exchange_symbols.get('binance', {'spot': [], 'futures': []})
         spot_symbols = binance_symbols.get('spot', [])
         
-        # 使用多路径模式同时监听多个币种
         streams = [f"{symbol.lower()}usdt@ticker" for symbol in spot_symbols]
-        stream_path = '/'.join(streams)
-        url = f"{EXCHANGE_WEBSOCKETS['binance']['spot']}{stream_path}"
-        
+        # 连接到 /ws，再通过 SUBSCRIBE 批量订阅
+        base_url = (EXCHANGE_WEBSOCKETS['binance']['spot'] or '').rstrip('/')
+        # 兼容旧配置：spot 可能是 ".../ws/"，此处强制指向 ".../ws"
+        if base_url.endswith('/ws'):
+            url = base_url
+        elif base_url.endswith('/stream'):
+            url = base_url.replace('/stream', '/ws')
+        else:
+            url = base_url  # best-effort
+
         print(f"Binance现货订阅币种: {len(spot_symbols)} 个")
         
         ws = websocket.WebSocketApp(url,
@@ -841,7 +864,10 @@ class ExchangeDataCollector:
         ws.run_forever()
 
     def _connect_binance_futures(self):
-        """连接Binance合约WebSocket - 多币种监听"""
+        """连接Binance合约WebSocket - 多币种监听
+
+        同现货：使用 `/ws` + SUBSCRIBE 分批订阅，避免 `Invalid stream name`。
+        """
         def on_message(ws, message):
             try:
                 data = json.loads(message)
@@ -897,17 +923,32 @@ class ExchangeDataCollector:
             print(f"Binance合约WebSocket错误: {error}")
 
         def on_open(ws):
-            print("Binance合约WebSocket连接已建立 - 基于实际币种订阅")
+            print("Binance合约WebSocket连接已建立 - SUBSCRIBE多币种")
+            try:
+                req_id = 1
+                chunk_size = 200
+                for i in range(0, len(streams), chunk_size):
+                    chunk = streams[i:i + chunk_size]
+                    payload = {"method": "SUBSCRIBE", "params": chunk, "id": req_id}
+                    req_id += 1
+                    ws.send(json.dumps(payload))
+                    time.sleep(0.1)
+            except Exception as exc:
+                print(f"Binance合约订阅发送失败: {exc}")
 
         # 获取Binance实际支持的期货币种
         binance_symbols = self.exchange_symbols.get('binance', {'spot': [], 'futures': []})
         futures_symbols = binance_symbols.get('futures', [])
         
-        # 使用多路径模式同时监听多个币种
-        streams = [f"{symbol.lower()}usdt@markPrice" for symbol in futures_symbols]
-        stream_path = '/'.join(streams)
-        url = f"{EXCHANGE_WEBSOCKETS['binance']['futures']}{stream_path}"
-        
+        streams = [f"{symbol.lower()}usdt@markPrice@1s" for symbol in futures_symbols]
+        base_url = (EXCHANGE_WEBSOCKETS['binance']['futures'] or '').rstrip('/')
+        if base_url.endswith('/ws'):
+            url = base_url
+        elif base_url.endswith('/stream'):
+            url = base_url.replace('/stream', '/ws')
+        else:
+            url = base_url
+
         print(f"Binance合约订阅币种: {len(futures_symbols)} 个")
         
         ws = websocket.WebSocketApp(url,

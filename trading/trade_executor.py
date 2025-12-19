@@ -17,6 +17,7 @@ import socket
 import threading
 import time
 import logging
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -41,6 +42,21 @@ try:
     from lighter.signer_client import SignerClient as LighterSignerClient  # type: ignore[import-not-found]
 except Exception:  # pragma: no cover
     LighterSignerClient = None  # type: ignore[assignment]
+
+try:
+    from pysdk.grvt_ccxt import GrvtCcxt  # type: ignore[import-not-found]
+    from pysdk.grvt_ccxt_env import GrvtEnv  # type: ignore[import-not-found]
+    from pysdk.grvt_raw_base import GrvtApiConfig  # type: ignore[import-not-found]
+    from pysdk.grvt_raw_env import GrvtEnv as GrvtRawEnv  # type: ignore[import-not-found]
+    from pysdk.grvt_raw_sync import GrvtRawSync  # type: ignore[import-not-found]
+    from pysdk import grvt_raw_types as grvt_raw_types  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    GrvtCcxt = None  # type: ignore[assignment]
+    GrvtEnv = None  # type: ignore[assignment]
+    GrvtApiConfig = None  # type: ignore[assignment]
+    GrvtRawEnv = None  # type: ignore[assignment]
+    GrvtRawSync = None  # type: ignore[assignment]
+    grvt_raw_types = None  # type: ignore[assignment]
 
 try:  # requests bundles urllib3, but allow user-installed urllib3 fallback
     import urllib3.util.connection as _urllib3_connection  # type: ignore
@@ -163,6 +179,14 @@ class LighterCredentials:
     base_url: str
 
 
+@dataclass(frozen=True)
+class GrvtCredentials:
+    api_key: str
+    private_key: str
+    trading_account_id: str
+    environment: str
+
+
 @dataclass
 class _BinanceSymbolFilters:
     min_qty: Decimal
@@ -221,7 +245,26 @@ _BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
 _BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
 
 
-SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid", "lighter")
+@dataclass
+class _GrvtInstrumentFilters:
+    instrument: str
+    min_size: Decimal
+    tick_size: Decimal
+    base_decimals: Optional[int]
+    quote_decimals: Optional[int]
+    funding_interval_hours: Optional[float]
+    adjusted_funding_rate_cap_pp: Optional[Decimal]
+    adjusted_funding_rate_floor_pp: Optional[Decimal]
+    fetched_at: float
+
+
+_GRVT_INSTRUMENT_CACHE: Dict[tuple[str, str], _GrvtInstrumentFilters] = {}
+_GRVT_INSTRUMENT_CACHE_TTL = 15 * 60  # seconds
+_GRVT_CLIENT_LOCK = threading.Lock()
+_GRVT_CLIENT_CACHE: Dict[tuple[str, str], tuple[Any, float]] = {}
+
+
+SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid", "lighter", "grvt")
 SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ()  # Spot helpers not yet implemented
 
 
@@ -382,6 +425,179 @@ def _resolve_lighter_credentials(
     if host.endswith("/api/v1"):
         host = host[: -len("/api/v1")]
     return LighterCredentials(private_key=pk, account_index=acct, api_key_index=key_idx, base_url=host)
+
+
+def _resolve_grvt_credentials(
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> GrvtCredentials:
+    env = (environment or getattr(config, "GRVT_ENVIRONMENT", "") or "prod").lower().strip()
+    ak = str(api_key or getattr(config, "GRVT_API_KEY", "") or "").strip()
+    pk = str(private_key or getattr(config, "GRVT_API_SECRET", "") or "").strip()
+    ta = str(trading_account_id or getattr(config, "GRVT_TRADING_ACCOUNT_ID", "") or "").strip()
+    if not ak:
+        raise TradeExecutionError("GRVT_API_KEY not configured")
+    if not pk:
+        raise TradeExecutionError("GRVT_SECRET_KEY/GRVT_PRIVATE_KEY not configured")
+    if not ta:
+        raise TradeExecutionError("GRVT_TRADING_ACCOUNT_ID not configured")
+    return GrvtCredentials(api_key=ak, private_key=pk, trading_account_id=ta, environment=env)
+
+
+def _grvt_env_enum(environment: str) -> Any:
+    if GrvtEnv is None:
+        raise TradeExecutionError("grvt-pysdk is required for GRVT trading APIs")
+    env = (environment or "prod").lower().strip()
+    mapping = {
+        "prod": GrvtEnv.PROD,
+        "testnet": GrvtEnv.TESTNET,
+        "staging": GrvtEnv.STAGING,
+        "dev": GrvtEnv.DEV,
+    }
+    return mapping.get(env, GrvtEnv.PROD)
+
+
+def _grvt_raw_env_enum(environment: str) -> Any:
+    if GrvtRawEnv is None:
+        raise TradeExecutionError("grvt-pysdk is required for GRVT raw APIs")
+    env = (environment or "prod").lower().strip()
+    mapping = {
+        "prod": GrvtRawEnv.PROD,
+        "testnet": GrvtRawEnv.TESTNET,
+        "staging": GrvtRawEnv.STAGING,
+        "dev": GrvtRawEnv.DEV,
+    }
+    return mapping.get(env, GrvtRawEnv.PROD)
+
+
+def _get_grvt_client(*, public: bool = False, creds: Optional[GrvtCredentials] = None) -> Any:
+    if GrvtCcxt is None:
+        raise TradeExecutionError("grvt-pysdk is required for GRVT trading APIs")
+
+    if public:
+        env = (getattr(config, "GRVT_ENVIRONMENT", "") or "prod").lower().strip()
+        key = ("public", env)
+        with _GRVT_CLIENT_LOCK:
+            cached = _GRVT_CLIENT_CACHE.get(key)
+            if cached and (time.time() - float(cached[1] or 0)) < 60.0:
+                return cached[0]
+            client = GrvtCcxt(env=_grvt_env_enum(env), parameters={})
+            _GRVT_CLIENT_CACHE[key] = (client, time.time())
+            return client
+
+    resolved = creds or _resolve_grvt_credentials()
+    cache_key = (resolved.environment, resolved.trading_account_id)
+    with _GRVT_CLIENT_LOCK:
+        cached = _GRVT_CLIENT_CACHE.get(cache_key)
+        if cached and (time.time() - float(cached[1] or 0)) < 30.0:
+            return cached[0]
+        client = GrvtCcxt(
+            env=_grvt_env_enum(resolved.environment),
+            parameters={
+                "api_key": resolved.api_key,
+                "private_key": resolved.private_key,
+                "trading_account_id": resolved.trading_account_id,
+            },
+        )
+        _GRVT_CLIENT_CACHE[cache_key] = (client, time.time())
+        return client
+
+
+def _grvt_client_order_id(value: Optional[str]) -> int:
+    """GRVT SDK expects client_order_id to be an integer (uint32-ish)."""
+    if value is None:
+        return int(time.time() * 1000) & 0xFFFFFFFF
+    text = str(value).strip()
+    if not text:
+        return int(time.time() * 1000) & 0xFFFFFFFF
+    if text.isdigit():
+        try:
+            return int(text) & 0xFFFFFFFF
+        except Exception:
+            return zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF
+    return zlib.crc32(text.encode("utf-8")) & 0xFFFFFFFF
+
+
+def _get_grvt_instrument_filters(symbol: str, *, environment: Optional[str] = None) -> _GrvtInstrumentFilters:
+    base = (symbol or "").upper().strip()
+    env = (environment or getattr(config, "GRVT_ENVIRONMENT", "") or "prod").lower().strip()
+    if not base:
+        raise TradeExecutionError("GRVT symbol missing")
+    cache_key = (env, base)
+    cached = _GRVT_INSTRUMENT_CACHE.get(cache_key)
+    now = time.time()
+    if cached and (now - float(cached.fetched_at or 0.0)) < _GRVT_INSTRUMENT_CACHE_TTL:
+        return cached
+
+    client = _get_grvt_client(public=True)
+    markets: Any = []
+    try:
+        markets = client.fetch_markets(params={"kind": "PERPETUAL", "base": base, "quote": "USDT", "limit": 20})  # type: ignore[call-arg]
+    except Exception:
+        markets = []
+
+    inst: Optional[Dict[str, Any]] = None
+    if isinstance(markets, list) and markets:
+        expected = f"{base}_USDT_Perp"
+        for m in markets:
+            if isinstance(m, dict) and str(m.get("instrument") or "") == expected:
+                inst = m
+                break
+        if inst is None and isinstance(markets[0], dict):
+            inst = markets[0]
+
+    if not isinstance(inst, dict):
+        inst = {"instrument": f"{base}_USDT_Perp"}
+
+    def _int_or_none(v: Any) -> Optional[int]:
+        try:
+            return int(v)
+        except Exception:
+            return None
+
+    def _dec_or_none(v: Any) -> Optional[Decimal]:
+        if v in (None, ""):
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return None
+
+    try:
+        min_size = Decimal(str(inst.get("min_size") or "0.01"))
+    except Exception:
+        min_size = Decimal("0.01")
+    try:
+        tick_size = Decimal(str(inst.get("tick_size") or "0.01"))
+    except Exception:
+        tick_size = Decimal("0.01")
+
+    out = _GrvtInstrumentFilters(
+        instrument=str(inst.get("instrument") or f"{base}_USDT_Perp"),
+        min_size=min_size if min_size > 0 else Decimal("0.01"),
+        tick_size=tick_size if tick_size > 0 else Decimal("0.01"),
+        base_decimals=_int_or_none(inst.get("base_decimals")),
+        quote_decimals=_int_or_none(inst.get("quote_decimals")),
+        funding_interval_hours=float(inst.get("funding_interval_hours")) if inst.get("funding_interval_hours") is not None else None,
+        adjusted_funding_rate_cap_pp=_dec_or_none(inst.get("adjusted_funding_rate_cap")),
+        adjusted_funding_rate_floor_pp=_dec_or_none(inst.get("adjusted_funding_rate_floor")),
+        fetched_at=now,
+    )
+    _GRVT_INSTRUMENT_CACHE[cache_key] = out
+    return out
+
+
+def _grvt_round_qty(symbol: str, quantity: Decimal) -> Decimal:
+    """Round qty down to GRVT min_size increments (best-effort)."""
+    filters = _get_grvt_instrument_filters(symbol)
+    step = filters.min_size if filters.min_size and filters.min_size > 0 else Decimal("0.01")
+    steps = (quantity / step).to_integral_value(rounding=ROUND_DOWN)
+    out = steps * step
+    if out < step:
+        out = step
+    return out
 
 
 def _utc_millis() -> int:
@@ -2935,6 +3151,318 @@ def get_hyperliquid_balance_summary(
     }
 
 
+def get_grvt_balance_summary(
+    *,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Return a normalized account balance summary for GRVT (USDT-margined)."""
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+    client = _get_grvt_client(creds=creds)
+    summary = client.get_account_summary()  # ccxt-style wrapper around /account_summary
+    if not isinstance(summary, dict):
+        raise TradeExecutionError(f"GRVT get_account_summary payload malformed: {summary!r}")
+    settle = str(summary.get("settle_currency") or "USDT").upper()
+    return {
+        "currency": settle,
+        "available_balance": summary.get("available_balance"),
+        "wallet_balance": summary.get("total_equity"),
+        "equity": summary.get("total_equity"),
+        "unrealized_pnl": summary.get("unrealized_pnl"),
+        "raw_summary": summary,
+    }
+
+
+def get_grvt_perp_positions(
+    *,
+    symbol: Optional[str] = None,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Return GRVT perp positions (private API)."""
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+    client = _get_grvt_client(creds=creds)
+    instruments: List[str] = []
+    if symbol:
+        filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
+        instruments = [filters.instrument]
+    rows = client.fetch_positions(symbols=instruments)
+    if not isinstance(rows, list):
+        raise TradeExecutionError(f"GRVT fetch_positions payload malformed: {rows!r}")
+    return rows
+
+
+def get_grvt_order(
+    order_id: str,
+    *,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Fetch an order by exchange order_id (private API)."""
+    if not order_id:
+        raise TradeExecutionError("GRVT order_id is required")
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+    client = _get_grvt_client(creds=creds)
+    data = client.fetch_order(id=str(order_id))
+    if not isinstance(data, dict):
+        raise TradeExecutionError(f"GRVT fetch_order payload malformed: {data!r}")
+    return data
+
+
+def place_grvt_perp_market_order(
+    symbol: str,
+    side: str,
+    quantity: Union[str, float, Decimal, int],
+    *,
+    reduce_only: bool = False,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Place a GRVT perp market order (best-effort).
+
+    Notes
+    - GRVT expects amount to respect min_size increments; we round down to min_size.
+    - reduce_only is forwarded via params["reduce_only"].
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise TradeExecutionError("GRVT symbol is required")
+    side_key = (side or "").lower().strip()
+    if side_key not in {"buy", "sell"}:
+        raise TradeExecutionError("GRVT side must be buy/sell")
+
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+    filters = _get_grvt_instrument_filters(sym, environment=creds.environment)
+    qty_dec = _coerce_positive_quantity(quantity)
+    qty_dec = _grvt_round_qty(sym, qty_dec)
+
+    client = _get_grvt_client(creds=creds)
+    params = {"reduce_only": bool(reduce_only), "client_order_id": _grvt_client_order_id(client_order_id)}
+    resp = client.create_order(filters.instrument, "market", side_key, str(qty_dec), None, params=params)
+    if not isinstance(resp, dict) or not resp:
+        raise TradeExecutionError(f"GRVT create_order returned empty payload: {resp!r}")
+    return resp
+
+
+def get_grvt_funding_payment_history(
+    *,
+    symbol: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 1000,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Query GRVT funding payment ledger (private API) and normalize sign.
+
+    GRVT docs: amount is positive if paid, negative if received.
+    We normalize to `income` semantics: positive -> received, negative -> paid.
+    """
+    if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
+        raise TradeExecutionError("grvt-pysdk is required for GRVT funding payment history")
+
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+
+    start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
+    end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
+    inst = None
+    if symbol:
+        filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
+        inst = filters.instrument
+
+    cfg = GrvtApiConfig(
+        env=_grvt_raw_env_enum(creds.environment),
+        trading_account_id=creds.trading_account_id,
+        private_key=creds.private_key,
+        api_key=creds.api_key,
+        logger=LOGGER,
+    )
+    client = GrvtRawSync(cfg)
+    req = grvt_raw_types.ApiFundingPaymentHistoryRequest(
+        sub_account_id=str(creds.trading_account_id),
+        instrument=str(inst) if inst else None,
+        start_time=start_ns,
+        end_time=end_ns,
+        limit=int(limit) if int(limit) > 0 else 500,
+        cursor=None,
+    )
+    resp = client.funding_payment_history_v1(req)
+    # resp can be GrvtError or ApiFundingPaymentHistoryResponse
+    if hasattr(resp, "code") and hasattr(resp, "message"):
+        raise TradeExecutionError(f"GRVT funding_payment_history reject: {resp}")
+    rows = getattr(resp, "result", None)
+    if not isinstance(rows, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in rows:
+        if not hasattr(item, "event_time"):
+            continue
+        try:
+            ts_ms = int(int(str(getattr(item, "event_time", "0") or "0")) / 1_000_000)
+        except Exception:
+            ts_ms = None
+        try:
+            amount = float(str(getattr(item, "amount", "0") or "0"))
+        except Exception:
+            amount = None
+        currency = str(getattr(item, "currency", "") or "").upper() or None
+        instrument = str(getattr(item, "instrument", "") or "") or None
+        # Normalize: positive income means received (opposite of GRVT amount).
+        income = (-amount) if amount is not None else None
+        out.append(
+            {
+                "time": ts_ms,
+                "instrument": instrument,
+                "currency": currency,
+                "income": income,
+                "raw_amount": amount,
+                "raw": {
+                    "tx_id": str(getattr(item, "tx_id", "") or ""),
+                    "sub_account_id": str(getattr(item, "sub_account_id", "") or ""),
+                },
+            }
+        )
+    return out
+
+
+def get_grvt_fill_history(
+    *,
+    symbol: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 200,
+    api_key: Optional[str] = None,
+    private_key: Optional[str] = None,
+    trading_account_id: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Fetch GRVT private fill history (executions) for an account.
+
+    Returns a normalized list of fills with:
+      - time (ms)
+      - instrument
+      - price
+      - size
+      - fee
+      - client_order_id
+      - order_id
+      - is_buyer
+    """
+    if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
+        raise TradeExecutionError("grvt-pysdk is required for GRVT fill history")
+
+    creds = _resolve_grvt_credentials(
+        api_key=api_key,
+        private_key=private_key,
+        trading_account_id=trading_account_id,
+        environment=environment,
+    )
+
+    start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
+    end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
+    base = (symbol or "").upper().strip() if symbol else None
+
+    cfg = GrvtApiConfig(
+        env=_grvt_raw_env_enum(creds.environment),
+        trading_account_id=creds.trading_account_id,
+        private_key=creds.private_key,
+        api_key=creds.api_key,
+        logger=LOGGER,
+    )
+    client = GrvtRawSync(cfg)
+    req = grvt_raw_types.ApiFillHistoryRequest(
+        sub_account_id=str(creds.trading_account_id),
+        kind=None,
+        base=[base] if base else None,
+        quote=["USDT"] if base else None,
+        start_time=start_ns,
+        end_time=end_ns,
+        limit=int(limit) if int(limit) > 0 else 200,
+        cursor=None,
+    )
+    resp = client.fill_history_v1(req)
+    if hasattr(resp, "code") and hasattr(resp, "message"):
+        raise TradeExecutionError(f"GRVT fill_history reject: {resp}")
+    rows = getattr(resp, "result", None)
+    if not isinstance(rows, list):
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for item in rows:
+        if not hasattr(item, "event_time"):
+            continue
+        try:
+            ts_ms = int(int(str(getattr(item, "event_time", "0") or "0")) / 1_000_000)
+        except Exception:
+            ts_ms = None
+        try:
+            price = float(str(getattr(item, "price", "0") or "0"))
+        except Exception:
+            price = None
+        try:
+            size = float(str(getattr(item, "size", "0") or "0"))
+        except Exception:
+            size = None
+        try:
+            fee = float(str(getattr(item, "fee", "0") or "0"))
+        except Exception:
+            fee = None
+        out.append(
+            {
+                "time": ts_ms,
+                "instrument": str(getattr(item, "instrument", "") or ""),
+                "price": price,
+                "size": size,
+                "fee": fee,
+                "client_order_id": str(getattr(item, "client_order_id", "") or ""),
+                "order_id": str(getattr(item, "order_id", "") or ""),
+                "is_buyer": bool(getattr(item, "is_buyer", False)),
+                "raw": {
+                    "trade_id": str(getattr(item, "trade_id", "") or ""),
+                    "venue": str(getattr(item, "venue", "") or ""),
+                },
+            }
+        )
+    return out
+
+
 def get_lighter_balance_summary(
     *,
     account_index: Optional[Union[int, str]] = None,
@@ -3585,6 +4113,21 @@ def execute_perp_market_order(
             api_key_index=lt_kwargs.pop("api_key_index", None),
             base_url=lt_kwargs.pop("base_url", "https://mainnet.zklighter.elliot.ai"),
             timeout=float(lt_kwargs.pop("timeout", 15.0)),
+        )
+    elif exchange_key == "grvt":
+        gv_kwargs = dict(kwargs)
+        reduce_only = bool(gv_kwargs.pop("reduce_only", False))
+        client_order_id = gv_kwargs.pop("client_order_id", None)
+        order = place_grvt_perp_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+            api_key=gv_kwargs.pop("api_key", None),
+            private_key=gv_kwargs.pop("private_key", None),
+            trading_account_id=gv_kwargs.pop("trading_account_id", None),
+            environment=gv_kwargs.pop("environment", None),
         )
     else:  # pragma: no cover - guarded above but keeps mypy happy
         raise TradeExecutionError(f"Unhandled exchange `{exchange}`")

@@ -1,4 +1,5 @@
 import math
+import re
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -7,6 +8,7 @@ import config
 
 HYPERLIQUID_API_BASE_URL = "https://api.hyperliquid.xyz"
 LIGHTER_BASE_URL = config.LIGHTER_REST_BASE_URL.rstrip("/")
+GRVT_BASE_URL = config.GRVT_REST_BASE_URL.rstrip("/")
 
 DEFAULT_SWEEP_NOTIONAL = 100.0  # USD notional to simulate across orderbooks
 REQUEST_TIMEOUT = 4
@@ -111,20 +113,31 @@ def _maybe_mark_ban(exchange: str, http_meta: Dict[str, Any]) -> None:
         status = 0
     if status not in (418, 429):
         return
+    now_ms = int(time.time() * 1000)
+
     body = http_meta.get("body_json")
-    if not isinstance(body, dict):
-        return
-    if body.get("code") != -1003:
-        return
-    msg = str(body.get("msg") or "")
-    # Typical: "IP(...) banned until 1766152196378"
-    for token in msg.split():
-        if token.isdigit() and len(token) >= 10:
+    if isinstance(body, dict) and body.get("code") == -1003:
+        msg = str(body.get("msg") or "")
+        # Typical: "... banned until 1766152196378."
+        m = re.search(r"banned\\s+until\\s+(\\d{10,})", msg, flags=re.IGNORECASE)
+        if m:
             try:
-                _EXCHANGE_BAN_UNTIL_MS[exchange] = int(token)
+                _EXCHANGE_BAN_UNTIL_MS[exchange] = int(m.group(1))
                 return
             except Exception:
-                return
+                pass
+
+    # Fallback: respect Retry-After header (seconds).
+    hdrs = http_meta.get("headers") or {}
+    if isinstance(hdrs, dict):
+        ra = hdrs.get("retry-after")
+        try:
+            ra_s = int(float(ra))
+        except Exception:
+            ra_s = 0
+        if ra_s > 0:
+            _EXCHANGE_BAN_UNTIL_MS[exchange] = max(int(_EXCHANGE_BAN_UNTIL_MS.get(exchange) or 0), now_ms + ra_s * 1000)
+            return
 
 
 def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]:
@@ -141,6 +154,9 @@ def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]
         return base
     if exchange == 'lighter':
         return base
+    if exchange == 'grvt':
+        # GRVT perpetual instruments look like: ETH_USDT_Perp
+        return f"{base}_USDT_Perp" if market_type == 'perp' else f"{base}_USDT"
     return None
 
 
@@ -310,6 +326,33 @@ def _fetch_raw_orderbook(
         asks = [(_safe_float(entry.get('px') if isinstance(entry, dict) else entry[0]),
                  _safe_float(entry.get('sz') if isinstance(entry, dict) else entry[1]))
                 for entry in raw_asks]
+    elif ex == "grvt":
+        # GRVT market-data RPC is POST-based and does not require auth cookies.
+        # Depth accepts only certain values (e.g. 10/50/100); use 50 to match other venues.
+        url = f"{GRVT_BASE_URL}/full/v1/book"
+        payload = {"instrument": inst, "aggregate": 1, "depth": 50}
+        try:
+            resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT, headers={"Accept": "application/json"})
+            meta.update({"http": {"status_code": int(resp.status_code)}})
+            if resp.status_code != 200:
+                try:
+                    meta["http"]["body_json"] = resp.json()
+                except Exception:
+                    meta["http"]["body_text"] = (resp.text or "")[:300]
+                err = "rate_limited" if resp.status_code == 429 else "no_data"
+                return None, err, meta
+            data = resp.json()
+        except Exception as exc:
+            meta.update({"http": {"error": str(exc)}})
+            return None, "http_error", meta
+
+        result = data.get("result") if isinstance(data, dict) else None
+        if not isinstance(result, dict):
+            return None, "no_data", meta
+        bids_raw = result.get("bids") or []
+        asks_raw = result.get("asks") or []
+        bids = [(_safe_float(x.get("price")), _safe_float(x.get("size"))) for x in bids_raw if isinstance(x, dict)]
+        asks = [(_safe_float(x.get("price")), _safe_float(x.get("size"))) for x in asks_raw if isinstance(x, dict)]
     else:
         return None, "unsupported_exchange", meta
 

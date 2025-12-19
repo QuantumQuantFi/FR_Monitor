@@ -35,9 +35,13 @@ def _normalize_datetime(value: Any) -> Optional[datetime]:
         return value.astimezone(timezone.utc)
 
     if isinstance(value, (int, float)):
-        # Distinguish seconds vs milliseconds
+        # Distinguish seconds vs milliseconds vs nanoseconds (best-effort).
         seconds = float(value)
-        if seconds > 1e12:
+        # Nanoseconds timestamps (e.g., GRVT) are typically ~1e18.
+        if seconds > 1e15:
+            seconds = seconds / 1_000_000_000.0
+        # Milliseconds timestamps are typically ~1e13.
+        elif seconds > 1e12:
             seconds = seconds / 1000.0
         elif seconds > 1e10:
             # already in milliseconds
