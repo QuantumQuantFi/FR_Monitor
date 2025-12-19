@@ -262,12 +262,16 @@ LIVE_TRADING_CONFIG = {
     'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
     'horizon_min': int(float(_get_private('LIVE_TRADING_HORIZON_MIN', 'LIVE_TRADING_HORIZON_MIN', '240'))),
     # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
-    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.012')),
-    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.93')),
+    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.011')),
+    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.91')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
     'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '20')),
     'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
     'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
+    # Optional guard for Type B: require both legs' current funding rates to satisfy
+    # abs(funding_rate) <= max_abs_funding before opening a trade.
+    # Default disabled (0) because watchlist already filters funding and we want maximum entry speed.
+    'max_abs_funding': float(_get_private('LIVE_TRADING_MAX_ABS_FUNDING', 'LIVE_TRADING_MAX_ABS_FUNDING', '0')),
     # 订单簿快速复核：在“决定开仓/止盈平仓”前做多次短间隔验算，避免瞬时价差假信号。
     # 注意：每次验算会同时请求两家交易所的订单簿（REST），请结合限频调整。
     # 临时策略：仅保留 i0（单次）复核，降低 skipped（后续可再改回 3 次复核）。
@@ -285,9 +289,9 @@ LIVE_TRADING_CONFIG = {
     'allowed_exchanges': _get_private(
         'LIVE_TRADING_ALLOWED_EXCHANGES',
         'LIVE_TRADING_ALLOWED_EXCHANGES',
-        'binance,bybit,okx,bitget,hyperliquid',
+        'binance,bybit,okx,bitget,hyperliquid,lighter',
     ),
-    'candidate_limit': int(float(_get_private('LIVE_TRADING_CANDIDATE_LIMIT', 'LIVE_TRADING_CANDIDATE_LIMIT', '200'))),
+    'candidate_limit': int(float(_get_private('LIVE_TRADING_CANDIDATE_LIMIT', 'LIVE_TRADING_CANDIDATE_LIMIT', '50'))),
     'per_symbol_top_k': int(float(_get_private('LIVE_TRADING_PER_SYMBOL_TOPK', 'LIVE_TRADING_PER_SYMBOL_TOPK', '3'))),
 }
 
