@@ -11,6 +11,11 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
+    import requests  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    requests = None  # type: ignore
+
+try:
     import psycopg
     from psycopg.rows import dict_row
     from psycopg.types.json import Jsonb  # type: ignore
@@ -25,13 +30,24 @@ from trading.trade_executor import (
     TradeExecutionError,
     execute_perp_market_order,
     place_binance_perp_market_order,
+    get_binance_perp_usdt_balance,
     get_binance_perp_positions,
     get_binance_perp_order,
+    get_binance_funding_fee_income,
     get_bybit_linear_order,
     get_bybit_linear_positions,
+    get_bybit_wallet_balance,
+    get_bybit_funding_fee_transactions,
     get_bitget_usdt_perp_order_detail,
     get_bitget_usdt_perp_positions,
+    get_bitget_usdt_balance,
+    get_bitget_funding_fee_bills,
+    get_hyperliquid_balance_summary,
     get_hyperliquid_perp_positions,
+    get_hyperliquid_user_funding_history,
+    get_lighter_balance_summary,
+    place_lighter_perp_market_order,
+    get_okx_account_balance,
     get_okx_swap_positions,
     get_okx_swap_contract_value,
     place_bitget_usdt_perp_market_order,
@@ -39,10 +55,12 @@ from trading.trade_executor import (
     place_hyperliquid_perp_market_order,
     get_okx_swap_order,
     place_okx_swap_market_order,
+    get_okx_funding_fee_bills,
     set_binance_perp_leverage,
     set_bybit_linear_leverage,
     set_bitget_usdt_perp_leverage,
     set_okx_swap_leverage,
+    get_supported_trading_backends,
 )
 
 
@@ -62,7 +80,7 @@ def _jsonb(val: Any) -> Any:
 class LiveTradingConfig:
     enabled: bool
     dsn: str
-    allowed_exchanges: Tuple[str, ...] = ("binance", "bybit", "okx")
+    allowed_exchanges: Tuple[str, ...] = ("binance", "bybit", "okx", "bitget", "hyperliquid", "lighter")
     horizon_min: int = 240
     pnl_threshold: float = 0.013
     win_prob_threshold: float = 0.94
@@ -71,13 +89,18 @@ class LiveTradingConfig:
     event_lookback_minutes: int = 30
     per_leg_notional_usdt: float = 20.0
     orderbook_market_type: str = "perp"
-    candidate_limit: int = 200
+    # 每分钟最多拉取/验算的 watchlist 候选数。过大时会导致大量订单簿 REST 请求，
+    # 尤其是 Binance 深度接口会触发 IP ban（-1003）。
+    candidate_limit: int = 50
     per_symbol_top_k: int = 3
     monitor_interval_seconds: float = 60.0
     take_profit_ratio: float = 0.8
     orderbook_confirm_samples: int = 3
     orderbook_confirm_sleep_seconds: float = 0.7
     max_hold_days: int = 7
+    # Type B funding guard: require both legs' current funding to satisfy abs(funding_rate) <= max_abs_funding.
+    # Set to 0 to disable.
+    max_abs_funding: float = 0.0
     close_retry_cooldown_seconds: float = 120.0
 
 
@@ -97,8 +120,22 @@ class LiveTradingManager:
         self.logger = logging.getLogger("live_trading")
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._wakeup = threading.Event()
+        self._wakeup_lock = threading.Lock()
+        self._wakeup_reason: Optional[str] = None
         self._symbol_locks: Dict[str, threading.Lock] = {}
         self._symbol_locks_lock = threading.Lock()
+        self._funding_cache: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        self._funding_cache_lock = threading.Lock()
+        self._funding_refresh_hour: Optional[int] = None
+        self._funding_backfill_hour: Optional[int] = None
+        self._balance_snapshot_hour: Optional[int] = None
+
+    def kick(self, *, reason: str = "external") -> None:
+        """Wake the live trading loop to scan immediately (non-blocking)."""
+        with self._wakeup_lock:
+            self._wakeup_reason = str(reason or "external")
+        self._wakeup.set()
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -111,6 +148,7 @@ class LiveTradingManager:
             return
         self.ensure_schema()
         self._stop.clear()
+        self._wakeup.set()  # run first scan immediately
         self._thread = threading.Thread(target=self._run_loop, name="live-trading", daemon=True)
         self._thread.start()
         self.logger.info(
@@ -125,6 +163,7 @@ class LiveTradingManager:
         if not self._thread:
             return
         self._stop.set()
+        self._wakeup.set()
         self._thread.join(timeout=5)
         self._thread = None
 
@@ -479,8 +518,18 @@ class LiveTradingManager:
 
     def _run_loop(self) -> None:
         last_monitor_ts = 0.0
-        while not self._stop.wait(timeout=self.config.scan_interval_seconds):
+        while not self._stop.is_set():
+            kicked = self._wakeup.wait(timeout=float(self.config.scan_interval_seconds))
+            self._wakeup.clear()
+            if self._stop.is_set():
+                break
             try:
+                if kicked:
+                    with self._wakeup_lock:
+                        reason = self._wakeup_reason
+                        self._wakeup_reason = None
+                    if reason:
+                        self.logger.debug("live trading woke up by kick: %s", reason)
                 self.process_once()
             except Exception as exc:  # pragma: no cover - safety net
                 self.logger.exception("live trading loop error: %s", exc)
@@ -614,6 +663,18 @@ class LiveTradingManager:
         CREATE INDEX IF NOT EXISTS idx_live_manual_order_exchange
           ON watchlist.live_manual_order(exchange, created_at DESC);
 
+        -- Balance snapshots (persisted whenever the UI queries balances, and hourly in the background).
+        CREATE TABLE IF NOT EXISTS watchlist.live_trade_balance_snapshot (
+          id bigserial PRIMARY KEY,
+          ts timestamptz NOT NULL DEFAULT now(),
+          source text NOT NULL DEFAULT 'manual',
+          balances jsonb,
+          totals jsonb,
+          context jsonb
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_trade_balance_snapshot_ts
+          ON watchlist.live_trade_balance_snapshot(ts DESC);
+
         -- Backward-compatible schema upgrades (safe no-op when already present).
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS entry_spread_metric double precision;
@@ -632,6 +693,32 @@ class LiveTradingManager:
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS close_pnl_spread double precision;
 
+        -- Funding PnL persistence (signals table stores latest snapshot; closed signals are finalized).
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_pnl_usdt double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_long_pnl_usdt double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_short_pnl_usdt double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_last_fee_time timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_long_last_fee_time timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_short_last_fee_time timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_long_last_fee_usdt double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_short_last_fee_usdt double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_source jsonb;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_error jsonb;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_updated_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS funding_finalized boolean NOT NULL DEFAULT false;
+
         ALTER TABLE watchlist.live_trade_order
           ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'open';
         ALTER TABLE watchlist.live_trade_order
@@ -649,6 +736,265 @@ class LiveTradingManager:
                 self._apply_runtime_config_migrations(conn)
             except Exception as exc:
                 self.logger.warning("apply runtime config migrations failed: %s", exc)
+
+    def _dt_to_ms(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            try:
+                v = int(value)
+            except Exception:
+                return None
+            return v if v > 10_000_000_000 else v * 1000
+        if isinstance(value, datetime):
+            dt = value
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        if isinstance(value, str):
+            try:
+                dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except Exception:
+                return None
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp() * 1000)
+        return None
+
+    def _funding_fee_summary_since_open(
+        self,
+        exchange: str,
+        symbol: str,
+        opened_at: Any,
+        *,
+        notional_usdt: Optional[float],
+        pos_sign: int,
+        end_ms: int,
+    ) -> Dict[str, Any]:
+        """Best-effort: query account funding fee history for a single exchange+symbol."""
+        ex = (exchange or "").lower().strip()
+        sym = (symbol or "").upper().strip()
+        start_ms = self._dt_to_ms(opened_at)
+        if not ex or not sym or start_ms is None:
+            return {
+                "funding_pnl_usdt": None,
+                "last_fee_usdt": None,
+                "last_fee_time": None,
+                "currency": None,
+                "n_records": 0,
+                "source": None,
+                "error": "missing exchange/symbol/opened_at",
+            }
+
+        out: Dict[str, Any] = {
+            "funding_pnl_usdt": 0.0,
+            "last_fee_usdt": None,
+            "last_fee_time": None,
+            "currency": None,
+            "n_records": 0,
+            "source": "ledger",
+            "error": None,
+        }
+
+        def _as_float(value: Any) -> Optional[float]:
+            if value is None:
+                return None
+            try:
+                v = float(value)
+            except Exception:
+                return None
+            if not math.isfinite(v):
+                return None
+            return v
+
+        def _as_dt_from_ms(ms: Any) -> Optional[datetime]:
+            try:
+                msv = int(float(ms))
+            except Exception:
+                return None
+            if msv <= 0:
+                return None
+            return datetime.fromtimestamp(msv / 1000, tz=timezone.utc)
+
+        try:
+            rows: List[Dict[str, Any]] = []
+            if ex == "binance":
+                rows = get_binance_funding_fee_income(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms)
+                for r in rows:
+                    fee = _as_float(r.get("income"))
+                    ts_ms = r.get("time")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee
+                    out["currency"] = str(r.get("asset") or "USDT").upper()
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            elif ex == "okx":
+                rows = get_okx_funding_fee_bills(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms)
+                for r in rows:
+                    fee = _as_float(r.get("fee")) or _as_float(r.get("pnl")) or _as_float(r.get("balChg"))
+                    ts_ms = r.get("ts") or r.get("uTime") or r.get("cTime")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee
+                    out["currency"] = str(r.get("ccy") or r.get("currency") or "USDT").upper()
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            elif ex == "bybit":
+                rows = get_bybit_funding_fee_transactions(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms)
+                for r in rows:
+                    fee = _as_float(r.get("cashFlow") or r.get("cashFlowAmount") or r.get("funding"))
+                    ts_ms = r.get("transactionTime") or r.get("execTime") or r.get("time")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee
+                    out["currency"] = str(r.get("currency") or "USDT").upper()
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            elif ex == "bitget":
+                rows = get_bitget_funding_fee_bills(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms)
+                for r in rows:
+                    fee = _as_float(r.get("amount")) or _as_float(r.get("pnl"))
+                    ts_ms = r.get("cTime") or r.get("uTime") or r.get("ts")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee
+                    out["currency"] = str(r.get("coin") or r.get("ccy") or "USDT").upper()
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            elif ex == "hyperliquid":
+                rows = get_hyperliquid_user_funding_history(start_time_ms=start_ms, end_time_ms=end_ms)
+                for r in rows:
+                    delta = r.get("delta")
+                    if not isinstance(delta, dict):
+                        continue
+                    if str(delta.get("type") or "").lower() != "funding":
+                        continue
+                    coin = str(delta.get("coin") or "").upper()
+                    if coin and coin != sym.upper():
+                        continue
+                    fee = _as_float(delta.get("usdc") or delta.get("amount"))
+                    ts_ms = r.get("time") or delta.get("time") or r.get("ts")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee  # treat USDC≈USDT for display
+                    out["currency"] = "USDC"
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            else:
+                out["funding_pnl_usdt"] = None
+                out["source"] = None
+                out["error"] = f"unsupported exchange: {ex}"
+                rows = []
+
+            out["n_records"] = len(rows) if isinstance(rows, list) else 0
+        except Exception as exc:
+            out["funding_pnl_usdt"] = None
+            out["source"] = "ledger"
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["n_records"] = 0
+
+        # Fallback estimate for bybit/bitget when private ledger is empty/unavailable.
+        if (
+            (out.get("funding_pnl_usdt") in (0.0, None))
+            and int(out.get("n_records") or 0) == 0
+            and pos_sign in (-1, 1)
+            and notional_usdt is not None
+            and float(notional_usdt or 0.0) > 0
+            and ex in {"bybit", "bitget"}
+        ):
+            try:
+                from watchlist_outcome_worker import FundingHistoryFetcher  # type: ignore
+
+                fetcher = FundingHistoryFetcher()
+                start_dt = datetime.fromtimestamp(int(start_ms) / 1000, tz=timezone.utc)
+                end_dt = datetime.fromtimestamp(int(end_ms) / 1000, tz=timezone.utc)
+                points = fetcher.fetch(ex, sym.upper(), start_dt, end_dt) or []
+                if points:
+                    total = 0.0
+                    last_fee = None
+                    last_time = None
+                    for ts, rate in points:
+                        fee = -float(pos_sign) * float(rate) * float(notional_usdt)
+                        total += fee
+                        last_fee = fee
+                        last_time = ts
+                    out["funding_pnl_usdt"] = total
+                    out["last_fee_usdt"] = last_fee
+                    out["last_fee_time"] = last_time if isinstance(last_time, datetime) else None
+                    out["currency"] = "USDT"
+                    out["n_records"] = len(points)
+                    out["source"] = "rate_estimate"
+            except Exception as exc:
+                out["error"] = out.get("error") or f"rate_estimate_failed: {type(exc).__name__}: {exc}"
+
+        return out
+
+    def _upsert_signal_funding(
+        self,
+        conn,
+        *,
+        signal_id: int,
+        total: Optional[float],
+        long_sum: Dict[str, Any],
+        short_sum: Dict[str, Any],
+        updated_at: datetime,
+        finalized: bool,
+    ) -> None:
+        conn.execute(
+            """
+            UPDATE watchlist.live_trade_signal
+               SET funding_pnl_usdt=%s,
+                   funding_long_pnl_usdt=%s,
+                   funding_short_pnl_usdt=%s,
+                   funding_last_fee_time=%s,
+                   funding_long_last_fee_time=%s,
+                   funding_short_last_fee_time=%s,
+                   funding_long_last_fee_usdt=%s,
+                   funding_short_last_fee_usdt=%s,
+                   funding_source=%s,
+                   funding_error=%s,
+                   funding_updated_at=%s,
+                   funding_finalized=CASE WHEN %s THEN true ELSE funding_finalized END,
+                   updated_at=now()
+             WHERE id=%s;
+            """,
+            (
+                float(total) if total is not None else None,
+                float(long_sum.get("funding_pnl_usdt")) if long_sum.get("funding_pnl_usdt") is not None else None,
+                float(short_sum.get("funding_pnl_usdt")) if short_sum.get("funding_pnl_usdt") is not None else None,
+                max(
+                    [t for t in [long_sum.get("last_fee_time"), short_sum.get("last_fee_time")] if isinstance(t, datetime)],
+                    default=None,
+                ),
+                long_sum.get("last_fee_time") if isinstance(long_sum.get("last_fee_time"), datetime) else None,
+                short_sum.get("last_fee_time") if isinstance(short_sum.get("last_fee_time"), datetime) else None,
+                float(long_sum.get("last_fee_usdt")) if long_sum.get("last_fee_usdt") is not None else None,
+                float(short_sum.get("last_fee_usdt")) if short_sum.get("last_fee_usdt") is not None else None,
+                _jsonb({"long": long_sum.get("source"), "short": short_sum.get("source")}),
+                _jsonb({"long": long_sum.get("error"), "short": short_sum.get("error")})
+                if (long_sum.get("error") or short_sum.get("error"))
+                else None,
+                updated_at,
+                bool(finalized),
+                int(signal_id),
+            ),
+        )
 
     def _parse_fill_fields(self, exchange: str, symbol: str, order: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         """
@@ -801,6 +1147,37 @@ class LiveTradingManager:
                     info["exchange_order_id"] = str(filled.get("oid") or "") or None
             return {k: v for k, v in info.items() if v is not None}
 
+        if ex == "lighter":
+            resp = order.get("response") if isinstance(order.get("response"), dict) else {}
+            tx_hash = resp.get("tx_hash") if isinstance(resp, dict) else None
+            info["exchange_order_id"] = str(tx_hash or "") or None
+            info["status"] = str(order.get("status") or "submitted")
+            info["filled_qty"] = _float_or_none(order.get("size"))
+            # Best-effort: use latest account position avg_entry_price as the fill price proxy.
+            try:
+                bal = get_lighter_balance_summary()
+                raw = bal.get("raw_account") if isinstance(bal, dict) else None
+                positions = raw.get("positions") if isinstance(raw, dict) else None
+                if isinstance(positions, list):
+                    sym_u = str(symbol or "").upper()
+                    for p in positions:
+                        if not isinstance(p, dict):
+                            continue
+                        if str(p.get("symbol") or "").upper() != sym_u:
+                            continue
+                        avg_entry = _float_or_none(p.get("avg_entry_price"))
+                        if avg_entry and avg_entry > 0:
+                            info["avg_price"] = avg_entry
+                            break
+            except Exception:
+                pass
+            if info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                try:
+                    info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
+                except Exception:
+                    pass
+            return {k: v for k, v in info.items() if v is not None}
+
         if ex == "bybit":
             base = order.get("result") if isinstance(order.get("result"), dict) else {}
             order_id = base.get("orderId") or order.get("orderId")
@@ -901,12 +1278,27 @@ class LiveTradingManager:
             if ex == "hyperliquid":
                 return float(self._get_hyperliquid_position_szi(sym))
             if ex == "binance":
+                # Binance USDT-M futures:
+                # - One-way mode: usually a single row with positionSide="BOTH"/"NET"
+                # - Hedge mode: returns two rows per symbol (positionSide="LONG"/"SHORT")
+                # In hedge mode, taking only rows[0] can miss the actual exposure.
                 rows = get_binance_perp_positions(symbol=f"{sym}USDT")
-                if not rows:
-                    return 0.0
-                if isinstance(rows[0], dict):
-                    return float(rows[0].get("positionAmt") or 0)
-                return 0.0
+                total = 0.0
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    pos_side = str(r.get("positionSide") or r.get("posSide") or "").strip().upper()
+                    try:
+                        pos_amt = float(r.get("positionAmt") or 0.0)
+                    except Exception:
+                        pos_amt = 0.0
+                    if pos_side == "LONG":
+                        total += abs(pos_amt)
+                    elif pos_side == "SHORT":
+                        total -= abs(pos_amt)
+                    else:
+                        total += pos_amt
+                return float(total)
             if ex == "okx":
                 ct_val = None
                 try:
@@ -977,6 +1369,29 @@ class LiveTradingManager:
                     elif hold == "long":
                         total += abs(qty)
                 return total
+            if ex == "lighter":
+                bal = get_lighter_balance_summary()
+                raw = bal.get("raw_account") if isinstance(bal, dict) else None
+                positions = raw.get("positions") if isinstance(raw, dict) else None
+                if not isinstance(positions, list):
+                    return 0.0
+                total = 0.0
+                for p in positions:
+                    if not isinstance(p, dict):
+                        continue
+                    if str(p.get("symbol") or "").upper() != sym:
+                        continue
+                    try:
+                        pos = float(p.get("position") or 0.0)
+                    except Exception:
+                        pos = 0.0
+                    try:
+                        sign = float(p.get("sign") or 1.0)
+                    except Exception:
+                        sign = 1.0
+                    # sign: 1 (long), -1 (short), position is abs qty
+                    total += float(sign) * abs(float(pos))
+                return float(total)
         except Exception:
             return None
         return None
@@ -1213,8 +1628,203 @@ class LiveTradingManager:
     def _supported_exchange(self, exchange: str) -> bool:
         allowed = {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
         if not allowed:
-            allowed = {"binance", "bybit", "okx", "bitget", "hyperliquid"}
+            allowed = {"binance", "bybit", "okx", "bitget", "hyperliquid", "lighter"}
         return (exchange or "").lower() in allowed
+
+    def _get_public_funding_mark(self, exchange: str, symbol: str) -> Dict[str, Any]:
+        """
+        Best-effort public funding/mark lookup (cached).
+        Returns {funding_rate, funding_interval_hours, next_funding_time, mark_price, error}.
+        funding_rate is a decimal (e.g. 0.0001 = 0.01%) per exchange's own interval.
+        """
+        ex = (exchange or "").lower().strip()
+        base = (symbol or "").upper().strip()
+        if not ex or not base:
+            return {"error": "missing_exchange_or_symbol"}
+
+        key = (ex, base)
+        now_ts = time.time()
+        with self._funding_cache_lock:
+            cached = self._funding_cache.get(key)
+        if isinstance(cached, dict) and float(cached.get("expires_at") or 0.0) > now_ts:
+            val = cached.get("value")
+            return dict(val) if isinstance(val, dict) else {}
+
+        out: Dict[str, Any] = {}
+        if requests is None:
+            out["error"] = "requests_not_available"
+        else:
+            try:
+                timeout = 6.0
+                headers = {"User-Agent": "FR-Monitor/1.0", "Accept": "application/json"}
+
+                if ex == "binance":
+                    sym = f"{base}USDT"
+                    resp = requests.get(
+                        "https://fapi.binance.com/fapi/v1/premiumIndex",
+                        params={"symbol": sym},
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json() if resp.content else {}
+                        if isinstance(data, dict):
+                            try:
+                                if data.get("markPrice") is not None:
+                                    out["mark_price"] = float(data.get("markPrice"))
+                            except Exception:
+                                pass
+                            try:
+                                if data.get("lastFundingRate") is not None:
+                                    out["funding_rate"] = float(data.get("lastFundingRate"))
+                            except Exception:
+                                pass
+                            out["next_funding_time"] = data.get("nextFundingTime")
+                    else:
+                        out["error"] = f"binance_http_{resp.status_code}"
+
+                elif ex == "bybit":
+                    sym = f"{base}USDT"
+                    resp = requests.get(
+                        "https://api.bybit.com/v5/market/tickers",
+                        params={"category": "linear", "symbol": sym},
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json() if resp.content else {}
+                        try:
+                            it = (((data or {}).get("result") or {}).get("list") or [None])[0]
+                        except Exception:
+                            it = None
+                        if isinstance(it, dict):
+                            try:
+                                if it.get("markPrice") is not None:
+                                    out["mark_price"] = float(it.get("markPrice"))
+                            except Exception:
+                                pass
+                            try:
+                                if it.get("fundingRate") is not None:
+                                    out["funding_rate"] = float(it.get("fundingRate"))
+                            except Exception:
+                                pass
+                            out["funding_interval_hours"] = it.get("fundingIntervalHour")
+                            out["next_funding_time"] = it.get("nextFundingTime")
+                    else:
+                        out["error"] = f"bybit_http_{resp.status_code}"
+
+                elif ex == "okx":
+                    inst = f"{base}-USDT-SWAP"
+                    resp = requests.get(
+                        "https://www.okx.com/api/v5/public/funding-rate",
+                        params={"instId": inst},
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json() if resp.content else {}
+                        try:
+                            row = ((data or {}).get("data") or [None])[0]
+                        except Exception:
+                            row = None
+                        if isinstance(row, dict):
+                            try:
+                                if row.get("fundingRate") is not None:
+                                    out["funding_rate"] = float(row.get("fundingRate"))
+                            except Exception:
+                                pass
+                            out["next_funding_time"] = row.get("nextFundingTime")
+                    else:
+                        out["error"] = f"okx_http_{resp.status_code}"
+
+                elif ex == "bitget":
+                    sym = f"{base}USDT"
+                    resp = requests.get(
+                        "https://api.bitget.com/api/v2/mix/market/current-fund-rate",
+                        params={"symbol": sym, "productType": "usdt-futures"},
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json() if resp.content else {}
+                        row = (data or {}).get("data")
+                        if isinstance(row, dict):
+                            try:
+                                fr = row.get("fundingRate") or row.get("fundingRateStr")
+                                if fr is not None:
+                                    out["funding_rate"] = float(fr)
+                            except Exception:
+                                pass
+                            out["funding_interval_hours"] = row.get("fundingRateInterval")
+                            out["next_funding_time"] = row.get("nextSettleTime")
+                    else:
+                        out["error"] = f"bitget_http_{resp.status_code}"
+
+                elif ex == "hyperliquid":
+                    try:
+                        from rest_collectors import get_hyperliquid_funding_map  # type: ignore
+
+                        fmap = get_hyperliquid_funding_map()
+                    except Exception:
+                        fmap = {}
+                    ctx = fmap.get(base) if isinstance(fmap, dict) else None
+                    if isinstance(ctx, dict):
+                        try:
+                            if ctx.get("markPx") is not None:
+                                out["mark_price"] = float(ctx.get("markPx"))
+                        except Exception:
+                            pass
+                        try:
+                            if ctx.get("funding") is not None:
+                                out["funding_rate"] = float(ctx.get("funding"))
+                        except Exception:
+                            pass
+                        out["funding_interval_hours"] = 1.0
+                else:
+                    out["error"] = "unsupported_exchange"
+            except Exception as exc:
+                out["error"] = f"{type(exc).__name__}: {exc}"
+
+        with self._funding_cache_lock:
+            self._funding_cache[key] = {"expires_at": now_ts + 10.0, "value": dict(out)}
+        return dict(out)
+
+    def _check_funding_guard(self, *, symbol: str, long_ex: str, short_ex: str, event: Dict[str, Any]) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        """
+        Type B funding guard: require both legs' *current* funding rates within threshold.
+        Returns (ok, payload_fragment, reason).
+        """
+        threshold = float(getattr(self.config, "max_abs_funding", 0.0) or 0.0)
+        if threshold <= 0:
+            return True, {"enabled": False}, None
+
+        if str((event or {}).get("signal_type") or "").upper() != "B":
+            return True, {"enabled": False}, None
+
+        long_info = self._get_public_funding_mark(long_ex, symbol)
+        short_info = self._get_public_funding_mark(short_ex, symbol)
+
+        def _fr(info: Dict[str, Any]) -> Optional[float]:
+            try:
+                v = info.get("funding_rate")
+                return float(v) if v is not None else None
+            except Exception:
+                return None
+
+        fr_long = _fr(long_info or {})
+        fr_short = _fr(short_info or {})
+        payload = {
+            "enabled": True,
+            "threshold": threshold,
+            "long": {"exchange": str(long_ex), **(long_info or {})},
+            "short": {"exchange": str(short_ex), **(short_info or {})},
+        }
+
+        if fr_long is None or fr_short is None:
+            return False, payload, "funding_unavailable"
+        if max(abs(float(fr_long)), abs(float(fr_short))) > threshold:
+            return False, payload, "funding_too_high"
+        return True, payload, None
 
     def _pick_high_low(
         self,
@@ -1607,6 +2217,58 @@ class LiveTradingManager:
         high_ex = str(confirm.get("short_exchange") or high_ex)
         low_ex = str(confirm.get("long_exchange") or low_ex)
 
+        # Funding guard (Type B): re-check current funding before opening.
+        f_ok, f_payload, f_reason = self._check_funding_guard(symbol=symbol, long_ex=low_ex, short_ex=high_ex, event=event)
+        if not f_ok:
+            client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+            payload = {
+                "event": {
+                    "id": int(event["id"]),
+                    "start_ts": str(event.get("start_ts")),
+                    "symbol": symbol,
+                    "signal_type": event.get("signal_type"),
+                    "trigger_details": event.get("trigger_details"),
+                },
+                "threshold": {
+                    "horizon_min": int(self.config.horizon_min),
+                    "pnl_threshold": float(self.config.pnl_threshold),
+                    "win_prob_threshold": float(self.config.win_prob_threshold),
+                    "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
+                    "max_abs_funding": float(getattr(self.config, "max_abs_funding", 0.0) or 0.0),
+                },
+                "orderbook_revalidation": {
+                    "pnl_hat": reval.get("pnl_hat"),
+                    "win_prob": reval.get("win_prob"),
+                    "orderbook": reval.get("orderbook"),
+                },
+                "orderbook_confirm_open": confirm,
+                "funding_revalidation": f_payload,
+            }
+            signal_id = self._insert_signal(
+                conn,
+                event=event,
+                leg_long_exchange=low_ex,
+                leg_short_exchange=high_ex,
+                pnl_hat=float(event.get("pnl_hat_240") or 0.0),
+                win_prob=float(event.get("win_prob_240") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+                win_prob_ob=float(reval.get("win_prob") or 0.0),
+                payload=payload,
+                status="skipped",
+                reason=str(f_reason or "funding_guard"),
+                client_order_id_base=client_base,
+            )
+            if signal_id:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="funding_guard",
+                    error_type="not_ok",
+                    message=str(f_reason or "funding_guard"),
+                    context={"symbol": symbol, "event_id": int(event["id"]), "funding": f_payload},
+                )
+            return
+
         client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
         payload = {
             "event": {
@@ -1628,6 +2290,7 @@ class LiveTradingManager:
                 "orderbook": reval.get("orderbook"),
             },
             "orderbook_confirm_open": confirm,
+            "funding_revalidation": f_payload,
         }
 
         signal_id = self._insert_signal(
@@ -1947,6 +2610,15 @@ class LiveTradingManager:
             return
 
         with self._conn() as conn:
+            # Persist balance snapshots at most once per UTC hour (best-effort).
+            self._refresh_balance_snapshot_if_due(conn)
+
+            # Funding PnL persistence:
+            # - Active trades: refresh at most once per UTC hour and store latest snapshot in DB.
+            # - Closed trades (unfinalized): backfill at most once per UTC hour (batched) to make history stable.
+            self._refresh_funding_pnl_if_due(conn)
+            self._backfill_closed_funding_if_due(conn)
+
             rows = conn.execute(
                 """
                 SELECT *
@@ -1971,6 +2643,358 @@ class LiveTradingManager:
                     self._monitor_one(conn, row)
                 finally:
                     lock.release()
+
+    def _configured_exchanges_for_balance_snapshot(self) -> List[str]:
+        default_exchanges = ["binance", "okx", "bybit", "bitget", "hyperliquid", "lighter"]
+        requested = [str(x).lower().strip() for x in (self.config.allowed_exchanges or ()) if str(x).strip()]
+
+        supported: Optional[set] = None
+        try:
+            backends = get_supported_trading_backends() if callable(get_supported_trading_backends) else None
+            if isinstance(backends, dict):
+                supported = set([str(x).lower() for x in (backends.get("perpetual") or [])]) | {"lighter"}
+        except Exception:
+            supported = None
+
+        out: List[str] = []
+        for ex in default_exchanges + requested:
+            exl = str(ex).lower().strip()
+            if not exl:
+                continue
+            if exl in out:
+                continue
+            if supported and exl not in supported:
+                continue
+            out.append(exl)
+        return out
+
+    @staticmethod
+    def _normalize_balance_for_totals(balance: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(balance, dict):
+            return None
+        currency = (str(balance.get("currency") or "") or "").upper().strip()
+        if not currency:
+            return None
+        avail = (
+            balance.get("available_balance")
+            if balance.get("available_balance") is not None
+            else balance.get("withdrawable")
+        )
+        wallet = (
+            balance.get("wallet_balance")
+            if balance.get("wallet_balance") is not None
+            else balance.get("equity")
+        )
+        if wallet is None and balance.get("account_value") is not None:
+            wallet = balance.get("account_value")
+        if wallet is None and balance.get("cash_bal") is not None:
+            wallet = balance.get("cash_bal")
+        try:
+            avail_f = float(avail) if avail not in ("", None) else None
+        except Exception:
+            avail_f = None
+        try:
+            wallet_f = float(wallet) if wallet not in ("", None) else None
+        except Exception:
+            wallet_f = None
+        return {"currency": currency, "available": avail_f, "wallet": wallet_f}
+
+    @classmethod
+    def _compute_balance_totals(cls, rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, float]]:
+        totals: Dict[str, Dict[str, float]] = {}
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            b = cls._normalize_balance_for_totals(r.get("balance"))
+            if not b:
+                continue
+            cur = str(b["currency"])
+            if cur not in totals:
+                totals[cur] = {"available": 0.0, "wallet": 0.0}
+            if b.get("available") is not None:
+                totals[cur]["available"] += float(b["available"])
+            if b.get("wallet") is not None:
+                totals[cur]["wallet"] += float(b["wallet"])
+        # Round for display/storage stability.
+        for cur, t in totals.items():
+            t["available"] = float(round(float(t.get("available") or 0.0), 10))
+            t["wallet"] = float(round(float(t.get("wallet") or 0.0), 10))
+        return totals
+
+    def _fetch_balance_rows(self, exchanges: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for ex in exchanges or []:
+            exl = str(ex).lower().strip()
+            if not exl:
+                continue
+            try:
+                if exl == "binance":
+                    bal = get_binance_perp_usdt_balance()
+                elif exl == "okx":
+                    bal = get_okx_account_balance(ccy="USDT")
+                elif exl == "bybit":
+                    bal = get_bybit_wallet_balance(coin="USDT", account_type="UNIFIED")
+                elif exl == "bitget":
+                    bal = get_bitget_usdt_balance(margin_coin="USDT")
+                elif exl == "hyperliquid":
+                    bal = get_hyperliquid_balance_summary()
+                elif exl == "lighter":
+                    bal = get_lighter_balance_summary()
+                else:
+                    bal = None
+                rows.append({"exchange": exl, "balance": bal, "error": None})
+            except TradeExecutionError as exc:
+                rows.append({"exchange": exl, "balance": None, "error": str(exc)})
+            except Exception as exc:
+                rows.append({"exchange": exl, "balance": None, "error": f"{type(exc).__name__}: {exc}"})
+        return rows
+
+    def _insert_balance_snapshot(
+        self,
+        conn,
+        *,
+        source: str,
+        balance_rows: List[Dict[str, Any]],
+        totals: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[int]:
+        try:
+            row = conn.execute(
+                """
+                INSERT INTO watchlist.live_trade_balance_snapshot(source, balances, totals, context)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id;
+                """,
+                (
+                    str(source or "manual"),
+                    _jsonb(balance_rows),
+                    _jsonb(totals),
+                    _jsonb(context or {}),
+                ),
+            ).fetchone()
+            if isinstance(row, dict):
+                return int(row.get("id") or 0) or None
+            if isinstance(row, (list, tuple)) and row:
+                return int(row[0]) or None
+        except Exception:
+            return None
+        return None
+
+    def _refresh_balance_snapshot_if_due(self, conn) -> None:
+        now = _utcnow()
+        hour_bucket = int(now.timestamp() // 3600)
+        if self._balance_snapshot_hour == hour_bucket:
+            return
+        self._balance_snapshot_hour = hour_bucket
+
+        exchanges = self._configured_exchanges_for_balance_snapshot()
+        rows = self._fetch_balance_rows(exchanges)
+        totals = self._compute_balance_totals(rows)
+        self._insert_balance_snapshot(
+            conn,
+            source="hourly",
+            balance_rows=rows,
+            totals=totals,
+            context={"mode": "hourly", "exchanges": exchanges},
+        )
+
+    def _refresh_funding_pnl_if_due(self, conn) -> None:
+        now = _utcnow()
+        hour_bucket = int(now.timestamp() // 3600)
+        if self._funding_refresh_hour == hour_bucket:
+            return
+        self._funding_refresh_hour = hour_bucket
+
+        rows = conn.execute(
+            """
+            SELECT id, symbol, leg_long_exchange, leg_short_exchange, opened_at, created_at, funding_finalized
+              FROM watchlist.live_trade_signal
+             WHERE status IN ('open','closing')
+               AND COALESCE(funding_finalized, false)=false
+             ORDER BY opened_at ASC NULLS LAST, created_at ASC
+             LIMIT %s;
+            """,
+            (int(self.config.max_concurrent_trades) * 2,),
+        ).fetchall()
+
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            sid = int(r.get("id") or 0)
+            sym = str(r.get("symbol") or "").upper()
+            long_ex = str(r.get("leg_long_exchange") or "").lower()
+            short_ex = str(r.get("leg_short_exchange") or "").lower()
+            opened_at = r.get("opened_at") or r.get("created_at")
+            if not (sid and sym and long_ex and short_ex and opened_at):
+                continue
+            # Prefer actual per-leg notional from open order records.
+            per_leg = float(self.config.per_leg_notional_usdt)
+            try:
+                open_rows = conn.execute(
+                    """
+                    SELECT leg, COALESCE(notional_usdt, 0) AS notional_usdt
+                      FROM watchlist.live_trade_order
+                     WHERE signal_id=%s AND action='open'
+                     ORDER BY id ASC;
+                    """,
+                    (sid,),
+                ).fetchall()
+            except Exception:
+                open_rows = []
+            long_notional = per_leg
+            short_notional = per_leg
+            for orow in open_rows or []:
+                if not isinstance(orow, dict):
+                    continue
+                leg = str(orow.get("leg") or "")
+                try:
+                    val = float(orow.get("notional_usdt") or 0.0)
+                except Exception:
+                    val = 0.0
+                if val <= 0:
+                    continue
+                if leg == "long":
+                    long_notional = val
+                elif leg == "short":
+                    short_notional = val
+
+            end_ms = int(now.timestamp() * 1000)
+            long_sum = self._funding_fee_summary_since_open(
+                long_ex, sym, opened_at, end_ms=end_ms, notional_usdt=long_notional, pos_sign=1
+            )
+            short_sum = self._funding_fee_summary_since_open(
+                short_ex, sym, opened_at, end_ms=end_ms, notional_usdt=short_notional, pos_sign=-1
+            )
+            total = None
+            try:
+                if long_sum.get("funding_pnl_usdt") is not None and short_sum.get("funding_pnl_usdt") is not None:
+                    total = float(long_sum.get("funding_pnl_usdt") or 0.0) + float(short_sum.get("funding_pnl_usdt") or 0.0)
+            except Exception:
+                total = None
+            try:
+                self._upsert_signal_funding(
+                    conn,
+                    signal_id=sid,
+                    total=total,
+                    long_sum=long_sum,
+                    short_sum=short_sum,
+                    updated_at=now,
+                    finalized=False,
+                )
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=sid,
+                    stage="funding_refresh",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": sym, "long_ex": long_ex, "short_ex": short_ex},
+                )
+
+    def _backfill_closed_funding_if_due(self, conn) -> None:
+        now = _utcnow()
+        hour_bucket = int(now.timestamp() // 3600)
+        if self._funding_backfill_hour == hour_bucket:
+            return
+        self._funding_backfill_hour = hour_bucket
+
+        rows = conn.execute(
+            """
+            SELECT id, symbol, leg_long_exchange, leg_short_exchange, opened_at, created_at, closed_at
+              FROM watchlist.live_trade_signal
+             WHERE status='closed'
+               AND COALESCE(funding_finalized, false)=false
+               AND closed_at IS NOT NULL
+             ORDER BY closed_at DESC
+             LIMIT 50;
+            """
+        ).fetchall()
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            sid = int(r.get("id") or 0)
+            sym = str(r.get("symbol") or "").upper()
+            long_ex = str(r.get("leg_long_exchange") or "").lower()
+            short_ex = str(r.get("leg_short_exchange") or "").lower()
+            opened_at = r.get("opened_at") or r.get("created_at")
+            closed_at = r.get("closed_at")
+            if not (sid and sym and long_ex and short_ex and opened_at and isinstance(closed_at, datetime)):
+                continue
+            self._finalize_signal_funding(conn, sid, sym, long_ex, short_ex, opened_at, closed_at)
+
+    def _finalize_signal_funding(
+        self,
+        conn,
+        signal_id: int,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        opened_at: Any,
+        closed_at: datetime,
+    ) -> None:
+        per_leg = float(self.config.per_leg_notional_usdt)
+        try:
+            open_rows = conn.execute(
+                """
+                SELECT leg, COALESCE(notional_usdt, 0) AS notional_usdt
+                  FROM watchlist.live_trade_order
+                 WHERE signal_id=%s AND action='open'
+                 ORDER BY id ASC;
+                """,
+                (int(signal_id),),
+            ).fetchall()
+        except Exception:
+            open_rows = []
+        long_notional = per_leg
+        short_notional = per_leg
+        for orow in open_rows or []:
+            if not isinstance(orow, dict):
+                continue
+            leg = str(orow.get("leg") or "")
+            try:
+                val = float(orow.get("notional_usdt") or 0.0)
+            except Exception:
+                val = 0.0
+            if val <= 0:
+                continue
+            if leg == "long":
+                long_notional = val
+            elif leg == "short":
+                short_notional = val
+
+        end_ms = int(closed_at.astimezone(timezone.utc).timestamp() * 1000)
+        long_sum = self._funding_fee_summary_since_open(
+            long_ex, symbol, opened_at, end_ms=end_ms, notional_usdt=long_notional, pos_sign=1
+        )
+        short_sum = self._funding_fee_summary_since_open(
+            short_ex, symbol, opened_at, end_ms=end_ms, notional_usdt=short_notional, pos_sign=-1
+        )
+        total = None
+        try:
+            if long_sum.get("funding_pnl_usdt") is not None and short_sum.get("funding_pnl_usdt") is not None:
+                total = float(long_sum.get("funding_pnl_usdt") or 0.0) + float(short_sum.get("funding_pnl_usdt") or 0.0)
+        except Exception:
+            total = None
+
+        try:
+            self._upsert_signal_funding(
+                conn,
+                signal_id=int(signal_id),
+                total=total,
+                long_sum=long_sum,
+                short_sum=short_sum,
+                updated_at=closed_at.astimezone(timezone.utc),
+                finalized=True,
+            )
+        except Exception as exc:
+            self._record_error(
+                conn,
+                signal_id=int(signal_id),
+                stage="funding_finalize",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex},
+            )
 
     def _monitor_one(self, conn, signal_row: Dict[str, Any]) -> None:
         signal_id = int(signal_row.get("id") or 0)
@@ -2572,6 +3596,33 @@ class LiveTradingManager:
             return
 
         self._update_signal_status(conn, signal_id, "closed")
+        # Funding PnL is time-window based; once closed, finalize it (opened_at → closed_at) and persist.
+        try:
+            closed_row = conn.execute(
+                """
+                SELECT symbol, leg_long_exchange, leg_short_exchange, opened_at, created_at, closed_at
+                  FROM watchlist.live_trade_signal
+                 WHERE id=%s;
+                """,
+                (int(signal_id),),
+            ).fetchone()
+            if isinstance(closed_row, dict):
+                sym = str(closed_row.get("symbol") or "").upper()
+                long_ex = str(closed_row.get("leg_long_exchange") or "").lower()
+                short_ex = str(closed_row.get("leg_short_exchange") or "").lower()
+                opened_at = closed_row.get("opened_at") or closed_row.get("created_at")
+                closed_at = closed_row.get("closed_at")
+                if sym and long_ex and short_ex and opened_at and isinstance(closed_at, datetime):
+                    self._finalize_signal_funding(conn, int(signal_id), sym, long_ex, short_ex, opened_at, closed_at)
+        except Exception as exc:  # pragma: no cover - best-effort
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="funding_finalize",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"signal_id": signal_id},
+            )
 
     def _place_close_order(
         self,
@@ -2716,6 +3767,16 @@ class LiveTradingManager:
                 symbol,
                 close_side,
                 close_qty,
+                reduce_only=True,
+                client_order_id=client_order_id,
+            )
+        if ex == "lighter":
+            # Lighter positions are signed; close by the requested qty (best-effort).
+            close_side = "sell" if pos == "long" else "buy"
+            return place_lighter_perp_market_order(
+                symbol,
+                close_side,
+                float(quantity),
                 reduce_only=True,
                 client_order_id=client_order_id,
             )
