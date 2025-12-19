@@ -6,7 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 # psycopg is not in requirements yet; keep import lazy and fail soft.
 try:
@@ -53,6 +53,9 @@ class PgWriter:
         # funding history cache: key=(exchange,symbol,day_bucket)
         self._funding_cache: Dict[Tuple[str, str, int], List[Tuple[datetime, float]]] = {}
         self._funding_calls = 0
+        # Optional hook: called after watch_signal_event rows are inserted.
+        # Signature: callback(event_ids: List[int]) -> None
+        self.on_event_written: Optional[Callable[[List[int]], None]] = None
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -508,6 +511,7 @@ class PgWriter:
             return payload
 
         try:
+            inserted_event_ids: List[int] = []
             with psycopg.connect(self.config.dsn, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     for ins in inserts:
@@ -533,6 +537,10 @@ class PgWriter:
                             _normalize_payload(_ensure_event_defaults(ins)),
                         )
                         event_id = cur.fetchone()[0]
+                        try:
+                            inserted_event_ids.append(int(event_id))
+                        except Exception:
+                            pass
                         key = (ins["exchange"], ins["symbol"], ins["signal_type"])
                         if key in self._event_state:
                             self._event_state[key]["event_id"] = event_id
@@ -570,6 +578,11 @@ class PgWriter:
                             _normalize_payload(_ensure_event_defaults(upd)),
                         )
             self.logger.info("event ops applied: %s inserts, %s updates", len(inserts), len(updates))
+            if inserted_event_ids and self.on_event_written:
+                try:
+                    self.on_event_written(list(inserted_event_ids))
+                except Exception as exc:  # pragma: no cover - callback best-effort
+                    self.logger.debug("on_event_written callback failed: %s", exc)
         except Exception as exc:
             self.logger.warning("apply event ops failed: %s", exc)
 

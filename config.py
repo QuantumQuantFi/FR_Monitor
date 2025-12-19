@@ -265,7 +265,11 @@ LIVE_TRADING_CONFIG = {
     'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.011')),
     'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.91')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
-    'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '20')),
+    # 扫描周期：建议使用 watchlist → kick 的事件驱动作为 fast-path，
+    # 定时扫描作为兜底即可，避免频繁订单簿复核导致交易所 ban。
+    'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '60')),
+    # 以 kick 为主：watchlist 写入 event 后立即唤醒 live trading；同时保留 scan_interval_seconds 作为兜底。
+    'kick_driven': _is_truthy(_get_private('LIVE_TRADING_KICK_DRIVEN', 'LIVE_TRADING_KICK_DRIVEN', '1')),
     'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
     'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
     # Optional guard for Type B: require both legs' current funding rates to satisfy
@@ -282,17 +286,21 @@ LIVE_TRADING_CONFIG = {
     'close_retry_cooldown_seconds': float(
         _get_private('LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', 'LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', '120')
     ),
-    'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '30'))),
+    # 只处理“最近”的 event，避免对历史候选重复做订单簿复核。
+    'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '3'))),
     # 注意：不同交易所/合约对存在最小下单名义金额/最小下单数量；默认提升到 50U 以降低拒单概率。
     'per_leg_notional_usdt': float(_get_private('LIVE_TRADING_PER_LEG_USDT', 'LIVE_TRADING_PER_LEG_USDT', '50')),
     # 限制自动实盘允许使用的交易所（逗号分隔）；避免因为某个交易所接口变更/余额不足导致全局失败。
     'allowed_exchanges': _get_private(
         'LIVE_TRADING_ALLOWED_EXCHANGES',
         'LIVE_TRADING_ALLOWED_EXCHANGES',
-        'binance,bybit,okx,bitget,hyperliquid,lighter',
+        'binance,bybit,okx,bitget,hyperliquid,lighter,grvt',
     ),
     'candidate_limit': int(float(_get_private('LIVE_TRADING_CANDIDATE_LIMIT', 'LIVE_TRADING_CANDIDATE_LIMIT', '50'))),
     'per_symbol_top_k': int(float(_get_private('LIVE_TRADING_PER_SYMBOL_TOPK', 'LIVE_TRADING_PER_SYMBOL_TOPK', '3'))),
+    # 每次扫描最多评估多少个币种（每个币种至少会请求 2 次订单簿：两家交易所各一次）。
+    # 用于控制对 Binance/OKX 等 REST 深度接口的压力，避免触发 418 ban。
+    'max_symbols_per_scan': int(float(_get_private('LIVE_TRADING_MAX_SYMBOLS_PER_SCAN', 'LIVE_TRADING_MAX_SYMBOLS_PER_SCAN', '8'))),
 }
 
 # 内存优化配置

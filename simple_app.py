@@ -37,6 +37,7 @@ from trading.trade_executor import (
     execute_dual_perp_market_order,
     execute_perp_market_batch,
     get_supported_trading_backends,
+    get_binance_perp_account,
     get_binance_perp_positions,
     get_binance_perp_usdt_balance,
     get_binance_funding_fee_income,
@@ -54,6 +55,9 @@ from trading.trade_executor import (
     get_hyperliquid_balance_summary,
     get_hyperliquid_user_funding_history,
     get_lighter_balance_summary,
+    get_grvt_balance_summary,
+    get_grvt_perp_positions,
+    get_grvt_funding_payment_history,
 )
 from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
 from watchlist_manager import WatchlistManager
@@ -1086,9 +1090,9 @@ if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"
     threading.Thread(target=_watchlist_preload_worker, name="watchlist-preload", daemon=True).start()
 
 # Live trading manager (Phase 1: Type B only). Default disabled via LIVE_TRADING_CONFIG.
-    live_trading_manager = LiveTradingManager(
-        LiveTradingConfig(
-            enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
+live_trading_manager = LiveTradingManager(
+    LiveTradingConfig(
+        enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
         dsn=str(WATCHLIST_PG_CONFIG.get('dsn')),
         allowed_exchanges=tuple(
             x.strip().lower()
@@ -1109,14 +1113,21 @@ if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"
         close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
         per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
-        candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 200)),
+        candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 50)),
         per_symbol_top_k=int(LIVE_TRADING_CONFIG.get('per_symbol_top_k', 3)),
+        max_symbols_per_scan=int(LIVE_TRADING_CONFIG.get('max_symbols_per_scan', 8)),
+        kick_driven=bool(LIVE_TRADING_CONFIG.get('kick_driven', True)),
     )
 )
 try:
     # Create tables even when auto-trading is disabled, so UI/API can inspect status.
     live_trading_manager.ensure_schema()
     live_trading_manager.start()
+    # When a new watchlist event is inserted into PG, wake live trading immediately (kick-driven).
+    try:
+        watchlist_manager.set_live_trading_kick(lambda reason: live_trading_manager.kick(reason=reason))
+    except Exception:
+        pass
 except Exception as exc:
     logging.getLogger('live_trading').warning("live trading start failed: %s", exc)
 
@@ -1367,6 +1378,21 @@ def _funding_fee_summary_since_open(
                     continue
                 out["funding_pnl_usdt"] += fee
                 out["currency"] = str(r.get("marginCoin") or r.get("ccy") or "USDT").upper()
+                iso = _as_iso_from_ms(ts_ms)
+                if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
+                    out["last_fee_time"] = iso
+                    out["last_fee_usdt"] = fee
+
+        elif ex == "grvt":
+            rows = get_grvt_funding_payment_history(symbol=sym, start_time_ms=start_ms, end_time_ms=now_ms, limit=1000)
+            for r in rows:
+                # Normalized: income >0 means received (benefit), <0 means paid (cost)
+                fee = _as_float(r.get("income"))
+                ts_ms = r.get("time")
+                if fee is None:
+                    continue
+                out["funding_pnl_usdt"] += fee
+                out["currency"] = str(r.get("currency") or "USDT").upper()
                 iso = _as_iso_from_ms(ts_ms)
                 if iso and (out["last_fee_time"] is None or iso > str(out["last_fee_time"])):
                     out["last_fee_time"] = iso
@@ -3152,6 +3178,35 @@ def live_trading_positions():
             if ex == 'lighter':
                 raw = row.get('position') or row.get('size') or 0.0
                 return abs(float(raw or 0.0)) > 1e-12
+            if ex == 'grvt':
+                return abs(float(row.get('size') or 0.0)) > 1e-12
+        except Exception:
+            return True
+        return True
+
+    def _pos_is_nonzero(exchange: str, row: Any) -> bool:
+        """Check whether a position row is non-zero (ignores `only_nonzero`)."""
+        if not isinstance(row, dict):
+            return False
+        ex = (exchange or '').lower()
+        try:
+            if ex == 'binance':
+                return abs(float(row.get('positionAmt') or 0.0)) > 1e-12
+            if ex == 'okx':
+                return abs(float(row.get('pos') or row.get('sz') or 0.0)) > 1e-12
+            if ex == 'bybit':
+                return abs(float(row.get('size') or row.get('qty') or 0.0)) > 1e-12
+            if ex == 'bitget':
+                raw = row.get('available') or row.get('total') or row.get('openQty') or row.get('pos') or 0.0
+                return abs(float(raw or 0.0)) > 1e-12
+            if ex == 'hyperliquid':
+                p = row.get('position') if isinstance(row.get('position'), dict) else row
+                return abs(float(p.get('szi') or 0.0)) > 1e-12
+            if ex == 'lighter':
+                raw = row.get('position') or row.get('size') or 0.0
+                return abs(float(raw or 0.0)) > 1e-12
+            if ex == 'grvt':
+                return abs(float(row.get('size') or 0.0)) > 1e-12
         except Exception:
             return True
         return True
@@ -3167,7 +3222,7 @@ def live_trading_positions():
         supported = set()
     if supported:
         supported.add("lighter")
-    default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid', 'lighter']
+    default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid', 'lighter', 'grvt']
     exchanges = [ex for ex in default_exchanges if not supported or ex in supported]
 
     # Public mark price / funding enrichment (best-effort, cached).
@@ -3227,7 +3282,13 @@ def live_trading_positions():
         val = item.get("value")
         return val if isinstance(val, dict) else None
 
-    def _cache_set(key: Tuple[str, str], value: Dict[str, Any], ttl_s: float = 10.0) -> None:
+    def _cache_set(key: Tuple[str, str], value: Dict[str, Any], ttl_s: float = 0.0) -> None:
+        # For positions UI we prefer accuracy over caching; default ttl=0 disables cache.
+        try:
+            if float(ttl_s) <= 0:
+                return
+        except Exception:
+            return
         with _PUB_CACHE_LOCK:
             _PUB_CACHE[key] = {"expires_at": time.time() + float(ttl_s), "value": value}
 
@@ -3417,6 +3478,43 @@ def live_trading_positions():
                 out["funding_interval_hours"] = float(interval)
                 out["next_funding_time"] = _next_utc_boundary_iso(int(interval or 1), now=now)
 
+        elif ex == "grvt":
+            base_url = (getattr(config, "GRVT_REST_BASE_URL", "") or "https://market-data.grvt.io").rstrip("/")
+            inst = f"{base_u}_USDT_Perp"
+            try:
+                resp = requests.post(
+                    f"{base_url}/full/v1/ticker",
+                    json={"instrument": inst},
+                    timeout=_timeout,
+                    headers={"User-Agent": _ua or "FR-Monitor/1.0", "Accept": "application/json"},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                else:
+                    data = None
+            except Exception:
+                data = None
+            row = data.get("result") if isinstance(data, dict) else None
+            if isinstance(row, dict):
+                try:
+                    if row.get("mark_price") is not None:
+                        out["mark_price"] = float(row.get("mark_price"))
+                except Exception:
+                    pass
+                try:
+                    # GRVT funding fields are expressed in percentage points.
+                    fr = row.get("funding_rate") or row.get("funding_rate_8h_curr")
+                    if fr is not None:
+                        out["funding_rate"] = float(fr) / 100.0
+                except Exception:
+                    pass
+                nft = normalize_next_funding_time(row.get("next_funding_time"))
+                if nft:
+                    out["next_funding_time"] = nft
+            interval = derive_funding_interval_hours("grvt")
+            if interval:
+                out["funding_interval_hours"] = float(interval)
+
         # Normalize next_funding_time and ensure it is in the future (best-effort).
         next_ft, interval_hours = normalize_and_advance_next_funding_time(
             now=now,
@@ -3428,7 +3526,7 @@ def live_trading_positions():
         if interval_hours is not None:
             out["funding_interval_hours"] = float(interval_hours)
 
-        _cache_set((ex, base_u), out, ttl_s=10.0)
+        _cache_set((ex, base_u), out, ttl_s=0.0)
         return dict(out)
 
     targets: List[Dict[str, str]] = []
@@ -3454,8 +3552,33 @@ def live_trading_positions():
             balance = None
             positions: Any = []
             if ex == 'binance':
-                balance = get_binance_perp_usdt_balance()
-                positions = get_binance_perp_positions(symbol=f"{sym}USDT") if sym else get_binance_perp_positions()
+                if sym:
+                    balance = get_binance_perp_usdt_balance()
+                    positions = get_binance_perp_positions(symbol=f"{sym}USDT")
+                else:
+                    # Efficient path for "all=1": fetch balance+positions in one signed call.
+                    # /fapi/v2/account contains both assets and positions.
+                    acct = get_binance_perp_account()
+                    usdt = None
+                    assets = acct.get("assets") or []
+                    if isinstance(assets, list):
+                        for item in assets:
+                            if not isinstance(item, dict):
+                                continue
+                            if str(item.get("asset") or "").upper() == "USDT":
+                                usdt = item
+                                break
+                    if isinstance(usdt, dict):
+                        balance = {
+                            "currency": "USDT",
+                            "wallet_balance": usdt.get("walletBalance"),
+                            "available_balance": usdt.get("availableBalance"),
+                            "margin_balance": usdt.get("marginBalance"),
+                            "unrealized_pnl": usdt.get("unrealizedProfit"),
+                        }
+                    else:
+                        balance = {"currency": "USDT"}
+                    positions = acct.get("positions") or []
             elif ex == 'okx':
                 balance = get_okx_account_balance(ccy="USDT")
                 positions = get_okx_swap_positions(symbol=sym) if sym else get_okx_swap_positions()
@@ -3495,6 +3618,9 @@ def live_trading_positions():
                     if isinstance(raw, dict):
                         raw_positions = raw.get("positions")
                 positions = raw_positions if isinstance(raw_positions, list) else []
+            elif ex == 'grvt':
+                balance = get_grvt_balance_summary()
+                positions = get_grvt_perp_positions(symbol=sym) if sym else get_grvt_perp_positions()
             else:
                 balance = None
                 positions = []
@@ -3502,7 +3628,13 @@ def live_trading_positions():
             if isinstance(positions, list):
                 positions = [p for p in positions if _pos_nonzero(ex, p)]
                 # Attach public mark/funding fields for each position row (best-effort).
-                for p in positions:
+                # IMPORTANT: only enrich when `only_nonzero=1`; otherwise `all=1&nonzero=0`
+                # could fan out into hundreds/thousands of public REST calls and trigger bans.
+                if not only_nonzero:
+                    results.append({'exchange': ex, 'symbol': sym or None, 'balance': balance, 'positions': positions, 'error': None})
+                    continue
+
+                for p in [x for x in positions if _pos_is_nonzero(ex, x)]:
                     if not isinstance(p, dict):
                         continue
                     try:
@@ -3523,6 +3655,9 @@ def live_trading_positions():
                         elif exl == "hyperliquid":
                             pos = p.get("position") if isinstance(p.get("position"), dict) else p
                             base = str(pos.get("coin") or "")
+                        elif exl == "grvt":
+                            inst = str(p.get("instrument") or "")
+                            base = inst.split("_")[0] if inst and "_" in inst else inst
                         base = (base or "").upper()
                         if base:
                             extra = _public_funding_mark(exl, base)
@@ -3560,6 +3695,10 @@ def live_trading_positions():
                                         szi = float((pos or {}).get("szi") or 0.0)
                                         pos_sign = 1 if szi >= 0 else -1
                                         notional_usdt = float((pos or {}).get("positionValue") or 0.0) if (pos or {}).get("positionValue") is not None else None
+                                    elif exl == "grvt":
+                                        sz = float(p.get("size") or 0.0)
+                                        pos_sign = 1 if sz >= 0 else -1
+                                        notional_usdt = abs(float(p.get("notional") or 0.0)) if p.get("notional") is not None else None
                                 except Exception:
                                     pos_sign = None
                                     notional_usdt = None

@@ -6,7 +6,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 import sqlite3
 
 from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
@@ -120,6 +120,26 @@ class WatchlistManager:
             self.pg_writer = None
         if self.pg_writer:
             self.pg_writer.start()
+        self._live_trading_kick: Optional[Callable[[str], None]] = None
+
+    def set_live_trading_kick(self, kick: Callable[[str], None]) -> None:
+        """Register a kick callback so watchlist PG event insert can wake live trading immediately."""
+        self._live_trading_kick = kick
+        if not self.pg_writer:
+            return
+
+        def _on_event_written(event_ids: List[int]) -> None:
+            if not self._live_trading_kick:
+                return
+            # Collapse burst inserts into a single wake-up (thread-safe event on the other side).
+            latest = event_ids[-1] if event_ids else None
+            reason = f"watchlist_event_inserted count={len(event_ids)} latest={latest}"
+            try:
+                self._live_trading_kick(reason)
+            except Exception:
+                pass
+
+        self.pg_writer.on_event_written = _on_event_written
 
     def _prune_history(self, symbol: str, now: datetime) -> None:
         interval_hours = self._funding_interval.get(symbol)
