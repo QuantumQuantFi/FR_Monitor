@@ -556,13 +556,17 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
     has_fut_filter = bool(valid_symbols.get('futures'))
     
     try:
-        data = _req_json('https://api.binance.com/api/v3/ticker/24hr')
+        # Prefer lightweight price endpoint to reduce rate-limit pressure / bans.
+        # Fallback to 24hr endpoint if needed.
+        data = _req_json('https://api.binance.com/api/v3/ticker/price')
+        if not isinstance(data, list):
+            data = _req_json('https://api.binance.com/api/v3/ticker/24hr')
         if isinstance(data, list):
             for item in data:
                 sym = item.get('symbol', '')
                 if sym.endswith('USDT') and (not has_spot_filter or sym in valid_symbols['spot']):
                     base = sym[:-4]
-                    price = float(item.get('lastPrice') or item.get('c') or 0)  # lastPrice preferred
+                    price = float(item.get('price') or item.get('lastPrice') or item.get('c') or 0)
                     if price:
                         out.setdefault(base, {}).setdefault('spot', {})
                         out[base]['spot'] = {'price': price, 'timestamp': ts, 'symbol': sym}
@@ -570,7 +574,10 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
         print(f"Binance现货REST获取失败: {e}")
 
     try:
-        data = _req_json('https://fapi.binance.com/fapi/v1/ticker/24hr')
+        # Prefer lightweight price endpoint to reduce bans; fallback to 24hr.
+        data = _req_json('https://fapi.binance.com/fapi/v1/ticker/price')
+        if not isinstance(data, list):
+            data = _req_json('https://fapi.binance.com/fapi/v1/ticker/24hr')
         if isinstance(data, list):
             filtered_count = 0
             for item in data:
@@ -579,7 +586,7 @@ def fetch_binance() -> Dict[str, Dict[str, Dict[str, Any]]]:
                     if (not has_fut_filter) or (sym in valid_symbols['futures']):
                         # 有效的期货合约
                         base = sym[:-4]
-                        price = float(item.get('lastPrice') or item.get('c') or 0)
+                        price = float(item.get('price') or item.get('lastPrice') or item.get('c') or 0)
                         if price:
                             out.setdefault(base, {}).setdefault('futures', {})
                             futures_snapshot = {
