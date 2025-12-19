@@ -47,6 +47,11 @@ from trading.trade_executor import (
     get_hyperliquid_user_funding_history,
     get_lighter_balance_summary,
     place_lighter_perp_market_order,
+    get_grvt_balance_summary,
+    get_grvt_perp_positions,
+    get_grvt_order,
+    get_grvt_funding_payment_history,
+    get_grvt_fill_history,
     get_okx_account_balance,
     get_okx_swap_positions,
     get_okx_swap_contract_value,
@@ -80,12 +85,20 @@ def _jsonb(val: Any) -> Any:
 class LiveTradingConfig:
     enabled: bool
     dsn: str
-    allowed_exchanges: Tuple[str, ...] = ("binance", "bybit", "okx", "bitget", "hyperliquid", "lighter")
+    allowed_exchanges: Tuple[str, ...] = ("binance", "bybit", "okx", "bitget", "hyperliquid", "lighter", "grvt")
     horizon_min: int = 240
     pnl_threshold: float = 0.013
     win_prob_threshold: float = 0.94
     max_concurrent_trades: int = 10
     scan_interval_seconds: float = 20.0
+    # If True, only evaluate new events when kicked (e.g. by watchlist event insert),
+    # rather than periodically scanning watch_signal_event.
+    kick_driven: bool = True
+    # Retry schedule (seconds) for skipped signals (orderbook not ok / no direction / unstable).
+    # After the last value, keep retrying with the last delay.
+    skipped_retry_schedule_seconds: Tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 240.0)
+    # Per process_once: limit how many skipped signals we retry to avoid orderbook storms.
+    max_skipped_retries_per_scan: int = 5
     event_lookback_minutes: int = 30
     per_leg_notional_usdt: float = 20.0
     orderbook_market_type: str = "perp"
@@ -93,6 +106,9 @@ class LiveTradingConfig:
     # 尤其是 Binance 深度接口会触发 IP ban（-1003）。
     candidate_limit: int = 50
     per_symbol_top_k: int = 3
+    # 每次扫描最多评估多少个币种（每个币种至少会请求两家交易所各一次订单簿：2 次 REST）。
+    # 该上限用于控制 Binance/OKX 等深度接口压力，避免 418 ban。
+    max_symbols_per_scan: int = 8
     monitor_interval_seconds: float = 60.0
     take_profit_ratio: float = 0.8
     orderbook_confirm_samples: int = 3
@@ -130,12 +146,142 @@ class LiveTradingManager:
         self._funding_refresh_hour: Optional[int] = None
         self._funding_backfill_hour: Optional[int] = None
         self._balance_snapshot_hour: Optional[int] = None
+        # Avoid hammering orderbook REST on the same event when revalidation fails.
+        # event_id -> {attempts:int, next_retry_ts:float, last_reason:str}
+        self._event_backoff: Dict[int, Dict[str, Any]] = {}
+        self._event_backoff_lock = threading.Lock()
+        self._event_backoff_schedule_seconds = (10, 30, 60, 120, 240)
 
     def kick(self, *, reason: str = "external") -> None:
         """Wake the live trading loop to scan immediately (non-blocking)."""
         with self._wakeup_lock:
             self._wakeup_reason = str(reason or "external")
         self._wakeup.set()
+
+    def _event_in_backoff(self, event_id: int) -> bool:
+        eid = int(event_id or 0)
+        if eid <= 0:
+            return False
+        now = time.time()
+        with self._event_backoff_lock:
+            rec = self._event_backoff.get(eid)
+            if not isinstance(rec, dict):
+                return False
+            next_ts = float(rec.get("next_retry_ts") or 0.0)
+            if next_ts <= 0 or now >= next_ts:
+                # Expired; allow retry and clean it up.
+                self._event_backoff.pop(eid, None)
+                return False
+            return True
+
+    def _bump_event_backoff(self, event_id: int, reason: str) -> None:
+        eid = int(event_id or 0)
+        if eid <= 0:
+            return
+        now = time.time()
+        with self._event_backoff_lock:
+            rec = self._event_backoff.get(eid) if isinstance(self._event_backoff.get(eid), dict) else {}
+            attempts = int(rec.get("attempts") or 0) + 1
+            schedule = tuple(self._event_backoff_schedule_seconds or ())
+            delay = schedule[min(max(0, attempts - 1), max(0, len(schedule) - 1))] if schedule else 60
+            next_ts = now + float(delay)
+            self._event_backoff[eid] = {"attempts": attempts, "next_retry_ts": float(next_ts), "last_reason": str(reason or "")}
+
+    def _next_skipped_retry_delay_seconds(self, attempts: int) -> float:
+        schedule = tuple(getattr(self.config, "skipped_retry_schedule_seconds", ()) or ())
+        if not schedule:
+            return 60.0
+        idx = min(max(0, int(attempts) - 1), max(0, len(schedule) - 1))
+        try:
+            return float(schedule[idx])
+        except Exception:
+            return float(schedule[-1])
+
+    def _bump_signal_retry(
+        self,
+        conn,
+        *,
+        signal_id: int,
+        reason: str,
+        payload: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Persist retry schedule for a skipped signal."""
+        try:
+            row = conn.execute(
+                "SELECT retry_attempts FROM watchlist.live_trade_signal WHERE id=%s;",
+                (int(signal_id),),
+            ).fetchone()
+            cur_attempts = int((row or {}).get("retry_attempts") or 0)
+        except Exception:
+            cur_attempts = 0
+        next_attempts = cur_attempts + 1
+        delay_s = self._next_skipped_retry_delay_seconds(next_attempts)
+        payload_param = _jsonb(payload) if payload is not None else None
+        conn.execute(
+            """
+            UPDATE watchlist.live_trade_signal
+               SET status='skipped',
+                   reason=%s,
+                   payload=COALESCE(%s, payload),
+                   retry_attempts=%s,
+                   last_attempt_at=now(),
+                   next_retry_at=(now() + make_interval(secs := %s)),
+                   updated_at=now()
+             WHERE id=%s;
+            """,
+            (str(reason or "skipped"), payload_param, int(next_attempts), float(delay_s), int(signal_id)),
+        )
+
+    def _update_signal_open_attempt(
+        self,
+        conn,
+        *,
+        signal_id: int,
+        status: str,
+        reason: Optional[str],
+        payload: Dict[str, Any],
+        client_order_id_base: str,
+        leg_long_exchange: str,
+        leg_short_exchange: str,
+        pnl_hat: float,
+        win_prob: float,
+        pnl_hat_ob: Optional[float],
+        win_prob_ob: Optional[float],
+    ) -> None:
+        payload_param = _jsonb(payload) if payload is not None else None
+        conn.execute(
+            """
+            UPDATE watchlist.live_trade_signal
+               SET status=%s,
+                   reason=%s,
+                   payload=%s,
+                   client_order_id_base=%s,
+                   leg_long_exchange=%s,
+                   leg_short_exchange=%s,
+                   pnl_hat=%s,
+                   win_prob=%s,
+                   pnl_hat_ob=%s,
+                   win_prob_ob=%s,
+                   updated_at=now(),
+                   -- clear retry schedule once we move out of skipped
+                   next_retry_at=CASE WHEN %s='skipped' THEN next_retry_at ELSE NULL END
+             WHERE id=%s;
+            """,
+            (
+                str(status),
+                reason,
+                payload_param,
+                str(client_order_id_base or ""),
+                str(leg_long_exchange or ""),
+                str(leg_short_exchange or ""),
+                float(pnl_hat) if pnl_hat is not None else None,
+                float(win_prob) if win_prob is not None else None,
+                float(pnl_hat_ob) if pnl_hat_ob is not None else None,
+                float(win_prob_ob) if win_prob_ob is not None else None,
+                str(status),
+                int(signal_id),
+            ),
+        )
 
     def start(self) -> None:
         if not self.config.enabled:
@@ -519,7 +665,10 @@ class LiveTradingManager:
     def _run_loop(self) -> None:
         last_monitor_ts = 0.0
         while not self._stop.is_set():
-            kicked = self._wakeup.wait(timeout=float(self.config.scan_interval_seconds))
+            # Kick-driven (fast-path) + periodic scan (fallback).
+            # - kicked: process immediately
+            # - timeout: process as fallback every scan_interval_seconds
+            kicked = self._wakeup.wait(timeout=max(0.2, float(self.config.scan_interval_seconds)))
             self._wakeup.clear()
             if self._stop.is_set():
                 break
@@ -530,6 +679,8 @@ class LiveTradingManager:
                         self._wakeup_reason = None
                     if reason:
                         self.logger.debug("live trading woke up by kick: %s", reason)
+                # Always keep the scan_interval_seconds fallback, even when kick-driven.
+                # This gives skipped candidates a second chance after cooldown.
                 self.process_once()
             except Exception as exc:  # pragma: no cover - safety net
                 self.logger.exception("live trading loop error: %s", exc)
@@ -567,11 +718,14 @@ class LiveTradingManager:
           closed_at timestamptz,
           close_reason text,
           entry_spread_metric double precision,
+          entry_spread_pct_actual double precision,
           take_profit_pnl double precision,
+          take_profit_exit_spread_pct double precision,
           force_close_at timestamptz,
           close_requested_at timestamptz,
           last_check_at timestamptz,
           last_spread_metric double precision,
+          last_exit_spread_pct double precision,
           last_pnl_spread double precision,
           close_pnl_spread double precision
         );
@@ -679,7 +833,11 @@ class LiveTradingManager:
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS entry_spread_metric double precision;
         ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS entry_spread_pct_actual double precision;
+        ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS take_profit_pnl double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS take_profit_exit_spread_pct double precision;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS force_close_at timestamptz;
         ALTER TABLE watchlist.live_trade_signal
@@ -688,6 +846,8 @@ class LiveTradingManager:
           ADD COLUMN IF NOT EXISTS last_check_at timestamptz;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS last_spread_metric double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS last_exit_spread_pct double precision;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS last_pnl_spread double precision;
         ALTER TABLE watchlist.live_trade_signal
@@ -718,6 +878,14 @@ class LiveTradingManager:
           ADD COLUMN IF NOT EXISTS funding_updated_at timestamptz;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS funding_finalized boolean NOT NULL DEFAULT false;
+
+        -- Skipped retry metadata (for kick-driven + periodic fallback retries).
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS retry_attempts integer NOT NULL DEFAULT 0;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS next_retry_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS last_attempt_at timestamptz;
 
         ALTER TABLE watchlist.live_trade_order
           ADD COLUMN IF NOT EXISTS action text NOT NULL DEFAULT 'open';
@@ -869,6 +1037,20 @@ class LiveTradingManager:
                         continue
                     out["funding_pnl_usdt"] += fee
                     out["currency"] = str(r.get("coin") or r.get("ccy") or "USDT").upper()
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
+            elif ex == "grvt":
+                rows = get_grvt_funding_payment_history(symbol=sym, start_time_ms=start_ms, end_time_ms=end_ms, limit=1000)
+                for r in rows:
+                    fee = _as_float(r.get("income"))
+                    ts_ms = r.get("time")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee
+                    out["currency"] = str(r.get("currency") or "USDT").upper()
                     ts_dt = _as_dt_from_ms(ts_ms)
                     if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
                         out["last_fee_time"] = ts_dt
@@ -1098,8 +1280,19 @@ class LiveTradingManager:
             base = _first_dict(order.get("data"))
             order_id = base.get("orderId") or base.get("order_id")
             cl_id = base.get("clientOid") or base.get("client_oid")
+            # For market orders on illiquid symbols, Bitget may return partial fills first and
+            # update `priceAvg/filledQty` asynchronously. Prefer a short polling window and
+            # stop early only when the order is in a terminal state or filled_qty is close to
+            # requested size.
+            try:
+                expected_sz = _float_or_none(base.get("size"))
+            except Exception:
+                expected_sz = None
             info["exchange_order_id"] = str(order_id or "") or None
             detail = None
+            last_good: Optional[Dict[str, Any]] = None
+            # Keep polling light: Bitget order detail usually becomes `filled` quickly for market orders.
+            # We cap retries to avoid hammering the exchange on every order.
             for _ in range(3):
                 try:
                     detail = get_bitget_usdt_perp_order_detail(
@@ -1112,20 +1305,42 @@ class LiveTradingManager:
                 if isinstance(detail, dict):
                     avg_px = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice") or detail.get("avgPx"))
                     filled_sz = _float_or_none(detail.get("filledQty") or detail.get("filledSize") or detail.get("baseVolume"))
+                    quote_vol = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
+                    state = str(detail.get("state") or detail.get("status") or "").lower()
+                    terminal = state in {"filled", "full_fill", "cancelled", "canceled", "rejected", "fail", "failed"}
+
+                    if filled_sz and filled_sz > 0 and quote_vol and quote_vol > 0:
+                        avg_px = quote_vol / filled_sz
+
                     if avg_px and filled_sz and filled_sz > 0:
-                        break
+                        last_good = {"avg_px": avg_px, "filled_sz": filled_sz, "quote_vol": quote_vol, "state": state}
+                        # Stop early when we are confident it's final or essentially fully filled.
+                        if terminal or expected_sz is None:
+                            break
+                        try:
+                            if expected_sz and filled_sz >= max(0.0, float(expected_sz) - 1e-12):
+                                break
+                        except Exception:
+                            pass
                 time.sleep(0.25)
             if isinstance(detail, dict):
-                info["avg_price"] = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice") or detail.get("avgPx"))
-                info["filled_qty"] = _float_or_none(
-                    detail.get("filledQty")
-                    or detail.get("filledSize")
-                    or detail.get("baseVolume")
-                    or detail.get("size")
-                )
-                info["cum_quote"] = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
-                status = detail.get("state") or detail.get("status")
-                info["status"] = str(status) if status is not None else None
+                # Prefer the last "good" snapshot so we don't store partial/inconsistent values.
+                if isinstance(last_good, dict):
+                    info["avg_price"] = _float_or_none(last_good.get("avg_px"))
+                    info["filled_qty"] = _float_or_none(last_good.get("filled_sz"))
+                    info["cum_quote"] = _float_or_none(last_good.get("quote_vol"))
+                    info["status"] = str(last_good.get("state") or "") or None
+                else:
+                    info["avg_price"] = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice") or detail.get("avgPx"))
+                    info["filled_qty"] = _float_or_none(
+                        detail.get("filledQty")
+                        or detail.get("filledSize")
+                        or detail.get("baseVolume")
+                        or detail.get("size")
+                    )
+                    info["cum_quote"] = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
+                    status = detail.get("state") or detail.get("status")
+                    info["status"] = str(status) if status is not None else None
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "hyperliquid":
@@ -1171,6 +1386,78 @@ class LiveTradingManager:
                             break
             except Exception:
                 pass
+            if info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                try:
+                    info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
+                except Exception:
+                    pass
+            return {k: v for k, v in info.items() if v is not None}
+
+        if ex == "grvt":
+            def _first_list(v: Any) -> Any:
+                if isinstance(v, list) and v:
+                    return v[0]
+                return None
+
+            raw_oid = str(order.get("order_id") or order.get("orderId") or order.get("id") or "") or ""
+            # GRVT create_order often returns order_id="0x00" while still executing; treat that as unknown.
+            if raw_oid.lower() in {"0x00", "0x0", "0"}:
+                raw_oid = ""
+            info["exchange_order_id"] = raw_oid or None
+            state = order.get("state") if isinstance(order.get("state"), dict) else {}
+            status = state.get("status") or order.get("status")
+            if status is not None:
+                info["status"] = str(status)
+            traded = _first_list(state.get("traded_size"))
+            avg_px = _first_list(state.get("avg_fill_price"))
+            info["filled_qty"] = _float_or_none(traded)
+            info["avg_price"] = _float_or_none(avg_px)
+
+            # Best-effort: compute fills from fill history using client_order_id.
+            if (
+                info.get("filled_qty") is None
+                or info.get("avg_price") is None
+                or float(info.get("filled_qty") or 0.0) <= 0.0
+                or float(info.get("avg_price") or 0.0) <= 0.0
+            ):
+                meta = order.get("metadata") if isinstance(order.get("metadata"), dict) else {}
+                cloid = str(meta.get("client_order_id") or "") or None
+                create_ns = meta.get("create_time")
+                now_ms = int(time.time() * 1000)
+                try:
+                    create_ms = int(int(str(create_ns)) / 1_000_000) if create_ns is not None else None
+                except Exception:
+                    create_ms = None
+                start_ms = (create_ms - 5_000) if create_ms else (now_ms - 120_000)
+                end_ms = now_ms + 30_000
+                try:
+                    fills = get_grvt_fill_history(symbol=symbol, start_time_ms=start_ms, end_time_ms=end_ms, limit=200)
+                except Exception:
+                    fills = []
+                if cloid and isinstance(fills, list):
+                    matched = [f for f in fills if isinstance(f, dict) and str(f.get("client_order_id") or "") == cloid]
+                else:
+                    matched = []
+                if matched:
+                    total_qty = 0.0
+                    total_quote = 0.0
+                    for f in matched:
+                        try:
+                            q = float(f.get("size") or 0.0)
+                            p = float(f.get("price") or 0.0)
+                        except Exception:
+                            continue
+                        if q <= 0 or p <= 0:
+                            continue
+                        total_qty += q
+                        total_quote += q * p
+                        if info.get("exchange_order_id") is None and f.get("order_id"):
+                            info["exchange_order_id"] = str(f.get("order_id"))
+                    if total_qty > 0 and total_quote > 0:
+                        info["filled_qty"] = total_qty
+                        info["avg_price"] = total_quote / total_qty
+                        info["status"] = str(info.get("status") or "filled")
+
             if info.get("avg_price") is not None and info.get("filled_qty") is not None:
                 try:
                     info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
@@ -1392,6 +1679,17 @@ class LiveTradingManager:
                     # sign: 1 (long), -1 (short), position is abs qty
                     total += float(sign) * abs(float(pos))
                 return float(total)
+            if ex == "grvt":
+                rows = get_grvt_perp_positions(symbol=sym)
+                total = 0.0
+                for r in rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    try:
+                        total += float(r.get("size") or 0.0)
+                    except Exception:
+                        continue
+                return float(total)
         except Exception:
             return None
         return None
@@ -1509,8 +1807,8 @@ class LiveTradingManager:
         leg_short_exchange: str,
         pnl_hat: float,
         win_prob: float,
-        pnl_hat_ob: float,
-        win_prob_ob: float,
+        pnl_hat_ob: Optional[float],
+        win_prob_ob: Optional[float],
         payload: Dict[str, Any],
         status: str,
         reason: Optional[str],
@@ -1537,8 +1835,8 @@ class LiveTradingManager:
                     int(self.config.horizon_min),
                     float(pnl_hat),
                     float(win_prob),
-                    float(pnl_hat_ob),
-                    float(win_prob_ob),
+                    float(pnl_hat_ob) if pnl_hat_ob is not None else None,
+                    float(win_prob_ob) if win_prob_ob is not None else None,
                     leg_long_exchange,
                     leg_short_exchange,
                     status,
@@ -1569,6 +1867,49 @@ class LiveTradingManager:
             """,
             (status, reason, status, status, int(self.config.max_hold_days), status, int(signal_id)),
         )
+
+    def _insert_skipped_event(
+        self,
+        conn,
+        *,
+        event: Dict[str, Any],
+        leg_long_exchange: str,
+        leg_short_exchange: str,
+        reason: str,
+        payload: Dict[str, Any],
+    ) -> Optional[int]:
+        try:
+            pnl_hat = float(event.get("pnl_hat_240") or 0.0)
+        except Exception:
+            pnl_hat = 0.0
+        try:
+            win_prob = float(event.get("win_prob_240") or 0.0)
+        except Exception:
+            win_prob = 0.0
+
+        # Keep a deterministic base for easier debugging; uniqueness is still enforced by event_id.
+        client_order_id_base = f"skip-{int(event.get('id') or 0)}"
+        sid = self._insert_signal(
+            conn,
+            event=event,
+            leg_long_exchange=str(leg_long_exchange or ""),
+            leg_short_exchange=str(leg_short_exchange or ""),
+            pnl_hat=pnl_hat,
+            win_prob=win_prob,
+            pnl_hat_ob=None,
+            win_prob_ob=None,
+            payload=payload,
+            status="skipped",
+            reason=str(reason or "skipped"),
+            client_order_id_base=client_order_id_base,
+        )
+        if sid:
+            # Persist a retry schedule so periodic fallback scans can re-attempt after cooldown.
+            try:
+                self._bump_signal_retry(conn, signal_id=int(sid), reason=str(reason or "skipped"), payload=payload)
+            except Exception:
+                pass
+        return sid
 
     def _record_error(
         self,
@@ -1614,7 +1955,12 @@ class LiveTradingManager:
                 AND e.signal_type = 'B'
                 AND e.start_ts >= now() - make_interval(mins := %s)
                 AND (e.features_agg #> '{meta_last,factors}') IS NOT NULL
-              ORDER BY e.start_ts DESC
+                AND (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}') IS NOT NULL
+                AND (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}') IS NOT NULL
+              ORDER BY
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision DESC NULLS LAST,
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision DESC NULLS LAST,
+                e.start_ts DESC
               LIMIT %s
             )
             SELECT * FROM cand;
@@ -1628,7 +1974,7 @@ class LiveTradingManager:
     def _supported_exchange(self, exchange: str) -> bool:
         allowed = {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
         if not allowed:
-            allowed = {"binance", "bybit", "okx", "bitget", "hyperliquid", "lighter"}
+            allowed = {"binance", "bybit", "okx", "bitget", "hyperliquid", "lighter", "grvt"}
         return (exchange or "").lower() in allowed
 
     def _get_public_funding_mark(self, exchange: str, symbol: str) -> Dict[str, Any]:
@@ -1780,6 +2126,38 @@ class LiveTradingManager:
                         except Exception:
                             pass
                         out["funding_interval_hours"] = 1.0
+                elif ex == "grvt":
+                    try:
+                        import config as _cfg  # local import to avoid cycles
+                        base_url = (getattr(_cfg, "GRVT_REST_BASE_URL", "") or "https://market-data.grvt.io").rstrip("/")
+                        inst = f"{base}_USDT_Perp"
+                        resp = requests.post(
+                            f"{base_url}/full/v1/ticker",
+                            json={"instrument": inst},
+                            timeout=timeout,
+                            headers=headers,
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json() if resp.content else {}
+                            row = (data or {}).get("result")
+                            if isinstance(row, dict):
+                                try:
+                                    if row.get("mark_price") is not None:
+                                        out["mark_price"] = float(row.get("mark_price"))
+                                except Exception:
+                                    pass
+                                try:
+                                    fr = row.get("funding_rate") or row.get("funding_rate_8h_curr")
+                                    if fr is not None:
+                                        out["funding_rate"] = float(fr) / 100.0
+                                except Exception:
+                                    pass
+                                out["next_funding_time"] = row.get("next_funding_time")
+                                out["funding_interval_hours"] = 8.0
+                        else:
+                            out["error"] = f"grvt_http_{resp.status_code}"
+                    except Exception as exc:
+                        out["error"] = f"{type(exc).__name__}: {exc}"
                 else:
                     out["error"] = "unsupported_exchange"
             except Exception as exc:
@@ -2072,7 +2450,16 @@ class LiveTradingManager:
                 return
 
             candidates = self._fetch_candidates(conn)
+            # We may still want to retry previously skipped signals even when there are no new events.
             if not candidates:
+                self._retry_skipped_signals(conn)
+                return
+
+            # Skip events that are in backoff due to recent orderbook revalidation failures.
+            # This prevents “revalidation storm” when an exchange is rate-limiting/banning.
+            candidates = [c for c in candidates if not self._event_in_backoff(int(c.get("id") or 0))]
+            if not candidates:
+                self._retry_skipped_signals(conn)
                 return
 
             by_symbol: Dict[str, List[Dict[str, Any]]] = {}
@@ -2082,11 +2469,31 @@ class LiveTradingManager:
                     continue
                 by_symbol.setdefault(sym, []).append(row)
 
-            # For each symbol, only evaluate top-k (sorted by base pnl/win from SQL)
-            for symbol, rows in by_symbol.items():
+            # 控制每轮扫描的订单簿压力：每评估 1 个 symbol 至少会触发 2 次订单簿 REST（两家交易所各一次）。
+            max_symbols = max(1, int(getattr(self.config, "max_symbols_per_scan", 8) or 8))
+
+            def _base_score(r: Dict[str, Any]) -> Tuple[float, float]:
+                try:
+                    pnl = float(r.get("pnl_hat_240") or -1e9)
+                except Exception:
+                    pnl = -1e9
+                try:
+                    prob = float(r.get("win_prob_240") or -1e9)
+                except Exception:
+                    prob = -1e9
+                return (pnl, prob)
+
+            ranked_symbols = sorted(
+                list(by_symbol.items()),
+                key=lambda kv: max((_base_score(r) for r in (kv[1] or [])), default=(-1e9, -1e9)),
+                reverse=True,
+            )[:max_symbols]
+
+            # For each symbol, only evaluate top-k.
+            for symbol, rows in ranked_symbols:
                 if active >= int(self.config.max_concurrent_trades):
                     break
-                rows = rows[: max(1, int(self.config.per_symbol_top_k))]
+                rows = sorted(rows or [], key=_base_score, reverse=True)[: max(1, int(self.config.per_symbol_top_k))]
                 lock = self._get_symbol_lock(symbol)
                 if not lock.acquire(blocking=False):
                     continue
@@ -2097,6 +2504,280 @@ class LiveTradingManager:
                     self._process_symbol_candidates(conn, symbol, rows)
                 finally:
                     lock.release()
+
+            # After processing new events, give skipped candidates a chance (cooldown-gated).
+            self._retry_skipped_signals(conn)
+
+    def _fetch_retry_skipped_signals(self, conn) -> List[Dict[str, Any]]:
+        limit_n = max(0, int(getattr(self.config, "max_skipped_retries_per_scan", 5) or 0))
+        if limit_n <= 0:
+            return []
+        # Keep the lookback at least a few minutes so the retry schedule (up to ~240s) has time to apply.
+        lookback_min = max(5, int(getattr(self.config, "event_lookback_minutes", 30) or 30))
+        return conn.execute(
+            """
+            SELECT
+              s.id AS signal_id,
+              s.event_id,
+              s.symbol,
+              s.retry_attempts,
+              s.next_retry_at,
+              s.reason AS last_reason,
+              e.start_ts,
+              e.end_ts,
+              e.exchange,
+              e.signal_type,
+              e.leg_a_exchange,
+              e.leg_b_exchange,
+              e.leg_a_price_last,
+              e.leg_b_price_last,
+              (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision AS pnl_hat_240,
+              (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision AS win_prob_240,
+              (e.features_agg #> '{meta_last,factors}') AS factors,
+              (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details
+            FROM watchlist.live_trade_signal s
+            JOIN watchlist.watch_signal_event e
+              ON e.id = s.event_id
+            WHERE s.status='skipped'
+              AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
+              AND e.start_ts >= now() - make_interval(mins := %s)
+            ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
+            LIMIT %s;
+            """,
+            (int(lookback_min), int(limit_n)),
+        ).fetchall()
+
+    def _retry_skipped_signals(self, conn) -> None:
+        rows = self._fetch_retry_skipped_signals(conn)
+        if not rows:
+            return
+        active = self._active_trade_count(conn)
+        if active >= int(self.config.max_concurrent_trades):
+            return
+        for row in rows:
+            if active >= int(self.config.max_concurrent_trades):
+                break
+            try:
+                signal_id = int(row.get("signal_id") or 0)
+                symbol = str(row.get("symbol") or "").upper()
+            except Exception:
+                continue
+            if not signal_id or not symbol:
+                continue
+            lock = self._get_symbol_lock(symbol)
+            if not lock.acquire(blocking=False):
+                continue
+            try:
+                active = self._active_trade_count(conn)
+                if active >= int(self.config.max_concurrent_trades):
+                    break
+                self._retry_one_skipped_signal(conn, row)
+                active = self._active_trade_count(conn)
+            finally:
+                lock.release()
+
+    def _retry_one_skipped_signal(self, conn, row: Dict[str, Any]) -> None:
+        signal_id = int(row.get("signal_id") or 0)
+        symbol = str(row.get("symbol") or "").upper()
+        if not signal_id or not symbol:
+            return
+
+        # If there's already an active trade for symbol, do not interfere.
+        exists = conn.execute(
+            "SELECT 1 FROM watchlist.live_trade_signal WHERE symbol=%s AND status IN ('opening','open','closing') LIMIT 1;",
+            (symbol,),
+        ).fetchone()
+        if exists:
+            # Push next retry a bit to avoid hot-loop when active trades exist.
+            self._bump_signal_retry(conn, signal_id=signal_id, reason="active_trade_exists", payload={"reason": "active_trade_exists"})
+            return
+
+        event: Dict[str, Any] = {
+            "id": int(row.get("event_id") or 0),
+            "start_ts": row.get("start_ts"),
+            "symbol": symbol,
+            "signal_type": row.get("signal_type") or "B",
+            "trigger_details": row.get("trigger_details"),
+            "factors": row.get("factors") or {},
+            "leg_a_exchange": row.get("leg_a_exchange"),
+            "leg_b_exchange": row.get("leg_b_exchange"),
+            "leg_a_price_last": row.get("leg_a_price_last"),
+            "leg_b_price_last": row.get("leg_b_price_last"),
+            "pnl_hat_240": row.get("pnl_hat_240"),
+            "win_prob_240": row.get("win_prob_240"),
+        }
+
+        high_low = self._pick_high_low(
+            symbol=symbol,
+            trigger_details=event.get("trigger_details"),
+            leg_a_exchange=event.get("leg_a_exchange"),
+            leg_b_exchange=event.get("leg_b_exchange"),
+            leg_a_price_last=event.get("leg_a_price_last"),
+            leg_b_price_last=event.get("leg_b_price_last"),
+        )
+        if not high_low:
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason="missing_pair_prices",
+                payload={"decision": "retry_skipped", "reason": "missing_pair_prices", "symbol": symbol, "event_id": int(event["id"])},
+            )
+            return
+        high_ex, low_ex = high_low
+        if not (self._supported_exchange(high_ex) and self._supported_exchange(low_ex)):
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason="unsupported_exchange",
+                payload={"decision": "retry_skipped", "reason": "unsupported_exchange", "picked_high_low": {"high": high_ex, "low": low_ex}},
+            )
+            return
+
+        base_factors = event.get("factors") or {}
+        if not isinstance(base_factors, dict):
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason="missing_factors",
+                payload={"decision": "retry_skipped", "reason": "missing_factors"},
+            )
+            return
+
+        reval = self._revalidate_with_orderbook(symbol=symbol, high_exchange=str(high_ex), low_exchange=str(low_ex), base_factors=base_factors)
+        if not reval or not reval.get("ok"):
+            r = None
+            if isinstance(reval, dict):
+                r = reval.get("reason") or reval.get("error")
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason=str(r or "not_ok"),
+                payload={
+                    "decision": "retry_skipped",
+                    "reason": str(r or "not_ok"),
+                    "picked_high_low": {"high": high_ex, "low": low_ex},
+                    "orderbook_revalidation": reval,
+                },
+            )
+            return
+
+        confirm = self._confirm_open_signal_with_orderbook(
+            symbol=symbol,
+            ex_a=str(high_ex),
+            ex_b=str(low_ex),
+            base_factors=base_factors,
+            initial_reval=reval if isinstance(reval, dict) else None,
+        )
+        if not confirm.get("ok"):
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason=str(confirm.get("reason") or "orderbook_unstable"),
+                payload={
+                    "decision": "retry_skipped",
+                    "reason": str(confirm.get("reason") or "orderbook_unstable"),
+                    "orderbook_revalidation": reval,
+                    "orderbook_confirm_open": confirm,
+                },
+            )
+            return
+
+        # Confirm passed; lock in direction to avoid flapping.
+        high_ex = str(confirm.get("short_exchange") or high_ex)
+        low_ex = str(confirm.get("long_exchange") or low_ex)
+
+        f_ok, f_payload, f_reason = self._check_funding_guard(symbol=symbol, long_ex=low_ex, short_ex=high_ex, event=event)
+        if not f_ok:
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason=str(f_reason or "funding_guard"),
+                payload={
+                    "decision": "retry_skipped",
+                    "reason": str(f_reason or "funding_guard"),
+                    "orderbook_revalidation": reval,
+                    "orderbook_confirm_open": confirm,
+                    "funding_revalidation": f_payload,
+                },
+            )
+            return
+
+        client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+        payload = {
+            "event": {
+                "id": int(event["id"]),
+                "start_ts": str(event.get("start_ts")),
+                "symbol": symbol,
+                "signal_type": event.get("signal_type"),
+                "trigger_details": event.get("trigger_details"),
+            },
+            "threshold": {
+                "horizon_min": int(self.config.horizon_min),
+                "pnl_threshold": float(self.config.pnl_threshold),
+                "win_prob_threshold": float(self.config.win_prob_threshold),
+                "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
+                "max_abs_funding": float(getattr(self.config, "max_abs_funding", 0.0) or 0.0),
+            },
+            "orderbook_revalidation": {
+                "pnl_hat": reval.get("pnl_hat"),
+                "win_prob": reval.get("win_prob"),
+                "orderbook": reval.get("orderbook"),
+            },
+            "orderbook_confirm_open": confirm,
+            "funding_revalidation": f_payload,
+            "retry": {
+                "from_signal_id": signal_id,
+                "retry_attempts": int(row.get("retry_attempts") or 0),
+                "ts": _utcnow().isoformat(),
+            },
+        }
+
+        self._update_signal_open_attempt(
+            conn,
+            signal_id=signal_id,
+            status="opening",
+            reason=None,
+            payload=payload,
+            client_order_id_base=client_base,
+            leg_long_exchange=low_ex,
+            leg_short_exchange=high_ex,
+            pnl_hat=float(event.get("pnl_hat_240") or 0.0),
+            win_prob=float(event.get("win_prob_240") or 0.0),
+            pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+            win_prob_ob=float(reval.get("win_prob") or 0.0),
+        )
+
+        try:
+            self._open_trade(
+                conn,
+                signal_id,
+                symbol,
+                low_ex,
+                high_ex,
+                client_base,
+                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+            )
+            self._update_signal_status(conn, signal_id, "open")
+        except TradeExecutionError as exc:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="open_trade",
+                error_type="TradeExecutionError",
+                message=str(exc),
+                context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
+            )
+            self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
+        except Exception as exc:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="open_trade",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
+            )
+            self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
 
     def _process_symbol_candidates(self, conn, symbol: str, rows: List[Dict[str, Any]]) -> None:
         # Fast check: already active trade for symbol?
@@ -2112,6 +2793,7 @@ class LiveTradingManager:
 
         for event in rows:
             try:
+                event_id = int(event.get("id") or 0)
                 high_low = self._pick_high_low(
                     symbol=symbol,
                     trigger_details=event.get("trigger_details"),
@@ -2121,13 +2803,65 @@ class LiveTradingManager:
                     leg_b_price_last=event.get("leg_b_price_last"),
                 )
                 if not high_low:
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange="",
+                        leg_short_exchange="",
+                        reason="missing_pair_prices",
+                        payload={
+                            "decision": "skipped",
+                            "reason": "missing_pair_prices",
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "trigger_details": event.get("trigger_details"),
+                            "legs": {
+                                "leg_a_exchange": event.get("leg_a_exchange"),
+                                "leg_b_exchange": event.get("leg_b_exchange"),
+                                "leg_a_price_last": event.get("leg_a_price_last"),
+                                "leg_b_price_last": event.get("leg_b_price_last"),
+                            },
+                        },
+                    )
                     continue
                 high_ex, low_ex = high_low
                 if not (self._supported_exchange(high_ex) and self._supported_exchange(low_ex)):
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange=str(low_ex or ""),
+                        leg_short_exchange=str(high_ex or ""),
+                        reason="unsupported_exchange",
+                        payload={
+                            "decision": "skipped",
+                            "reason": "unsupported_exchange",
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "picked_high_low": {"high": high_ex, "low": low_ex},
+                            "allowed_exchanges": sorted(
+                                {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
+                            ),
+                        },
+                    )
                     continue
 
                 base_factors = event.get("factors") or {}
                 if not isinstance(base_factors, dict):
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange=str(low_ex or ""),
+                        leg_short_exchange=str(high_ex or ""),
+                        reason="missing_factors",
+                        payload={
+                            "decision": "skipped",
+                            "reason": "missing_factors",
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "picked_high_low": {"high": high_ex, "low": low_ex},
+                            "factors_type": str(type(event.get("factors"))),
+                        },
+                    )
                     continue
 
                 reval = self._revalidate_with_orderbook(
@@ -2137,6 +2871,33 @@ class LiveTradingManager:
                     base_factors=base_factors,
                 )
                 if not reval or not reval.get("ok"):
+                    # Do not retry this event immediately; apply short backoff.
+                    reason = None
+                    if isinstance(reval, dict):
+                        reason = reval.get("reason") or reval.get("error")
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange=str(low_ex or ""),
+                        leg_short_exchange=str(high_ex or ""),
+                        reason=str(reason or "not_ok"),
+                        payload={
+                            "decision": "skipped",
+                            "reason": str(reason or "not_ok"),
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "picked_high_low": {"high": high_ex, "low": low_ex},
+                            "orderbook_revalidation": reval,
+                            "config": {
+                                "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
+                                "horizon_min": int(self.config.horizon_min),
+                                "pnl_threshold": float(self.config.pnl_threshold),
+                                "win_prob_threshold": float(self.config.win_prob_threshold),
+                                "orderbook_market_type": str(self.config.orderbook_market_type),
+                            },
+                        },
+                    )
+                    self._bump_event_backoff(event_id, str(reason or "revalidate_not_ok"))
                     continue
                 score = (float(reval.get("pnl_hat") or -1e9), float(reval.get("win_prob") or -1e9))
                 if score > best_score:
@@ -2147,7 +2908,13 @@ class LiveTradingManager:
                         "long_ex": str(reval.get("long_exchange") or low_ex),
                         "reval": reval,
                     }
-            except Exception:
+            except Exception as exc:
+                try:
+                    event_id = int(event.get("id") or 0)
+                except Exception:
+                    event_id = 0
+                if event_id:
+                    self._bump_event_backoff(event_id, f"exception:{type(exc).__name__}")
                 continue
 
         if not best:
@@ -2475,6 +3242,7 @@ class LiveTradingManager:
         ]
 
         opened: List[Dict[str, Any]] = []
+        fill_by_side: Dict[str, Dict[str, Any]] = {}
         try:
             for leg in legs:
                 order = execute_perp_market_order(
@@ -2494,6 +3262,7 @@ class LiveTradingManager:
 
                 order_resp_param = _jsonb(order) if order is not None else None
                 fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order)
+                fill_by_side[str(leg["side"])] = dict(fill or {})
                 conn.execute(
                     """
                     INSERT INTO watchlist.live_trade_order(
@@ -2527,6 +3296,55 @@ class LiveTradingManager:
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
                 else:
                     self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
+
+            # Persist:
+            # - entry_spread_pct_actual: based on fills (percent), (short_entry_avg / long_entry_avg) - 1
+            # - take_profit_exit_spread_pct: based on the SAME metric used by the TP logic (orderbook sweep metric)
+            #     take_profit_exit_spread_pct = exp(entry_spread_metric - take_profit_pnl) - 1
+            # This makes the displayed "TP exit spread" consistent with the monitor trigger:
+            #     pnl_spread_now = entry_spread_metric - spread_now >= take_profit_pnl
+            long_entry_px = fill_by_side.get("long", {}).get("avg_price")
+            short_entry_px = fill_by_side.get("short", {}).get("avg_price")
+            entry_spread_pct_actual = None
+            take_profit_exit_spread_pct = None  # from orderbook metric (not from fills)
+            try:
+                if long_entry_px and short_entry_px and float(long_entry_px) > 0 and float(short_entry_px) > 0:
+                    entry_spread_pct_actual = (float(short_entry_px) / float(long_entry_px)) - 1.0
+                take_profit_exit_spread_pct = float(math.exp(float(entry_spread_metric) - float(take_profit_pnl)) - 1.0)
+            except Exception:
+                entry_spread_pct_actual = None
+                take_profit_exit_spread_pct = None
+
+            conn.execute(
+                """
+                UPDATE watchlist.live_trade_signal
+                   SET entry_spread_pct_actual=%s,
+                       take_profit_exit_spread_pct=%s,
+                       updated_at=now(),
+                       payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
+                         'entry_spread_actual', jsonb_build_object(
+                           'ts', now(),
+                           'long_entry_avg_px', %s::double precision,
+                           'short_entry_avg_px', %s::double precision,
+                           'entry_spread_pct_actual', %s::double precision,
+                           'take_profit_exit_spread_pct', %s::double precision,
+                           'take_profit_exit_spread_pct_source', 'orderbook_metric',
+                           'take_profit_pnl', %s::double precision
+                         )
+                       )
+                 WHERE id=%s::bigint;
+                """,
+                (
+                    float(entry_spread_pct_actual) if entry_spread_pct_actual is not None else None,
+                    float(take_profit_exit_spread_pct) if take_profit_exit_spread_pct is not None else None,
+                    float(long_entry_px) if long_entry_px is not None else None,
+                    float(short_entry_px) if short_entry_px is not None else None,
+                    float(entry_spread_pct_actual) if entry_spread_pct_actual is not None else None,
+                    float(take_profit_exit_spread_pct) if take_profit_exit_spread_pct is not None else None,
+                    float(take_profit_pnl),
+                    int(signal_id),
+                ),
+            )
         except Exception as exc:
             # Best-effort rollback: close any legs that were opened before a failure.
             rollback_base = f"wl{signal_id}R{int(time.time())}"
@@ -2645,7 +3463,7 @@ class LiveTradingManager:
                     lock.release()
 
     def _configured_exchanges_for_balance_snapshot(self) -> List[str]:
-        default_exchanges = ["binance", "okx", "bybit", "bitget", "hyperliquid", "lighter"]
+        default_exchanges = ["binance", "okx", "bybit", "bitget", "hyperliquid", "lighter", "grvt"]
         requested = [str(x).lower().strip() for x in (self.config.allowed_exchanges or ()) if str(x).strip()]
 
         supported: Optional[set] = None
@@ -2740,6 +3558,8 @@ class LiveTradingManager:
                     bal = get_hyperliquid_balance_summary()
                 elif exl == "lighter":
                     bal = get_lighter_balance_summary()
+                elif exl == "grvt":
+                    bal = get_grvt_balance_summary()
                 else:
                     bal = None
                 rows.append({"exchange": exl, "balance": bal, "error": None})
@@ -3017,6 +3837,73 @@ class LiveTradingManager:
         else:
             opened_at = now
 
+        # Best-effort backfill: if open fills arrive after we set the signal row (or were unavailable at open time),
+        # compute and persist the entry spread percent from fills and the TP exit spread percent from the
+        # SAME orderbook metric used by the TP logic (entry_spread_metric / take_profit_pnl).
+        try:
+            if signal_row.get("entry_spread_pct_actual") is None or signal_row.get("take_profit_exit_spread_pct") is None:
+                orows = conn.execute(
+                    """
+                    SELECT DISTINCT ON (leg)
+                           leg, avg_price, filled_qty, created_at, id
+                      FROM watchlist.live_trade_order
+                     WHERE signal_id=%s
+                       AND action='open'
+                       AND avg_price IS NOT NULL
+                     ORDER BY leg, created_at DESC, id DESC;
+                    """,
+                    (signal_id,),
+                ).fetchall()
+                px_by_leg: Dict[str, float] = {}
+                for r in orows or []:
+                    if isinstance(r, dict):
+                        leg = str(r.get("leg") or "")
+                        try:
+                            px = float(r.get("avg_price"))  # type: ignore[arg-type]
+                        except Exception:
+                            continue
+                        if leg and px > 0:
+                            px_by_leg[leg] = px
+                if px_by_leg.get("long") and px_by_leg.get("short"):
+                    long_entry_px = float(px_by_leg["long"])
+                    short_entry_px = float(px_by_leg["short"])
+                    entry_spread_pct_actual = (short_entry_px / long_entry_px) - 1.0
+                    tp_pnl = float(signal_row.get("take_profit_pnl") or 0.0)
+                    entry_metric = None
+                    try:
+                        entry_metric = float(signal_row.get("entry_spread_metric"))  # type: ignore[arg-type]
+                    except Exception:
+                        entry_metric = None
+                    take_profit_exit_spread_pct = None
+                    try:
+                        if entry_metric is not None and tp_pnl > 0:
+                            take_profit_exit_spread_pct = float(math.exp(float(entry_metric) - float(tp_pnl)) - 1.0)
+                    except Exception:
+                        take_profit_exit_spread_pct = None
+                    conn.execute(
+                        """
+                        UPDATE watchlist.live_trade_signal
+                           SET entry_spread_pct_actual=COALESCE(entry_spread_pct_actual, %s),
+                               take_profit_exit_spread_pct=COALESCE(take_profit_exit_spread_pct, %s),
+                               updated_at=now()
+                         WHERE id=%s::bigint;
+                        """,
+                        (float(entry_spread_pct_actual), float(take_profit_exit_spread_pct), signal_id),
+                    )
+                    # Keep this row dict fresh for downstream logic (avoid another fetch).
+                    signal_row["entry_spread_pct_actual"] = float(entry_spread_pct_actual)
+                    if take_profit_exit_spread_pct is not None:
+                        signal_row["take_profit_exit_spread_pct"] = float(take_profit_exit_spread_pct)
+        except Exception as exc:
+            self._record_error(
+                conn,
+                signal_id=signal_id,
+                stage="monitor_entry_spread_backfill",
+                error_type=type(exc).__name__,
+                message=str(exc),
+                context={"symbol": symbol},
+            )
+
         # Hedge health check: if one leg position is missing/flat while the other is not,
         # treat as unhedged risk and force close (after a short grace period).
         grace_seconds = 90.0
@@ -3149,6 +4036,13 @@ class LiveTradingManager:
             )
             return
 
+        exit_spread_pct_now = None
+        try:
+            if float(long_sell) > 0 and float(short_buy) > 0:
+                exit_spread_pct_now = (float(short_buy) / float(long_sell)) - 1.0
+        except Exception:
+            exit_spread_pct_now = None
+
         spread_now = float(math.log(float(short_buy) / float(long_sell)))
         pnl_spread_now = float(entry_spread_metric_f) - float(spread_now)
 
@@ -3253,6 +4147,7 @@ class LiveTradingManager:
             UPDATE watchlist.live_trade_signal
                SET last_check_at=now(),
                    last_spread_metric=%s,
+                   last_exit_spread_pct=%s,
                    last_pnl_spread=%s,
                    take_profit_pnl=CASE
                        WHEN take_profit_pnl IS NULL OR take_profit_pnl <= 0 THEN %s
@@ -3264,6 +4159,7 @@ class LiveTradingManager:
             """,
             (
                 float(spread_now),
+                float(exit_spread_pct_now) if exit_spread_pct_now is not None else None,
                 float(pnl_spread_now),
                 float(take_profit_pnl_f) if take_profit_pnl_f is not None else None,
                 force_close_at,
@@ -3730,13 +4626,27 @@ class LiveTradingManager:
                 close_qty = float(quantity)
             if close_qty <= 0:
                 raise TradeExecutionError("Bitget close quantity invalid/zero")
-            primary_side = "sell" if pos == "long" else "buy"
+            # Bitget hedge-mode close semantics are tricky:
+            # - We MUST specify `posSide` (long/short) to close the correct leg.
+            # - Some accounts reject the intuitive side mapping and require the opposite side when `tradeSide=close`.
+            # We therefore:
+            #   1) Try the intuitive close (long->sell, short->buy) with posSide
+            #   2) On specific errors, retry with opposite side but same posSide
+            # Observed on this account (posMode=hedge_mode):
+            # - tradeSide=close requires side to match the position direction:
+            #   - close long: side=buy, posSide=long
+            #   - close short: side=sell, posSide=short
+            # This is counter-intuitive but confirmed by live ETH/PROMPT tests.
+            # Keep a fallback to the opposite side for safety.
+            primary_side = "buy" if pos == "long" else "sell"
+            pos_side = "long" if pos == "long" else "short"
             try:
                 return place_bitget_usdt_perp_market_order(
                     symbol,
                     primary_side,
                     close_qty,
                     trade_side="close",
+                    pos_side=pos_side,
                     client_order_id=client_order_id,
                     margin_coin="USDT",
                 )
@@ -3751,6 +4661,7 @@ class LiveTradingManager:
                         opposite_side,
                         close_qty,
                         trade_side="close",
+                        pos_side=pos_side,
                         client_order_id=client_order_id,
                         margin_coin="USDT",
                     )
@@ -3779,5 +4690,21 @@ class LiveTradingManager:
                 float(quantity),
                 reduce_only=True,
                 client_order_id=client_order_id,
+            )
+        if ex == "grvt":
+            # GRVT is one-way/netted; close by the *current* signed position size when available.
+            size = self._get_exchange_position_size("grvt", symbol)
+            if size is not None and abs(float(size)) > 1e-9:
+                close_qty = abs(float(size))
+                close_dir = "short" if float(size) > 0 else "long"  # short->sell, long->buy
+            else:
+                close_qty = abs(float(quantity))
+                close_dir = "short" if pos == "long" else "long"
+            return execute_perp_market_order(
+                "grvt",
+                symbol,
+                close_qty,
+                side=close_dir,
+                order_kwargs={"reduce_only": True, "client_order_id": client_order_id},
             )
         raise TradeExecutionError(f"Unsupported exchange for close: {exchange}")

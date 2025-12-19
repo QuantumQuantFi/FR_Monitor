@@ -89,6 +89,12 @@
                 <span class="hint" title="交易所B（Short腿）平仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">B Short 平仓价</span>
               </th>
               <th style="width: 130px;">
+                <span class="hint" title="开仓“实际价差”（百分比）：用两条腿的开仓成交均价估算，entry_spread_pct_actual = (B_short开仓价 / A_long开仓价) - 1。用于复盘滑点/下单时刻价差是否真实存在。">开仓价差%</span>
+              </th>
+              <th style="width: 150px;">
+                <span class="hint" title="预计达到止盈条件时的“平仓临界价差”（百分比）：与实际止盈判断口径一致（使用开仓时订单簿扫盘得到的 entry_spread_metric）。计算：take_profit_exit_spread_pct = exp(entry_spread_metric - tp_pnl) - 1。含义：当后续平仓方向订单簿可成交价差 short_buy/long_sell 收敛到该水平附近，则 last_pnl≈tp_pnl，进入止盈判定。">止盈临界价差%</span>
+              </th>
+              <th style="width: 130px;">
                 <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
               </th>
               <th style="width: 140px;">
@@ -104,6 +110,9 @@
               <th style="width: 110px;">
                 <span class="hint" title="last_pnl：最近一次 1min 监控样本计算的“订单簿估算PnL指标”（小数，口径为价差变化而非账户真实收益）。计算：last_pnl = entry_spread_metric - now_spread_metric，其中 entry_spread_metric=log(short_sell_entry/long_buy_entry)，now_spread_metric=log(short_buy_now/long_sell_now)。注意：不包含手续费/资金费/滑点/成交延迟，且若订单簿/合约口径与实际下单不一致，可能与 realized_pnl_usdt 显著偏离。">last_pnl</span>
               </th>
+              <th style="width: 130px;">
+                <span class="hint" title="实时平仓价差%：最近一次 1min 监控中，为“平仓方向”用订单簿扫盘得到的可成交价差（百分比）。计算：last_exit_spread_pct = (short_buy_px / long_sell_px) - 1，其中 long_sell_px=Long腿卖出(Bid扫盘价)，short_buy_px=Short腿买入(Ask扫盘价)。用于判断当前平仓可成交价差是否已明显收敛。">实时平仓价差%</span>
+              </th>
               <th style="width: 170px;">created_at</th>
               <th style="width: 170px;">opened_at</th>
               <th style="width: 170px;">close_req_at</th>
@@ -115,7 +124,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="23" class="muted">loading...</td></tr>
+            <tr><td colspan="26" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -332,7 +341,10 @@
         const aClose = fmt(s.close_long_avg_price, 8);
         const bOpen = fmt(s.open_short_avg_price, 8);
         const bClose = fmt(s.close_short_avg_price, 8);
+        const entrySpreadPct = fmtPct(s.entry_spread_pct_actual, 4);
+        const tpExitSpreadPct = fmtPct(s.take_profit_exit_spread_pct, 4);
         const realized = fmt(s.realized_pnl_usdt, 6);
+        const exitSpreadPctNow = fmtPct(s.last_exit_spread_pct, 4);
         const src = s.funding_source || {};
         const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate');
         const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
@@ -364,12 +376,15 @@
             <td class="muted">${aClose}</td>
             <td class="muted">${bOpen}</td>
             <td class="muted">${bClose}</td>
+            <td class="muted">${entrySpreadPct}</td>
+            <td class="muted">${tpExitSpreadPct}</td>
             <td class="muted">${realized}</td>
             <td class="muted"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
             <td><span class="pill ${stCls}">${stText}</span></td>
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
             <td>${fmt(s.last_pnl_spread, 6)}</td>
+            <td class="muted">${exitSpreadPctNow}</td>
             <td class="muted">${createdAt}</td>
             <td class="muted">${openAt}</td>
             <td class="muted">${closeReqAt}</td>
@@ -545,6 +560,14 @@
             const mark = Number(p.markPx || 0);
             const notional = Number(p.positionValue || 0) || (Math.abs(szi) * mark);
             return {exchange: ex, symbol: sym, side: szi >= 0 ? 'long' : 'short', size: Math.abs(szi), value_usdt: notional, entry: p.entryPx, upnl_usdt: p.unrealizedPnl, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
+          }
+          if (ex === 'grvt') {
+            const sz = Number(raw.size || 0);
+            const inst = String(raw.instrument || raw.symbol || '');
+            const sym = (inst && inst.includes('_')) ? inst.split('_')[0] : (inst || '-');
+            const mark = Number(raw.mark_price || raw.markPrice || 0);
+            const notional = Math.abs(Number(raw.notional || 0)) || (Math.abs(sz) * mark);
+            return {exchange: ex, symbol: sym, side: sz >= 0 ? 'long' : 'short', size: Math.abs(sz), value_usdt: notional, entry: raw.entry_price || raw.entryPrice, upnl_usdt: raw.unrealized_pnl || raw.unrealizedPnl, mark_price: markPrice, funding_rate: fundingRate, funding_interval_hours: fundingInterval, next_funding_time: nextFunding, funding_pnl_usdt: fundingPnl, funding_last_fee_usdt: fundingLastFee, funding_last_fee_time: fundingLastTime, funding_opened_at: fundingOpenedAt, funding_source: fundingSource, funding_fee_error: fundingFeeError};
           }
         } catch (e) {
           return null;
