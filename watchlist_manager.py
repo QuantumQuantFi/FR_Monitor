@@ -72,6 +72,8 @@ class WatchlistEntry:
     updated_at: str = field(default_factory=lambda: _iso(_utcnow()))
     entry_type: str = "A"  # A: Binance funding spike; B: cross-exchange futures diff; C: spot vs futures diff
     trigger_details: Optional[Dict[str, Any]] = None
+    # Type B/C: pnl regression prediction payload (see watchlist_pnl_regression_model.predict_bc)
+    pnl_regression: Optional[Dict[str, Any]] = None
 
 
 class WatchlistManager:
@@ -651,8 +653,8 @@ class WatchlistManager:
                     else None
                 ),
             }
-            # 为 Type B 事件补齐 pnl_regression.pred(240) 写入，供自动实盘/回溯统计读取。
-            if entry.entry_type == 'B' and isinstance(row.get('meta'), dict):
+            # 为 Type B/C 事件补齐 pnl_regression.pred(240) 写入，供自动实盘/回溯统计读取。
+            if entry.entry_type in ('B', 'C') and isinstance(row.get('meta'), dict):
                 try:
                     meta_obj: Dict[str, Any] = row['meta']  # type: ignore[assignment]
                     factors = meta_obj.get('factors') or {}
@@ -694,7 +696,7 @@ class WatchlistManager:
                                         factors2.setdefault('spread_log_short_over_long', float(math.log(1.0 + fb)))
                             except Exception:
                                 pass
-                        pred = predict_bc(signal_type='B', factors=factors2, horizons=(240,))
+                        pred = predict_bc(signal_type=str(entry.entry_type), factors=factors2, horizons=(240,))
                         pred_240 = ((pred or {}).get('pred') or {}).get('240') if isinstance(pred, dict) else None
                         if (
                             isinstance(pred, dict)
@@ -704,6 +706,9 @@ class WatchlistManager:
                         ):
                             meta_obj['pnl_regression'] = pred
                             meta_obj['factors'] = factors2
+                            # Also keep a lightweight copy on the in-memory entry for watchlist UI display.
+                            # Do NOT attach factors2 here to keep payload small.
+                            entry.pnl_regression = pred
                 except Exception:
                     pass
             rows.append(row)

@@ -2272,6 +2272,15 @@ def get_all_data():
 def get_watchlist():
     """获取基于资金费率的Binance关注列表"""
     payload = watchlist_manager.snapshot()
+    # Expose live trading thresholds so watchlist UI can show “Type B/C 入场信号”状态。
+    try:
+        payload['live_trading_thresholds'] = {
+            'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.011)),
+            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.91)),
+        }
+    except Exception:
+        payload['live_trading_thresholds'] = None
     try:
         entries = payload.get('entries', [])
         active_entries = [e for e in entries if e.get('status') == 'active']

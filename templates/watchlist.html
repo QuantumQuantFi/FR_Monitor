@@ -584,8 +584,8 @@
             return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
         };
 
-        const render = (payload) => {
-            const { summary, entries, timestamp } = payload;
+            const render = (payload) => {
+            const { summary, entries, timestamp, live_trading_thresholds: ltThr } = payload;
             summaryEls.active.textContent = summary.active_count;
             summaryEls.total.textContent = summary.total_tracked;
             summaryEls.threshold.textContent = formatPct(summary.threshold);
@@ -605,19 +605,55 @@
                 const entryType = item.entry_type || 'A';
                 const metrics = metricsCache[item.symbol] || {};
                 const trigger = item.trigger_details || {};
-                const entryFlags = entryType === 'A'
-                    ? [
-                        metrics.entry_condition1 ? 'C1✔' : '',
-                        metrics.entry_condition2 ? 'C2✔' : ''
-                    ].filter(Boolean).join(' ') || '-'
-                    : '-';
-                const entryTitle = entryType === 'A'
-                    ? [
-                        '仅 Type A: 开仓需要 C1 和 C2 同时满足',
-                        `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} <= 0`,
-                        `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间12h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} (3h/30m) Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥2 且 Drift≤0.3)`
-                    ].join('\\n')
-                    : 'Type B/C 触发：跨交易所价差条件';
+                const pred240 = (() => {
+                    try {
+                        const pr = item.pnl_regression || {};
+                        const p = (pr.pred || pr['pred'] || {});
+                        return p['240'] || p[240] || null;
+                    } catch (e) {
+                        return null;
+                    }
+                })();
+
+                const entryFlags = (() => {
+                    if (entryType === 'A') {
+                        return [
+                            metrics.entry_condition1 ? 'C1✔' : '',
+                            metrics.entry_condition2 ? 'C2✔' : ''
+                        ].filter(Boolean).join(' ') || '-';
+                    }
+                    // Type B/C: show regression-based entry signal (horizon=240m)
+                    if (!pred240) return '-';
+                    const pnlHat = pred240.pnl_hat;
+                    const winProb = pred240.win_prob;
+                    if (pnlHat === null || pnlHat === undefined || winProb === null || winProb === undefined) return '-';
+                    const pnlTxt = `${formatPct(pnlHat)}`;
+                    const probTxt = `${formatPct(winProb)}`;
+                    const thrPnl = ltThr && ltThr.pnl_threshold !== undefined ? Number(ltThr.pnl_threshold) : null;
+                    const thrProb = ltThr && ltThr.win_prob_threshold !== undefined ? Number(ltThr.win_prob_threshold) : null;
+                    const ok = (thrPnl !== null && thrProb !== null) ? (Number(pnlHat) >= thrPnl && Number(winProb) >= thrProb) : false;
+                    return `${ok ? 'SIG✔' : 'SIG'} ${pnlTxt}/${probTxt}`;
+                })();
+
+                const entryTitle = (() => {
+                    if (entryType === 'A') {
+                        return [
+                            '仅 Type A: 开仓需要 C1 和 C2 同时满足',
+                            `C1: Spread ${formatPct(metrics.last_spread)} < 基线 ${formatPct(metrics.baseline_rel)} 且 < 绝对阈值 ${formatPct(SPREAD_ABS_BASELINE)} 且斜率 ${formatNumber(metrics.recent_slope, 6)} <= 0`,
+                            `C2: 波动 ${formatPct(metrics.volatility)} 区间1h ${formatPct(metrics.range_short)} 区间12h ${formatPct(metrics.range_long)} 穿越 ${metrics.crossings_1h || 0} (3h/30m) Drift ${formatNumber(metrics.drift_ratio, 3)} (需穿越≥2 且 Drift≤0.3)`
+                        ].join('\\n');
+                    }
+                    const thrLine = (ltThr && ltThr.horizon_min)
+                        ? `实盘阈值(用于参考)：h=${ltThr.horizon_min}m pnl>=${formatPct(ltThr.pnl_threshold)} prob>=${formatPct(ltThr.win_prob_threshold)}`
+                        : '实盘阈值(用于参考)：未知';
+                    if (!pred240) return `Type ${entryType}: 触发来自跨交易所价差；回归预测未就绪\\n${thrLine}`;
+                    return [
+                        `Type ${entryType}: 回归预测(240m)`,
+                        `pnl_hat=${formatPct(pred240.pnl_hat)} win_prob=${formatPct(pred240.win_prob)} fee_thr=${formatPct(pred240.fee_threshold)}`,
+                        thrLine,
+                        '说明：win_prob 是 P(pnl>fee_threshold) 的近似，不含完整手续费/滑点/资金费。'
+                    ].join('\\n');
+                })();
                 const exitFlags = entryType === 'A'
                     ? [
                         metrics.take_profit_trigger ? 'TP' : '',
