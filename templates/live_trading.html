@@ -660,10 +660,54 @@
       detailsPre.textContent = 'loading...';
       detailsSummary.textContent = 'loading...';
       try {
-        const [orders, samples] = await Promise.all([
+        const [orders, samples, sigResp] = await Promise.all([
           fetchJson(`/api/live_trading/orders?signal_id=${signalId}&limit=200`),
           fetchJson(`/api/live_trading/samples?signal_id=${signalId}&limit=200`),
+          fetchJson(`/api/live_trading/signals?signal_id=${signalId}&limit=1&include_prices=0&include_funding=0`),
         ]);
+        const sig = (sigResp && Array.isArray(sigResp.signals) && sigResp.signals.length) ? sigResp.signals[0] : null;
+        const payload = sig ? sig.payload : null;
+        const reval = payload?.orderbook_revalidation || null;
+
+        function deriveCandidatesFromOrderbook(revalObj) {
+          try {
+            const oba = revalObj?.orderbook?.a;
+            const obb = revalObj?.orderbook?.b;
+            const exa = oba?.meta?.exchange || oba?.exchange || null;
+            const exb = obb?.meta?.exchange || obb?.exchange || null;
+            const aSell = Number(oba?.sell);
+            const aBuy = Number(oba?.buy);
+            const bSell = Number(obb?.sell);
+            const bBuy = Number(obb?.buy);
+            const out = [];
+            const add = (shortEx, longEx, shortPx, longPx) => {
+              const s = Number(shortPx), l = Number(longPx);
+              if (!Number.isFinite(s) || !Number.isFinite(l) || l <= 0 || s <= 0) return;
+              out.push({
+                short_exchange: shortEx,
+                long_exchange: longEx,
+                short_px: s,
+                long_px: l,
+                tradable_spread: (s - l) / l,
+                entry_spread_metric: Math.log(s / l),
+                note: 'derived_from_orderbook',
+              });
+            };
+            if (exa && exb) {
+              // short on A, long on B
+              add(exa, exb, aSell, bBuy);
+              // short on B, long on A
+              add(exb, exa, bSell, aBuy);
+            }
+            return out;
+          } catch (e) {
+            return [];
+          }
+        }
+
+        const revalCandidates = (reval && Array.isArray(reval.candidates) && reval.candidates.length)
+          ? reval.candidates
+          : deriveCandidatesFromOrderbook(reval);
 
         const os = (orders.orders || []).slice().reverse(); // chronological
         const pick = (action, leg) => os.filter(o => o.action === action && o.leg === leg).slice(-1)[0];
@@ -709,13 +753,18 @@
 
         detailsSummary.textContent = JSON.stringify({
           signal_id: signalId,
+          status: sig?.status || null,
+          symbol: sig?.symbol || null,
+          reason: sig?.reason || null,
+          orderbook_revalidation: reval ? {...reval, candidates: revalCandidates} : null,
+          orderbook_confirm_open: payload?.orderbook_confirm_open || null,
           open: { long: legSummary(openLong), short: legSummary(openShort) },
           close: { long: legSummary(closeLong), short: legSummary(closeShort) },
           realized_pnl_usdt: realized,
           note: 'filled_qty/avg_price 为 best-effort：若交易所回执不含成交信息，会尝试查询订单详情；仍可能为空。',
         }, null, 2);
 
-        detailsPre.textContent = JSON.stringify({signal_id: signalId, orders: orders.orders, samples: samples.samples}, null, 2);
+        detailsPre.textContent = JSON.stringify({signal_id: signalId, signal: sig, orders: orders.orders, samples: samples.samples}, null, 2);
       } catch (e) {
         detailsPre.textContent = String(e);
         detailsSummary.textContent = String(e);

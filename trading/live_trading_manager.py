@@ -2273,23 +2273,25 @@ class LiveTradingManager:
         ex_a = str(high_exchange)
         ex_b = str(low_exchange)
 
+        notional_usdt = float(self.config.per_leg_notional_usdt)
         ob_a = fetch_orderbook_prices(
             ex_a,
             symbol,
             self.config.orderbook_market_type,
-            notional=float(self.config.per_leg_notional_usdt),
+            notional=notional_usdt,
         )
         ob_b = fetch_orderbook_prices(
             ex_b,
             symbol,
             self.config.orderbook_market_type,
-            notional=float(self.config.per_leg_notional_usdt),
+            notional=notional_usdt,
         )
         if not ob_a or ob_a.get("error") or not ob_b or ob_b.get("error"):
             return {
                 "ok": False,
                 "reason": "orderbook_unavailable",
                 "orderbook": {"a": ob_a, "b": ob_b},
+                "notional_usdt": notional_usdt,
             }
 
         candidates = [
@@ -2301,26 +2303,70 @@ class LiveTradingManager:
 
         best: Optional[Dict[str, Any]] = None
         best_score: Tuple[float, float] = (-1e9, -1e9)
+        evaluated: List[Dict[str, Any]] = []
 
         for cand in candidates:
             short_px = cand.get("short_px")
             long_px = cand.get("long_px")
             if short_px is None or long_px is None:
+                evaluated.append(
+                    {
+                        "short_exchange": str(cand.get("short_ex") or ""),
+                        "long_exchange": str(cand.get("long_ex") or ""),
+                        "short_px": short_px,
+                        "long_px": long_px,
+                        "tradable_spread": None,
+                        "entry_spread_metric": None,
+                        "note": "missing_px",
+                    }
+                )
                 continue
             try:
                 short_f = float(short_px)
                 long_f = float(long_px)
             except Exception:
+                evaluated.append(
+                    {
+                        "short_exchange": str(cand.get("short_ex") or ""),
+                        "long_exchange": str(cand.get("long_ex") or ""),
+                        "short_px": short_px,
+                        "long_px": long_px,
+                        "tradable_spread": None,
+                        "entry_spread_metric": None,
+                        "note": "px_parse_error",
+                    }
+                )
                 continue
             if short_f <= 0 or long_f <= 0:
+                evaluated.append(
+                    {
+                        "short_exchange": str(cand.get("short_ex") or ""),
+                        "long_exchange": str(cand.get("long_ex") or ""),
+                        "short_px": float(short_f),
+                        "long_px": float(long_f),
+                        "tradable_spread": None,
+                        "entry_spread_metric": None,
+                        "note": "non_positive_px",
+                    }
+                )
                 continue
             tradable_spread = (short_f - long_f) / long_f
+            entry_spread_metric = float(math.log(short_f / long_f))
+            evaluated.append(
+                {
+                    "short_exchange": str(cand.get("short_ex") or ""),
+                    "long_exchange": str(cand.get("long_ex") or ""),
+                    "short_px": float(short_f),
+                    "long_px": float(long_f),
+                    "tradable_spread": float(tradable_spread),
+                    "entry_spread_metric": float(entry_spread_metric),
+                }
+            )
             # 必须可成交价差为正，否则这个方向“买贵卖便宜”，不符合本策略的开仓定义。
             if tradable_spread <= 0:
                 continue
 
             factors = dict(base_factors or {})
-            entry_spread_metric = float(math.log(short_f / long_f))
             factors["spread_log_short_over_long"] = float(entry_spread_metric)
             factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
 
@@ -2356,6 +2402,8 @@ class LiveTradingManager:
                     "entry_spread_metric": float(entry_spread_metric),
                     "orderbook": {"a": ob_a, "b": ob_b},
                     "factors": factors,
+                    "candidates": evaluated,
+                    "notional_usdt": notional_usdt,
                 }
 
         if not best:
@@ -2363,6 +2411,8 @@ class LiveTradingManager:
                 "ok": False,
                 "reason": "no_tradable_direction",
                 "orderbook": {"a": ob_a, "b": ob_b},
+                "candidates": evaluated,
+                "notional_usdt": notional_usdt,
             }
 
         best["ok"] = bool(

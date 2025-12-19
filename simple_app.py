@@ -2903,6 +2903,7 @@ def live_trading_signals():
         return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
 
     limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
+    signal_id = request.args.get('signal_id')
     status = request.args.get('status')
     symbol = request.args.get('symbol')
     include_prices = str(request.args.get('include_prices', '1') or '1').lower() not in ('0', 'false', 'no')
@@ -2910,6 +2911,12 @@ def live_trading_signals():
 
     where = []
     params: List[Any] = []
+    if signal_id:
+        where.append("id=%s")
+        try:
+            params.append(int(signal_id))
+        except Exception:
+            return jsonify({'error': 'invalid signal_id', 'timestamp': now_utc_iso()}), 400
     if status:
         where.append("status=%s")
         params.append(str(status))
