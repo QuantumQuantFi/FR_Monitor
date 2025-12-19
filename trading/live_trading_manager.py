@@ -134,7 +134,14 @@ class LiveTradingManager:
     def __init__(self, config: LiveTradingConfig):
         self.config = config
         self.logger = logging.getLogger("live_trading")
-        self._thread: Optional[threading.Thread] = None
+        # Split scan vs monitor loops:
+        # - scan loop: processes new events + retries skipped (kick-driven + periodic fallback)
+        # - monitor loop: polls orderbooks/funding/balances for open trades and decides take-profit/force-close
+        #
+        # Rationale: monitor loop can be slow (multiple REST calls); if it blocks the scan loop, we may miss
+        # short-lived events when event_lookback_minutes is small (e.g. 3 minutes).
+        self._thread_scan: Optional[threading.Thread] = None
+        self._thread_monitor: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._wakeup = threading.Event()
         self._wakeup_lock = threading.Lock()
@@ -290,13 +297,15 @@ class LiveTradingManager:
         if psycopg is None:
             self.logger.error("psycopg not installed; live trading cannot start")
             return
-        if self._thread:
+        if self._thread_scan or self._thread_monitor:
             return
         self.ensure_schema()
         self._stop.clear()
         self._wakeup.set()  # run first scan immediately
-        self._thread = threading.Thread(target=self._run_loop, name="live-trading", daemon=True)
-        self._thread.start()
+        self._thread_scan = threading.Thread(target=self._run_scan_loop, name="live-trading-scan", daemon=True)
+        self._thread_monitor = threading.Thread(target=self._run_monitor_loop, name="live-trading-monitor", daemon=True)
+        self._thread_scan.start()
+        self._thread_monitor.start()
         self.logger.info(
             "live trading started horizon=%sm pnl>%.4f win>%.3f max=%s",
             self.config.horizon_min,
@@ -306,12 +315,16 @@ class LiveTradingManager:
         )
 
     def stop(self) -> None:
-        if not self._thread:
+        if not (self._thread_scan or self._thread_monitor):
             return
         self._stop.set()
         self._wakeup.set()
-        self._thread.join(timeout=5)
-        self._thread = None
+        if self._thread_scan:
+            self._thread_scan.join(timeout=5)
+        if self._thread_monitor:
+            self._thread_monitor.join(timeout=5)
+        self._thread_scan = None
+        self._thread_monitor = None
 
     def manual_force_close(self, signal_id: int) -> Dict[str, Any]:
         """One-click manual flatten for a signal.
@@ -662,8 +675,7 @@ class LiveTradingManager:
                 self._symbol_locks[key] = lock
             return lock
 
-    def _run_loop(self) -> None:
-        last_monitor_ts = 0.0
+    def _run_scan_loop(self) -> None:
         while not self._stop.is_set():
             # Kick-driven (fast-path) + periodic scan (fallback).
             # - kicked: process immediately
@@ -684,13 +696,20 @@ class LiveTradingManager:
                 self.process_once()
             except Exception as exc:  # pragma: no cover - safety net
                 self.logger.exception("live trading loop error: %s", exc)
+
+    def _run_monitor_loop(self) -> None:
+        interval = max(1.0, float(self.config.monitor_interval_seconds or 60.0))
+        while not self._stop.is_set():
             try:
-                now = time.time()
-                if now - last_monitor_ts >= float(self.config.monitor_interval_seconds):
-                    self.monitor_open_trades_once()
-                    last_monitor_ts = now
+                self.monitor_open_trades_once()
             except Exception as exc:  # pragma: no cover - safety net
                 self.logger.exception("live trading monitor error: %s", exc)
+            # Sleep in small chunks so stop() is responsive.
+            slept = 0.0
+            while slept < interval and not self._stop.is_set():
+                chunk = min(0.5, interval - slept)
+                time.sleep(chunk)
+                slept += chunk
 
     def ensure_schema(self) -> None:
         if psycopg is None:
