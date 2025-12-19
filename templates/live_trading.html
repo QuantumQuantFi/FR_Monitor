@@ -556,6 +556,22 @@
       if (!rows.length) {
         balancesBody.innerHTML = '<tr><td colspan="5" class="muted">暂无数据</td></tr>';
       } else {
+        const totalMap = (payload && payload.balance_totals && typeof payload.balance_totals === 'object') ? payload.balance_totals : {};
+        const totalsRows = Object.keys(totalMap || {}).sort().map(cur => {
+          const t = totalMap[cur] || {};
+          const a = (t.available !== undefined && t.available !== null) ? Number(t.available).toFixed(8).replace(/0+$/,'').replace(/\.$/,'') : '-';
+          const w = (t.wallet !== undefined && t.wallet !== null) ? Number(t.wallet).toFixed(8).replace(/0+$/,'').replace(/\.$/,'') : '-';
+          return `
+            <tr style="border-top:1px solid #333;">
+              <td><b>Total</b></td>
+              <td class="muted"><b>${cur}</b></td>
+              <td class="muted"><b>${a}</b></td>
+              <td class="muted"><b>${w}</b></td>
+              <td class="muted">-</td>
+            </tr>
+          `;
+        });
+
         balancesBody.innerHTML = rows.map(r => {
           const ex = r.exchange || '-';
           const err = r.error || '';
@@ -569,7 +585,7 @@
               <td class="muted">${err || '-'}</td>
             </tr>
           `;
-        }).join('');
+        }).join('') + totalsRows.join('');
       }
 
       // Positions

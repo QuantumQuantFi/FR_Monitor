@@ -53,6 +53,7 @@ from trading.trade_executor import (
     get_hyperliquid_perp_positions,
     get_hyperliquid_balance_summary,
     get_hyperliquid_user_funding_history,
+    get_lighter_balance_summary,
 )
 from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
 from watchlist_manager import WatchlistManager
@@ -1085,9 +1086,9 @@ if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"
     threading.Thread(target=_watchlist_preload_worker, name="watchlist-preload", daemon=True).start()
 
 # Live trading manager (Phase 1: Type B only). Default disabled via LIVE_TRADING_CONFIG.
-live_trading_manager = LiveTradingManager(
-    LiveTradingConfig(
-        enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
+    live_trading_manager = LiveTradingManager(
+        LiveTradingConfig(
+            enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
         dsn=str(WATCHLIST_PG_CONFIG.get('dsn')),
         allowed_exchanges=tuple(
             x.strip().lower()
@@ -1104,6 +1105,7 @@ live_trading_manager = LiveTradingManager(
         orderbook_confirm_samples=int(LIVE_TRADING_CONFIG.get('orderbook_confirm_samples', 3)),
         orderbook_confirm_sleep_seconds=float(LIVE_TRADING_CONFIG.get('orderbook_confirm_sleep_seconds', 0.7)),
         max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 1)),
+        max_abs_funding=float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.001)),
         close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
         per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
@@ -2100,9 +2102,21 @@ def watchlist_refresh_loop():
             all_data = data_collector.get_all_data()
             exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
             watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
+            _kick_live_trading("watchlist_refresh_loop")
         except Exception as exc:
             logger.warning("watchlist refresh failed: %s", exc)
         time.sleep(watchlist_manager.refresh_seconds)
+
+
+def _kick_live_trading(reason: str) -> None:
+    """Watchlist → Live trading fast path: wake the live trading loop to scan now."""
+    try:
+        ltm = globals().get("live_trading_manager")
+        kick = getattr(ltm, "kick", None) if ltm is not None else None
+        if callable(kick):
+            kick(reason=str(reason or "watchlist"))
+    except Exception as exc:
+        logging.getLogger("live_trading").warning("live trading kick failed: %s", exc)
 
 
 def cold_start_watchlist_from_db(limit_minutes: int = 1) -> None:
@@ -2347,6 +2361,7 @@ def trigger_watchlist_refresh():
         all_data = data_collector.get_all_data()
         exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
         watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
+        _kick_live_trading("api_watchlist_refresh")
         return jsonify({'message': 'ok', 'timestamp': now_utc_iso(), 'summary': watchlist_manager.snapshot().get('summary')})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
@@ -3000,72 +3015,11 @@ def live_trading_signals():
                     item['realized_pnl_usdt'] = realized_pnl
 
             if include_funding:
-                status_v = str(r.get("status") or "")
-                if status_v in ("opening", "open", "closing") and (r.get("opened_at") or r.get("created_at")):
-                    try:
-                        sid = int(r.get("id")) if r.get("id") is not None else None
-                    except Exception:
-                        sid = None
-                    cache_key = ("sig", sid) if sid is not None else None
-                    cached = None
-                    if cache_key is not None:
-                        with _FUNDING_SIG_LOCK:
-                            cached = _FUNDING_SIG_CACHE.get(cache_key)
-                    if isinstance(cached, dict):
-                        item.update(cached)
-                    else:
-                        sym_u = str(r.get("symbol") or "").upper()
-                        long_ex = str(r.get("leg_long_exchange") or "").lower()
-                        short_ex = str(r.get("leg_short_exchange") or "").lower()
-                        opened_at = r.get("opened_at") or r.get("created_at")
-                        # Prefer actual per-leg notional from order records when available; fallback to configured per-leg.
-                        per_leg = float(LIVE_TRADING_CONFIG.get("per_leg_notional_usdt", 50.0))
-                        try:
-                            long_notional = float(item.get("open_long_notional_usdt") or per_leg)
-                        except Exception:
-                            long_notional = per_leg
-                        try:
-                            short_notional = float(item.get("open_short_notional_usdt") or per_leg)
-                        except Exception:
-                            short_notional = per_leg
-
-                        long_sum = _funding_fee_summary_since_open(
-                            long_ex, sym_u, opened_at, now_ms=now_ms, notional_usdt=long_notional, pos_sign=1
-                        ) if long_ex and sym_u else {}
-                        short_sum = _funding_fee_summary_since_open(
-                            short_ex, sym_u, opened_at, now_ms=now_ms, notional_usdt=short_notional, pos_sign=-1
-                        ) if short_ex and sym_u else {}
-                        total = None
-                        try:
-                            if long_sum.get("funding_pnl_usdt") is not None and short_sum.get("funding_pnl_usdt") is not None:
-                                total = float(long_sum.get("funding_pnl_usdt") or 0.0) + float(short_sum.get("funding_pnl_usdt") or 0.0)
-                        except Exception:
-                            total = None
-
-                        sched_long = _public_funding_schedule(long_ex, sym_u) if long_ex and sym_u else {}
-                        sched_short = _public_funding_schedule(short_ex, sym_u) if short_ex and sym_u else {}
-
-                        funding_payload = {
-                            "funding_pnl_usdt": total,
-                            "funding_long_pnl_usdt": long_sum.get("funding_pnl_usdt"),
-                            "funding_short_pnl_usdt": short_sum.get("funding_pnl_usdt"),
-                            "funding_source": {"long": long_sum.get("source"), "short": short_sum.get("source")},
-                            "funding_last_fee_time": max(
-                                [t for t in [long_sum.get("last_fee_time"), short_sum.get("last_fee_time")] if t], default=None
-                            ),
-                            "funding_long_last_fee_usdt": long_sum.get("last_fee_usdt"),
-                            "funding_short_last_fee_usdt": short_sum.get("last_fee_usdt"),
-                            "funding_long_last_fee_time": long_sum.get("last_fee_time"),
-                            "funding_short_last_fee_time": short_sum.get("last_fee_time"),
-                            "funding_schedule_long": sched_long or None,
-                            "funding_schedule_short": sched_short or None,
-                            "funding_updated_at": datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).isoformat(),
-                            "funding_error": {"long": long_sum.get("error"), "short": short_sum.get("error")} if (long_sum.get("error") or short_sum.get("error")) else None,
-                        }
-                        item.update(funding_payload)
-                        if cache_key is not None:
-                            with _FUNDING_SIG_LOCK:
-                                _FUNDING_SIG_CACHE[cache_key] = dict(funding_payload)
+                # Funding fields are persisted by LiveTradingManager:
+                # - Active trades: updated at most once per UTC hour.
+                # - Closed trades: finalized using (opened_at → closed_at).
+                # Keep the API as a pure read so page refresh doesn't hammer private bill endpoints.
+                pass
             out.append(item)
         else:
             out.append(r)
@@ -3128,6 +3082,7 @@ def live_trading_positions():
     limit = min(max(int(request.args.get('limit', 50) or 50), 1), 100)
     query_all = str(request.args.get('all') or '').lower() in {'1', 'true', 'yes', 'y'}
     only_nonzero = str(request.args.get('nonzero') or '1').lower() not in {'0', 'false', 'no', 'n'}
+    persist_balances = str(request.args.get('persist') or '1').lower() not in {'0', 'false', 'no', 'n'}
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
@@ -3185,6 +3140,9 @@ def live_trading_positions():
             if ex == 'hyperliquid':
                 p = row.get('position') if isinstance(row.get('position'), dict) else row
                 return abs(float(p.get('szi') or 0.0)) > 1e-12
+            if ex == 'lighter':
+                raw = row.get('position') or row.get('size') or 0.0
+                return abs(float(raw or 0.0)) > 1e-12
         except Exception:
             return True
         return True
@@ -3198,7 +3156,9 @@ def live_trading_positions():
             supported = set([str(x).lower() for x in backends])
     except Exception:
         supported = set()
-    default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid']
+    if supported:
+        supported.add("lighter")
+    default_exchanges = ['binance', 'okx', 'bybit', 'bitget', 'hyperliquid', 'lighter']
     exchanges = [ex for ex in default_exchanges if not supported or ex in supported]
 
     # Public mark price / funding enrichment (best-effort, cached).
@@ -3518,6 +3478,14 @@ def live_trading_positions():
             elif ex == 'hyperliquid':
                 balance = get_hyperliquid_balance_summary()
                 positions = get_hyperliquid_perp_positions()
+            elif ex == 'lighter':
+                balance = get_lighter_balance_summary()
+                raw_positions = None
+                if isinstance(balance, dict):
+                    raw = balance.get("raw_account")
+                    if isinstance(raw, dict):
+                        raw_positions = raw.get("positions")
+                positions = raw_positions if isinstance(raw_positions, list) else []
             else:
                 balance = None
                 positions = []
@@ -3602,7 +3570,44 @@ def live_trading_positions():
         except Exception as exc:
             results.append({'exchange': ex, 'symbol': sym or None, 'balance': None, 'positions': None, 'error': f"{type(exc).__name__}: {exc}"})
 
-    return jsonify({'timestamp': now_utc_iso(), 'mode': 'all' if query_all else 'active', 'only_nonzero': only_nonzero, 'targets': list(uniq), 'results': results})
+    balance_rows = [
+        {'exchange': r.get('exchange'), 'balance': r.get('balance'), 'error': r.get('error')}
+        for r in (results or [])
+        if isinstance(r, dict)
+    ]
+    totals: Dict[str, Any] = {}
+    snapshot_id: Optional[int] = None
+    try:
+        if live_trading_manager:
+            totals = live_trading_manager._compute_balance_totals(balance_rows)  # type: ignore[attr-defined]
+            if persist_balances:
+                with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], autocommit=True) as conn:
+                    snapshot_id = live_trading_manager._insert_balance_snapshot(  # type: ignore[attr-defined]
+                        conn,
+                        source="manual",
+                        balance_rows=balance_rows,
+                        totals=totals,
+                        context={
+                            "endpoint": "/api/live_trading/positions",
+                            "mode": "all" if query_all else "active",
+                            "only_nonzero": only_nonzero,
+                            "targets": [{"exchange": ex, "symbol": sym} for (ex, sym) in list(uniq)],
+                        },
+                    )
+    except Exception:
+        snapshot_id = None
+
+    return jsonify(
+        {
+            'timestamp': now_utc_iso(),
+            'mode': 'all' if query_all else 'active',
+            'only_nonzero': only_nonzero,
+            'targets': list(uniq),
+            'results': results,
+            'balance_totals': totals,
+            'balance_snapshot_id': snapshot_id,
+        }
+    )
 
 
 @app.route('/api/live_trading/force_close', methods=['POST'])
@@ -4080,6 +4085,7 @@ if __name__ == '__main__':
     # 用最近 1 分钟数据库数据做一次冷启动，避免跨所列表长时间为空
     try:
         cold_start_watchlist_from_db(limit_minutes=1)
+        _kick_live_trading("cold_start_watchlist")
     except Exception as exc:
         logging.getLogger('watchlist').warning("cold start at bootstrap failed: %s", exc)
     
