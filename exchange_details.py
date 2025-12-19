@@ -2,6 +2,7 @@ import time
 import requests
 from typing import Dict, Any, List
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 
 
 def _get_json(url: str, timeout: float = 4.0):
@@ -362,6 +363,92 @@ def fetch_bitget(symbol: str):
     return row
 
 
+_LIGHTER_BASE = "https://mainnet.zklighter.elliot.ai/api/v1"
+_LIGHTER_CACHE: Dict[str, Any] = {"ts": 0.0, "funding_rates": None, "exchange_stats": None}
+_LIGHTER_CACHE_TTL = 10.0  # seconds
+
+
+def _utc_next_hour_ms(now_ms: int) -> int:
+    # Round up to next UTC hour boundary.
+    hour_ms = 3_600_000
+    return ((int(now_ms) // hour_ms) + 1) * hour_ms
+
+
+def fetch_lighter(symbol: str):
+    """
+    Lighter perpetual public metrics.
+
+    Notes
+    - Lighter REST currently exposes:
+      - /exchangeStats: 24h volume (quote/base), last trade price, etc. (bulk list)
+      - /funding-rates: current funding rates (bulk list)
+    - It does NOT expose (at least via these public endpoints) mark/index price, OI, insurance fund,
+      or funding rate cap/floor. Those fields are returned as None to keep schema consistent.
+    - Funding interval is treated as 1h (rule-based) and next funding time is aligned to next UTC hour.
+      If Lighter later provides per-market schedule, replace this with the authoritative fields.
+    """
+    sym = symbol.upper()
+    now_ms = int(time.time() * 1000)
+    now_s = time.time()
+
+    cached = _LIGHTER_CACHE if isinstance(_LIGHTER_CACHE, dict) else {}
+    if now_s - float(cached.get("ts") or 0.0) > _LIGHTER_CACHE_TTL:
+        cached["funding_rates"] = _get_json(f"{_LIGHTER_BASE}/funding-rates")
+        cached["exchange_stats"] = _get_json(f"{_LIGHTER_BASE}/exchangeStats")
+        cached["ts"] = now_s
+
+    funding_rates = cached.get("funding_rates")
+    exchange_stats = cached.get("exchange_stats")
+
+    row = {
+        "exchange": "lighter",
+        "symbol": symbol,
+        "funding_interval_hours": 1.0,
+        "funding_rate": None,
+        "funding_cap": None,
+        "funding_floor": None,
+        "index_diff": None,
+        "open_interest": None,
+        "risk_fund": None,
+        "volume_quote": None,
+        "timestamp": now_ms,
+        "mark_price": None,
+        "index_price": None,
+        "insurance_fund": None,
+        "funding_history": [],
+        "index_components": [],
+        "next_funding_time": _utc_next_hour_ms(now_ms),
+    }
+
+    try:
+        if isinstance(funding_rates, dict):
+            for entry in funding_rates.get("funding_rates") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("symbol") or "").upper() != sym:
+                    continue
+                row["funding_rate"] = _fmt_pct(entry.get("rate"))
+                break
+    except Exception:
+        pass
+
+    try:
+        if isinstance(exchange_stats, dict):
+            for entry in exchange_stats.get("order_book_stats") or []:
+                if not isinstance(entry, dict):
+                    continue
+                if str(entry.get("symbol") or "").upper() != sym:
+                    continue
+                # Use daily quote volume as "24h额" proxy.
+                row["volume_quote"] = _fmt_float(entry.get("daily_quote_token_volume"))
+                # Lighter does not publish mark/index in this endpoint; keep None.
+                break
+    except Exception:
+        pass
+
+    return row
+
+
 def fetch_okx(symbol: str):
     sym = symbol.upper() + "-USDT-SWAP"
     uly = symbol.upper() + "-USDT"
@@ -555,6 +642,7 @@ FETCHERS = {
     "bybit": fetch_bybit,
     "gate": fetch_gate,
     "bitget": fetch_bitget,
+    "lighter": fetch_lighter,
     "okx": fetch_okx,
     "htx": fetch_htx,
 }
