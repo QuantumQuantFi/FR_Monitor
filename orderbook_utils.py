@@ -1,4 +1,5 @@
 import math
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -10,6 +11,13 @@ LIGHTER_BASE_URL = config.LIGHTER_REST_BASE_URL.rstrip("/")
 DEFAULT_SWEEP_NOTIONAL = 100.0  # USD notional to simulate across orderbooks
 REQUEST_TIMEOUT = 4
 BITGET_USDT_PRODUCT_TYPE = "USDT-FUTURES"
+
+# Short-lived cache to avoid double/triple polling within a single decision path
+# (e.g., entry validation + execution sizing). This helps reduce REST rate-limit
+# pressure without materially impacting latency.
+_ORDERBOOK_CACHE: Dict[Tuple[str, str, str], Tuple[Optional[Dict[str, List[Tuple[float, float]]]], Optional[str], Dict[str, Any], float]] = {}
+_ORDERBOOK_CACHE_TTL_SECONDS = 0.8
+_EXCHANGE_BAN_UNTIL_MS: Dict[str, int] = {}
 
 
 def _safe_float(val: Any) -> Optional[float]:
@@ -95,6 +103,30 @@ def _req_json(url: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Option
         return None, meta
 
 
+def _maybe_mark_ban(exchange: str, http_meta: Dict[str, Any]) -> None:
+    """Detect exchange-level bans from HTTP metadata (best-effort)."""
+    try:
+        status = int(http_meta.get("status_code") or 0)
+    except Exception:
+        status = 0
+    if status not in (418, 429):
+        return
+    body = http_meta.get("body_json")
+    if not isinstance(body, dict):
+        return
+    if body.get("code") != -1003:
+        return
+    msg = str(body.get("msg") or "")
+    # Typical: "IP(...) banned until 1766152196378"
+    for token in msg.split():
+        if token.isdigit() and len(token) >= 10:
+            try:
+                _EXCHANGE_BAN_UNTIL_MS[exchange] = int(token)
+                return
+            except Exception:
+                return
+
+
 def _build_symbol(exchange: str, symbol: str, market_type: str) -> Optional[str]:
     base = symbol.upper()
     if exchange == 'binance':
@@ -118,12 +150,30 @@ def _fetch_raw_orderbook(
     ex = exchange.lower()
     inst = _build_symbol(ex, symbol, market_type)
     meta: Dict[str, Any] = {"exchange": ex, "symbol": symbol, "inst": inst, "market_type": market_type}
+
+    # Reuse a recent snapshot to avoid multiple REST hits within <1s.
+    cache_key = (ex, str(inst or ""), market_type)
+    now = time.time()
+
+    cached = _ORDERBOOK_CACHE.get(cache_key)
+    if cached and (now - cached[3]) < _ORDERBOOK_CACHE_TTL_SECONDS:
+        raw_cached, err_cached, meta_cached, _ = cached
+        meta_out = dict(meta_cached)
+        meta_out["cached"] = True
+        return raw_cached, err_cached, meta_out
+
+    ban_until = _EXCHANGE_BAN_UNTIL_MS.get(ex) or 0
+    if ban_until and int(now * 1000) < int(ban_until):
+        meta["banned_until_ms"] = int(ban_until)
+        return None, "banned", meta
+
     if not inst and ex != 'hyperliquid':
         return None, "unsupported_exchange", meta
     if ex == 'binance':
         path = "https://fapi.binance.com/fapi/v1/depth" if market_type == 'perp' else "https://api.binance.com/api/v3/depth"
         data, http_meta = _req_json(path, params={'symbol': inst, 'limit': 50})
         meta.update({"http": http_meta})
+        _maybe_mark_ban(ex, http_meta)
         if not isinstance(data, dict):
             err = "rate_limited" if http_meta.get("status_code") == 429 else "no_data"
             return None, err, meta
@@ -190,31 +240,55 @@ def _fetch_raw_orderbook(
         bids = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('bids', [])]
         asks = [(_safe_float(p), _safe_float(sz)) for p, sz in book.get('asks', [])]
     elif ex == 'lighter':
-        # Lighter REST 未直接提供档位深度，这里回退到 exchangeStats 的最近成交价作为近似中价
+        # Lighter: Use REST orderBookOrders to build a depth snapshot (best-effort).
+        # Unlike centralized venues, the SDK exposes camelCase endpoint /orderBookOrders.
         try:
-            resp = requests.get(f"{LIGHTER_BASE_URL}/exchangeStats", timeout=REQUEST_TIMEOUT)
+            market_resp = requests.get(f"{LIGHTER_BASE_URL}/orderBooks", timeout=REQUEST_TIMEOUT)
+            if market_resp.status_code != 200:
+                meta.update({"http": {"status_code": int(market_resp.status_code), "body_text": (market_resp.text or "")[:300]}})
+                return None, f"status_{market_resp.status_code}", meta
+            markets = market_resp.json()
+        except Exception:
+            meta.update({"http": {"error": "http_error"}})
+            return None, "http_error", meta
+        sym_upper = symbol.upper()
+        market_id = None
+        if isinstance(markets, dict):
+            for entry in markets.get("order_books", []):
+                if (entry.get("symbol") or "").upper() == sym_upper and str(entry.get("status") or "").lower() in {"active", ""}:
+                    market_id = entry.get("market_id")
+                    break
+        if market_id is None:
+            return None, "no_market", meta
+
+        try:
+            resp = requests.get(
+                f"{LIGHTER_BASE_URL}/orderBookOrders",
+                params={"market_id": int(market_id), "limit": 50},
+                timeout=REQUEST_TIMEOUT,
+            )
+            meta.update({"http": {"status_code": int(resp.status_code)}})
             if resp.status_code != 200:
-                meta.update({"http": {"status_code": int(resp.status_code), "body_text": (resp.text or "")[:300]}})
+                meta["http"]["body_text"] = (resp.text or "")[:300]
                 return None, f"status_{resp.status_code}", meta
             data = resp.json()
         except Exception:
             meta.update({"http": {"error": "http_error"}})
             return None, "http_error", meta
-        sym_upper = symbol.upper()
-        stats = None
-        if isinstance(data, dict):
-            for entry in data.get('order_book_stats', []):
-                if (entry.get('symbol') or '').upper() == sym_upper:
-                    stats = entry
-                    break
-        if not stats:
-            return None, "no_data", meta
-        price = _safe_float(stats.get('last_trade_price') or stats.get('mark_price'))
-        if not price:
-            return None, "no_data", meta
-        # 用单档估计买卖均价，标记误差在前端显示 error=None 以参与计算
-        bids = [(price, 1.0)]
-        asks = [(price, 1.0)]
+
+        bids = [
+            (_safe_float(entry.get("price")), _safe_float(entry.get("remaining_base_amount") or entry.get("initial_base_amount")))
+            for entry in (data.get("bids") or [])
+            if isinstance(entry, dict)
+        ]
+        asks = [
+            (_safe_float(entry.get("price")), _safe_float(entry.get("remaining_base_amount") or entry.get("initial_base_amount")))
+            for entry in (data.get("asks") or [])
+            if isinstance(entry, dict)
+        ]
+        # Ensure best-first ordering for sweep simulation.
+        bids = sorted([x for x in bids if x[0] and x[1]], key=lambda x: float(x[0]), reverse=True)
+        asks = sorted([x for x in asks if x[0] and x[1]], key=lambda x: float(x[0]))
     elif ex == 'hyperliquid':
         payload = {'type': 'l2Book', 'coin': symbol.upper()}
         try:
@@ -243,7 +317,9 @@ def _fetch_raw_orderbook(
     asks_clean = [(p, sz) for p, sz in asks if p and sz]
     if not bids_clean and not asks_clean:
         return None, "empty_orderbook", meta
-    return {'bids': bids_clean, 'asks': asks_clean}, None, meta
+    raw_out = {'bids': bids_clean, 'asks': asks_clean}
+    _ORDERBOOK_CACHE[cache_key] = (raw_out, None, dict(meta), now)
+    return raw_out, None, meta
 
 
 def fetch_orderbook_prices(exchange: str, symbol: str, market_type: str, *, notional: float = DEFAULT_SWEEP_NOTIONAL) -> Optional[Dict[str, Any]]:
