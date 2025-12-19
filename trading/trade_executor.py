@@ -37,6 +37,11 @@ except Exception:  # pragma: no cover
     HyperliquidExchange = None  # type: ignore[assignment]
     HyperliquidInfo = None  # type: ignore[assignment]
 
+try:
+    from lighter.signer_client import SignerClient as LighterSignerClient  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover
+    LighterSignerClient = None  # type: ignore[assignment]
+
 try:  # requests bundles urllib3, but allow user-installed urllib3 fallback
     import urllib3.util.connection as _urllib3_connection  # type: ignore
 except Exception:  # pragma: no cover - optional dependency path
@@ -50,6 +55,7 @@ USER_AGENT = config.REST_CONNECTION_CONFIG.get("user_agent", "CrossExchange-Arb/
 LOGGER = logging.getLogger(__name__)
 
 _OKX_CLIENT_ID_RE = re.compile(r"[^0-9A-Za-z]")
+_BINANCE_BAN_UNTIL_RE = re.compile(r"banned until (\\d+)", re.IGNORECASE)
 
 
 def _sanitize_okx_client_order_id(value: str) -> str:
@@ -149,6 +155,14 @@ class HyperliquidCredentials:
     base_url: str
 
 
+@dataclass(frozen=True)
+class LighterCredentials:
+    private_key: str
+    account_index: int
+    api_key_index: int
+    base_url: str
+
+
 @dataclass
 class _BinanceSymbolFilters:
     min_qty: Decimal
@@ -160,6 +174,12 @@ class _BinanceSymbolFilters:
 
 _BINANCE_FILTER_CACHE: Dict[tuple[str, str], _BinanceSymbolFilters] = {}
 _BINANCE_FILTER_CACHE_TTL = 15 * 60  # seconds
+
+# Binance price cache to reduce per-symbol polling (helps avoid IP bans).
+_BINANCE_PRICE_CACHE: Dict[str, tuple[float, float]] = {}
+_BINANCE_PRICE_ALL_CACHE: tuple[Dict[str, float], float] = ({}, 0.0)
+_BINANCE_PRICE_CACHE_TTL_SECONDS = 2.0
+_BINANCE_BAN_UNTIL_MS: int = 0
 
 
 @dataclass
@@ -201,7 +221,7 @@ _BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
 _BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
 
 
-SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid")
+SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid", "lighter")
 SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ()  # Spot helpers not yet implemented
 
 
@@ -328,8 +348,61 @@ def _resolve_hyperliquid_credentials(
     return HyperliquidCredentials(private_key=pk, address=addr, base_url=base)
 
 
+def _resolve_lighter_credentials(
+    private_key: Optional[str],
+    account_index: Optional[Union[int, str]],
+    api_key_index: Optional[Union[int, str]],
+    *,
+    base_url: Optional[str] = None,
+) -> LighterCredentials:
+    if CONFIG_PRIVATE is None:
+        raise TradeExecutionError("config_private.py not available; unable to load credentials")
+
+    pk = (private_key or "").strip() or str(getattr(CONFIG_PRIVATE, "LIGHTER_PRIVATE_KEY", "") or "").strip()
+    if not pk:
+        raise TradeExecutionError("Missing LIGHTER_PRIVATE_KEY in config_private.py (or private_key=...)")
+
+    raw_account = account_index if account_index not in (None, "") else getattr(CONFIG_PRIVATE, "LIGHTER_ACCOUNT_INDEX", None)
+    raw_key = api_key_index if api_key_index not in (None, "") else getattr(CONFIG_PRIVATE, "LIGHTER_KEY_INDEX", None)
+    if raw_account in (None, ""):
+        raise TradeExecutionError("Missing LIGHTER_ACCOUNT_INDEX in config_private.py (or account_index=...)")
+    if raw_key in (None, ""):
+        raise TradeExecutionError("Missing LIGHTER_KEY_INDEX in config_private.py (or api_key_index=...)")
+    try:
+        acct = int(raw_account)
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid LIGHTER_ACCOUNT_INDEX: {raw_account!r}") from exc
+    try:
+        key_idx = int(raw_key)
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid LIGHTER_KEY_INDEX: {raw_key!r}") from exc
+
+    host = (base_url or getattr(config, "LIGHTER_REST_BASE_URL", None) or "https://mainnet.zklighter.elliot.ai").rstrip("/")
+    # config.LIGHTER_REST_BASE_URL typically ends with /api/v1; strip it for SignerClient host.
+    if host.endswith("/api/v1"):
+        host = host[: -len("/api/v1")]
+    return LighterCredentials(private_key=pk, account_index=acct, api_key_index=key_idx, base_url=host)
+
+
 def _utc_millis() -> int:
     return int(time.time() * 1000)
+
+
+def _run_async(coro):
+    """Run an async coroutine from sync code (best-effort)."""
+    import asyncio
+    import concurrent.futures
+
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    def _worker():
+        return asyncio.run(coro)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(_worker).result(timeout=60)
 
 
 def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFilters:
@@ -952,16 +1025,74 @@ def get_binance_perp_price(
     target into a base-asset ``quantity`` before calling
     :func:`place_binance_perp_market_order`.
     """
+    global _BINANCE_BAN_UNTIL_MS, _BINANCE_PRICE_ALL_CACHE
+
     pair = symbol.upper()
     if not pair.endswith("USDT"):
         pair = f"{pair}USDT"
 
+    now = time.time()
+    cached = _BINANCE_PRICE_CACHE.get(pair)
+    if cached and (now - cached[1]) < _BINANCE_PRICE_CACHE_TTL_SECONDS:
+        return float(cached[0])
+
+    # If the IP is currently banned, only allow returning from cache (if available).
+    if _BINANCE_BAN_UNTIL_MS and int(now * 1000) < _BINANCE_BAN_UNTIL_MS:
+        all_prices, fetched_at = _BINANCE_PRICE_ALL_CACHE
+        if all_prices and (now - fetched_at) < max(5.0, _BINANCE_PRICE_CACHE_TTL_SECONDS):
+            if pair in all_prices:
+                price = float(all_prices[pair])
+                _BINANCE_PRICE_CACHE[pair] = (price, now)
+                return price
+        raise TradeExecutionError(
+            f"Binance IP banned until {_BINANCE_BAN_UNTIL_MS}; use websocket/cached prices to avoid bans."
+        )
+
     price_url = f"{base_url}/fapi/v1/ticker/price"
+
+    def _record_price(val: float) -> float:
+        _BINANCE_PRICE_CACHE[pair] = (float(val), now)
+        return float(val)
+
+    # Attempt per-symbol query first.
     response = _send_request("GET", price_url, params=[("symbol", pair)])
     data = _json_or_error(response)
-    if response.status_code != 200 or "price" not in data:
-        raise TradeExecutionError(f"Binance price query failed: {data}")
-    return float(data["price"])
+    if response.status_code == 200 and isinstance(data, dict) and "price" in data:
+        return _record_price(float(data["price"]))
+
+    # Detect ban window and cache it, then fall back to bulk prices if possible.
+    if isinstance(data, dict) and data.get("code") == -1003:
+        msg = str(data.get("msg") or "")
+        match = _BINANCE_BAN_UNTIL_RE.search(msg)
+        if match:
+            try:
+                _BINANCE_BAN_UNTIL_MS = int(match.group(1))
+            except Exception:
+                _BINANCE_BAN_UNTIL_MS = max(_BINANCE_BAN_UNTIL_MS, int(now * 1000) + 60_000)
+
+    # Fallback: bulk ticker/price, then read the requested symbol from the bulk map.
+    response2 = _send_request("GET", price_url)
+    data2 = _json_or_error(response2)
+    if response2.status_code == 200 and isinstance(data2, list):
+        prices: Dict[str, float] = {}
+        for item in data2:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "").upper()
+            if not sym:
+                continue
+            try:
+                px = float(item.get("price"))
+            except Exception:
+                continue
+            if px > 0:
+                prices[sym] = px
+        if prices:
+            _BINANCE_PRICE_ALL_CACHE = (prices, now)
+            if pair in prices:
+                return _record_price(prices[pair])
+
+    raise TradeExecutionError(f"Binance price query failed: {data}")
 
 
 def get_binance_perp_order(
@@ -2804,6 +2935,308 @@ def get_hyperliquid_balance_summary(
     }
 
 
+def get_lighter_balance_summary(
+    *,
+    account_index: Optional[Union[int, str]] = None,
+    base_url: Optional[str] = None,
+    timeout: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Return a normalized balance summary for Lighter.
+
+    Notes
+    - This uses the public `GET /account?by=index&value=...` endpoint (no auth).
+    - Collateral on Lighter is USDC; we normalize currency to USDC.
+    """
+
+    resolved_account_index = account_index
+    if resolved_account_index in (None, ""):
+        resolved_account_index = (
+            getattr(CONFIG_PRIVATE, "LIGHTER_ACCOUNT_INDEX", None) if CONFIG_PRIVATE else None
+        ) or os.getenv("LIGHTER_ACCOUNT_INDEX")
+    if resolved_account_index in (None, ""):
+        raise TradeExecutionError("Lighter balance requires LIGHTER_ACCOUNT_INDEX (or account_index=...)")
+
+    try:
+        resolved_account_index_int = int(str(resolved_account_index))
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid LIGHTER_ACCOUNT_INDEX: {resolved_account_index!r}") from exc
+
+    base = (base_url or getattr(config, "LIGHTER_REST_BASE_URL", "") or "").rstrip("/")
+    if not base:
+        base = "https://mainnet.zklighter.elliot.ai/api/v1"
+
+    url = f"{base}/account"
+    response = _send_request(
+        "GET",
+        url,
+        params=[("by", "index"), ("value", str(resolved_account_index_int))],
+        timeout=float(timeout) if timeout is not None else REQUEST_TIMEOUT,
+    )
+    data = _json_or_error(response)
+    if response.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+        raise TradeExecutionError(f"Lighter account query failed {response.status_code}: {data}")
+
+    accounts = data.get("accounts") or []
+    account = accounts[0] if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict) else {}
+
+    return {
+        "currency": "USDC",
+        "available_balance": account.get("available_balance"),
+        "wallet_balance": account.get("collateral"),
+        "account_value": account.get("total_asset_value"),
+        "account_index": account.get("account_index"),
+        "l1_address": account.get("l1_address"),
+        "status": account.get("status"),
+        "raw_account": account,
+    }
+
+
+def get_lighter_market_meta(
+    symbol: str,
+    *,
+    base_url: str = "https://mainnet.zklighter.elliot.ai",
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return Lighter market metadata for a symbol via public REST GET /api/v1/orderBooks."""
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        raise TradeExecutionError("Lighter symbol is required")
+    url = f"{base_url.rstrip('/')}/api/v1/orderBooks"
+    resp = _send_request("GET", url, timeout=int(timeout))
+    data = _json_or_error(resp)
+    if resp.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+        raise TradeExecutionError(f"Lighter orderBooks query failed {resp.status_code}: {data}")
+    for entry in data.get("order_books") or []:
+        if not isinstance(entry, dict):
+            continue
+        if str(entry.get("symbol") or "").upper() != sym:
+            continue
+        if str(entry.get("status") or "").lower() not in {"active", ""}:
+            continue
+        return entry
+    raise TradeExecutionError(f"Lighter market not found/active: {sym}")
+
+
+def get_lighter_orderbook_orders(
+    market_id: int,
+    *,
+    limit: int = 50,
+    base_url: str = "https://mainnet.zklighter.elliot.ai",
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return Lighter L2 order book via public REST GET /api/v1/orderBookOrders."""
+    url = f"{base_url.rstrip('/')}/api/v1/orderBookOrders"
+    params = [("market_id", str(int(market_id))), ("limit", str(int(limit)))]
+    resp = _send_request("GET", url, params=params, timeout=int(timeout))
+    data = _json_or_error(resp)
+    if resp.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+        raise TradeExecutionError(f"Lighter orderBookOrders query failed {resp.status_code}: {data}")
+    return data
+
+
+def get_lighter_recent_trades(
+    market_id: int,
+    *,
+    limit: int = 50,
+    base_url: str = "https://mainnet.zklighter.elliot.ai",
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return recent trades via public REST GET /api/v1/recentTrades."""
+    url = f"{base_url.rstrip('/')}/api/v1/recentTrades"
+    params = [("market_id", str(int(market_id))), ("limit", str(int(limit)))]
+    resp = _send_request("GET", url, params=params, timeout=int(timeout))
+    data = _json_or_error(resp)
+    if resp.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+        raise TradeExecutionError(f"Lighter recentTrades failed {resp.status_code}: {data}")
+    return data
+
+
+def get_lighter_funding_rates_map(
+    *,
+    base_url: str = "https://mainnet.zklighter.elliot.ai",
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return funding rates via public REST GET /api/v1/funding-rates."""
+    url = f"{base_url.rstrip('/')}/api/v1/funding-rates"
+    resp = _send_request("GET", url, timeout=int(timeout))
+    data = _json_or_error(resp)
+    if resp.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+        raise TradeExecutionError(f"Lighter funding-rates query failed {resp.status_code}: {data}")
+    out: Dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat(), "rates": {}}
+    for entry in data.get("funding_rates") or []:
+        if not isinstance(entry, dict):
+            continue
+        sym = str(entry.get("symbol") or "").upper()
+        if not sym:
+            continue
+        try:
+            out["rates"][sym] = float(entry.get("rate"))
+        except Exception:
+            continue
+    return out
+
+
+def place_lighter_perp_market_order(
+    symbol: str,
+    side: str,
+    size: Union[str, float, Decimal, int],
+    *,
+    reduce_only: bool = False,
+    client_order_id: Optional[Union[int, str]] = None,
+    max_slippage_bps: float = 30.0,
+    private_key: Optional[str] = None,
+    account_index: Optional[Union[int, str]] = None,
+    api_key_index: Optional[Union[int, str]] = None,
+    base_url: str = "https://mainnet.zklighter.elliot.ai",
+    timeout: float = 15.0,
+) -> Dict[str, Any]:
+    """Submit a market order on Lighter perp via SignerClient (async under the hood)."""
+    if LighterSignerClient is None:
+        raise TradeExecutionError("lighter SDK is required for Lighter trading (pip install lighter)")
+
+    creds = _resolve_lighter_credentials(private_key, account_index, api_key_index, base_url=base_url)
+    market = get_lighter_market_meta(symbol, base_url=creds.base_url, timeout=timeout)
+    try:
+        market_id = int(market.get("market_id"))
+    except Exception as exc:
+        raise TradeExecutionError(f"Lighter market_id invalid for {symbol}: {market.get('market_id')!r}") from exc
+
+    try:
+        size_dec = Decimal(str(size))
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid Lighter size: {size!r}") from exc
+    if size_dec <= 0:
+        raise TradeExecutionError("Lighter size must be positive")
+
+    try:
+        size_decimals = int(market.get("supported_size_decimals") or 0)
+        price_decimals = int(market.get("supported_price_decimals") or 0)
+    except Exception:
+        size_decimals = 0
+        price_decimals = 0
+    base_multiplier = Decimal("10") ** Decimal(str(max(0, size_decimals)))
+    price_multiplier = Decimal("10") ** Decimal(str(max(0, price_decimals)))
+
+    book = get_lighter_orderbook_orders(market_id, limit=50, base_url=creds.base_url, timeout=timeout)
+    bids = book.get("bids") or []
+    asks = book.get("asks") or []
+    try:
+        best_bid = float((bids[0] or {}).get("price")) if isinstance(bids, list) and bids else None
+        best_ask = float((asks[0] or {}).get("price")) if isinstance(asks, list) and asks else None
+    except Exception:
+        best_bid, best_ask = None, None
+    if not best_bid or not best_ask:
+        raise TradeExecutionError(f"Lighter orderbook missing best levels for market_id={market_id}")
+    mid = (float(best_bid) + float(best_ask)) / 2.0
+    slippage = float(max_slippage_bps) / 10000.0
+
+    side_key = (side or "").strip().lower()
+    if side_key in {"long", "buy", "b"}:
+        is_ask = False
+        px = mid * (1.0 + slippage)
+    elif side_key in {"short", "sell", "s"}:
+        is_ask = True
+        px = mid * (1.0 - slippage)
+    else:
+        raise TradeExecutionError("Lighter side must be BUY/LONG or SELL/SHORT")
+
+    step = Decimal("1").scaleb(-max(0, size_decimals))
+    size_dec = size_dec.quantize(step, rounding=ROUND_DOWN)
+    if size_dec <= 0:
+        raise TradeExecutionError(f"Lighter size too small after rounding ({size_decimals} dp): {size!r}")
+
+    base_amount_int = int((size_dec * base_multiplier).to_integral_value(rounding=ROUND_DOWN))
+    if base_amount_int <= 0:
+        raise TradeExecutionError("Lighter base_amount becomes 0 after scaling")
+
+    px_int = int((Decimal(str(px)) * price_multiplier).to_integral_value(rounding=ROUND_DOWN))
+    if px_int <= 0:
+        raise TradeExecutionError("Lighter price becomes 0 after scaling")
+
+    try:
+        min_base = Decimal(str(market.get("min_base_amount"))) if market.get("min_base_amount") is not None else None
+        if min_base is not None and size_dec < min_base:
+            raise TradeExecutionError(f"Lighter size below min_base_amount={min_base} for {symbol}")
+    except Exception:
+        pass
+    try:
+        min_quote = Decimal(str(market.get("min_quote_amount"))) if market.get("min_quote_amount") is not None else None
+        if min_quote is not None and (size_dec * Decimal(str(mid))) < min_quote:
+            raise TradeExecutionError(f"Lighter notional below min_quote_amount={min_quote} for {symbol}")
+    except Exception:
+        pass
+
+    if client_order_id is None:
+        client_order_index = int(time.time() * 1000) % 2_000_000_000
+    else:
+        try:
+            client_order_index = int(str(client_order_id))
+        except Exception:
+            digest = hashlib.sha256(str(client_order_id).encode("utf-8")).hexdigest()
+            client_order_index = int(digest[:12], 16) % 2_000_000_000
+
+    async def _submit():
+        signer = LighterSignerClient(
+            creds.base_url,
+            creds.private_key,
+            int(creds.api_key_index),
+            int(creds.account_index),
+        )
+        try:
+            tx_info, tx_hash, error = await signer.create_market_order(
+            market_id,
+            int(client_order_index),
+            int(base_amount_int),
+            int(px_int),
+            bool(is_ask),
+            reduce_only=bool(reduce_only),
+            )
+            if error is not None:
+                raise TradeExecutionError(f"Lighter create_market_order error: {error}")
+            tx_hash_value = None
+            try:
+                tx_hash_value = getattr(tx_hash, "tx_hash", None)
+            except Exception:
+                tx_hash_value = None
+            if not tx_hash_value:
+                tx_hash_value = str(tx_hash)
+
+            if hasattr(tx_info, "to_dict"):
+                try:
+                    tx_info_value = tx_info.to_dict()  # type: ignore[attr-defined]
+                except Exception:
+                    tx_info_value = getattr(tx_info, "__dict__", str(tx_info))
+            else:
+                tx_info_value = getattr(tx_info, "__dict__", str(tx_info))
+
+            return {"tx_info": tx_info_value, "tx_hash": tx_hash_value}
+        finally:
+            try:
+                close = getattr(signer, "close", None)
+                if callable(close):
+                    await close()
+            except Exception:
+                pass
+
+    try:
+        resp = _run_async(_submit())
+    finally:
+        pass
+
+    return {
+        "symbol": symbol.upper(),
+        "market_id": market_id,
+        "side": side_key,
+        "reduce_only": bool(reduce_only),
+        "size": str(size_dec),
+        "client_order_index": int(client_order_index),
+        "price_limit": float(px),
+        "best_bid": best_bid,
+        "best_ask": best_ask,
+        "response": resp,
+    }
+
+
 def get_hyperliquid_user_funding_history(
     *,
     start_time_ms: int,
@@ -3134,6 +3567,24 @@ def execute_perp_market_order(
             private_key=hl_kwargs.pop("private_key", None),
             base_url=hl_kwargs.pop("base_url", None),
             timeout=float(hl_kwargs.pop("timeout", 10.0)),
+        )
+    elif exchange_key == "lighter":
+        lt_kwargs = dict(kwargs)
+        reduce_only = bool(lt_kwargs.pop("reduce_only", False))
+        client_order_id = lt_kwargs.pop("client_order_id", None)
+        max_slippage_bps = float(lt_kwargs.pop("max_slippage_bps", 30.0))
+        order = place_lighter_perp_market_order(
+            symbol,
+            "buy" if direction == "long" else "sell",
+            str(quantity_dec),
+            reduce_only=reduce_only,
+            client_order_id=client_order_id,
+            max_slippage_bps=max_slippage_bps,
+            private_key=lt_kwargs.pop("private_key", None),
+            account_index=lt_kwargs.pop("account_index", None),
+            api_key_index=lt_kwargs.pop("api_key_index", None),
+            base_url=lt_kwargs.pop("base_url", "https://mainnet.zklighter.elliot.ai"),
+            timeout=float(lt_kwargs.pop("timeout", 15.0)),
         )
     else:  # pragma: no cover - guarded above but keeps mypy happy
         raise TradeExecutionError(f"Unhandled exchange `{exchange}`")
