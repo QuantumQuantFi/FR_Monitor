@@ -955,7 +955,24 @@ class PgWriter:
             }
             features_agg["meta_last"] = meta_last
             ins["features_agg"] = features_agg
-        except Exception:
+        except Exception as exc:
+            # Never fail the event insert; but keep a minimal error snapshot so we can confirm
+            # whether enrichment is being executed and why it failed.
+            try:
+                features_agg2 = ins.get("features_agg")
+                if isinstance(features_agg2, dict):
+                    meta_last2 = features_agg2.get("meta_last")
+                    if isinstance(meta_last2, dict) and meta_last2.get("orderbook_validation") is None:
+                        meta_last2["orderbook_validation"] = {
+                            "ok": False,
+                            "reason": "exception",
+                            "ts": _utcnow().isoformat(),
+                            "exception": f"{type(exc).__name__}: {exc}",
+                        }
+                        features_agg2["meta_last"] = meta_last2
+                        ins["features_agg"] = features_agg2
+            except Exception:
+                pass
             return ins
         return ins
 
