@@ -627,6 +627,59 @@ class PgWriter:
             if not ex1 or not ex2:
                 return ins
 
+            # Candidate exchanges/pairs: best-effort context for Top-K orderbook validation.
+            candidate_pairs = trigger.get("candidate_pairs")
+            if not isinstance(candidate_pairs, list):
+                candidate_pairs = []
+            candidate_pairs_norm: List[Dict[str, Any]] = []
+            for cp in candidate_pairs:
+                if not isinstance(cp, dict):
+                    continue
+                p = cp.get("pair") or []
+                if not (isinstance(p, list) and len(p) == 2):
+                    continue
+                a, b = str(p[0]), str(p[1])
+                if not (a and b):
+                    continue
+                try:
+                    sp = float(cp.get("spread")) if cp.get("spread") is not None else None
+                except Exception:
+                    sp = None
+                candidate_pairs_norm.append(
+                    {
+                        "pair": [a, b],
+                        "spread": sp,
+                        "prices": cp.get("prices") if isinstance(cp.get("prices"), dict) else None,
+                        "funding": cp.get("funding") if isinstance(cp.get("funding"), dict) else None,
+                    }
+                )
+            if not candidate_pairs_norm:
+                candidate_pairs_norm = [
+                    {
+                        "pair": [ex1, ex2],
+                        "spread": float(trigger.get("spread")) if trigger.get("spread") is not None else None,
+                        "prices": trigger.get("prices") if isinstance(trigger.get("prices"), dict) else None,
+                        "funding": trigger.get("funding") if isinstance(trigger.get("funding"), dict) else None,
+                    }
+                ]
+
+            candidate_exchanges = trigger.get("candidate_exchanges")
+            if not isinstance(candidate_exchanges, list):
+                candidate_exchanges = []
+            candidate_exchanges_norm: List[str] = []
+            for ex in candidate_exchanges:
+                exs = str(ex)
+                if exs and exs not in candidate_exchanges_norm:
+                    candidate_exchanges_norm.append(exs)
+            if not candidate_exchanges_norm:
+                for cp in candidate_pairs_norm:
+                    p = cp.get("pair") or []
+                    if isinstance(p, list) and len(p) == 2:
+                        for ex in p:
+                            exs = str(ex)
+                            if exs and exs not in candidate_exchanges_norm:
+                                candidate_exchanges_norm.append(exs)
+
             pnl_reg = meta_last.get("pnl_regression") or {}
             pred_240 = ((pnl_reg or {}).get("pred") or {}).get("240") if isinstance(pnl_reg, dict) else None
             if not isinstance(pred_240, dict):
@@ -651,6 +704,15 @@ class PgWriter:
                 except Exception:
                     spread_watch = None
             if spread_watch is None:
+                try:
+                    spread_watch = max(
+                        float(cp.get("spread") or 0.0)
+                        for cp in candidate_pairs_norm
+                        if cp.get("spread") is not None and math.isfinite(float(cp.get("spread")))
+                    )
+                except Exception:
+                    spread_watch = None
+            if spread_watch is None:
                 factors0 = meta_last.get("factors") or {}
                 if isinstance(factors0, dict) and factors0.get("raw_best_buy_high_sell_low") is not None:
                     try:
@@ -660,44 +722,82 @@ class PgWriter:
             if spread_watch is None or not math.isfinite(float(spread_watch)) or float(spread_watch) < 0.003:
                 return ins
 
-            # Only validate when both legs are tradable in live trading.
+            # Only validate when at least 2 exchanges are tradable in live trading.
             try:
                 import config as _cfg  # local import: avoid import side-effects at module load
 
                 allowed = _cfg.LIVE_TRADING_CONFIG.get("allowed_exchanges") or []
                 allowed_set = {str(x).lower() for x in allowed if str(x).strip()}
-                if allowed_set and (ex1.lower() not in allowed_set or ex2.lower() not in allowed_set):
-                    return ins
                 notional = float(_cfg.LIVE_TRADING_CONFIG.get("per_leg_notional_usdt") or 50.0)
                 market_type = str(_cfg.LIVE_TRADING_CONFIG.get("orderbook_market_type") or "perp")
+                topk_exchanges = int(_cfg.LIVE_TRADING_CONFIG.get("watchlist_event_topk_exchanges") or 5)
+                topk_exchanges = max(2, min(10, topk_exchanges))
+                live_pnl_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("pnl_threshold") or 0.0)
+                live_prob_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("win_prob_threshold") or 0.0)
             except Exception:
                 # Safe defaults when config import fails.
+                allowed_set = set()
                 notional = 50.0
                 market_type = "perp"
+                topk_exchanges = 5
+                live_pnl_threshold = 0.0
+                live_prob_threshold = 0.0
 
-            # Orderbook sweep (same notional/market_type as live trading).
-            ob_a = fetch_orderbook_prices(ex1, str(ins.get("symbol") or ""), market_type, notional=notional)
-            ob_b = fetch_orderbook_prices(ex2, str(ins.get("symbol") or ""), market_type, notional=notional)
+            symbol = str(ins.get("symbol") or "")
+            if not symbol:
+                return ins
 
-            if not ob_a or ob_a.get("error") or not ob_b or ob_b.get("error"):
+            # Build Top-K exchanges list, so we can evaluate many pairs in-memory while
+            # keeping REST calls bounded (K orderbooks, not K^2).
+            ranked_exchanges: List[str] = []
+            for ex in (ex1, ex2):
+                if ex and ex not in ranked_exchanges:
+                    ranked_exchanges.append(ex)
+
+            cps_sorted = sorted(candidate_pairs_norm, key=lambda x: float(x.get("spread") or 0.0), reverse=True)
+            for cp in cps_sorted:
+                p = cp.get("pair") or []
+                if not (isinstance(p, list) and len(p) == 2):
+                    continue
+                for ex in (str(p[0]), str(p[1])):
+                    if ex and ex not in ranked_exchanges:
+                        ranked_exchanges.append(ex)
+                if len(ranked_exchanges) >= topk_exchanges:
+                    break
+            if len(ranked_exchanges) < topk_exchanges:
+                for ex in candidate_exchanges_norm:
+                    if ex and ex not in ranked_exchanges:
+                        ranked_exchanges.append(ex)
+                    if len(ranked_exchanges) >= topk_exchanges:
+                        break
+
+            if allowed_set:
+                ranked_exchanges = [ex for ex in ranked_exchanges if ex.lower() in allowed_set]
+            if len(ranked_exchanges) < 2:
+                return ins
+
+            # Fetch orderbooks once per exchange (same notional/market_type as live trading).
+            orderbooks: Dict[str, Any] = {}
+            orderbook_ok: List[str] = []
+            for ex in ranked_exchanges:
+                ob = fetch_orderbook_prices(ex, symbol, market_type, notional=notional)
+                orderbooks[ex] = ob
+                if ob and not ob.get("error") and ob.get("buy") is not None and ob.get("sell") is not None:
+                    orderbook_ok.append(ex)
+
+            if len(orderbook_ok) < 2:
                 meta_last["orderbook_validation"] = {
                     "ok": False,
                     "reason": "orderbook_unavailable",
                     "ts": _utcnow().isoformat(),
                     "notional_usdt": notional,
                     "market_type": market_type,
-                    "orderbook": {"a": ob_a, "b": ob_b},
+                    "topk_exchanges": ranked_exchanges,
+                    "orderbooks": orderbooks,
                 }
                 features_agg["meta_last"] = meta_last
                 ins["features_agg"] = features_agg
                 return ins
-
-            candidates = [
-                # short on A, long on B
-                {"short_ex": ex1, "long_ex": ex2, "short_px": ob_a.get("sell"), "long_px": ob_b.get("buy")},
-                # short on B, long on A (swap)
-                {"short_ex": ex2, "long_ex": ex1, "short_px": ob_b.get("sell"), "long_px": ob_a.get("buy")},
-            ]
 
             base_factors = meta_last.get("factors") or {}
             if not isinstance(base_factors, dict):
@@ -706,75 +806,105 @@ class PgWriter:
             evaluated: List[Dict[str, Any]] = []
             best: Optional[Dict[str, Any]] = None
             best_score: Tuple[float, float] = (-1e9, -1e9)
-            for cand in candidates:
-                short_px = cand.get("short_px")
-                long_px = cand.get("long_px")
-                try:
-                    short_f = float(short_px)
-                    long_f = float(long_px)
-                except Exception:
-                    evaluated.append(
-                        {
-                            "short_exchange": str(cand.get("short_ex") or ""),
-                            "long_exchange": str(cand.get("long_ex") or ""),
-                            "short_px": short_px,
-                            "long_px": long_px,
-                            "tradable_spread": None,
-                            "entry_spread_metric": None,
-                            "note": "px_parse_error",
-                        }
-                    )
-                    continue
-                if short_f <= 0 or long_f <= 0:
-                    evaluated.append(
-                        {
-                            "short_exchange": str(cand.get("short_ex") or ""),
-                            "long_exchange": str(cand.get("long_ex") or ""),
-                            "short_px": float(short_f),
-                            "long_px": float(long_f),
-                            "tradable_spread": None,
-                            "entry_spread_metric": None,
-                            "note": "non_positive_px",
-                        }
-                    )
-                    continue
-                tradable_spread = (short_f - long_f) / long_f
-                entry_spread_metric = float(math.log(short_f / long_f))
-                evaluated.append(
-                    {
-                        "short_exchange": str(cand.get("short_ex") or ""),
-                        "long_exchange": str(cand.get("long_ex") or ""),
-                        "short_px": float(short_f),
-                        "long_px": float(long_f),
-                        "tradable_spread": float(tradable_spread),
-                        "entry_spread_metric": float(entry_spread_metric),
-                    }
-                )
-                if tradable_spread <= 0:
-                    continue
 
-                factors = dict(base_factors)
-                factors["spread_log_short_over_long"] = float(entry_spread_metric)
-                factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
-                pred = predict_bc(signal_type="B", factors=factors, horizons=(240,))
-                pred_map = (pred or {}).get("pred") or {}
-                hpred = pred_map.get("240") or {}
-                pnl_hat_ob = hpred.get("pnl_hat")
-                win_prob_ob = hpred.get("win_prob")
-                if pnl_hat_ob is None or win_prob_ob is None:
-                    continue
-                score = (float(pnl_hat_ob), float(win_prob_ob))
-                if score > best_score:
-                    best_score = score
-                    best = {
-                        "long_exchange": str(cand.get("long_ex") or ""),
-                        "short_exchange": str(cand.get("short_ex") or ""),
-                        "pnl_hat_ob": float(pnl_hat_ob),
-                        "win_prob_ob": float(win_prob_ob),
-                        "tradable_spread": float(tradable_spread),
-                        "entry_spread_metric": float(entry_spread_metric),
-                        "factors": factors,
-                    }
+            # Evaluate all pairs in-memory using the fetched orderbooks.
+            for i in range(len(orderbook_ok)):
+                for j in range(i + 1, len(orderbook_ok)):
+                    ex_a = orderbook_ok[i]
+                    ex_b = orderbook_ok[j]
+                    ob_a = orderbooks.get(ex_a) or {}
+                    ob_b = orderbooks.get(ex_b) or {}
+                    candidates = [
+                        # long on A (buy ask), short on B (sell bid)
+                        {"long_ex": ex_a, "short_ex": ex_b, "long_px": ob_a.get("buy"), "short_px": ob_b.get("sell")},
+                        # swap direction
+                        {"long_ex": ex_b, "short_ex": ex_a, "long_px": ob_b.get("buy"), "short_px": ob_a.get("sell")},
+                    ]
+                    for cand in candidates:
+                        short_px = cand.get("short_px")
+                        long_px = cand.get("long_px")
+                        try:
+                            short_f = float(short_px)
+                            long_f = float(long_px)
+                        except Exception:
+                            evaluated.append(
+                                {
+                                    "short_exchange": str(cand.get("short_ex") or ""),
+                                    "long_exchange": str(cand.get("long_ex") or ""),
+                                    "short_px": short_px,
+                                    "long_px": long_px,
+                                    "tradable_spread": None,
+                                    "entry_spread_metric": None,
+                                    "pnl_hat": None,
+                                    "win_prob": None,
+                                    "note": "px_parse_error",
+                                }
+                            )
+                            continue
+                        if short_f <= 0 or long_f <= 0:
+                            evaluated.append(
+                                {
+                                    "short_exchange": str(cand.get("short_ex") or ""),
+                                    "long_exchange": str(cand.get("long_ex") or ""),
+                                    "short_px": float(short_f),
+                                    "long_px": float(long_f),
+                                    "tradable_spread": None,
+                                    "entry_spread_metric": None,
+                                    "pnl_hat": None,
+                                    "win_prob": None,
+                                    "note": "non_positive_px",
+                                }
+                            )
+                            continue
+
+                        tradable_spread = (short_f - long_f) / long_f
+                        entry_spread_metric = float(math.log(short_f / long_f))
+
+                        factors = dict(base_factors)
+                        factors["spread_log_short_over_long"] = float(entry_spread_metric)
+                        factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
+                        pred = predict_bc(signal_type="B", factors=factors, horizons=(240,))
+                        pred_map = (pred or {}).get("pred") or {}
+                        hpred = pred_map.get("240") or {}
+                        pnl_hat_ob = hpred.get("pnl_hat")
+                        win_prob_ob = hpred.get("win_prob")
+
+                        evaluated.append(
+                            {
+                                "short_exchange": str(cand.get("short_ex") or ""),
+                                "long_exchange": str(cand.get("long_ex") or ""),
+                                "short_px": float(short_f),
+                                "long_px": float(long_f),
+                                "tradable_spread": float(tradable_spread),
+                                "entry_spread_metric": float(entry_spread_metric),
+                                "pnl_hat": float(pnl_hat_ob) if pnl_hat_ob is not None else None,
+                                "win_prob": float(win_prob_ob) if win_prob_ob is not None else None,
+                                "ok": bool(
+                                    pnl_hat_ob is not None
+                                    and win_prob_ob is not None
+                                    and float(pnl_hat_ob) >= float(live_pnl_threshold)
+                                    and float(win_prob_ob) >= float(live_prob_threshold)
+                                    and tradable_spread > 0
+                                ),
+                            }
+                        )
+
+                        if pnl_hat_ob is None or win_prob_ob is None:
+                            continue
+                        if tradable_spread <= 0:
+                            continue
+                        score = (float(pnl_hat_ob), float(win_prob_ob))
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                "long_exchange": str(cand.get("long_ex") or ""),
+                                "short_exchange": str(cand.get("short_ex") or ""),
+                                "pnl_hat_ob": float(pnl_hat_ob),
+                                "win_prob_ob": float(win_prob_ob),
+                                "tradable_spread": float(tradable_spread),
+                                "entry_spread_metric": float(entry_spread_metric),
+                                "factors": factors,
+                            }
 
             if not best:
                 meta_last["orderbook_validation"] = {
@@ -783,27 +913,31 @@ class PgWriter:
                     "ts": _utcnow().isoformat(),
                     "notional_usdt": notional,
                     "market_type": market_type,
-                    "orderbook": {"a": ob_a, "b": ob_b},
+                    "topk_exchanges": ranked_exchanges,
+                    "orderbooks": orderbooks,
                     "candidates": evaluated,
                 }
                 features_agg["meta_last"] = meta_last
                 ins["features_agg"] = features_agg
                 return ins
 
-            # Persist orderbook validation and orderbook-based prediction for live trading to consume.
             meta_last["orderbook_validation"] = {
-                "ok": True,
+                "ok": bool(best["pnl_hat_ob"] >= live_pnl_threshold and best["win_prob_ob"] >= live_prob_threshold),
                 "reason": None,
                 "ts": _utcnow().isoformat(),
                 "notional_usdt": notional,
                 "market_type": market_type,
-                "orderbook": {"a": ob_a, "b": ob_b},
+                "threshold": {"pnl": live_pnl_threshold, "win_prob": live_prob_threshold},
+                "topk_exchanges": ranked_exchanges,
+                "orderbooks": orderbooks,
                 "candidates": evaluated,
                 "chosen": {
                     "long_exchange": best["long_exchange"],
                     "short_exchange": best["short_exchange"],
                     "tradable_spread": best["tradable_spread"],
                     "entry_spread_metric": best["entry_spread_metric"],
+                    "pnl_hat": best["pnl_hat_ob"],
+                    "win_prob": best["win_prob_ob"],
                 },
             }
             meta_last["pnl_regression_ob"] = {

@@ -1972,7 +1972,8 @@ class LiveTradingManager:
                     (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
                 ) AS win_prob_240,
                 (e.features_agg #> '{meta_last,factors}') AS factors,
-                (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details
+                (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details,
+                (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
               FROM watchlist.watch_signal_event e
               LEFT JOIN watchlist.live_trade_signal s
                 ON s.event_id = e.id
@@ -2286,6 +2287,49 @@ class LiveTradingManager:
             high, low = (leg_a_exchange, leg_b_exchange) if a >= b else (leg_b_exchange, leg_a_exchange)
             return str(high), str(low)
         return None
+
+    def _chosen_reval_from_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        obv = event.get("orderbook_validation")
+        if not isinstance(obv, dict):
+            return None
+        if not bool(obv.get("ok")):
+            return None
+        chosen = obv.get("chosen")
+        if not isinstance(chosen, dict):
+            return None
+
+        long_ex = str(chosen.get("long_exchange") or "")
+        short_ex = str(chosen.get("short_exchange") or "")
+        if not (long_ex and short_ex):
+            return None
+        if not (self._supported_exchange(long_ex) and self._supported_exchange(short_ex)):
+            return None
+
+        try:
+            pnl_hat = float(chosen.get("pnl_hat"))
+            win_prob = float(chosen.get("win_prob"))
+            tradable_spread = float(chosen.get("tradable_spread"))
+            entry_spread_metric = float(chosen.get("entry_spread_metric"))
+        except Exception:
+            return None
+
+        ok = bool(
+            pnl_hat >= float(self.config.pnl_threshold)
+            and win_prob >= float(self.config.win_prob_threshold)
+            and tradable_spread > 0
+        )
+        return {
+            "ok": ok,
+            "reason": None if ok else "not_ok",
+            "long_exchange": long_ex,
+            "short_exchange": short_ex,
+            "pnl_hat": pnl_hat,
+            "win_prob": win_prob,
+            "tradable_spread": tradable_spread,
+            "entry_spread_metric": entry_spread_metric,
+            "orderbook": {"source": "event", "topk_exchanges": obv.get("topk_exchanges"), "orderbooks": obv.get("orderbooks")},
+            "candidates": obv.get("candidates"),
+        }
 
     def _revalidate_with_orderbook(
         self,
@@ -2628,10 +2672,17 @@ class LiveTradingManager:
               e.leg_b_exchange,
               e.leg_a_price_last,
               e.leg_b_price_last,
-              (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision AS pnl_hat_240,
-              (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision AS win_prob_240,
+              COALESCE(
+                (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+              ) AS pnl_hat_240,
+              COALESCE(
+                (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+              ) AS win_prob_240,
               (e.features_agg #> '{meta_last,factors}') AS factors,
-              (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details
+              (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details,
+              (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
             FROM watchlist.live_trade_signal s
             JOIN watchlist.watch_signal_event e
               ON e.id = s.event_id
@@ -2695,6 +2746,7 @@ class LiveTradingManager:
             "symbol": symbol,
             "signal_type": row.get("signal_type") or "B",
             "trigger_details": row.get("trigger_details"),
+            "orderbook_validation": row.get("orderbook_validation"),
             "factors": row.get("factors") or {},
             "leg_a_exchange": row.get("leg_a_exchange"),
             "leg_b_exchange": row.get("leg_b_exchange"),
@@ -2703,32 +2755,6 @@ class LiveTradingManager:
             "pnl_hat_240": row.get("pnl_hat_240"),
             "win_prob_240": row.get("win_prob_240"),
         }
-
-        high_low = self._pick_high_low(
-            symbol=symbol,
-            trigger_details=event.get("trigger_details"),
-            leg_a_exchange=event.get("leg_a_exchange"),
-            leg_b_exchange=event.get("leg_b_exchange"),
-            leg_a_price_last=event.get("leg_a_price_last"),
-            leg_b_price_last=event.get("leg_b_price_last"),
-        )
-        if not high_low:
-            self._bump_signal_retry(
-                conn,
-                signal_id=signal_id,
-                reason="missing_pair_prices",
-                payload={"decision": "retry_skipped", "reason": "missing_pair_prices", "symbol": symbol, "event_id": int(event["id"])},
-            )
-            return
-        high_ex, low_ex = high_low
-        if not (self._supported_exchange(high_ex) and self._supported_exchange(low_ex)):
-            self._bump_signal_retry(
-                conn,
-                signal_id=signal_id,
-                reason="unsupported_exchange",
-                payload={"decision": "retry_skipped", "reason": "unsupported_exchange", "picked_high_low": {"high": high_ex, "low": low_ex}},
-            )
-            return
 
         base_factors = event.get("factors") or {}
         if not isinstance(base_factors, dict):
@@ -2740,23 +2766,61 @@ class LiveTradingManager:
             )
             return
 
-        reval = self._revalidate_with_orderbook(symbol=symbol, high_exchange=str(high_ex), low_exchange=str(low_ex), base_factors=base_factors)
-        if not reval or not reval.get("ok"):
-            r = None
-            if isinstance(reval, dict):
-                r = reval.get("reason") or reval.get("error")
-            self._bump_signal_retry(
-                conn,
-                signal_id=signal_id,
-                reason=str(r or "not_ok"),
-                payload={
-                    "decision": "retry_skipped",
-                    "reason": str(r or "not_ok"),
-                    "picked_high_low": {"high": high_ex, "low": low_ex},
-                    "orderbook_revalidation": reval,
-                },
+        chosen_reval = self._chosen_reval_from_event(event)
+        if chosen_reval and chosen_reval.get("ok"):
+            high_ex = str(chosen_reval.get("short_exchange") or "")
+            low_ex = str(chosen_reval.get("long_exchange") or "")
+            reval = chosen_reval
+        else:
+            high_low = self._pick_high_low(
+                symbol=symbol,
+                trigger_details=event.get("trigger_details"),
+                leg_a_exchange=event.get("leg_a_exchange"),
+                leg_b_exchange=event.get("leg_b_exchange"),
+                leg_a_price_last=event.get("leg_a_price_last"),
+                leg_b_price_last=event.get("leg_b_price_last"),
             )
-            return
+            if not high_low:
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason="missing_pair_prices",
+                    payload={"decision": "retry_skipped", "reason": "missing_pair_prices", "symbol": symbol, "event_id": int(event["id"])},
+                )
+                return
+            high_ex, low_ex = high_low
+            if not (self._supported_exchange(high_ex) and self._supported_exchange(low_ex)):
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason="unsupported_exchange",
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": "unsupported_exchange",
+                        "picked_high_low": {"high": high_ex, "low": low_ex},
+                    },
+                )
+                return
+
+            reval = self._revalidate_with_orderbook(
+                symbol=symbol, high_exchange=str(high_ex), low_exchange=str(low_ex), base_factors=base_factors
+            )
+            if not reval or not reval.get("ok"):
+                r = None
+                if isinstance(reval, dict):
+                    r = reval.get("reason") or reval.get("error")
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason=str(r or "not_ok"),
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": str(r or "not_ok"),
+                        "picked_high_low": {"high": high_ex, "low": low_ex},
+                        "orderbook_revalidation": reval,
+                    },
+                )
+                return
 
         confirm = self._confirm_open_signal_with_orderbook(
             symbol=symbol,
@@ -2891,6 +2955,39 @@ class LiveTradingManager:
         for event in rows:
             try:
                 event_id = int(event.get("id") or 0)
+
+                chosen_reval = self._chosen_reval_from_event(event)
+                if chosen_reval and chosen_reval.get("ok"):
+                    base_factors = event.get("factors") or {}
+                    if not isinstance(base_factors, dict):
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=str(chosen_reval.get("long_exchange") or ""),
+                            leg_short_exchange=str(chosen_reval.get("short_exchange") or ""),
+                            reason="missing_factors",
+                            payload={
+                                "decision": "skipped",
+                                "reason": "missing_factors",
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "orderbook_validation": event.get("orderbook_validation"),
+                            },
+                        )
+                        continue
+                    score = (
+                        float(chosen_reval.get("pnl_hat") or -1e9),
+                        float(chosen_reval.get("win_prob") or -1e9),
+                    )
+                    if score > best_score:
+                        best_score = score
+                        best = {
+                            "event": event,
+                            "short_ex": str(chosen_reval.get("short_exchange") or ""),
+                            "long_ex": str(chosen_reval.get("long_exchange") or ""),
+                            "reval": chosen_reval,
+                        }
+                    continue
                 high_low = self._pick_high_low(
                     symbol=symbol,
                     trigger_details=event.get("trigger_details"),

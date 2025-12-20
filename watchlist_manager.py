@@ -382,6 +382,7 @@ class WatchlistManager:
 
             # Type B：两家永续价差 > 阈值，且资金费在区间内
             best_b = None
+            candidate_pairs: List[Dict[str, Any]] = []
             for i in range(len(futures_list)):
                 for j in range(i + 1, len(futures_list)):
                     a_ex, a_price, a_fr = futures_list[i]
@@ -394,16 +395,39 @@ class WatchlistManager:
                     if not base:
                         continue
                     diff = abs(a_price - b_price) / base
-                    if diff > self.type_b_spread_threshold:
-                        if best_b is None or diff > best_b['spread']:
-                            best_b = {
-                                'pair': [a_ex, b_ex],
-                                'spread': diff,
-                                'prices': {a_ex: a_price, b_ex: b_price},
-                                'funding': {a_ex: a_fr, b_ex: b_fr},
-                            }
+                    candidate_pairs.append(
+                        {
+                            "pair": [a_ex, b_ex],
+                            "spread": diff,
+                            "prices": {a_ex: a_price, b_ex: b_price},
+                            "funding": {a_ex: a_fr, b_ex: b_fr},
+                        }
+                    )
+
+                    if diff > self.type_b_spread_threshold and (best_b is None or diff > best_b["spread"]):
+                        best_b = {
+                            "pair": [a_ex, b_ex],
+                            "spread": diff,
+                            "prices": {a_ex: a_price, b_ex: b_price},
+                            "funding": {a_ex: a_fr, b_ex: b_fr},
+                        }
 
             if best_b:
+                candidate_pairs_sorted = sorted(candidate_pairs, key=lambda x: float(x.get("spread") or 0.0), reverse=True)
+                # Provide extra context for downstream orderbook validation (best-effort; does not change trading logic).
+                # Keep payload bounded: top-N candidates only.
+                top_n = 10
+                best_b["candidate_pairs"] = candidate_pairs_sorted[:top_n]
+                candidate_exchanges: List[str] = []
+                for c in best_b["candidate_pairs"]:
+                    p = c.get("pair") or []
+                    if isinstance(p, list) and len(p) == 2:
+                        for ex in p:
+                            exs = str(ex)
+                            if exs and exs not in candidate_exchanges:
+                                candidate_exchanges.append(exs)
+                best_b["candidate_exchanges"] = candidate_exchanges
+
                 intervals = []
                 next_fts = []
                 for ex_name in best_b.get('pair') or []:

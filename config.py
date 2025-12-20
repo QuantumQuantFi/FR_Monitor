@@ -301,6 +301,10 @@ LIVE_TRADING_CONFIG = {
     # 每次扫描最多评估多少个币种（每个币种至少会请求 2 次订单簿：两家交易所各一次）。
     # 用于控制对 Binance/OKX 等 REST 深度接口的压力，避免触发 418 ban。
     'max_symbols_per_scan': int(float(_get_private('LIVE_TRADING_MAX_SYMBOLS_PER_SCAN', 'LIVE_TRADING_MAX_SYMBOLS_PER_SCAN', '8'))),
+    # watchlist 写入 event 时的订单簿验算：每个 symbol 最多抓取 Top-K 个交易所的订单簿（一次/交易所），并在内存里评估所有 pair。
+    'watchlist_event_topk_exchanges': int(
+        float(_get_private('LIVE_TRADING_WATCHLIST_EVENT_TOPK_EXCH', 'LIVE_TRADING_WATCHLIST_EVENT_TOPK_EXCH', '5'))
+    ),
 }
 
 # 内存优化配置
