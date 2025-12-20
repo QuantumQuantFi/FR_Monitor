@@ -1963,8 +1963,14 @@ class LiveTradingManager:
                 e.leg_b_exchange,
                 e.leg_a_price_last,
                 e.leg_b_price_last,
-                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision AS pnl_hat_240,
-                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision AS win_prob_240,
+                COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+                ) AS pnl_hat_240,
+                COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+                ) AS win_prob_240,
                 (e.features_agg #> '{meta_last,factors}') AS factors,
                 (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details
               FROM watchlist.watch_signal_event e
@@ -1974,11 +1980,31 @@ class LiveTradingManager:
                 AND e.signal_type = 'B'
                 AND e.start_ts >= now() - make_interval(mins := %s)
                 AND (e.features_agg #> '{meta_last,factors}') IS NOT NULL
-                AND (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}') IS NOT NULL
-                AND (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}') IS NOT NULL
+                AND COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}'),
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')
+                ) IS NOT NULL
+                AND COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}'),
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')
+                ) IS NOT NULL
+                AND COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+                ) >= %s
+                AND COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+                ) >= %s
               ORDER BY
-                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision DESC NULLS LAST,
-                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision DESC NULLS LAST,
+                COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+                ) DESC NULLS LAST,
+                COALESCE(
+                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
+                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+                ) DESC NULLS LAST,
                 e.start_ts DESC
               LIMIT %s
             )
@@ -1986,6 +2012,8 @@ class LiveTradingManager:
             """,
             (
                 int(self.config.event_lookback_minutes),
+                float(self.config.pnl_threshold),
+                float(self.config.win_prob_threshold),
                 int(self.config.candidate_limit),
             ),
         ).fetchall()
