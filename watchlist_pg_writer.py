@@ -753,8 +753,14 @@ class PgWriter:
             try:
                 import config as _cfg  # local import: avoid import side-effects at module load
 
-                allowed = _cfg.LIVE_TRADING_CONFIG.get("allowed_exchanges") or []
-                allowed_set = {str(x).lower() for x in allowed if str(x).strip()}
+                allowed_raw = _cfg.LIVE_TRADING_CONFIG.get("allowed_exchanges") or []
+                if isinstance(allowed_raw, str):
+                    allowed_list = [x.strip() for x in allowed_raw.split(",") if x.strip()]
+                elif isinstance(allowed_raw, (list, tuple, set)):
+                    allowed_list = [str(x).strip() for x in allowed_raw if str(x).strip()]
+                else:
+                    allowed_list = []
+                allowed_set = {str(x).lower() for x in allowed_list if str(x).strip()}
                 notional = float(_cfg.LIVE_TRADING_CONFIG.get("per_leg_notional_usdt") or 50.0)
                 market_type = str(_cfg.LIVE_TRADING_CONFIG.get("orderbook_market_type") or "perp")
                 topk_exchanges = int(_cfg.LIVE_TRADING_CONFIG.get("watchlist_event_topk_exchanges") or 5)
