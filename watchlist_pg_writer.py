@@ -777,13 +777,21 @@ class PgWriter:
                 return ins
 
             # Fetch orderbooks once per exchange (same notional/market_type as live trading).
+            # Important: never let an exception here drop the whole enrichment silently — always
+            # persist a failure snapshot for post-mortem.
             orderbooks: Dict[str, Any] = {}
             orderbook_ok: List[str] = []
             for ex in ranked_exchanges:
-                ob = fetch_orderbook_prices(ex, symbol, market_type, notional=notional)
+                try:
+                    ob = fetch_orderbook_prices(ex, symbol, market_type, notional=notional)
+                except Exception as exc:
+                    ob = {"error": "exception", "exception": f"{type(exc).__name__}: {exc}"}
                 orderbooks[ex] = ob
-                if ob and not ob.get("error") and ob.get("buy") is not None and ob.get("sell") is not None:
-                    orderbook_ok.append(ex)
+                try:
+                    if ob and not ob.get("error") and ob.get("buy") is not None and ob.get("sell") is not None:
+                        orderbook_ok.append(ex)
+                except Exception:
+                    continue
 
             if len(orderbook_ok) < 2:
                 meta_last["orderbook_validation"] = {
