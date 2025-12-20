@@ -462,7 +462,14 @@ class PgWriter:
             out[f"{name}_min"] = stats.get("min")
             out[f"{name}_max"] = stats.get("max")
         out["meta_first"] = agg.get("meta_first")
-        out["meta_last"] = agg.get("meta_last")
+        meta_last = agg.get("meta_last")
+        meta_enrich = agg.get("meta_enrich")
+        if isinstance(meta_last, dict) and isinstance(meta_enrich, dict) and meta_enrich:
+            merged = dict(meta_last)
+            merged.update(meta_enrich)
+            out["meta_last"] = merged
+        else:
+            out["meta_last"] = meta_last
         if legs:
             out["legs_last"] = legs
         if funding_hist:
@@ -525,6 +532,26 @@ class PgWriter:
                             ins = self._maybe_add_orderbook_validation(dict(ins))
                         except Exception as exc:  # pragma: no cover - best-effort enrichment
                             self.logger.debug("orderbook validation skipped/failed: %s", exc)
+
+                        # Persist enrichment into in-memory event state so subsequent UPDATE payloads
+                        # keep these fields (otherwise later updates overwrite features_agg.meta_last).
+                        try:
+                            key = (ins.get("exchange"), ins.get("symbol"), ins.get("signal_type"))
+                            features_agg = ins.get("features_agg")
+                            meta_last = features_agg.get("meta_last") if isinstance(features_agg, dict) else None
+                            enrich: Dict[str, Any] = {}
+                            if isinstance(meta_last, dict):
+                                if meta_last.get("orderbook_validation") is not None:
+                                    enrich["orderbook_validation"] = meta_last.get("orderbook_validation")
+                                if meta_last.get("pnl_regression_ob") is not None:
+                                    enrich["pnl_regression_ob"] = meta_last.get("pnl_regression_ob")
+                            if enrich and key in self._event_state:
+                                st = self._event_state.get(key) or {}
+                                agg = st.get("agg")
+                                if isinstance(agg, dict):
+                                    agg["meta_enrich"] = enrich
+                        except Exception:
+                            pass
                         cur.execute(
                             """
                             INSERT INTO watchlist.watch_signal_event
