@@ -7,6 +7,7 @@
 ## 0. 当前代码现状（已具备的组件）
 - Watchlist 信号与预测：`watchlist_manager.py` 生成 `trigger_details` + `pnl_regression`（含 `pnl_hat` / `win_prob`，展示在 `templates/watchlist.html`）。
 - Watchlist 落库：`watchlist_pg_writer.py` 双写到 PostgreSQL（schema=`watchlist`），核心表：`watch_signal_raw` / `watch_signal_event` / `future_outcome` / `watchlist_series_agg` / `watchlist_outcome`。
+- Watchlist 事件写入时订单簿验算（Type B）：`watchlist_pg_writer.py` 在“首次 INSERT 新 event”时按 Top‑K 交易所抓订单簿（每交易所一次），枚举所有 pair+方向并选出最优 `chosen`，写入 `features_agg.meta_last.orderbook_validation/pnl_regression_ob`（与 live trading 口径对齐，避免只验证“last 价差最大的一对”而漏掉更可成交的 pair）。
 - 实盘交易接口封装：`trading/trade_executor.py` 支持 `binance/okx/bybit/bitget` 的永续市价单、部分杠杆设置与持仓查询。
 - Web 侧交易入口：`simple_app.py` 已有 `/api/trade/options` + `/api/trade/dual`（多腿、USDT金额换算、reduceOnly/closeAll），`templates/chart_index.html` 已有“对冲交易执行”面板。
 - 订单簿价差工具：`orderbook_utils.py` 已有 REST 拉取与扫单价差计算，可用来做 1min 频率监听。
@@ -31,6 +32,8 @@
 ### 0.1.3 已做的防护/修复（与本计划强相关）
 - **watchlist 侧缺失回退**：当 `trigger_details` 无法提供价格时，允许用 snapshot 的 `best_buy_high_sell_low` 退化补齐 `raw_best_buy_high_sell_low`，并用 `log(1+spread)` 补 `spread_log_short_over_long`，避免因子不齐导致预测直接失败（仍建议以订单簿复算为准）。
 - **实盘侧方向一致性**：订单簿复算时，必须使用“高所 bid(sell) / 低所 ask(buy)”计算 `spread_log_short_over_long` 与 `raw_best_buy_high_sell_low`，确保与开仓方向一致。
+- **避免漏掉更可成交的 pair**：watchlist 触发 event 时的 pair 基于 last/mark 价差，可能被“浅盘口/跳价”误导；因此 event 写入阶段会按 Top‑K 交易所抓订单簿并在内存枚举所有 pair+方向，最终用订单簿口径选出 `chosen`（例如 BN‑Lighter 看似最大，但 BN‑Bitget 更可成交，则 `chosen` 会落到 BN‑Bitget）。
+- **修复 event 更新覆盖问题**：event 后续 UPDATE 会刷新 `features_agg.meta_last`；为避免覆盖掉 INSERT 阶段写入的 `orderbook_validation/pnl_regression_ob`，writer 在聚合更新时会把 enrich 合并回 `meta_last`（保证证据持续可复盘、live trading 可读取）。
 
 ### 0.1.4 下一步建议（不影响现有功能，但提升稳定性/准确性）
 - 增加“预测覆盖率”监控：`watch_signal_event` 中 `meta_last.factors`/`pnl_regression` 的缺失占比、缺失原因分布（按交易所/币种/时间）。
@@ -171,12 +174,33 @@
   - 为防止盘口瞬时跳变导致“触发即打回”，会做短间隔多次确认（默认 3 次、间隔约 0.7s），全部通过才真正进入平仓下单
 - 强平：持有时间超过 `max_hold_days` 强制平仓（不依赖 pnl）。当前业务要求为 **1 天**；如果配置从 7 天缩短到 1 天，已开仓的单也应同步缩短其 `force_close_at`（避免旧仓位继续按 7 天滞留）。
 
-### 7.1 开仓前订单簿复核（避免假信号；已落地）
-- watchlist 侧的 `pnl_hat/win_prob` 可能基于 last/mark 等口径，不等于“可成交价差”；因此开仓前必须用订单簿按名义金额扫盘复算并复核。
-- 当前实现为“三次复核”（默认 3 次、间隔约 0.7s），要求每次都通过阈值且方向一致，否则写入 `live_trade_signal` 为 `skipped` 并记录原因：
-  - `no_tradable_direction`：两种方向都无法得到正的“可成交价差”（扫盘后满足不了 `short_sell > long_buy`）
-  - `not_ok`：存在方向，但至少一次复核样本的 `pnl_hat_ob/win_prob_ob` 掉出阈值（或复核过程出现无法细分的失败）
-- 为便于复盘，复核阶段会把每一次采样的订单簿结果、HTTP meta（含可能的 rate-limit 线索）与扫盘摘要写入 `payload.orderbook_confirm_open.series[]`，用于解释“为什么 skipped”。
+### 7.1 开仓前订单簿复核（两段：watchlist‑event 选 pair + live trading 执行确认；已落地）
+**目标**：避免“watchlist last 价差很大但盘口不可成交”的假信号，并防止只验证一对交易所导致漏掉更可成交的 pair。
+
+#### 7.1.1 watchlist 写入 event 时的 Top‑K 订单簿验算（选择最合适交易所组合）
+- 触发时机：`watchlist_pg_writer.py` 在“首次 INSERT 新 event”时 best‑effort 执行（不阻断 event 入库）。
+- **不是每个 event 都打订单簿**：只有通过预筛才会触发订单簿抓取（当前实现为硬编码门槛，后续可配置化）：
+  - `pnl_hat_240 >= 0.009` 且 `win_prob_240 >= 0.85`
+  - 且 `trigger_details.spread`（或候选 spread/factors 退化值）`>= 0.003`
+  - 且交易所在 `LIVE_TRADING_CONFIG.allowed_exchanges`
+- Top‑K 交易所选择（K 默认 5，配置 `LIVE_TRADING_WATCHLIST_EVENT_TOPK_EXCH`）：
+  - 必选：`trigger_details.pair` 的两家交易所
+  - 补充：按 `trigger_details.candidate_pairs`（watchlist 两两组合按 last 价差排序的 Top‑N）从大到小补齐到 K
+  - 若仍不足：用 `trigger_details.candidate_exchanges` 补齐
+  - 最后按 `allowed_exchanges` 过滤
+- 订单簿请求策略（控制 REST 压力）：
+  - **每交易所一次**：对 Top‑K 交易所各抓 1 次订单簿（`fetch_orderbook_prices(exchange, symbol, market_type='perp', notional=per_leg_notional_usdt)`），得到 `buy`（扫 ask）与 `sell`（扫 bid）
+  - **内存枚举 pair**：对 K 个交易所两两组合，并枚举两个方向（long/short 交换）计算 `tradable_spread` / `entry_spread_metric`，不再额外打 REST
+  - 用订单簿口径覆盖两个关键因子并调用 `predict_bc(..., horizons=(240,))` 得到 `pnl_hat_ob/win_prob_ob`，选出最优 `chosen`
+- 落库字段（供复盘与 live trading 使用）：
+  - `features_agg.meta_last.orderbook_validation`：包含 `topk_exchanges/orderbooks/candidates/chosen`
+  - `features_agg.meta_last.pnl_regression_ob`：订单簿口径的回归预测（当前仅写 240min）
+
+#### 7.1.2 live trading 开仓确认与执行（优先使用 chosen，仍保留 execution 扫盘确认）
+- live trading 候选筛选：优先用 `COALESCE(pnl_regression_ob, pnl_regression)` 的 `pnl_hat/win_prob` 做阈值过滤与排序（减少无意义复核）。
+- **优先使用 `chosen`**：若 event 内已有 `orderbook_validation.ok=true` 的 `chosen`，live trading 会把它作为 initial direction（避免重复订单簿复核与额外 REST）。
+- 仍保留执行前的确认：在真正下单前会做一次 execution 级别的扫盘确认（与下单名义金额一致），防止“选 pair 时刻 OK，但执行时价差已消失”。
+- skipped 复盘：若确认失败/不可成交，会以 `skipped` 记录并在 payload 中保存当时的复核证据，便于解释“为什么没成交”。
 
 ---
 
