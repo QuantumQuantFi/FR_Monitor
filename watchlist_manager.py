@@ -89,6 +89,9 @@ class WatchlistManager:
         self.type_b_spread_threshold = float(cfg.get('type_b_spread_threshold', 0.01))
         self.type_b_funding_min = float(cfg.get('type_b_funding_min', -0.001))
         self.type_b_funding_max = float(cfg.get('type_b_funding_max', 0.001))
+        self.type_b_funding_filter_mode = str(cfg.get('type_b_funding_filter_mode', 'range')).strip().lower()
+        self.type_b_funding_net_cost_max = float(cfg.get('type_b_funding_net_cost_max', 0.001))
+        self.type_b_funding_net_cost_horizon_hours = float(cfg.get('type_b_funding_net_cost_horizon_hours', 8))
         self.type_c_spread_threshold = float(cfg.get('type_c_spread_threshold', 0.01))
         self.type_c_funding_min = float(cfg.get('type_c_funding_min', -0.001))
 
@@ -140,6 +143,82 @@ class WatchlistManager:
                 pass
 
         self.pg_writer.on_event_written = _on_event_written
+
+    def _type_b_funding_ok(
+        self,
+        *,
+        exch_data: Dict[str, Dict[str, Any]],
+        a_ex: str,
+        a_price: float,
+        a_fr: float,
+        b_ex: str,
+        b_price: float,
+        b_fr: float,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Type B 资金费过滤。
+
+        - range：要求两腿 funding_rate 同时落在 [min, max]
+        - net_cost：按「高价做空/低价做多」方向计算净资金费（按小时归一并映射到 horizon），仅限制“亏损”不超过阈值
+        """
+        mode = (self.type_b_funding_filter_mode or "range").lower()
+        if mode == "range":
+            ok = (self.type_b_funding_min <= a_fr <= self.type_b_funding_max) and (self.type_b_funding_min <= b_fr <= self.type_b_funding_max)
+            return ok, {"mode": "range", "ok": ok}
+
+        if mode != "net_cost":
+            ok = (self.type_b_funding_min <= a_fr <= self.type_b_funding_max) and (self.type_b_funding_min <= b_fr <= self.type_b_funding_max)
+            return ok, {"mode": mode, "ok": ok, "fallback": "range"}
+
+        if a_price == b_price:
+            return False, {"mode": "net_cost", "ok": False, "reason": "equal_price"}
+
+        short_ex = a_ex if a_price > b_price else b_ex
+        long_ex = b_ex if short_ex == a_ex else a_ex
+        short_fr = a_fr if short_ex == a_ex else b_fr
+        long_fr = b_fr if long_ex == b_ex else a_fr
+        short_iv = (exch_data.get(short_ex) or {}).get("funding_interval_hours")
+        long_iv = (exch_data.get(long_ex) or {}).get("funding_interval_hours")
+        try:
+            short_iv_h = float(short_iv) if short_iv else None
+            long_iv_h = float(long_iv) if long_iv else None
+        except Exception:
+            short_iv_h = None
+            long_iv_h = None
+        if not short_iv_h or not long_iv_h or short_iv_h <= 0 or long_iv_h <= 0:
+            return (
+                False,
+                {
+                    "mode": "net_cost",
+                    "ok": False,
+                    "reason": "missing_funding_interval",
+                    "short_ex": short_ex,
+                    "long_ex": long_ex,
+                },
+            )
+
+        horizon_h = float(self.type_b_funding_net_cost_horizon_hours or 8.0)
+        # funding_rate 通常是“每 interval”的比例；先按小时归一。
+        net_per_hour = (float(short_fr) / short_iv_h) - (float(long_fr) / long_iv_h)
+        net_over_horizon = net_per_hour * horizon_h
+        net_loss = max(0.0, -net_over_horizon)
+        ok = net_loss <= float(self.type_b_funding_net_cost_max or 0.0)
+        return (
+            ok,
+            {
+                "mode": "net_cost",
+                "ok": ok,
+                "horizon_hours": horizon_h,
+                "net_over_horizon": net_over_horizon,
+                "net_loss": net_loss,
+                "short_ex": short_ex,
+                "long_ex": long_ex,
+                "short_fr": short_fr,
+                "long_fr": long_fr,
+                "short_interval_hours": short_iv_h,
+                "long_interval_hours": long_iv_h,
+            },
+        )
 
     def _prune_history(self, symbol: str, now: datetime) -> None:
         interval_hours = self._funding_interval.get(symbol)
@@ -389,7 +468,16 @@ class WatchlistManager:
                     b_ex, b_price, b_fr = futures_list[j]
                     if a_fr is None or b_fr is None:
                         continue
-                    if not (self.type_b_funding_min <= a_fr <= self.type_b_funding_max and self.type_b_funding_min <= b_fr <= self.type_b_funding_max):
+                    funding_ok, funding_info = self._type_b_funding_ok(
+                        exch_data=exch_data,
+                        a_ex=a_ex,
+                        a_price=a_price,
+                        a_fr=a_fr,
+                        b_ex=b_ex,
+                        b_price=b_price,
+                        b_fr=b_fr,
+                    )
+                    if not funding_ok:
                         continue
                     base = min(a_price, b_price)
                     if not base:
@@ -401,6 +489,7 @@ class WatchlistManager:
                             "spread": diff,
                             "prices": {a_ex: a_price, b_ex: b_price},
                             "funding": {a_ex: a_fr, b_ex: b_fr},
+                            "funding_filter": funding_info,
                         }
                     )
 
@@ -410,6 +499,7 @@ class WatchlistManager:
                             "spread": diff,
                             "prices": {a_ex: a_price, b_ex: b_price},
                             "funding": {a_ex: a_fr, b_ex: b_fr},
+                            "funding_filter": funding_info,
                         }
 
             if best_b:

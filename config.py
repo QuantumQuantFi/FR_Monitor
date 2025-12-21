@@ -216,6 +216,13 @@ WATCHLIST_CONFIG = {
     'type_b_spread_threshold': float(_get_private('WATCHLIST_TYPEB_SPREAD', 'WATCHLIST_TYPEB_SPREAD', '0.01')),  # 1%
     'type_b_funding_min': float(_get_private('WATCHLIST_TYPEB_FUNDING_MIN', 'WATCHLIST_TYPEB_FUNDING_MIN', '-0.001')),  # -0.1%
     'type_b_funding_max': float(_get_private('WATCHLIST_TYPEB_FUNDING_MAX', 'WATCHLIST_TYPEB_FUNDING_MAX', '0.001')),   # +0.1%
+    # Type B 资金费过滤模式：
+    # - "range": 要求两腿 funding_rate 同时落在 [min, max]（旧行为，默认）
+    # - "net_cost": 允许 funding_rate 绝对值很大，但要求按「高价做空/低价做多」方向计算的净资金费“亏损”不超过阈值
+    #   亏损定义：net_funding_over_horizon < 0 时，abs(net_funding_over_horizon) <= max_loss
+    'type_b_funding_filter_mode': str(_get_private('WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'net_cost')).strip().lower(),
+    'type_b_funding_net_cost_max': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', 'WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', '0.001')),  # 0.1%
+    'type_b_funding_net_cost_horizon_hours': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', 'WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', '8')),
     # Type C：现货低于永续
     'type_c_spread_threshold': float(_get_private('WATCHLIST_TYPEC_SPREAD', 'WATCHLIST_TYPEC_SPREAD', '0.01')),  # 1%
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),
