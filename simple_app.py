@@ -2904,10 +2904,62 @@ def live_trading_signals():
 
     limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
     signal_id = request.args.get('signal_id')
-    status = request.args.get('status')
+    event_id = request.args.get('event_id')
+    # Multi-status filter: accept repeated ?status=... or comma-separated list.
+    raw_status_list = request.args.getlist('status') or []
+    status_list: List[str] = []
+    for raw in raw_status_list:
+        if raw is None:
+            continue
+        for part in str(raw).split(','):
+            v = part.strip()
+            if v:
+                status_list.append(v)
     symbol = request.args.get('symbol')
+    signal_type = request.args.get('signal_type')
+    exchange = request.args.get('exchange')
+
+    def _float_arg(name: str) -> Optional[float]:
+        raw = request.args.get(name)
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            return float(raw)
+        except Exception:
+            raise ValueError(f"invalid {name}")
+
+    def _dt_arg(name: str) -> Optional[datetime]:
+        raw = request.args.get(name)
+        if raw is None or str(raw).strip() == "":
+            return None
+        try:
+            # Accept ISO8601 (with or without timezone); assume UTC if naive.
+            dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            raise ValueError(f"invalid {name}")
+
+    try:
+        pnl_hat_ob_min = _float_arg("pnl_hat_ob_min")
+        pnl_hat_ob_max = _float_arg("pnl_hat_ob_max")
+        win_prob_ob_min = _float_arg("win_prob_ob_min")
+        win_prob_ob_max = _float_arg("win_prob_ob_max")
+        realized_pnl_min = _float_arg("realized_pnl_min")
+        realized_pnl_max = _float_arg("realized_pnl_max")
+        funding_pnl_min = _float_arg("funding_pnl_min")
+        funding_pnl_max = _float_arg("funding_pnl_max")
+        created_after = _dt_arg("created_after")
+        created_before = _dt_arg("created_before")
+    except ValueError as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 400
+
     include_prices = str(request.args.get('include_prices', '1') or '1').lower() not in ('0', 'false', 'no')
     include_funding = str(request.args.get('include_funding', '1') or '1').lower() not in ('0', 'false', 'no')
+    # realized_pnl 需要 open/close 的成交均价/数量；若用户请求按 realized_pnl 筛选，强制开启 include_prices
+    if realized_pnl_min is not None or realized_pnl_max is not None:
+        include_prices = True
 
     where = []
     params: List[Any] = []
@@ -2917,12 +2969,53 @@ def live_trading_signals():
             params.append(int(signal_id))
         except Exception:
             return jsonify({'error': 'invalid signal_id', 'timestamp': now_utc_iso()}), 400
-    if status:
-        where.append("status=%s")
-        params.append(str(status))
+    if event_id:
+        where.append("event_id=%s")
+        try:
+            params.append(int(event_id))
+        except Exception:
+            return jsonify({'error': 'invalid event_id', 'timestamp': now_utc_iso()}), 400
+    if status_list:
+        if len(status_list) == 1:
+            where.append("status=%s")
+            params.append(str(status_list[0]))
+        else:
+            where.append("status = ANY(%s)")
+            params.append(status_list)
+    if signal_type:
+        where.append("signal_type=%s")
+        params.append(str(signal_type).strip().upper()[:1])
     if symbol:
         where.append("upper(symbol)=upper(%s)")
         params.append(str(symbol))
+    if exchange:
+        where.append("(upper(leg_long_exchange)=upper(%s) OR upper(leg_short_exchange)=upper(%s))")
+        params.append(str(exchange))
+        params.append(str(exchange))
+    if pnl_hat_ob_min is not None:
+        where.append("pnl_hat_ob >= %s")
+        params.append(float(pnl_hat_ob_min))
+    if pnl_hat_ob_max is not None:
+        where.append("pnl_hat_ob <= %s")
+        params.append(float(pnl_hat_ob_max))
+    if win_prob_ob_min is not None:
+        where.append("win_prob_ob >= %s")
+        params.append(float(win_prob_ob_min))
+    if win_prob_ob_max is not None:
+        where.append("win_prob_ob <= %s")
+        params.append(float(win_prob_ob_max))
+    if funding_pnl_min is not None:
+        where.append("funding_pnl_usdt >= %s")
+        params.append(float(funding_pnl_min))
+    if funding_pnl_max is not None:
+        where.append("funding_pnl_usdt <= %s")
+        params.append(float(funding_pnl_max))
+    if created_after is not None:
+        where.append("created_at >= %s")
+        params.append(created_after)
+    if created_before is not None:
+        where.append("created_at <= %s")
+        params.append(created_before)
     where_sql = f"WHERE {' AND '.join(where)}" if where else ""
 
     try:
@@ -2930,6 +3023,10 @@ def live_trading_signals():
         if dict_row:
             conn_kwargs["row_factory"] = dict_row
         with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            # realized_pnl 是基于 orders 表的 best-effort 计算；需要更大的候选集后再做后置过滤。
+            fetch_limit = limit
+            if realized_pnl_min is not None or realized_pnl_max is not None:
+                fetch_limit = min(max(limit * 5, limit), 5000)
             rows = conn.execute(
                 f"""
                 SELECT *
@@ -2938,7 +3035,7 @@ def live_trading_signals():
                  ORDER BY created_at DESC
                  LIMIT %s;
                 """,
-                (*params, limit),
+                (*params, fetch_limit),
             ).fetchall()
 
             price_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
@@ -3062,9 +3159,24 @@ def live_trading_signals():
                 # - Closed trades: finalized using (opened_at → closed_at).
                 # Keep the API as a pure read so page refresh doesn't hammer private bill endpoints.
                 pass
+            # Post-filter realized_pnl when requested (best-effort, depends on fills).
+            if realized_pnl_min is not None or realized_pnl_max is not None:
+                rp = item.get('realized_pnl_usdt')
+                if rp is None:
+                    continue
+                try:
+                    rp_f = float(rp)
+                except Exception:
+                    continue
+                if realized_pnl_min is not None and rp_f < float(realized_pnl_min):
+                    continue
+                if realized_pnl_max is not None and rp_f > float(realized_pnl_max):
+                    continue
             out.append(item)
         else:
             out.append(r)
+        if len(out) >= limit:
+            break
     return jsonify({'timestamp': now_utc_iso(), 'signals': out})
 
 
