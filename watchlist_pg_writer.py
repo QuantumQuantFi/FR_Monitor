@@ -51,6 +51,7 @@ class PgWriter:
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._last_priority_flush_ts: float = 0.0
         # state for event merge: (exchange, symbol, signal_type) -> state dict
         self._event_state: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # 缓存最近一次双腿信息，便于事件聚合时保留首/末腿快照
@@ -116,6 +117,47 @@ class PgWriter:
             return
         with self._lock:
             self._queue.append(row)
+            # Best-effort: for "high-value" triggered rows, flush immediately to reduce event latency.
+            # This matters when consecutive_required=1 and live trading is kick-driven.
+            try:
+                is_triggered = bool(row.get("triggered"))
+                sig_type = str(row.get("signal_type") or "").strip().upper()
+                if is_triggered and sig_type == "B":
+                    meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
+                    pnl_reg = meta.get("pnl_regression") if isinstance(meta, dict) else None
+                    pred = (pnl_reg or {}).get("pred") if isinstance(pnl_reg, dict) else None
+                    pred_240 = pred.get("240") if isinstance(pred, dict) else None
+                    pnl_hat = (
+                        float(pred_240.get("pnl_hat"))
+                        if isinstance(pred_240, dict) and pred_240.get("pnl_hat") is not None
+                        else None
+                    )
+                    win_prob = (
+                        float(pred_240.get("win_prob"))
+                        if isinstance(pred_240, dict) and pred_240.get("win_prob") is not None
+                        else None
+                    )
+                    spread_est = row.get("spread_rel")
+                    spread_est_f = float(spread_est) if spread_est is not None else None
+                    # Mirror the cheap prefilter in _maybe_add_orderbook_validation (avoid flushing for weak signals).
+                    if (
+                        pnl_hat is not None
+                        and win_prob is not None
+                        and spread_est_f is not None
+                        and math.isfinite(pnl_hat)
+                        and math.isfinite(win_prob)
+                        and math.isfinite(spread_est_f)
+                        and pnl_hat >= 0.009
+                        and win_prob >= 0.85
+                        and spread_est_f >= 0.003
+                    ):
+                        now_ts = time.time()
+                        if now_ts - float(self._last_priority_flush_ts or 0.0) >= 1.0:
+                            self._last_priority_flush_ts = now_ts
+                            self._flush_locked()
+                            return
+            except Exception:
+                pass
             if len(self._queue) >= self.config.batch_size:
                 self._flush_locked()
 
