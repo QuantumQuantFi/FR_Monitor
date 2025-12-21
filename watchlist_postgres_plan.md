@@ -101,6 +101,37 @@
 - Type C（现货 vs 永续）：一期 **不自动交易**（当前交易模块未实现 spot 下单）。后续加入现货交易后，再实现 Type C 自动开仓与平仓。
 - Type A（同所现货 vs 永续、资金费逻辑）：同样受限于 spot 下单与策略口径，建议先不自动化，先做记录与展示。
 
+### 3.2.1 Watchlist→Event→Live Trading 的“时刻”与延迟来源（重要）
+
+为了复盘“为什么 raw 看到价差、但最终没成交/被 skipped”，需要明确三个不同的时间点（口径不同）：
+
+1) **raw 信号产生时刻（last/metrics 口径）**
+   - 表：`watchlist.watch_signal_raw`
+   - 字段：`ts`、`spread_rel`、`meta.trigger_details`
+   - 含义：基于监控系统的最新价格/快照计算的“观察价差”，未必等于“市价可成交价差”。
+
+2) **event 首次写入时刻（订单簿 Top‑K 验算口径）**
+   - 表：`watchlist.watch_signal_event`
+   - 字段：`start_ts`（事件起点）、以及 `features_agg.meta_last.orderbook_validation.ts`
+   - 含义：当 event 第一次 INSERT 时，满足预筛门槛会触发 Top‑K 订单簿验算：
+     - 每交易所一次按名义金额扫盘（`per_leg_notional_usdt`）得到 buy/sell 可成交价
+     - 内存枚举候选 pairs+方向，选出 `chosen.long_exchange/short_exchange`
+     - 用订单簿覆盖关键因子后计算 `pnl_regression_ob`（horizon=240）
+   - 影响 event 延迟的主要参数：
+     - `WATCHLIST_PG_CONFIG.consecutive_required`：连续触发分钟数（已改为 1，以降低事件生成延迟）
+     - `WATCHLIST_PG_CONFIG.flush_seconds` / batch：PG writer 刷新与队列延迟
+     - `WATCHLIST_PG_CONFIG.enable_event_merge`：是否启用事件归并
+
+3) **live trading 下单准备时刻（execution 口径）**
+   - 表：`watchlist.live_trade_signal`
+   - 字段：`payload.orderbook_execution.ts`（真正准备发市价单前再次扫盘）
+   - 含义：在准备发市价单前，对 long/short 两端各再扫一次订单簿，得到实际用于算 qty 的 `long_buy_px / short_sell_px`。
+
+**常见“价差消失”的位置**
+- raw→event：若 `consecutive_required>1` 或 writer flush 较慢，会引入分钟级等待，秒级价差可能已收敛。
+- event→live trading：kick-driven 通常很短；scan 仅作兜底。
+- revalidation→execution：同一轮内延迟很短，但市场秒级波动，execution 时入场价差可能明显收敛。
+
 ### 3.3 幂等去重（必须做，否则会被连续信号刷爆）
 规则：实盘系统收到开仓信号后，先检查同币种是否已开仓或正在开仓；如果是重复信号则丢弃。
 推荐实现：
@@ -120,6 +151,17 @@
 - 异常与回滚：
   - 若一腿下单成功、另一腿失败：立刻尝试把已下单腿“反向 reduceOnly 市价平掉”（需要可靠的成交数量与交易所支持），并标记该次执行为 `partial_failed`。
 - 错误记录（你提出的第 5 点）：所有阶段错误（验算失败/下单拒绝/网络超时/最小数量不足/杠杆设置失败）必须写入 PG 的 `live_trade_error`，用于后续迭代稳定性。
+
+### 4.1 为什么“预测 pnl 很高，但 execution 入场价差很小”仍会被尝试？
+
+这是当前策略的刻意设计（先看预测，再用 execution 兜底拦截）：
+
+- **准入门槛（event 选择）**：以 `pnl_hat_ob / win_prob_ob`（回归输出）为主；这是 240min horizon 的“未来预期”判断。
+- **可执行兜底（真正发单前）**：以 execution 扫盘的 `entry_spread_metric` 与 TP 目标比较做硬拦截：
+  - `take_profit_pnl = take_profit_ratio * pnl_hat_ob`
+  - 若 `entry_spread_metric < take_profit_pnl`，则即便预测达标也会拒绝开仓（避免“成交时刻无价差”的开仓）。
+
+因此会出现一种常见现象：**raw/回归预测很强，但市价可成交价差很小**，最终会在 `_open_trade` 阶段被判为 skipped/failed（取决于错误类别是否属于“未发单类”）。
 
 ---
 
