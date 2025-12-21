@@ -24,6 +24,7 @@ from config import (
     GRVT_API_KEY,
     GRVT_API_SECRET,
     GRVT_ENVIRONMENT,
+    GRVT_REST_BASE_URL,
     GRVT_REST_SYMBOLS_PER_CALL,
     GRVT_TRADING_ACCOUNT_ID,
     HYPERLIQUID_API_BASE_URL,
@@ -757,12 +758,32 @@ def fetch_bybit() -> Dict[str, Dict[str, Dict[str, Any]]]:
     return out
 
 
-# GRVT helper：通过官方 grvt-pysdk 访问 REST/WS
-# SDK 会负责签名与 IP 白名单校验，我们在这里缓存 client 并轮询 ticker。
+# GRVT helper：
+# - Public market-data endpoints are available (no API key required) for funding/mark/next funding time.
+# - Private trading endpoints may still require the official SDK + API key/whitelist (handled elsewhere).
 _GRVT_CLIENT_LOCK = threading.Lock()
 _GRVT_CLIENT: Optional["GrvtCcxt"] = None
 _GRVT_SYMBOL_QUEUE: deque[str] = deque()
 _GRVT_BASE_SYMBOLS: List[str] = []
+_GRVT_INSTRUMENT_CACHE: Dict[str, Dict[str, Any]] = {}
+_GRVT_INSTRUMENT_CACHE_TS: Dict[str, float] = {}
+
+
+def _grvt_market_base_url() -> str:
+    base = (GRVT_REST_BASE_URL or "").rstrip("/")
+    return base or "https://market-data.grvt.io"
+
+
+def _grvt_post_json(path: str, payload: Dict[str, Any], *, timeout: float = 4.0) -> Optional[Dict[str, Any]]:
+    url = _grvt_market_base_url() + path
+    try:
+        resp = requests.post(url, json=payload, timeout=timeout)
+        resp.raise_for_status()
+        out = resp.json()
+        return out if isinstance(out, dict) else None
+    except Exception as exc:
+        print(f"GRVT market-data POST failed url={url} err={exc}")
+        return None
 
 
 def _get_grvt_env_enum():
@@ -804,16 +825,41 @@ def _get_grvt_client():
 
 def get_grvt_supported_bases(refresh: bool = False) -> List[str]:
     """
-    Retrieve active GRVT USDT perpetual bases via the official SDK.
+    Retrieve active GRVT USDT perpetual bases.
+    - Prefer the public market-data endpoint (works without API key).
+    - Fallback to the official SDK if available.
     Results are cached in-memory unless refresh=True.
     """
     global _GRVT_BASE_SYMBOLS
     if _GRVT_BASE_SYMBOLS and not refresh:
         return _GRVT_BASE_SYMBOLS.copy()
 
+    bases: List[str] = []
+
+    # Fast-path: public market-data instruments.
+    instruments = _grvt_post_json("/full/v1/instruments", {}) or {}
+    items = instruments.get("result") if isinstance(instruments, dict) else None
+    if isinstance(items, list) and items:
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            quote = (it.get("quote") or "").upper()
+            kind = (it.get("kind") or "").upper()
+            base = (it.get("base") or "").upper()
+            if not base or quote != "USDT":
+                continue
+            if kind not in ("PERPETUAL", "SWAP"):
+                continue
+            if base not in bases:
+                bases.append(base)
+        if bases:
+            _GRVT_BASE_SYMBOLS = bases
+            return _GRVT_BASE_SYMBOLS.copy()
+
+    # Fallback: official SDK.
     client = _get_grvt_client()
     if client is None:
-        return []
+        return _GRVT_BASE_SYMBOLS.copy()
 
     try:
         markets = client.fetch_markets()
@@ -891,16 +937,45 @@ def _decode_grvt_funding(value) -> Optional[float]:
     return funding
 
 
+def _get_grvt_instrument_meta(instrument: str, *, ttl_seconds: float = 6 * 3600.0) -> Dict[str, Any]:
+    """
+    Best-effort instrument metadata cache.
+    Fields we care about for monitoring:
+    - funding_interval_hours
+    - adjusted_funding_rate_cap / floor
+    """
+    inst = (instrument or "").strip()
+    if not inst:
+        return {}
+
+    now = time.time()
+    ts = _GRVT_INSTRUMENT_CACHE_TS.get(inst)
+    if ts and (now - ts) < ttl_seconds:
+        return _GRVT_INSTRUMENT_CACHE.get(inst, {}) or {}
+
+    payload = _grvt_post_json("/full/v1/instrument", {"instrument": inst}) or {}
+    row = payload.get("result") if isinstance(payload, dict) else None
+    meta: Dict[str, Any] = {}
+    if isinstance(row, dict):
+        if row.get("funding_interval_hours") is not None:
+            meta["funding_interval_hours"] = row.get("funding_interval_hours")
+        if row.get("adjusted_funding_rate_cap") is not None:
+            meta["adjusted_funding_rate_cap"] = row.get("adjusted_funding_rate_cap")
+        if row.get("adjusted_funding_rate_floor") is not None:
+            meta["adjusted_funding_rate_floor"] = row.get("adjusted_funding_rate_floor")
+
+    _GRVT_INSTRUMENT_CACHE[inst] = meta
+    _GRVT_INSTRUMENT_CACHE_TS[inst] = now
+    return meta
+
+
 def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
     """
-    Fetch GRVT tickers via authenticated REST calls using the official SDK.
-    SDK 会向 `market-data.<env>.grvt.io` 发起 `full/v1/ticker` 请求，
-    因此必须提前配置 API Key/白名单；这里按批次轮询避免触发限频。
+    Fetch GRVT tickers via the public market-data REST endpoints.
+    - Uses `POST /full/v1/ticker` per instrument (no auth required).
+    - Funding is returned as "percentage points" (e.g. "0.0019" == 0.0019%), then normalized to decimal.
     """
     out: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    client = _get_grvt_client()
-    if client is None:
-        return out
 
     _ensure_grvt_symbol_queue()
     if not _GRVT_SYMBOL_QUEUE:
@@ -911,18 +986,56 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
     for symbol in symbols:
         instrument = _build_grvt_instrument(symbol)
         try:
-            ticker = client.fetch_ticker(instrument)
+            payload = _grvt_post_json("/full/v1/ticker", {"instrument": instrument}) or {}
+            ticker = payload.get("result") if isinstance(payload, dict) else None
         except Exception as exc:
             print(f"GRVT REST获取 {instrument} 失败: {exc}")
             continue
-        if not ticker:
+        if not isinstance(ticker, dict) or not ticker:
             continue
+
+        # If orderbook is effectively empty (common for delisted/stale instruments),
+        # avoid publishing a tradable price that would create false cross-exchange spreads.
+        try:
+            best_bid = _decode_grvt_price(ticker.get("best_bid_price"))
+            best_ask = _decode_grvt_price(ticker.get("best_ask_price"))
+        except Exception:
+            best_bid, best_ask = None, None
+        orderbook_ok = (best_bid is not None and best_bid > 0) and (best_ask is not None and best_ask > 0)
 
         price = (
             _decode_grvt_price(ticker.get('mark_price'))
             or _decode_grvt_price(ticker.get('last_price'))
         )
-        if not price:
+        if not price or not orderbook_ok:
+            # Still emit a snapshot so the rest merge can overwrite stale prices.
+            snapshot: Dict[str, Any] = {
+                'price': None,
+                'timestamp': ts,
+                'symbol': instrument,
+                'error': 'empty_orderbook' if not orderbook_ok else 'no_price',
+            }
+            inst_meta = _get_grvt_instrument_meta(instrument)
+            interval = derive_funding_interval_hours('grvt', inst_meta.get("funding_interval_hours"))
+            if interval is not None:
+                snapshot['funding_interval_hours'] = interval
+            funding = _decode_grvt_funding(
+                ticker.get('funding_rate_8h_curr')
+                or ticker.get('funding_rate_curr')
+                or ticker.get('funding_rate')
+            )
+            normalized_funding = normalize_funding_rate(funding, assume_percent=True)
+            if normalized_funding is not None:
+                snapshot['funding_rate'] = normalized_funding
+            next_ft = normalize_next_funding_time(
+                ticker.get('next_funding_time') or ticker.get('nextFundingTime') or ticker.get('next_funding_time_ns')
+            )
+            if next_ft:
+                snapshot['next_funding_time'] = next_ft
+            else:
+                snapshot['next_funding_time'] = _next_utc_boundary_iso(int(interval or 8))
+
+            out.setdefault(symbol, {})['futures'] = snapshot
             continue
 
         snapshot: Dict[str, Any] = {
@@ -930,8 +1043,9 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
             'timestamp': ts,
             'symbol': instrument
         }
-        interval = derive_funding_interval_hours('grvt')
-        if interval:
+        inst_meta = _get_grvt_instrument_meta(instrument)
+        interval = derive_funding_interval_hours('grvt', inst_meta.get("funding_interval_hours"))
+        if interval is not None:
             snapshot['funding_interval_hours'] = interval
         funding = _decode_grvt_funding(
             ticker.get('funding_rate_8h_curr')
@@ -943,7 +1057,7 @@ def fetch_grvt() -> Dict[str, Dict[str, Dict[str, Any]]]:
             snapshot['funding_rate'] = normalized_funding
 
         next_ft = normalize_next_funding_time(
-            ticker.get('next_funding_time') or ticker.get('nextFundingTime')
+            ticker.get('next_funding_time') or ticker.get('nextFundingTime') or ticker.get('next_funding_time_ns')
         )
         if next_ft:
             snapshot['next_funding_time'] = next_ft

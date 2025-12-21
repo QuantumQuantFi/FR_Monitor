@@ -762,6 +762,17 @@ class GrvtMarketWebSocket:
         if not instrument:
             return None
         symbol = instrument.split('_')[0]
+
+        # If the orderbook is effectively empty (common for delisted/stale markets),
+        # avoid emitting a tradable price snapshot that would create false cross-exchange spreads.
+        try:
+            best_bid = self._decode_price(feed.get('best_bid_price'))
+            best_ask = self._decode_price(feed.get('best_ask_price'))
+        except Exception:
+            best_bid, best_ask = None, None
+        if (best_bid is not None and best_bid <= 0) or (best_ask is not None and best_ask <= 0):
+            return None
+
         price = (
             self._decode_price(feed.get('mark_price'))
             or self._decode_price(feed.get('last_price'))
