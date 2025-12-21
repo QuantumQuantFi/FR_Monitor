@@ -23,6 +23,7 @@
     button.secondary { background: #21262d; border-color: #30363d; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
     input { background: #0b1220; border: 1px solid #263040; color: #e6edf3; border-radius: 8px; padding: 6px 10px; }
+    select { background: #0b1220; border: 1px solid #263040; color: #e6edf3; border-radius: 8px; padding: 6px 10px; }
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #0b1220; border: 1px solid #263040; border-radius: 10px; padding: 10px; max-height: 35vh; overflow: auto; }
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
     @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
@@ -54,10 +55,49 @@
       <span class="muted" style="margin-left: 12px;">信号条数：</span>
       <input id="signalsLimit" type="number" min="10" max="2000" value="500" style="width: 90px;" />
       <span class="muted" style="margin-left: 12px;">筛选：</span>
-      <input id="filterSymbol" placeholder="symbol(可选)" style="width: 120px;" />
-      <input id="filterStatus" placeholder="status(可选)" style="width: 140px;" />
+      <input id="filterSymbol" placeholder="symbol(可选)" style="width: 110px;" />
+      <div id="statusFilterWrap" style="position: relative;">
+        <button id="statusFilterBtn" class="secondary" type="button" title="status(可选)；点击后在下拉里打勾" style="padding: 6px 10px;">
+          <span id="statusFilterLabel" class="muted">status(全部)</span>
+        </button>
+        <div id="statusFilterMenu" class="card" style="display:none; position:absolute; top: 42px; left:0; z-index: 5; min-width: 180px; padding: 10px;">
+          <div class="row" style="justify-content: space-between; margin-bottom: 6px;">
+            <span class="muted">Status</span>
+            <div class="row" style="gap: 6px;">
+              <button id="statusSelectAllBtn" class="secondary" type="button" style="padding: 4px 8px;">全选</button>
+              <button id="statusClearBtn" class="secondary" type="button" style="padding: 4px 8px;">清空</button>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:6px;">
+            <label class="muted"><input class="status-cb" type="checkbox" value="new"> new</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="skipped"> skipped</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="opening"> opening</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="open"> open</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="closing"> closing</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="closed"> closed</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="failed"> failed</label>
+          </div>
+        </div>
+      </div>
+      <select id="filterType" title="signal_type(可选)" style="width: 120px;">
+        <option value="">type(全部)</option>
+        <option value="B">B</option>
+      </select>
+      <input id="filterExchange" placeholder="exchange(可选)" style="width: 120px;" />
       <button id="refreshBtn" class="secondary">立即刷新</button>
+      <button id="resetBtn" class="secondary">清空筛选</button>
       <button id="posBtn" class="secondary">刷新持仓(私有API)</button>
+    </div>
+    <div class="row" style="margin-top: 8px;">
+      <span class="muted">预计收益(pnl_hat_ob)：</span>
+      <input id="filterPnlMin" type="number" step="0.0001" placeholder="min" style="width: 90px;" />
+      <input id="filterPnlMax" type="number" step="0.0001" placeholder="max" style="width: 90px;" />
+      <span class="muted" style="margin-left: 12px;">胜率(win_prob_ob)：</span>
+      <input id="filterProbMin" type="number" step="0.0001" placeholder="min" style="width: 90px;" />
+      <input id="filterProbMax" type="number" step="0.0001" placeholder="max" style="width: 90px;" />
+      <span class="muted" style="margin-left: 12px;">RealizedPnL(USDT)：</span>
+      <input id="filterRealMin" type="number" step="0.0001" placeholder="min" style="width: 100px;" />
+      <input id="filterRealMax" type="number" step="0.0001" placeholder="max" style="width: 100px;" />
     </div>
   </div>
 
@@ -251,6 +291,28 @@
       return (n * 100).toFixed(nd) + '%';
     }
 
+    function fmtTsBJ(iso) {
+      if (!iso || iso === '-') return '-';
+      const t = Date.parse(String(iso));
+      if (!Number.isFinite(t)) return String(iso);
+      try {
+        const parts = new Intl.DateTimeFormat('zh-CN', {
+          timeZone: 'Asia/Shanghai',
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+        }).formatToParts(new Date(t));
+        const get = (type) => (parts.find(p => p.type === type) || {}).value || '';
+        return `${get('year')}-${get('month')}-${get('day')} ${get('hour')}:${get('minute')}:${get('second')}`;
+      } catch (e) {
+        return new Date(t).toLocaleString();
+      }
+    }
+
     function fmtCountdown(iso) {
       if (!iso) return '-';
       const t = Date.parse(String(iso));
@@ -310,10 +372,26 @@
       const overview = await fetchJson('/api/live_trading/overview?limit=80');
       const limit = Math.max(10, Math.min(2000, Number(document.getElementById('signalsLimit').value || 500)));
       const symbol = (document.getElementById('filterSymbol').value || '').trim();
-      const status = (document.getElementById('filterStatus').value || '').trim();
+      const statuses = Array.from(document.querySelectorAll('.status-cb:checked')).map(cb => (cb.value || '').trim()).filter(v => v);
+      const type = (document.getElementById('filterType').value || '').trim();
+      const exchange = (document.getElementById('filterExchange').value || '').trim();
+      const pnlMin = (document.getElementById('filterPnlMin').value || '').trim();
+      const pnlMax = (document.getElementById('filterPnlMax').value || '').trim();
+      const probMin = (document.getElementById('filterProbMin').value || '').trim();
+      const probMax = (document.getElementById('filterProbMax').value || '').trim();
+      const realMin = (document.getElementById('filterRealMin').value || '').trim();
+      const realMax = (document.getElementById('filterRealMax').value || '').trim();
       const qs = new URLSearchParams({limit: String(limit)});
       if (symbol) qs.set('symbol', symbol);
-      if (status) qs.set('status', status);
+      for (const st of statuses) qs.append('status', st);
+      if (type) qs.set('signal_type', type);
+      if (exchange) qs.set('exchange', exchange);
+      if (pnlMin) qs.set('pnl_hat_ob_min', pnlMin);
+      if (pnlMax) qs.set('pnl_hat_ob_max', pnlMax);
+      if (probMin) qs.set('win_prob_ob_min', probMin);
+      if (probMax) qs.set('win_prob_ob_max', probMax);
+      if (realMin) qs.set('realized_pnl_min', realMin);
+      if (realMax) qs.set('realized_pnl_max', realMax);
       const signalsResp = await fetchJson(`/api/live_trading/signals?${qs.toString()}`);
       document.getElementById('ts').textContent = overview.timestamp || '-';
       const cfg = overview.live_trading_config || {};
@@ -330,7 +408,7 @@
       const body = document.getElementById('signalsBody');
       const signals = signalsResp.signals || [];
       if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="23" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="26" class="muted">暂无数据</td></tr>';
         return;
       }
 
@@ -356,17 +434,22 @@
           `long(${s.leg_long_exchange || '-'}) pnl=${s.funding_long_pnl_usdt ?? '-'} last_fee=${s.funding_long_last_fee_usdt ?? '-'} last_time=${s.funding_long_last_fee_time ?? '-'} rate=${schedL.funding_rate ?? '-'} interval_h=${schedL.funding_interval_hours ?? '-'} next=${schedL.next_funding_time ?? '-'}`,
           `short(${s.leg_short_exchange || '-'}) pnl=${s.funding_short_pnl_usdt ?? '-'} last_fee=${s.funding_short_last_fee_usdt ?? '-'} last_time=${s.funding_short_last_fee_time ?? '-'} rate=${schedS.funding_rate ?? '-'} interval_h=${schedS.funding_interval_hours ?? '-'} next=${schedS.next_funding_time ?? '-'}`,
           s.funding_error ? `error=${JSON.stringify(s.funding_error)}` : '',
-        ].filter(Boolean).join('\n');
-        const canForceClose = true;
-        const createdAt = s.created_at || '-';
-        const openAt = s.opened_at || '-';
-        const closeReqAt = s.close_requested_at || '-';
-        const closedAt = s.closed_at || '-';
-        const forceAt = s.force_close_at || '-';
-        const closeReason = s.close_reason || '-';
-        const reason = s.reason || '-';
-        return `
-          <tr>
+	        ].filter(Boolean).join('\n');
+	        const canForceClose = true;
+	        const createdAtUtc = s.created_at || '-';
+	        const openAtUtc = s.opened_at || '-';
+	        const closeReqAtUtc = s.close_requested_at || '-';
+	        const closedAtUtc = s.closed_at || '-';
+	        const forceAtUtc = s.force_close_at || '-';
+	        const createdAt = fmtTsBJ(createdAtUtc);
+	        const openAt = fmtTsBJ(openAtUtc);
+	        const closeReqAt = fmtTsBJ(closeReqAtUtc);
+	        const closedAt = fmtTsBJ(closedAtUtc);
+	        const forceAt = fmtTsBJ(forceAtUtc);
+	        const closeReason = s.close_reason || '-';
+	        const reason = s.reason || '-';
+	        return `
+	          <tr>
             <td>${s.id}</td>
             <td class="muted">${s.event_id || '-'}</td>
             <td>${s.symbol || '-'}</td>
@@ -385,15 +468,15 @@
             <td>${fmt(s.take_profit_pnl, 6)}</td>
             <td>${fmt(s.last_pnl_spread, 6)}</td>
             <td class="muted">${exitSpreadPctNow}</td>
-            <td class="muted">${createdAt}</td>
-            <td class="muted">${openAt}</td>
-            <td class="muted">${closeReqAt}</td>
-            <td class="muted">${closedAt}</td>
-            <td class="muted">${forceAt}</td>
-            <td class="muted">${closeReason}</td>
-            <td class="muted">${reason}</td>
-            <td>
-              <button class="secondary" onclick="loadDetails(${s.id})">Details</button>
+	            <td class="muted" title="UTC: ${escapeHtml(createdAtUtc)}">${createdAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(openAtUtc)}">${openAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(closeReqAtUtc)}">${closeReqAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(closedAtUtc)}">${closedAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(forceAtUtc)}">${forceAt}</td>
+	            <td class="muted">${closeReason}</td>
+	            <td class="muted">${reason}</td>
+	            <td>
+	              <button class="secondary" onclick="loadDetails(${s.id})">Details</button>
               <button class="secondary" ${canForceClose ? '' : 'disabled'} onclick="forceClose(${s.id})">一键平仓</button>
             </td>
           </tr>
@@ -774,7 +857,7 @@
     async function refreshPositions() {
       const nonzero = document.getElementById('posNonzeroOnly')?.checked ? '1' : '0';
       document.getElementById('balancesBody').innerHTML = '<tr><td colspan="5" class="muted">loading...</td></tr>';
-      document.getElementById('positionsBody').innerHTML = '<tr><td colspan="12" class="muted">loading...</td></tr>';
+      document.getElementById('positionsBody').innerHTML = '<tr><td colspan="14" class="muted">loading...</td></tr>';
       try {
         const pos = await fetchJson(`/api/live_trading/positions?all=1&nonzero=${encodeURIComponent(nonzero)}`);
         document.getElementById('posTs').textContent = `更新时间：${pos.timestamp || '-'}`;
@@ -782,7 +865,7 @@
       } catch (e) {
         document.getElementById('posTs').textContent = String(e);
         document.getElementById('balancesBody').innerHTML = `<tr><td colspan="5" class="muted">${String(e)}</td></tr>`;
-        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="12" class="muted">${String(e)}</td></tr>`;
+        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="14" class="muted">${String(e)}</td></tr>`;
       }
     }
 
@@ -793,13 +876,84 @@
     }
 
     document.getElementById('refreshBtn').addEventListener('click', () => refresh().catch(err => console.error(err)));
+    document.getElementById('resetBtn').addEventListener('click', () => {
+      document.getElementById('filterSymbol').value = '';
+      for (const cb of document.querySelectorAll('.status-cb')) cb.checked = false;
+      updateStatusLabel();
+      document.getElementById('filterType').value = '';
+      document.getElementById('filterExchange').value = '';
+      document.getElementById('filterPnlMin').value = '';
+      document.getElementById('filterPnlMax').value = '';
+      document.getElementById('filterProbMin').value = '';
+      document.getElementById('filterProbMax').value = '';
+      document.getElementById('filterRealMin').value = '';
+      document.getElementById('filterRealMax').value = '';
+      refresh().catch(err => console.error(err));
+    });
     document.getElementById('posBtn').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
     document.getElementById('posBtn2').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
     document.getElementById('posNonzeroOnly').addEventListener('change', () => refreshPositions().catch(err => console.error(err)));
     document.getElementById('refreshSec').addEventListener('change', () => schedule());
     document.getElementById('signalsLimit').addEventListener('change', () => refresh().catch(err => console.error(err)));
     document.getElementById('filterSymbol').addEventListener('change', () => refresh().catch(err => console.error(err)));
-    document.getElementById('filterStatus').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterType').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterExchange').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterPnlMin').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterPnlMax').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterProbMin').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterProbMax').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterRealMin').addEventListener('change', () => refresh().catch(err => console.error(err)));
+    document.getElementById('filterRealMax').addEventListener('change', () => refresh().catch(err => console.error(err)));
+
+    function updateStatusLabel() {
+      const statuses = Array.from(document.querySelectorAll('.status-cb:checked')).map(cb => cb.value);
+      const el = document.getElementById('statusFilterLabel');
+      if (!el) return;
+      if (!statuses.length) {
+        el.textContent = 'status(全部)';
+        return;
+      }
+      if (statuses.length <= 2) {
+        el.textContent = 'status: ' + statuses.join(',');
+        return;
+      }
+      el.textContent = `status(${statuses.length})`;
+    }
+
+    function toggleStatusMenu(show) {
+      const menu = document.getElementById('statusFilterMenu');
+      if (!menu) return;
+      const next = (show === undefined) ? (menu.style.display === 'none') : !!show;
+      menu.style.display = next ? 'block' : 'none';
+    }
+
+    document.getElementById('statusFilterBtn').addEventListener('click', (e) => {
+      e.preventDefault();
+      toggleStatusMenu();
+    });
+    document.getElementById('statusSelectAllBtn').addEventListener('click', () => {
+      for (const cb of document.querySelectorAll('.status-cb')) cb.checked = true;
+      updateStatusLabel();
+      refresh().catch(err => console.error(err));
+    });
+    document.getElementById('statusClearBtn').addEventListener('click', () => {
+      for (const cb of document.querySelectorAll('.status-cb')) cb.checked = false;
+      updateStatusLabel();
+      refresh().catch(err => console.error(err));
+    });
+    for (const cb of document.querySelectorAll('.status-cb')) {
+      cb.addEventListener('change', () => {
+        updateStatusLabel();
+        refresh().catch(err => console.error(err));
+      });
+    }
+    document.addEventListener('click', (e) => {
+      const wrap = document.getElementById('statusFilterWrap');
+      const menu = document.getElementById('statusFilterMenu');
+      if (!wrap || !menu) return;
+      if (menu.style.display !== 'none' && !wrap.contains(e.target)) toggleStatusMenu(false);
+    });
+    updateStatusLabel();
 
     refresh().catch(err => console.error(err));
     schedule();
