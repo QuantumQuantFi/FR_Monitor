@@ -270,8 +270,8 @@ LIVE_TRADING_CONFIG = {
     'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
     'horizon_min': int(float(_get_private('LIVE_TRADING_HORIZON_MIN', 'LIVE_TRADING_HORIZON_MIN', '240'))),
     # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
-    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.011')),
-    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.91')),
+    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.01')),
+    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.89')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
     # 扫描周期：建议使用 watchlist → kick 的事件驱动作为 fast-path，
     # 定时扫描作为兜底即可，避免频繁订单簿复核导致交易所 ban。
@@ -293,6 +293,10 @@ LIVE_TRADING_CONFIG = {
     'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '1'))),
     'close_retry_cooldown_seconds': float(
         _get_private('LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', 'LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', '120')
+    ),
+    # Hyperliquid reduce-only close uses IOC limit internally; too small slippage may fail to cross the spread.
+    'hyperliquid_close_slippage': float(
+        _get_private('LIVE_TRADING_HL_CLOSE_SLIPPAGE', 'LIVE_TRADING_HL_CLOSE_SLIPPAGE', '0.03')
     ),
     # 只处理“最近”的 event，避免对历史候选重复做订单簿复核。
     'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '3'))),

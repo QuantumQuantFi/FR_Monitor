@@ -118,6 +118,10 @@ class LiveTradingConfig:
     # Set to 0 to disable.
     max_abs_funding: float = 0.0
     close_retry_cooldown_seconds: float = 120.0
+    # Hyperliquid reduce-only close uses an IOC limit under the hood; for illiquid symbols,
+    # small slippage may fail to cross the spread ("could not immediately match...").
+    # Keep it configurable so we can tune without changing code.
+    hyperliquid_close_slippage: float = 0.03
 
 
 class LiveTradingManager:
@@ -2928,7 +2932,24 @@ class LiveTradingManager:
                 message=str(exc),
                 context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
             )
-            self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
+            msg = str(exc)
+            msg_l = msg.lower()
+            # Treat "did not send orders" class errors as skipped (not failed) to reduce noise and
+            # keep failed reserved for partial fills / position mismatches / other execution issues.
+            status = (
+                "skipped"
+                if any(
+                    key in msg_l
+                    for key in (
+                        "entry spread too small",
+                        "non-tradable entry spread",
+                        "orderbook unavailable",
+                        "orderbook missing",
+                    )
+                )
+                else "failed"
+            )
+            self._update_signal_status(conn, signal_id, status, reason=msg)
         except Exception as exc:
             self._record_error(
                 conn,
@@ -3373,20 +3394,17 @@ class LiveTradingManager:
         short_qty = float(self.config.per_leg_notional_usdt) / float(short_px)
 
         take_profit_pnl = float(self.config.take_profit_ratio) * float(pnl_hat_ob)
-        # Final guard: if entry spread is smaller than TP target, this trade is unlikely to
-        # ever hit TP (pnl_spread <= entry_spread_metric when spread_now >= 0). Abort to
-        # avoid "成交时刻无价差" openings.
-        if float(entry_spread_metric) < float(take_profit_pnl):
-            raise TradeExecutionError(
-                f"Entry spread too small for TP target: entry_spread_metric={entry_spread_metric:.6f} "
-                f"< tp_pnl={take_profit_pnl:.6f} (pnl_hat_ob={float(pnl_hat_ob):.6f}, "
-                f"long_ex={long_ex}, short_ex={short_ex}, symbol={symbol})"
-            )
+        entry_spread_pct_actual = float(math.exp(float(entry_spread_metric)) - 1.0)
+        take_profit_exit_spread_pct = float(math.exp(float(entry_spread_metric) - float(take_profit_pnl)) - 1.0)
+
+        # Persist execution-time prices/thresholds even if we abort before sending orders.
         conn.execute(
             """
             UPDATE watchlist.live_trade_signal
                SET entry_spread_metric=%s,
                    take_profit_pnl=%s,
+                   entry_spread_pct_actual=%s,
+                   take_profit_exit_spread_pct=%s,
                    updated_at=now(),
                    payload = COALESCE(payload, '{}'::jsonb) || jsonb_build_object(
                        'orderbook_execution', jsonb_build_object(
@@ -3396,6 +3414,9 @@ class LiveTradingManager:
                            'long_buy_px', %s::double precision,
                            'short_sell_px', %s::double precision,
                            'entry_spread_metric', %s::double precision,
+                           'entry_spread_pct', %s::double precision,
+                           'take_profit_pnl', %s::double precision,
+                           'take_profit_exit_spread_pct', %s::double precision,
                            'long_qty', %s::double precision,
                            'short_qty', %s::double precision,
                            'orderbook_long', %s::jsonb,
@@ -3407,11 +3428,16 @@ class LiveTradingManager:
             (
                 float(entry_spread_metric),
                 float(take_profit_pnl),
+                float(entry_spread_pct_actual),
+                float(take_profit_exit_spread_pct),
                 str(long_ex),
                 str(short_ex),
                 float(long_px),
                 float(short_px),
                 float(entry_spread_metric),
+                float(entry_spread_pct_actual),
+                float(take_profit_pnl),
+                float(take_profit_exit_spread_pct),
                 float(long_qty),
                 float(short_qty),
                 _jsonb(ob_long),
@@ -3419,6 +3445,15 @@ class LiveTradingManager:
                 int(signal_id),
             ),
         )
+        # Final guard: if entry spread is smaller than TP target, this trade is unlikely to
+        # ever hit TP (pnl_spread <= entry_spread_metric when spread_now >= 0). Abort to
+        # avoid "成交时刻无价差" openings.
+        if float(entry_spread_metric) < float(take_profit_pnl):
+            raise TradeExecutionError(
+                f"Entry spread too small for TP target: entry_spread_metric={entry_spread_metric:.6f} "
+                f"< tp_pnl={take_profit_pnl:.6f} (pnl_hat_ob={float(pnl_hat_ob):.6f}, "
+                f"long_ex={long_ex}, short_ex={short_ex}, symbol={symbol})"
+            )
 
         legs = [
             {
@@ -4025,6 +4060,76 @@ class LiveTradingManager:
             return
 
         now = _utcnow()
+
+        # If we are already in "closing", do NOT wait for TP/force-close conditions again.
+        # Instead, (1) re-verify whether positions are flat (could be closed manually/out-of-band),
+        # (2) if not flat and cooldown passed, retry close using the current position sizes.
+        if status == "closing":
+            try:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol)
+                    fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol)
+                    pos_l = fut_l.result()
+                    pos_s = fut_s.result()
+
+                if pos_l is not None and pos_s is not None and abs(float(pos_l)) <= 1e-9 and abs(float(pos_s)) <= 1e-9:
+                    self._update_signal_status(conn, signal_id, "closed")
+                    # Funding PnL finalization: ensure history becomes stable for closed trades.
+                    try:
+                        opened_at = signal_row.get("opened_at") or signal_row.get("created_at")
+                        if isinstance(opened_at, datetime):
+                            opened_at = opened_at.astimezone(timezone.utc)
+                        closed_at = _utcnow()
+                        self._finalize_signal_funding(
+                            conn,
+                            int(signal_id),
+                            symbol,
+                            str(long_ex).lower(),
+                            str(short_ex).lower(),
+                            opened_at,
+                            closed_at,
+                        )
+                    except Exception:
+                        pass
+                    return
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="closing_verify",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex},
+                )
+
+            close_requested_at = signal_row.get("close_requested_at")
+            if isinstance(close_requested_at, datetime):
+                close_requested_at = close_requested_at.astimezone(timezone.utc)
+                if (now - close_requested_at).total_seconds() < float(self.config.close_retry_cooldown_seconds):
+                    return
+
+            # Retry close using current position sizes (skip already-flat legs).
+            try:
+                self._close_symbol_positions(
+                    conn,
+                    signal_id=signal_id,
+                    symbol=symbol,
+                    long_ex=str(long_ex),
+                    short_ex=str(short_ex),
+                    close_reason=str(signal_row.get("close_reason") or "retry_close"),
+                    status_before="closing",
+                )
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="closing_retry",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex},
+                )
+            return
+
         opened_at = signal_row.get("opened_at") or signal_row.get("created_at")
         if isinstance(opened_at, datetime):
             opened_at = opened_at.astimezone(timezone.utc)
@@ -4874,6 +4979,7 @@ class LiveTradingManager:
                 close_qty,
                 reduce_only=True,
                 client_order_id=client_order_id,
+                slippage=float(self.config.hyperliquid_close_slippage),
             )
         if ex == "lighter":
             # Lighter positions are signed; close by the requested qty (best-effort).
