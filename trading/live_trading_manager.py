@@ -1292,8 +1292,17 @@ class LiveTradingManager:
                         break
                 time.sleep(0.25)
             if isinstance(detail, dict):
+                ct_val = None
+                try:
+                    ct_val = float(get_okx_swap_contract_value(symbol))
+                except Exception:
+                    ct_val = None
                 info["avg_price"] = _float_or_none(detail.get("avgPx") or detail.get("fillPx"))
-                info["filled_qty"] = _float_or_none(detail.get("accFillSz") or detail.get("fillSz") or detail.get("sz"))
+                filled_contracts = _float_or_none(detail.get("accFillSz") or detail.get("fillSz") or detail.get("sz"))
+                if filled_contracts is not None and ct_val and ct_val > 0:
+                    info["filled_qty"] = float(filled_contracts) * float(ct_val)
+                else:
+                    info["filled_qty"] = filled_contracts
                 info["cum_quote"] = _float_or_none(detail.get("accFillNotional") or detail.get("fillNotional"))
                 status = detail.get("state") or detail.get("status")
                 info["status"] = str(status) if status is not None else None
@@ -4651,17 +4660,65 @@ class LiveTradingManager:
         # Keep client order IDs short enough for venues like Binance (<=36 chars).
         # Use signal_id instead of the (potentially longer) event/symbol base.
         close_base = f"wl{signal_id}C{int(time.time())}"
+        close_specs = [
+            {
+                "leg": "long",
+                "exchange": long_ex,
+                "qty": qty_long,
+                "suffix": "L",
+                "side": "short",
+                "stage": "close_long",
+            },
+            {
+                "leg": "short",
+                "exchange": short_ex,
+                "qty": qty_short,
+                "suffix": "S",
+                "side": "long",
+                "stage": "close_short",
+            },
+        ]
 
-        try:
-            long_order = self._place_close_order(
-                exchange=long_ex,
-                symbol=symbol,
-                position_leg="long",
-                quantity=float(qty_long),
-                client_order_id=f"{close_base}-L",
-            )
-            long_order_param = _jsonb(long_order) if long_order is not None else None
-            long_fill = self._parse_fill_fields(long_ex, symbol, long_order)
+        orders: Dict[str, Optional[Dict[str, Any]]] = {}
+        had_error = False
+        # Submit both close orders in parallel to minimize leg timing drift.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = {}
+            for spec in close_specs:
+                futures[
+                    pool.submit(
+                        self._place_close_order,
+                        exchange=str(spec["exchange"]),
+                        symbol=symbol,
+                        position_leg=str(spec["leg"]),
+                        quantity=float(spec["qty"]),
+                        client_order_id=f"{close_base}-{spec['suffix']}",
+                    )
+                ] = spec
+            for fut, spec in futures.items():
+                try:
+                    orders[str(spec["leg"])] = fut.result()
+                except Exception as exc:
+                    had_error = True
+                    self._record_error(
+                        conn,
+                        signal_id=signal_id,
+                        stage=str(spec["stage"]),
+                        error_type=type(exc).__name__,
+                        message=str(exc),
+                        context={
+                            "symbol": symbol,
+                            "exchange": str(spec["exchange"]),
+                            "quantity": spec["qty"],
+                        },
+                    )
+
+        for spec in close_specs:
+            order = orders.get(str(spec["leg"]))
+            if order is None:
+                continue
+            order_param = _jsonb(order) if order is not None else None
+            fill = self._parse_fill_fields(str(spec["exchange"]), symbol, order)
             conn.execute(
                 """
                 INSERT INTO watchlist.live_trade_order(
@@ -4674,80 +4731,24 @@ class LiveTradingManager:
                 (
                     int(signal_id),
                     "close",
-                    "long",
-                    str(long_ex),
-                    "short",
+                    str(spec["leg"]),
+                    str(spec["exchange"]),
+                    str(spec["side"]),
                     "perp",
                     None,
-                    str(qty_long),
-                    float(long_fill.get("filled_qty")) if long_fill.get("filled_qty") is not None else None,
-                    float(long_fill.get("avg_price")) if long_fill.get("avg_price") is not None else None,
-                    float(long_fill.get("cum_quote")) if long_fill.get("cum_quote") is not None else None,
-                    str(long_fill.get("exchange_order_id")) if long_fill.get("exchange_order_id") is not None else None,
-                    f"{close_base}-L",
+                    str(spec["qty"]),
+                    float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                    float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                    float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                    str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
+                    f"{close_base}-{spec['suffix']}",
                     _utcnow(),
-                    long_order_param,
-                    str(long_fill.get("status") or "submitted"),
+                    order_param,
+                    str(fill.get("status") or "submitted"),
                 ),
             )
-        except Exception as exc:
-            self._record_error(
-                conn,
-                signal_id=signal_id,
-                stage="close_long",
-                error_type=type(exc).__name__,
-                message=str(exc),
-                context={"symbol": symbol, "exchange": long_ex, "quantity": qty_long},
-            )
-            return
 
-        try:
-            short_order = self._place_close_order(
-                exchange=short_ex,
-                symbol=symbol,
-                position_leg="short",
-                quantity=float(qty_short),
-                client_order_id=f"{close_base}-S",
-            )
-            short_order_param = _jsonb(short_order) if short_order is not None else None
-            short_fill = self._parse_fill_fields(short_ex, symbol, short_order)
-            conn.execute(
-                """
-                INSERT INTO watchlist.live_trade_order(
-                    signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                    filled_qty, avg_price, cum_quote, exchange_order_id,
-                    client_order_id, submitted_at, order_resp, status
-                )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
-                """,
-                (
-                    int(signal_id),
-                    "close",
-                    "short",
-                    str(short_ex),
-                    "long",
-                    "perp",
-                    None,
-                    str(qty_short),
-                    float(short_fill.get("filled_qty")) if short_fill.get("filled_qty") is not None else None,
-                    float(short_fill.get("avg_price")) if short_fill.get("avg_price") is not None else None,
-                    float(short_fill.get("cum_quote")) if short_fill.get("cum_quote") is not None else None,
-                    str(short_fill.get("exchange_order_id")) if short_fill.get("exchange_order_id") is not None else None,
-                    f"{close_base}-S",
-                    _utcnow(),
-                    short_order_param,
-                    str(short_fill.get("status") or "submitted"),
-                ),
-            )
-        except Exception as exc:
-            self._record_error(
-                conn,
-                signal_id=signal_id,
-                stage="close_short",
-                error_type=type(exc).__name__,
-                message=str(exc),
-                context={"symbol": symbol, "exchange": short_ex, "quantity": qty_short},
-            )
+        if had_error:
             return
 
         # Post-close verify: ensure both legs are flat (Hyperliquid is netted/one-way so we must query actual szi).
