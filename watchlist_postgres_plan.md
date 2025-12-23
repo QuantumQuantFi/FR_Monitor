@@ -412,6 +412,164 @@ Phase 3（策略与质量）：
 - 阶段 5：监控/清理  
   监控写入失败率、分区大小；每日分区滚动已由 cron 处理。磁盘占用极低，但仍保留自动清理。
 
+### 阶段 4.1：第二版回测（反转信号/多时间框趋势/4H 历史/资金费变化/趋势指标）
+目标：在不引入未来信息泄露的前提下，把“watchlist 的价差均值回归信号”升级为“价差 + 趋势 + 资金费 +（可选）趋势指标”的统一回测框架，用来决定哪些因子/阈值值得进入下一版模型与实盘准入。
+
+#### 4.1.1 复用我们第一版回测（当前已有）
+我们已有 v1 回测链路（见 `reports/first_backtest_ic_ir_*.md`，脚本 `backtest/first_backtest_report.py`）口径是：
+- 决策时点：`watch_signal_event.start_ts`
+- 因子快照：`watch_signal_raw.ts = event.start_ts`（避免未来信息泄露；不要直接用“最终版 features_agg”）
+- 标签：`future_outcome.{pnl|spread_change|funding_change}`（默认 pnl）
+- 评估：按桶（`bucket-min`）做横截面 Spearman IC/IR + 分位收益
+
+第二版回测将保留上述三段式对齐（decision_ts/factor_ts/label_ts），只扩展“因子来源与类型”与“分层/稳健性评估”。
+
+#### 4.1.2 第二版因子设计（建议最小增量集合）
+优先围绕 **价差序列**（canonical 的 `spread_metric = log(short/long)`）计算；腿级趋势作为补充；指标从简到繁逐步验证增量。
+
+**时间粒度（与实盘对齐）**
+- 主粒度：**1min bar**（因为实盘与 watchlist 都是 1min 一算，回测必须能复现同样的节奏与噪声水平）。
+- 参照粒度：5min bar（用于验证“降噪后仍有效”的稳健性；同时更适合 MACD/RSI 等传统指标）。
+- 对齐方法：所有因子均以 `decision_ts` 为 anchor，只取 `<= decision_ts` 的历史点（asof）；严禁使用 `decision_ts` 之后的点。
+
+**A) 反转/拐点类（推荐优先做）**
+- `spread_reversal_5m/15m/30m`：窗口末端斜率/动量发生符号翻转的标志（捕捉“收敛→再扩张 / 扩张→再收敛”）。
+- `spread_mean_reversion_speed`：均值回归速度（可先用 AR(1) 半衰期近似或 rolling autocorr 近似）。
+- `spread_exhaustion`：短期收益极值后回撤比例（区分“可持续收敛” vs “一次性跳变”）。
+
+**B) 多时间框趋势/动量（5m/15m/30m + 4H）**
+- `spread_ret_{5,15,30,240}m`、`spread_slope_{5,15,30,240}m`：窗口收益/斜率（点数不足则降级/置空，并记录质量标识）。
+- `spread_vol_{15,30,240}m`、`spread_vol_ratio_short_over_long`：短长波动结构（判断“更像趋势延续还是均值回归”）。
+- `trend_alignment_legs`：两腿各自趋势方向是否一致（一致时往往是系统性行情驱动，对均值回归策略可能更不利，需要回测验证）。
+
+**C) 资金费率变化/净成本（与你的 TypeB 新准入对齐）**
+从“限制 funding 绝对值”升级为“限制按方向产生的 carry 净成本”：
+- `funding_edge_short_minus_long`（已有/可复用）：按 canonical long/short 方向计算资金费边际。
+- `funding_edge_change_{1,3,6}h`：资金费边际的变化与加速度（用最近 N 个结算点或分钟序列近似）。
+- `time_to_next_funding_min`、`funding_interval_h`（已有）：结合 edge 评估“临近结算点的跳变/滑点风险”。
+- `carry_net_cost_horizon`：按“计划持有 horizon（例如 240m/1d）”估算资金费净成本；允许为负（盈利），只约束净成本上限。
+
+**D) 趋势交易常用指标（可选，建议先只做 spread 版本）**
+- `spread_macd`（默认 12/26/9，建议基于 5m bar 更稳）、`spread_rsi_14`、`spread_boll_pct_b`、`spread_adx_14`。
+原则：只要在 IC/IR、分位收益或策略级回测中没有带来可验证的增量，就不进入实盘准入逻辑（避免复杂度膨胀）。
+
+#### 4.1.3 4H 历史与缺失容错（必须写死口径）
+长窗口指标会被“缺失/稀疏/延迟更新”显著污染，第二版回测需要把缺失处理规则固化并可审计：
+- 对齐：以 `decision_ts` 为 anchor，取 `<=decision_ts` 最近点做 asof join：
+  - 1min bar：`tol` 建议 90s（允许少量采集抖动，但避免过旧点污染）
+  - 5min bar：`tol` 建议 180s
+- 有限前向填充：仅允许有限长度的 forward-fill（例如最多 2 个 bar），并输出 `quality_flag`：`ok/sparse/stale`。
+- 回测输出需要分层：至少同时给出 “仅 quality=ok” 与 “包含 sparse” 的结果，避免把数据问题当成模型能力。
+
+#### 4.1.4 第二版回测的固定输出（你最终会拿它做决策）
+在 v1 的 IC/IR 基础上，第二版建议固定输出三类结果：
+1) **增量信息**：加入新因子后，IC/IR、分位收益、覆盖率、缺失率如何变化（按 horizon 报告）。
+2) **环境分层**：按“反转/趋势/资金费 regime/流动性”分层，输出同阈值的胜率/回撤差异（用于制定准入与风控）。
+3) **（可选）策略级回测**：事件驱动模拟 entry/exit（tp/stop/time），费用/资金费/滑点参数化，用来验证“预测→可交易收益”的映射。
+
+#### 4.1.5 建议的落地顺序（先规划，后写代码）
+- M1：先把 `spread_ret/slope(5/15/30/240)` + `spread_reversal_15m` + `carry_net_cost_horizon` 加进回测（只做 IC/IR）。
+- M2：补齐 4H 缺失容错与质量标识；把“质量分层结果”写进报告模板。
+- M3：引入 MACD/RSI 等（仅 spread 版本），做增量对比；无增益就移除。
+- M4（可选）：做事件驱动策略回测（与 live trading 口径尽量一致：价差用 log，资金费按结算点累加，手续费/滑点参数化）。
+
+#### 4.1.6 第二版回测：可执行任务清单（以 240m 为主，60/480/1440 对照）
+**T0：确认数据映射（1 次性）**
+- 从 PG `watchlist.watch_signal_event` 获取事件与腿信息（用于 canonical long/short 的“腿定义”）：
+  - 事件主键：`id`，决策时点：`start_ts`（timestamptz，UTC）
+  - 腿字段：`leg_a_exchange/leg_a_symbol/leg_a_kind`、`leg_b_exchange/leg_b_symbol/leg_b_kind`
+  - 腿快照（仅作参考/审计，不作为序列源）：`leg_*_price_first/last`、`leg_*_funding_rate_first/last`、`leg_*_next_funding_time/interval_hours`
+- 从 PG `watchlist.watch_signal_raw` 获取“当分钟快照因子”（用于与 v1 因子兼容，且避免未来信息泄露）：
+  - join 条件：`watch_signal_raw.ts = watch_signal_event.start_ts` 且 `exchange/symbol/signal_type` 相同（LATERAL + `ORDER BY id DESC LIMIT 1`）
+  - raw 内已有：`spread_rel/funding_rate/range_1h/range_12h/volatility/slope_3m/crossings_1h/drift_ratio/...` 以及盘口/流动性代理（`bid_ask_spread/depth_imbalance/...`）
+- 从 SQLite `market_data.db` 获取两条腿的 1min 时间序列（用于 v2 的“价差序列因子/传统指标/资金费变化”）：
+  - 表：`price_data_1min`
+  - 核心列：
+    - 时间：`timestamp`（文本 DATETIME，形如 `YYYY-MM-DD HH:MM:SS`；当前观测为 **UTC**）
+    - 键：`exchange`、`symbol`（与 PG event 的 `leg_*_exchange/leg_*_symbol` 字符串一致）
+    - 价格：`futures_price_close`（perp）、`spot_price_close`（spot）
+    - 资金费：`funding_rate_avg`（分钟均值；你当前口径是“每分钟记录”可直接使用）
+    - 资金费 schedule：`funding_interval_hours`、`next_funding_time`（文本，通常是 ISO8601）
+    - 数据质量：`data_points`（该分钟聚合使用的原始点数；可用于 quality_flag）
+  - 兜底表：`price_data`（更高频/最新点，列为 `futures_price`、`funding_rate`，但时间戳粒度与更新节奏可能更抖；v2 以 1min 表为主）
+- 序列口径（Type B perp-perp 为主）：
+  - `P_long(t)`：`leg_long.kind='perp'` → `futures_price_close`（若未来加入 spot-leg，则用 `spot_price_close`）
+  - `P_short(t)`：同上
+  - canonical `spread_metric(t) = ln(P_short(t) / P_long(t))`
+  - `funding_edge(t) = funding_short(t) - funding_long(t)`，其中 `funding_*` 取 `funding_rate_avg`
+- 缺失/异常值处理（必须写死，避免 silent failure）：
+  - 价格：`NULL` 或 `<=0` 一律视为缺失（SQLite 表存在 `DEFAULT 0.0` 的历史遗留）
+  - funding：`NULL` 视为缺失；若为 0 需结合 `data_points` 判断（data_points=0 时视为缺失）
+  - asof 对齐：以 `decision_ts` 为 anchor，取 `<=t` 最近点；1min 使用 `tol=90s`，超出 tol 视为 stale
+  - forward-fill：最多 2 根 bar；超过则该因子置空，并把 `quality_flag=stale`
+- 性能约束（避免扫 43GB 全表）：
+  - SQLite 查询必须带时间范围：`WHERE timestamp BETWEEN (start_ts - lookback) AND start_ts`
+  - 由于 `price_data_1min` 有 `UNIQUE(timestamp, symbol, exchange)`，按 timestamp 范围过滤能命中索引路径；严禁对全表做 group-by 统计
+- 产出一个“事件→序列”抽取器（v2 回测的数据基线）：
+  - 输入：`event_id, lookback_minutes, bar='1m'|'5m'`
+  - 输出：对齐后的 `spread_metric(t)`、`funding_edge(t)`、以及 `quality`（missing_rate、stale_count、data_points 分布）
+  - 同时输出可审计 meta：使用了哪个价格列（perp= `futures_price_close`）、最终有效点数、最大时间戳偏差
+
+**统一口径（公式前置定义）**
+- spread 序列定义（canonical，避免方向混乱）：
+  - `spread(t) = ln(P_short(t) / P_long(t))`
+  - `P_short/P_long` 来自 event 中 **选定方向** 的两条腿（perp 用 `futures_price_close`）
+  - 5min 版本：`P_5m` 取 5m 窗口最后一个有效价格；`funding_edge_5m` 取窗口内均值（更稳健）
+- funding edge 定义（净成本模式）：
+  - `edge(t) = fr_short(t) - fr_long(t)`（允许盈利为正，亏损为负）
+  - 若 funding interval 缺失：用交易所默认值，并记录 `quality_flag=assumed_interval`
+- spread 的 “收益/变化” 统一用差分：
+  - `spread_ret_Δm = spread(t0) - spread(t0-Δ)`
+  - `spread_diff(t) = spread(t) - spread(t-1m)`
+
+**T1：实现 Core 因子（先 30~45 个）**
+- 价差反转/趋势（全部基于 1min spread 序列；必要时并行计算 5min 版本做稳健性对照）：
+  - `spread_ret_{1,5,15,30,60,240}m`：`spread(t0)-spread(t0-Δ)`
+  - `spread_slope_{5,15,30,60,240}m`：OLS 斜率（x 为分钟索引 0..N-1，y=spread；输出“每分钟斜率”）
+  - `spread_reversal_15m`：`sign(slope_5m) != sign(slope_30m)` 或 `spread_ret_5m * spread_ret_30m < 0`
+  - `spread_crossings_{60,240}m`：`sign(spread - mean(spread))` 的符号翻转次数
+  - `spread_vol_{15,30,60,240}m`：`std(spread_diff)`（用 1m 差分）
+  - `spread_vol_ratio_30_over_240`：`spread_vol_30m / spread_vol_240m`（分母为 0 或缺失则置空）
+  - `spread_drawdown_240m`：对 `cum_ret(t)=spread(t)-spread(t0-240m)` 做 `max_peak_to_trough` 回撤
+  - `spread_skew_240m/spread_kurt_240m`：对 `spread_diff` 的偏度/峰度（样本不足置空）
+- 传统指标（先少量，避免过拟合；全部基于 spread 序列）：
+  - `spread_rsi_14`：对 `spread_diff` 计算 RSI（14 period），1min 主、5min 对照
+  - `spread_macd_hist`：`EMA12(spread) - EMA26(spread) - EMA9(MACD)`；优先 5min 版本
+  - `spread_boll_pct_b`：`(spread - (ma20-2σ)) / (4σ)`，超界可 >1 或 <0
+- 资金费“净成本模式”（基于 1min funding_rate 序列）：
+  - `funding_edge_short_minus_long(t)`：`edge(t)=fr_short(t)-fr_long(t)`
+  - `funding_edge_change_{60,180,360}m`：`edge(t0)-edge(t0-Δ)`
+  - `carry_net_cost_horizon_240m`：`edge(t0) * (240 / funding_interval_min)`（无 interval 时用默认并标记）
+  - `funding_edge_vol_240m`：`std(edge)`（资金费稳定性）
+
+**T2：扩展 Plus 因子（“银子越多越好”但要可控）**
+- 多时间框动量：补齐 `spread_ret/slope` 在 90/120/180/360/720/1440m 的版本。
+- 更多反转/形态：
+  - `exhaustion`：`abs(slope_5m) < abs(slope_30m)` 且 `spread_ret_5m` 与 `spread_ret_30m` 反向
+  - `turning_point_score`：`-diff2(spread)` 在窗口内的 zscore（拐点强度）
+  - `zscore_{1h,4h,12h}`：`(spread(t0)-mean)/std`
+  - `hurst_proxy`：`log(std(spread_diff_2m)/std(spread_diff_1m)) / log(2)`（轻量 proxy）
+- 更多资金费结构：
+  - `funding_regime_quantile`：`edge(t0)` 在过去 30d/60d 分位（Q1..Q5）
+  - `funding_edge_regime`：按 `edge` 的均值±1σ 切分（low/mid/high）或突变（`abs(edge_change_1h) > k*std`）
+  - `time_to_next_funding_min`：`min(next_funding_time - decision_ts)`（仅 perp leg 可得）
+
+**T3：回测评估与报告模板升级**
+- horizon：主 240m；对照 60/480/1440m。
+- 输出至少包含：
+  - 每因子：覆盖率/缺失率、IC/IR、分位收益（Q5-Q1）
+  - 分层：`quality_flag` 分层（ok vs sparse）+ 按“资金费 regime/波动 regime”分层
+  - 稳健性：1min vs 5min 版本对照（同一因子两套粒度对比）
+
+**T4（可选）：策略级事件回测**
+- 用事件驱动模拟（entry@decision_ts，exit@tp/stop/time），手续费/滑点/资金费均参数化；用于回答“IC 好不等于可交易收益”的落地问题。
+
+#### 4.1.7 第二版因子落库策略（先回测，后落库）
+- v2 阶段优先“回测脚本内计算”，避免 PG 表膨胀。
+- 当确认某些因子对 240m 的增量稳定后，再选择：
+  - **开列落库**：少量核心因子（例如 `spread_ret_15m/spread_slope_30m/funding_edge/carry_net_cost_horizon`）
+  - **meta jsonb 落库**：大量实验性指标（MACD/RSI/Bollinger 各参数版本），并在 `features_agg` 聚合压缩（首/末/均/极值）。
+
 ## 性能与效率建议（结合现有页面与因子需求）
 - 写入侧：仅入库“原始信号/归并事件/精简序列”，不存全量逐笔；高频特征以窗口统计（均值/σ/极值）压缩；批量 INSERT 或 `COPY`，减少索引。  
 - 存储侧：分区 + 短保留优先，压缩次之；核心数值列拆开，长尾字段放 JSONB。  
