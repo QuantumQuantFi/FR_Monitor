@@ -20,6 +20,7 @@ import math
 
 from orderbook_utils import fetch_orderbook_prices
 from watchlist_pnl_regression_model import predict_bc
+from watchlist_series_factors import SeriesCache, compute_event_series_factors
 
 
 def _utcnow() -> datetime:
@@ -59,6 +60,7 @@ class PgWriter:
         # funding history cache: key=(exchange,symbol,day_bucket)
         self._funding_cache: Dict[Tuple[str, str, int], List[Tuple[datetime, float]]] = {}
         self._funding_calls = 0
+        self._series_cache: Optional[SeriesCache] = None
         # Optional hook: called after watch_signal_event rows are inserted.
         # Signature: callback(event_ids: List[int]) -> None
         self.on_event_written: Optional[Callable[[List[int]], None]] = None
@@ -574,6 +576,11 @@ class PgWriter:
                             ins = self._maybe_add_orderbook_validation(dict(ins))
                         except Exception as exc:  # pragma: no cover - best-effort enrichment
                             self.logger.debug("orderbook validation skipped/failed: %s", exc)
+                        # Best-effort: compute series-based factors for the new event.
+                        try:
+                            ins = self._maybe_add_series_factors(dict(ins))
+                        except Exception as exc:  # pragma: no cover - best-effort enrichment
+                            self.logger.debug("series factor enrichment skipped/failed: %s", exc)
 
                         # Persist enrichment into in-memory event state so subsequent UPDATE payloads
                         # keep these fields (otherwise later updates overwrite features_agg.meta_last).
@@ -587,6 +594,10 @@ class PgWriter:
                                     enrich["orderbook_validation"] = meta_last.get("orderbook_validation")
                                 if meta_last.get("pnl_regression_ob") is not None:
                                     enrich["pnl_regression_ob"] = meta_last.get("pnl_regression_ob")
+                                if meta_last.get("factors_v2") is not None:
+                                    enrich["factors_v2"] = meta_last.get("factors_v2")
+                                if meta_last.get("factors_v2_meta") is not None:
+                                    enrich["factors_v2_meta"] = meta_last.get("factors_v2_meta")
                             if enrich and key in self._event_state:
                                 st = self._event_state.get(key) or {}
                                 agg = st.get("agg")
@@ -1039,6 +1050,179 @@ class PgWriter:
                     meta_last2 = features_agg2.get("meta_last")
                     if isinstance(meta_last2, dict) and meta_last2.get("orderbook_validation") is None:
                         meta_last2["orderbook_validation"] = {
+                            "ok": False,
+                            "reason": "exception",
+                            "ts": _utcnow().isoformat(),
+                            "exception": f"{type(exc).__name__}: {exc}",
+                        }
+                        features_agg2["meta_last"] = meta_last2
+                        ins["features_agg"] = features_agg2
+            except Exception:
+                pass
+            return ins
+        return ins
+
+    def _maybe_add_series_factors(self, ins: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        在首次插入 event 时，根据两腿的 1min K 线构造 spread/funding 序列并计算 T1 因子。
+        因子写入 features_agg.meta_last.factors_v2 / factors_v2_meta，供回测与后续模型使用。
+        """
+        try:
+            stype = str(ins.get("signal_type") or "").strip().upper()
+            if stype not in ("B", "C"):
+                return ins
+            features_agg = ins.get("features_agg")
+            if not isinstance(features_agg, dict):
+                return ins
+            meta_last = features_agg.get("meta_last")
+            if not isinstance(meta_last, dict):
+                return ins
+            if isinstance(meta_last.get("factors_v2"), dict):
+                return ins
+
+            def _dt(val: Any) -> Optional[datetime]:
+                if isinstance(val, datetime):
+                    return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+                if isinstance(val, str):
+                    try:
+                        ts = datetime.fromisoformat(val)
+                        return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                    except Exception:
+                        return None
+                return None
+
+            event_ts = _dt(ins.get("start_ts")) or _dt(ins.get("end_ts")) or _utcnow()
+
+            leg_a = {
+                "exchange": ins.get("leg_a_exchange"),
+                "symbol": ins.get("leg_a_symbol"),
+                "kind": ins.get("leg_a_kind") or "perp",
+                "price": ins.get("leg_a_price_first") or ins.get("leg_a_price_last"),
+                "funding_interval_hours": ins.get("leg_a_funding_interval_hours"),
+                "next_funding_time": ins.get("leg_a_next_funding_time"),
+            }
+            leg_b = {
+                "exchange": ins.get("leg_b_exchange"),
+                "symbol": ins.get("leg_b_symbol"),
+                "kind": ins.get("leg_b_kind") or "perp",
+                "price": ins.get("leg_b_price_first") or ins.get("leg_b_price_last"),
+                "funding_interval_hours": ins.get("leg_b_funding_interval_hours"),
+                "next_funding_time": ins.get("leg_b_next_funding_time"),
+            }
+            if not (leg_a.get("exchange") and leg_a.get("symbol") and leg_b.get("exchange") and leg_b.get("symbol")):
+                meta_last["factors_v2_meta"] = {
+                    "ok": False,
+                    "reason": "missing_leg_identity",
+                    "ts": _utcnow().isoformat(),
+                }
+                features_agg["meta_last"] = meta_last
+                ins["features_agg"] = features_agg
+                return ins
+
+            price_a = leg_a.get("price")
+            price_b = leg_b.get("price")
+            if price_a is None or price_b is None:
+                trigger = meta_last.get("trigger_details") or {}
+                if isinstance(trigger, dict):
+                    prices = trigger.get("prices") or {}
+                    if isinstance(prices, dict):
+                        try:
+                            price_a = price_a if price_a is not None else prices.get(leg_a.get("exchange"))
+                            price_b = price_b if price_b is not None else prices.get(leg_b.get("exchange"))
+                        except Exception:
+                            pass
+
+            if price_a is None or price_b is None:
+                meta_last["factors_v2_meta"] = {
+                    "ok": False,
+                    "reason": "missing_leg_price",
+                    "ts": _utcnow().isoformat(),
+                }
+                features_agg["meta_last"] = meta_last
+                ins["features_agg"] = features_agg
+                return ins
+
+            try:
+                price_a_f = float(price_a)
+                price_b_f = float(price_b)
+            except Exception:
+                meta_last["factors_v2_meta"] = {
+                    "ok": False,
+                    "reason": "invalid_leg_price",
+                    "ts": _utcnow().isoformat(),
+                }
+                features_agg["meta_last"] = meta_last
+                ins["features_agg"] = features_agg
+                return ins
+
+            if price_a_f == price_b_f:
+                meta_last["factors_v2_meta"] = {
+                    "ok": False,
+                    "reason": "equal_leg_price",
+                    "ts": _utcnow().isoformat(),
+                }
+                features_agg["meta_last"] = meta_last
+                ins["features_agg"] = features_agg
+                return ins
+
+            if price_a_f > price_b_f:
+                short_leg, long_leg = leg_a, leg_b
+            else:
+                short_leg, long_leg = leg_b, leg_a
+
+            try:
+                import config as _cfg  # local import
+
+                sqlite_path = _cfg.WATCHLIST_CONFIG.get("db_path", "market_data.db")
+                metrics_cfg = _cfg.WATCHLIST_METRICS_CONFIG if hasattr(_cfg, "WATCHLIST_METRICS_CONFIG") else {}
+                lookback_min = int(metrics_cfg.get("series_lookback_min", 240))
+                tol_sec = int(metrics_cfg.get("series_asof_tol_sec", 90))
+                ffill_bars = int(metrics_cfg.get("series_forward_fill_bars", 2))
+                min_valid_ratio = float(metrics_cfg.get("series_min_valid_ratio", 0.8))
+                max_backfill_bars = int(metrics_cfg.get("series_max_backfill_bars", ffill_bars))
+                cache_entries = int(metrics_cfg.get("series_cache_entries", 64))
+            except Exception:
+                sqlite_path = "market_data.db"
+                lookback_min = 240
+                tol_sec = 90
+                ffill_bars = 2
+                min_valid_ratio = 0.8
+                max_backfill_bars = ffill_bars
+                cache_entries = 0
+
+            if cache_entries > 0:
+                if self._series_cache is None or self._series_cache.max_entries != cache_entries:
+                    self._series_cache = SeriesCache(max_entries=cache_entries)
+            else:
+                self._series_cache = None
+
+            factors, meta = compute_event_series_factors(
+                sqlite_path,
+                event_ts,
+                short_leg,
+                long_leg,
+                lookback_min=lookback_min,
+                tol_sec=tol_sec,
+                ffill_bars=ffill_bars,
+                min_valid_ratio=min_valid_ratio,
+                max_backfill_bars=max_backfill_bars,
+                series_cache=self._series_cache,
+            )
+            meta_last["factors_v2"] = factors
+            meta_last["factors_v2_meta"] = {
+                "ok": True,
+                "ts": _utcnow().isoformat(),
+                **(meta or {}),
+            }
+            features_agg["meta_last"] = meta_last
+            ins["features_agg"] = features_agg
+        except Exception as exc:
+            try:
+                features_agg2 = ins.get("features_agg")
+                if isinstance(features_agg2, dict):
+                    meta_last2 = features_agg2.get("meta_last")
+                    if isinstance(meta_last2, dict):
+                        meta_last2["factors_v2_meta"] = {
                             "ok": False,
                             "reason": "exception",
                             "ts": _utcnow().isoformat(),
