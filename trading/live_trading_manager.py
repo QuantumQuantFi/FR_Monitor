@@ -744,7 +744,11 @@ class LiveTradingManager:
           payload jsonb,
           client_order_id_base text,
           opened_at timestamptz,
+          open_long_at timestamptz,
+          open_short_at timestamptz,
           closed_at timestamptz,
+          close_long_at timestamptz,
+          close_short_at timestamptz,
           close_reason text,
           entry_spread_metric double precision,
           entry_spread_pct_actual double precision,
@@ -756,7 +760,12 @@ class LiveTradingManager:
           last_spread_metric double precision,
           last_exit_spread_pct double precision,
           last_pnl_spread double precision,
-          close_pnl_spread double precision
+          close_pnl_spread double precision,
+          open_long_funding_rate double precision,
+          open_short_funding_rate double precision,
+          last_long_funding_rate double precision,
+          last_short_funding_rate double precision,
+          last_funding_rate_at timestamptz
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_live_trade_signal_event
           ON watchlist.live_trade_signal(event_id);
@@ -881,6 +890,24 @@ class LiveTradingManager:
           ADD COLUMN IF NOT EXISTS last_pnl_spread double precision;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS close_pnl_spread double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS open_long_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS open_short_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS close_long_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS close_short_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS open_long_funding_rate double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS open_short_funding_rate double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS last_long_funding_rate double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS last_short_funding_rate double precision;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS last_funding_rate_at timestamptz;
 
         -- Funding PnL persistence (signals table stores latest snapshot; closed signals are finalized).
         ALTER TABLE watchlist.live_trade_signal
@@ -3546,6 +3573,21 @@ class LiveTradingManager:
                 f"long_ex={long_ex}, short_ex={short_ex}, symbol={symbol})"
             )
 
+        open_funding_long = None
+        open_funding_short = None
+        try:
+            info = self._get_public_funding_mark(str(long_ex), symbol)
+            if info.get("funding_rate") is not None:
+                open_funding_long = float(info.get("funding_rate"))
+        except Exception:
+            open_funding_long = None
+        try:
+            info = self._get_public_funding_mark(str(short_ex), symbol)
+            if info.get("funding_rate") is not None:
+                open_funding_short = float(info.get("funding_rate"))
+        except Exception:
+            open_funding_short = None
+
         legs = [
             {
                 "exchange": long_ex,
@@ -3565,6 +3607,7 @@ class LiveTradingManager:
         fill_by_side: Dict[str, Dict[str, Any]] = {}
         try:
             for leg in legs:
+                leg_opened_at = _utcnow()
                 order = execute_perp_market_order(
                     str(leg["exchange"]),
                     symbol,
@@ -3606,11 +3649,33 @@ class LiveTradingManager:
                         float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
                         str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                         str((leg.get("order_kwargs") or {}).get("client_order_id") or ""),
-                        _utcnow(),
+                        leg_opened_at,
                         order_resp_param,
                         str(fill.get("status") or "submitted"),
                     ),
                 )
+                if str(leg["side"]) == "long":
+                    conn.execute(
+                        """
+                        UPDATE watchlist.live_trade_signal
+                           SET open_long_at=COALESCE(open_long_at, %s),
+                               open_long_funding_rate=COALESCE(open_long_funding_rate, %s),
+                               updated_at=now()
+                         WHERE id=%s;
+                        """,
+                        (leg_opened_at, open_funding_long, int(signal_id)),
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE watchlist.live_trade_signal
+                           SET open_short_at=COALESCE(open_short_at, %s),
+                               open_short_funding_rate=COALESCE(open_short_funding_rate, %s),
+                               updated_at=now()
+                         WHERE id=%s;
+                        """,
+                        (leg_opened_at, open_funding_short, int(signal_id)),
+                    )
                 ex_l = str(leg["exchange"]).lower()
                 if ex_l == "hyperliquid":
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
@@ -4151,6 +4216,38 @@ class LiveTradingManager:
             return
 
         now = _utcnow()
+        fr_long = None
+        fr_short = None
+        try:
+            info = self._get_public_funding_mark(str(long_ex), symbol)
+            if info.get("funding_rate") is not None:
+                fr_long = float(info.get("funding_rate"))
+        except Exception:
+            fr_long = None
+        try:
+            info = self._get_public_funding_mark(str(short_ex), symbol)
+            if info.get("funding_rate") is not None:
+                fr_short = float(info.get("funding_rate"))
+        except Exception:
+            fr_short = None
+        if fr_long is not None or fr_short is not None:
+            conn.execute(
+                """
+                UPDATE watchlist.live_trade_signal
+                   SET last_long_funding_rate=CASE WHEN %s IS NULL THEN last_long_funding_rate ELSE %s END,
+                       last_short_funding_rate=CASE WHEN %s IS NULL THEN last_short_funding_rate ELSE %s END,
+                       last_funding_rate_at=now(),
+                       updated_at=now()
+                 WHERE id=%s;
+                """,
+                (
+                    fr_long,
+                    fr_long,
+                    fr_short,
+                    fr_short,
+                    int(signal_id),
+                ),
+            )
 
         # If we are already in "closing", do NOT wait for TP/force-close conditions again.
         # Instead, (1) re-verify whether positions are flat (could be closed manually/out-of-band),
@@ -4799,6 +4896,7 @@ class LiveTradingManager:
             order = orders.get(str(spec["leg"]))
             if order is None:
                 continue
+            close_leg_at = _utcnow()
             order_param = _jsonb(order) if order is not None else None
             fill = self._parse_fill_fields(str(spec["exchange"]), symbol, order)
             conn.execute(
@@ -4824,11 +4922,31 @@ class LiveTradingManager:
                     float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
                     str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                     f"{close_base}-{spec['suffix']}",
-                    _utcnow(),
+                    close_leg_at,
                     order_param,
                     str(fill.get("status") or "submitted"),
                 ),
             )
+            if str(spec["leg"]) == "long":
+                conn.execute(
+                    """
+                    UPDATE watchlist.live_trade_signal
+                       SET close_long_at=%s,
+                           updated_at=now()
+                     WHERE id=%s;
+                    """,
+                    (close_leg_at, int(signal_id)),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE watchlist.live_trade_signal
+                       SET close_short_at=%s,
+                           updated_at=now()
+                     WHERE id=%s;
+                    """,
+                    (close_leg_at, int(signal_id)),
+                )
 
         if had_error:
             return

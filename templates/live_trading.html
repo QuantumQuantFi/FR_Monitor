@@ -140,6 +140,21 @@
               <th style="width: 140px;">
                 <span class="hint" title="FundingPnL(USDT)：从 opened_at 起，按交易所账户“已收/已付”资金费明细累加（两条腿叠加，best-effort；不同交易所回执字段不同，可能为空/延迟）。每小时整点后的首次刷新会更新一次（其余时间使用缓存）。">FundingPnL</span>
               </th>
+              <th style="width: 120px;">
+                <span class="hint" title="开仓时 Long 腿资金费率（小数；例如 0.0001=0.01%）。来自公开 funding rate 快照。">开仓费率L</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="开仓时 Short 腿资金费率（小数；例如 0.0001=0.01%）。来自公开 funding rate 快照。">开仓费率S</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="最近一次刷新到的 Long 腿资金费率（小数；例如 0.0001=0.01%）。">实时费率L</span>
+              </th>
+              <th style="width: 120px;">
+                <span class="hint" title="最近一次刷新到的 Short 腿资金费率（小数；例如 0.0001=0.01%）。">实时费率S</span>
+              </th>
+              <th style="width: 160px;">
+                <span class="hint" title="资金费率最近刷新时间（UTC 转北京时间显示）。">费率更新时间</span>
+              </th>
               <th style="width: 90px;">Status</th>
               <th style="width: 110px;">
                 <span class="hint" title="pnl_hat_ob：下单前用两家交易所订单簿“扫单成交价”（按每腿名义金额）重新计算关键因子，并在 horizon=240min 上回归预测得到的预计收益（小数，如 0.012=1.2%）。">pnl_hat_ob</span>
@@ -155,7 +170,11 @@
               </th>
               <th style="width: 170px;">created_at</th>
               <th style="width: 170px;">opened_at</th>
-              <th style="width: 170px;">close_req_at</th>
+              <th style="width: 170px;">open_long_at</th>
+              <th style="width: 170px;">open_short_at</th>
+              <th style="width: 170px;">close_decision_at</th>
+              <th style="width: 170px;">close_long_at</th>
+              <th style="width: 170px;">close_short_at</th>
               <th style="width: 170px;">closed_at</th>
               <th style="width: 170px;">force_close_at</th>
               <th style="width: 140px;">close_reason</th>
@@ -164,7 +183,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="26" class="muted">loading...</td></tr>
+            <tr><td colspan="35" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -408,7 +427,7 @@
       const body = document.getElementById('signalsBody');
       const signals = signalsResp.signals || [];
       if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="26" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="35" class="muted">暂无数据</td></tr>';
         return;
       }
 
@@ -426,6 +445,12 @@
         const src = s.funding_source || {};
         const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate');
         const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
+        const openFundLong = fmtPct(s.open_long_funding_rate, 6);
+        const openFundShort = fmtPct(s.open_short_funding_rate, 6);
+        const liveFundLong = fmtPct(s.last_long_funding_rate, 6);
+        const liveFundShort = fmtPct(s.last_short_funding_rate, 6);
+        const fundRateAtUtc = s.last_funding_rate_at || '-';
+        const fundRateAt = fmtTsBJ(fundRateAtUtc);
         const schedL = s.funding_schedule_long || {};
         const schedS = s.funding_schedule_short || {};
         const fundingTitle = [
@@ -435,20 +460,28 @@
           `short(${s.leg_short_exchange || '-'}) pnl=${s.funding_short_pnl_usdt ?? '-'} last_fee=${s.funding_short_last_fee_usdt ?? '-'} last_time=${s.funding_short_last_fee_time ?? '-'} rate=${schedS.funding_rate ?? '-'} interval_h=${schedS.funding_interval_hours ?? '-'} next=${schedS.next_funding_time ?? '-'}`,
           s.funding_error ? `error=${JSON.stringify(s.funding_error)}` : '',
 	        ].filter(Boolean).join('\n');
-	        const canForceClose = true;
-	        const createdAtUtc = s.created_at || '-';
-	        const openAtUtc = s.opened_at || '-';
-	        const closeReqAtUtc = s.close_requested_at || '-';
-	        const closedAtUtc = s.closed_at || '-';
-	        const forceAtUtc = s.force_close_at || '-';
-	        const createdAt = fmtTsBJ(createdAtUtc);
-	        const openAt = fmtTsBJ(openAtUtc);
-	        const closeReqAt = fmtTsBJ(closeReqAtUtc);
-	        const closedAt = fmtTsBJ(closedAtUtc);
-	        const forceAt = fmtTsBJ(forceAtUtc);
-	        const closeReason = s.close_reason || '-';
-	        const reason = s.reason || '-';
-	        return `
+        const canForceClose = true;
+        const createdAtUtc = s.created_at || '-';
+        const openAtUtc = s.opened_at || '-';
+        const openLongAtUtc = s.open_long_at || '-';
+        const openShortAtUtc = s.open_short_at || '-';
+        const closeReqAtUtc = s.close_requested_at || '-';
+        const closeLongAtUtc = s.close_long_at || '-';
+        const closeShortAtUtc = s.close_short_at || '-';
+        const closedAtUtc = s.closed_at || '-';
+        const forceAtUtc = s.force_close_at || '-';
+        const createdAt = fmtTsBJ(createdAtUtc);
+        const openAt = fmtTsBJ(openAtUtc);
+        const openLongAt = fmtTsBJ(openLongAtUtc);
+        const openShortAt = fmtTsBJ(openShortAtUtc);
+        const closeReqAt = fmtTsBJ(closeReqAtUtc);
+        const closeLongAt = fmtTsBJ(closeLongAtUtc);
+        const closeShortAt = fmtTsBJ(closeShortAtUtc);
+        const closedAt = fmtTsBJ(closedAtUtc);
+        const forceAt = fmtTsBJ(forceAtUtc);
+        const closeReason = s.close_reason || '-';
+        const reason = s.reason || '-';
+        return `
 	          <tr>
             <td>${s.id}</td>
             <td class="muted">${s.event_id || '-'}</td>
@@ -463,6 +496,11 @@
             <td class="muted">${tpExitSpreadPct}</td>
             <td class="muted">${realized}</td>
             <td class="muted"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
+            <td class="muted">${openFundLong}</td>
+            <td class="muted">${openFundShort}</td>
+            <td class="muted">${liveFundLong}</td>
+            <td class="muted">${liveFundShort}</td>
+            <td class="muted" title="UTC: ${escapeHtml(fundRateAtUtc)}">${fundRateAt}</td>
             <td><span class="pill ${stCls}">${stText}</span></td>
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
@@ -470,7 +508,11 @@
             <td class="muted">${exitSpreadPctNow}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(createdAtUtc)}">${createdAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(openAtUtc)}">${openAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(openLongAtUtc)}">${openLongAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(openShortAtUtc)}">${openShortAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(closeReqAtUtc)}">${closeReqAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(closeLongAtUtc)}">${closeLongAt}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(closeShortAtUtc)}">${closeShortAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(closedAtUtc)}">${closedAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(forceAtUtc)}">${forceAt}</td>
 	            <td class="muted">${closeReason}</td>
