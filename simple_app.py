@@ -1610,7 +1610,11 @@ def _public_funding_schedule(exchange: str, base: str) -> Dict[str, Any]:
                             out["funding_rate"] = float(entry.get("fundingRate"))
                     except Exception:
                         pass
-                    nft = normalize_next_funding_time(entry.get("nextUpdate"))
+                    nft = normalize_next_funding_time(
+                        entry.get("nextSettleTime")
+                        or entry.get("nextUpdate")
+                        or entry.get("nextFundingTime")
+                    )
                     if nft:
                         out["next_funding_time"] = nft
                     interval = derive_funding_interval_hours("bitget", entry.get("fundingRateInterval"), fallback=True)
@@ -3537,6 +3541,7 @@ def live_trading_positions():
 
         elif ex == "bitget":
             sym = f"{base_u}USDT"
+            ticker_rate = None
             ticker = _req_json(
                 "https://api.bitget.com/api/v2/mix/market/ticker",
                 params={"productType": "USDT-FUTURES", "symbol": sym},
@@ -3552,9 +3557,9 @@ def live_trading_positions():
                         pass
                     try:
                         if entry.get("fundingRate") is not None:
-                            out["funding_rate"] = float(entry.get("fundingRate"))
+                            ticker_rate = float(entry.get("fundingRate"))
                     except Exception:
-                        pass
+                        ticker_rate = None
             sched = _req_json(
                 "https://api.bitget.com/api/v2/mix/market/current-fund-rate",
                 params={"productType": "USDT-FUTURES", "symbol": sym},
@@ -3563,12 +3568,24 @@ def live_trading_positions():
                 data = sched.get("data") or []
                 entry = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else None
                 if entry:
-                    nft = normalize_next_funding_time(entry.get("nextUpdate"))
+                    try:
+                        fr = entry.get("fundingRate") or entry.get("fundingRateStr")
+                        if fr is not None:
+                            out["funding_rate"] = float(fr)
+                    except Exception:
+                        pass
+                    nft = normalize_next_funding_time(
+                        entry.get("nextSettleTime")
+                        or entry.get("nextUpdate")
+                        or entry.get("nextFundingTime")
+                    )
                     if nft:
                         out["next_funding_time"] = nft
                     interval = derive_funding_interval_hours("bitget", entry.get("fundingRateInterval"), fallback=True)
                     if interval:
                         out["funding_interval_hours"] = float(interval)
+            if out.get("funding_rate") is None and ticker_rate is not None:
+                out["funding_rate"] = ticker_rate
             if "funding_interval_hours" not in out:
                 interval = derive_funding_interval_hours("bitget")
                 if interval:

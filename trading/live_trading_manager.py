@@ -25,6 +25,12 @@ except Exception:  # pragma: no cover - optional dependency
     Jsonb = None  # type: ignore
 
 from orderbook_utils import fetch_orderbook_prices, fetch_orderbook_prices_for_quantity
+from funding_utils import (
+    derive_funding_interval_hours,
+    derive_interval_hours_from_times,
+    normalize_next_funding_time,
+    normalize_and_advance_next_funding_time,
+)
 from watchlist_pnl_regression_model import predict_bc
 from trading.trade_executor import (
     TradeExecutionError,
@@ -2058,6 +2064,7 @@ class LiveTradingManager:
             return dict(val) if isinstance(val, dict) else {}
 
         out: Dict[str, Any] = {}
+        now = datetime.now(timezone.utc)
         if requests is None:
             out["error"] = "requests_not_available"
         else:
@@ -2086,7 +2093,12 @@ class LiveTradingManager:
                                     out["funding_rate"] = float(data.get("lastFundingRate"))
                             except Exception:
                                 pass
-                            out["next_funding_time"] = data.get("nextFundingTime")
+                            nft = normalize_next_funding_time(data.get("nextFundingTime"))
+                            if nft:
+                                out["next_funding_time"] = nft
+                            interval = derive_funding_interval_hours("binance")
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
                     else:
                         out["error"] = f"binance_http_{resp.status_code}"
 
@@ -2115,8 +2127,16 @@ class LiveTradingManager:
                                     out["funding_rate"] = float(it.get("fundingRate"))
                             except Exception:
                                 pass
-                            out["funding_interval_hours"] = it.get("fundingIntervalHour")
-                            out["next_funding_time"] = it.get("nextFundingTime")
+                            interval = derive_funding_interval_hours("bybit", it.get("fundingIntervalHour"), fallback=True)
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
+                            nft = normalize_next_funding_time(it.get("nextFundingTime"))
+                            if nft:
+                                out["next_funding_time"] = nft
+                        if "funding_interval_hours" not in out:
+                            interval = derive_funding_interval_hours("bybit")
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
                     else:
                         out["error"] = f"bybit_http_{resp.status_code}"
 
@@ -2130,17 +2150,48 @@ class LiveTradingManager:
                     )
                     if resp.status_code == 200:
                         data = resp.json() if resp.content else {}
-                        try:
-                            row = ((data or {}).get("data") or [None])[0]
-                        except Exception:
-                            row = None
+                        row = None
+                        if isinstance(data, dict) and data.get("code") == "0":
+                            try:
+                                row = ((data or {}).get("data") or [None])[0]
+                            except Exception:
+                                row = None
                         if isinstance(row, dict):
                             try:
                                 if row.get("fundingRate") is not None:
                                     out["funding_rate"] = float(row.get("fundingRate"))
                             except Exception:
                                 pass
-                            out["next_funding_time"] = row.get("nextFundingTime")
+                            ft = normalize_next_funding_time(row.get("fundingTime"))
+                            nft = normalize_next_funding_time(row.get("nextFundingTime"))
+                            try:
+                                cand = []
+                                for x in (ft, nft):
+                                    if not x:
+                                        continue
+                                    dt = datetime.fromisoformat(str(x).replace("Z", "+00:00"))
+                                    if dt.tzinfo is None:
+                                        dt = dt.replace(tzinfo=timezone.utc)
+                                    if dt > (now - timedelta(seconds=60)):
+                                        cand.append(dt.astimezone(timezone.utc))
+                                if cand:
+                                    out["next_funding_time"] = min(cand).isoformat()
+                                elif nft:
+                                    out["next_funding_time"] = nft
+                                elif ft:
+                                    out["next_funding_time"] = ft
+                            except Exception:
+                                if nft:
+                                    out["next_funding_time"] = nft
+                                elif ft:
+                                    out["next_funding_time"] = ft
+                            interval = derive_interval_hours_from_times(row.get("fundingTime"), row.get("nextFundingTime"))
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
+                        if "funding_interval_hours" not in out:
+                            interval = derive_funding_interval_hours("okx")
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
                     else:
                         out["error"] = f"okx_http_{resp.status_code}"
 
@@ -2148,13 +2199,19 @@ class LiveTradingManager:
                     sym = f"{base}USDT"
                     resp = requests.get(
                         "https://api.bitget.com/api/v2/mix/market/current-fund-rate",
-                        params={"symbol": sym, "productType": "usdt-futures"},
+                        params={"symbol": sym, "productType": "USDT-FUTURES"},
                         timeout=timeout,
                         headers=headers,
                     )
                     if resp.status_code == 200:
                         data = resp.json() if resp.content else {}
-                        row = (data or {}).get("data")
+                        row = None
+                        if isinstance(data, dict) and data.get("code") == "00000":
+                            payload = data.get("data")
+                            if isinstance(payload, list):
+                                row = payload[0] if payload else None
+                            elif isinstance(payload, dict):
+                                row = payload
                         if isinstance(row, dict):
                             try:
                                 fr = row.get("fundingRate") or row.get("fundingRateStr")
@@ -2162,8 +2219,20 @@ class LiveTradingManager:
                                     out["funding_rate"] = float(fr)
                             except Exception:
                                 pass
-                            out["funding_interval_hours"] = row.get("fundingRateInterval")
-                            out["next_funding_time"] = row.get("nextSettleTime")
+                            nft = normalize_next_funding_time(
+                                row.get("nextSettleTime")
+                                or row.get("nextUpdate")
+                                or row.get("nextFundingTime")
+                            )
+                            if nft:
+                                out["next_funding_time"] = nft
+                            interval = derive_funding_interval_hours("bitget", row.get("fundingRateInterval"), fallback=True)
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
+                        if "funding_interval_hours" not in out:
+                            interval = derive_funding_interval_hours("bitget")
+                            if interval:
+                                out["funding_interval_hours"] = float(interval)
                     else:
                         out["error"] = f"bitget_http_{resp.status_code}"
 
@@ -2186,7 +2255,8 @@ class LiveTradingManager:
                                 out["funding_rate"] = float(ctx.get("funding"))
                         except Exception:
                             pass
-                        out["funding_interval_hours"] = 1.0
+                        out["funding_interval_hours"] = float(derive_funding_interval_hours("hyperliquid") or 1.0)
+                        out["next_funding_time"] = (now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
                 elif ex == "grvt":
                     try:
                         import config as _cfg  # local import to avoid cycles
@@ -2213,8 +2283,10 @@ class LiveTradingManager:
                                         out["funding_rate"] = float(fr) / 100.0
                                 except Exception:
                                     pass
-                                out["next_funding_time"] = row.get("next_funding_time")
-                                out["funding_interval_hours"] = 8.0
+                                nft = normalize_next_funding_time(row.get("next_funding_time"))
+                                if nft:
+                                    out["next_funding_time"] = nft
+                                out["funding_interval_hours"] = float(derive_funding_interval_hours("grvt") or 8.0)
                         else:
                             out["error"] = f"grvt_http_{resp.status_code}"
                     except Exception as exc:
@@ -2223,6 +2295,16 @@ class LiveTradingManager:
                     out["error"] = "unsupported_exchange"
             except Exception as exc:
                 out["error"] = f"{type(exc).__name__}: {exc}"
+
+        next_ft, interval_hours = normalize_and_advance_next_funding_time(
+            now=now,
+            next_funding_time=out.get("next_funding_time"),
+            interval_hours=out.get("funding_interval_hours"),
+        )
+        if next_ft:
+            out["next_funding_time"] = next_ft
+        if interval_hours is not None:
+            out["funding_interval_hours"] = float(interval_hours)
 
         with self._funding_cache_lock:
             self._funding_cache[key] = {"expires_at": now_ts + 10.0, "value": dict(out)}

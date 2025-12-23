@@ -423,30 +423,40 @@ class FundingHistoryFetcher:
                     continue
             return out_local
 
-        params = {
-            "symbol": inst_id,
-            "productType": "umcbl",  # USDT 本位永续
-            "startTime": int(start_ts.timestamp() * 1000),
-            "endTime": int(end_ts.timestamp() * 1000),
-            "limit": 1000,
-        }
         out: List[Tuple[datetime, float]] = []
-        try:
-            out.extend(_query(params))
-        except Exception:
-            pass
-        # 若窗口或 instId 查询无结果，再尝试不带时间/不带 _UMCBL 的符号
-        if not out:
+        product_types = ["USDT-FUTURES", "umcbl"]
+        for product_type in product_types:
+            params = {
+                "symbol": inst_id,
+                "productType": product_type,
+                "startTime": int(start_ts.timestamp() * 1000),
+                "endTime": int(end_ts.timestamp() * 1000),
+                "limit": 1000,
+            }
             try:
-                out.extend(_query({"symbol": inst_id, "productType": "umcbl", "limit": 200}))
+                out.extend(_query(params))
             except Exception:
                 pass
+            if out:
+                break
+        # 若窗口或 instId 查询无结果，再尝试不带时间
+        if not out:
+            for product_type in product_types:
+                try:
+                    out.extend(_query({"symbol": inst_id, "productType": product_type, "limit": 200}))
+                except Exception:
+                    pass
+                if out:
+                    break
         if not out:
             plain_sym = f"{symbol.upper()}USDT"
             try:
-                out.extend(_query({"symbol": plain_sym, "productType": "umcbl", "limit": 200}))
+                out.extend(_query({"symbol": plain_sym, "productType": "USDT-FUTURES", "limit": 200}))
             except Exception:
-                pass
+                try:
+                    out.extend(_query({"symbol": plain_sym, "productType": "umcbl", "limit": 200}))
+                except Exception:
+                    pass
         # 仍为空，尝试旧版 v1 接口兜底并分页
         if not out:
             page_no = 1
