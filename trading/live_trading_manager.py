@@ -4949,6 +4949,42 @@ class LiveTradingManager:
                 )
 
         if had_error:
+            # Immediate fallback: close by actual positions to avoid prolonged single-leg exposure.
+            try:
+                retry = self._close_symbol_positions(
+                    conn,
+                    signal_id=int(signal_id),
+                    symbol=symbol,
+                    long_ex=str(long_ex),
+                    short_ex=str(short_ex),
+                    close_reason=str(close_reason),
+                    status_before=status,
+                )
+                if isinstance(retry, dict) and retry.get("closed"):
+                    return
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="close_retry_immediate",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex, "reason": close_reason},
+                )
+            # Allow the next monitor tick to retry without waiting the full cooldown.
+            try:
+                retry_at = _utcnow() - timedelta(seconds=float(self.config.close_retry_cooldown_seconds))
+                conn.execute(
+                    """
+                    UPDATE watchlist.live_trade_signal
+                       SET close_requested_at=%s,
+                           updated_at=now()
+                     WHERE id=%s;
+                    """,
+                    (retry_at, int(signal_id)),
+                )
+            except Exception:
+                pass
             return
 
         # Post-close verify: ensure both legs are flat (Hyperliquid is netted/one-way so we must query actual szi).
