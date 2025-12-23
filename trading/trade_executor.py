@@ -72,6 +72,7 @@ LOGGER = logging.getLogger(__name__)
 
 _OKX_CLIENT_ID_RE = re.compile(r"[^0-9A-Za-z]")
 _BINANCE_BAN_UNTIL_RE = re.compile(r"banned until (\\d+)", re.IGNORECASE)
+_BINANCE_CLIENT_ID_MAX_LEN = 36
 
 
 def _sanitize_okx_client_order_id(value: str) -> str:
@@ -83,6 +84,15 @@ def _sanitize_okx_client_order_id(value: str) -> str:
     if not cleaned:
         return ""
     return cleaned[-32:]
+
+
+def _sanitize_binance_client_order_id(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    cleaned = str(value)
+    if len(cleaned) <= _BINANCE_CLIENT_ID_MAX_LEN:
+        return cleaned
+    return cleaned[-_BINANCE_CLIENT_ID_MAX_LEN:]
 
 
 def _configure_ipv4_only() -> None:
@@ -959,6 +969,23 @@ def place_binance_perp_market_order(
         raise TradeExecutionError("`quantity` must be provided in base asset units")
 
     quantity_str, normalised_qty = _normalise_binance_quantity(pair, quantity, base_url)
+    client_order_id = _sanitize_binance_client_order_id(client_order_id)
+
+    if reduce_only is not True:
+        filters = _get_binance_symbol_filters(pair, base_url)
+        min_notional = filters.min_notional
+        if min_notional is not None:
+            try:
+                price = get_binance_perp_price(pair, base_url=base_url)
+                notional_check = Decimal(str(price)) * Decimal(str(normalised_qty))
+            except Exception as exc:
+                LOGGER.warning("binance_min_notional_check_failed symbol=%s err=%s", pair, exc)
+            else:
+                if notional_check < min_notional:
+                    raise TradeExecutionError(
+                        f"Binance notional {notional_check} is below minimum {min_notional} for {pair}; "
+                        "increase the order size"
+                    )
 
     def _effective_step() -> Decimal:
         filters = _get_binance_symbol_filters(pair, base_url)
@@ -1309,6 +1336,44 @@ def get_binance_perp_price(
                 return _record_price(prices[pair])
 
     raise TradeExecutionError(f"Binance price query failed: {data}")
+
+
+def derive_binance_perp_qty_from_usdt(
+    symbol: str,
+    notional_usdt: float,
+    *,
+    price: Optional[float] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> str:
+    if notional_usdt is None or notional_usdt <= 0:
+        raise TradeExecutionError("`notional_usdt` must be a positive value")
+
+    if price is None:
+        price = get_binance_perp_price(symbol, base_url=base_url)
+
+    if price <= 0:
+        raise TradeExecutionError("Binance price must be positive")
+
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+
+    base_amount = Decimal(str(notional_usdt)) / Decimal(str(price))
+    quantity_str, normalised_qty = _normalise_binance_quantity(pair, base_amount, base_url)
+
+    filters = _get_binance_symbol_filters(pair, base_url)
+    min_notional = filters.min_notional
+    if min_notional is not None:
+        try:
+            notional_check = Decimal(str(price)) * Decimal(str(normalised_qty))
+        except InvalidOperation as exc:
+            raise TradeExecutionError(f"Binance notional calculation failed: {exc}") from exc
+        if notional_check < min_notional:
+            raise TradeExecutionError(
+                f"Binance notional {notional_check} is below minimum {min_notional} for {pair}; increase order size"
+            )
+
+    return quantity_str
 
 
 def get_binance_perp_order(
@@ -4030,13 +4095,28 @@ def execute_perp_market_order(
             else:
                 raise
     elif exchange_key == "okx":
-        order = place_okx_swap_market_order(
-            symbol,
-            "buy" if direction == "long" else "sell",
-            str(quantity_dec),
-            pos_side="long" if direction == "long" else "short",
-            **kwargs,
-        )
+        side_val = "buy" if direction == "long" else "sell"
+        pos_side_val = "long" if direction == "long" else "short"
+        try:
+            order = place_okx_swap_market_order(
+                symbol,
+                side_val,
+                str(quantity_dec),
+                pos_side=pos_side_val,
+                **kwargs,
+            )
+        except TradeExecutionError as exc:
+            msg = str(exc).lower()
+            if "posside" in msg or "pos side" in msg:
+                order = place_okx_swap_market_order(
+                    symbol,
+                    side_val,
+                    str(quantity_dec),
+                    pos_side=None,
+                    **kwargs,
+                )
+            else:
+                raise
     elif exchange_key == "bybit":
         bybit_category = kwargs.get("category", "linear")
         receiver_window = kwargs.get("recv_window", 5000)
@@ -4065,11 +4145,18 @@ def execute_perp_market_order(
         try:
             order = _submit(int(bybit_position_idx_resolved))
         except TradeExecutionError as exc:
-            # Some accounts use hedge-mode (positionIdx=1 long / 2 short).
+            # Some accounts use hedge-mode (positionIdx=1 long / 2 short) or one-way (positionIdx=0).
             msg = str(exc).lower()
-            if bybit_position_idx is None and "position idx not match position mode" in msg:
-                hedge_idx = 1 if direction == "long" else 2
-                order = _submit(int(hedge_idx))
+            if "position idx not match position mode" in msg:
+                resolved = int(bybit_position_idx_resolved)
+                if resolved in (1, 2):
+                    fallback_idx = 0
+                else:
+                    fallback_idx = 1 if direction == "long" else 2
+                if fallback_idx != resolved:
+                    order = _submit(int(fallback_idx))
+                else:
+                    raise
             else:
                 raise
     elif exchange_key == "bitget":

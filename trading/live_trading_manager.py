@@ -2985,7 +2985,7 @@ class LiveTradingManager:
             )
             return
 
-        client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+        client_base = f"wl{int(event['id'])}O{int(time.time())}"
         payload = {
             "event": {
                 "id": int(event["id"]),
@@ -3266,7 +3266,7 @@ class LiveTradingManager:
             initial_reval=reval if isinstance(reval, dict) else None,
         )
         if not confirm.get("ok"):
-            client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+            client_base = f"wl{int(event['id'])}O{int(time.time())}"
             payload = {
                 "event": {
                     "id": int(event["id"]),
@@ -3320,7 +3320,7 @@ class LiveTradingManager:
         # Funding guard (Type B): re-check current funding before opening.
         f_ok, f_payload, f_reason = self._check_funding_guard(symbol=symbol, long_ex=low_ex, short_ex=high_ex, event=event)
         if not f_ok:
-            client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+            client_base = f"wl{int(event['id'])}O{int(time.time())}"
             payload = {
                 "event": {
                     "id": int(event["id"]),
@@ -3369,7 +3369,7 @@ class LiveTradingManager:
                 )
             return
 
-        client_base = f"wl{event['id']}-{symbol}-{int(time.time())}"
+        client_base = f"wl{int(event['id'])}O{int(time.time())}"
         payload = {
             "event": {
                 "id": int(event["id"]),

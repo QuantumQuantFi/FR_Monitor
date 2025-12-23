@@ -41,16 +41,20 @@ from trading.trade_executor import (
     get_binance_perp_positions,
     get_binance_perp_usdt_balance,
     get_binance_funding_fee_income,
+    derive_binance_perp_qty_from_usdt,
     get_okx_swap_positions,
     get_okx_swap_contract_value,
     get_okx_account_balance,
     get_okx_funding_fee_bills,
+    derive_okx_swap_size_from_usdt,
     get_bybit_linear_positions,
     get_bybit_wallet_balance,
     get_bybit_funding_fee_transactions,
+    derive_bybit_linear_qty_from_usdt,
     get_bitget_usdt_perp_positions,
     get_bitget_usdt_balance,
     get_bitget_funding_fee_bills,
+    derive_bitget_usdt_perp_size_from_usdt,
     get_hyperliquid_perp_positions,
     get_hyperliquid_balance_summary,
     get_hyperliquid_user_funding_history,
@@ -609,9 +613,40 @@ def _convert_notional_to_quantity(
         )
 
     notional_dec = _coerce_positive_decimal(notional, "交易金额(USDT)")
-    with decimal.localcontext() as ctx:  # type: ignore[attr-defined]
-        ctx.prec = 28
-        quantity = (notional_dec / price).quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
+    exchange_key = (exchange or "").lower()
+    quantity: Optional[Decimal] = None
+    if market_key == "futures":
+        try:
+            if exchange_key == "binance":
+                qty_str = derive_binance_perp_qty_from_usdt(
+                    symbol, float(notional_dec), price=float(price)
+                )
+                quantity = Decimal(str(qty_str))
+            elif exchange_key == "okx":
+                size_str = derive_okx_swap_size_from_usdt(
+                    symbol, float(notional_dec), price=float(price)
+                )
+                ct_val = get_okx_swap_contract_value(symbol)
+                quantity = (Decimal(str(size_str)) * Decimal(str(ct_val))).quantize(
+                    DEFAULT_QUANT, rounding=ROUND_DOWN
+                )
+            elif exchange_key == "bybit":
+                qty_str = derive_bybit_linear_qty_from_usdt(
+                    symbol, float(notional_dec), price=float(price)
+                )
+                quantity = Decimal(str(qty_str))
+            elif exchange_key == "bitget":
+                size_str = derive_bitget_usdt_perp_size_from_usdt(
+                    symbol, float(notional_dec), price=float(price)
+                )
+                quantity = Decimal(str(size_str))
+        except TradeExecutionError as exc:
+            raise TradeRequestValidationError(str(exc)) from exc
+
+    if quantity is None:
+        with decimal.localcontext() as ctx:  # type: ignore[attr-defined]
+            ctx.prec = 28
+            quantity = (notional_dec / price).quantize(DEFAULT_QUANT, rounding=ROUND_DOWN)
 
     if quantity <= 0:
         raise TradeRequestValidationError("换算后的下单数量过小，请提高USDT金额")
