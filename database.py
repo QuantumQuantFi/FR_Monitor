@@ -99,6 +99,7 @@ class PriceDatabase:
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_data_exchange ON price_data (exchange)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_data_1min_timestamp ON price_data_1min (timestamp)')
             cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_data_1min_symbol ON price_data_1min (symbol)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_price_data_1min_exchange_symbol_ts ON price_data_1min (exchange, symbol, timestamp)')
             
             conn.commit()
     

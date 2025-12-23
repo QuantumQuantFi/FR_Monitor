@@ -262,6 +262,13 @@ WATCHLIST_METRICS_CONFIG = {
     'take_profit_multiplier': 1.2,       # 止盈临界值 = mean_long + multiplier * std_long
     'stop_loss_buffer': 0.005,           # 止损缓冲（0.5%）
     'funding_exit_minutes': 5,           # 靠近资金费时间的提前平仓窗口
+    # v2 因子序列（event→series→factors）参数，仅 1min K
+    'series_lookback_min': 21600,        # T2 因子含 3/7/15day，默认取 15d 覆盖
+    'series_asof_tol_sec': 90,           # asof 最近邻容忍
+    'series_forward_fill_bars': 2,       # 允许最多 forward-fill 的 bar 数
+    'series_min_valid_ratio': 0.8,       # 允许窗口内最多 20% 缺失
+    'series_max_backfill_bars': 2,       # 计算 ret 时允许回补的最大 bar
+    'series_cache_entries': int(_get_private('WATCHLIST_SERIES_CACHE_ENTRIES', 'WATCHLIST_SERIES_CACHE_ENTRIES', '64')),
 }
 
 # Live trading (Phase 1: Type B only, perp-perp)
