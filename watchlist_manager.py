@@ -116,6 +116,7 @@ class WatchlistManager:
                     consecutive_required=int(pg_cfg_dict.get('consecutive_required', 2)),
                     cooldown_minutes=int(pg_cfg_dict.get('cooldown_minutes', 3)),
                     enable_event_merge=bool(pg_cfg_dict.get('enable_event_merge', False)),
+                    orderbook_validation_on_write=bool(pg_cfg_dict.get('orderbook_validation_on_write', False)),
                 )
             )
         except Exception as exc:  # pragma: no cover - optional path

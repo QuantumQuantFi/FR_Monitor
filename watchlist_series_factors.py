@@ -525,6 +525,8 @@ def compute_event_series_factors(
     ffill_bars: int = DEFAULT_FFILL_BARS,
     min_valid_ratio: float = DEFAULT_MIN_VALID_RATIO,
     max_backfill_bars: int = DEFAULT_MAX_BACKFILL_BARS,
+    override_short_price: Optional[float] = None,
+    override_long_price: Optional[float] = None,
     series_cache: Optional[SeriesCache] = None,
 ) -> Tuple[Dict[str, Optional[float]], Dict[str, Any]]:
     if event_ts.tzinfo is None:
@@ -560,6 +562,37 @@ def compute_event_series_factors(
 
     aligned_short, meta_short = _align_series(s_short, grid, tol_sec, ffill_bars)
     aligned_long, meta_long = _align_series(s_long, grid, tol_sec, ffill_bars)
+
+    def _override_last_price(
+        aligned: List[Optional[Tuple[float, Optional[float], Optional[float], Optional[datetime]]]],
+        override_price: Optional[float],
+    ) -> None:
+        if not aligned or override_price is None:
+            return
+        try:
+            price_f = float(override_price)
+        except Exception:
+            return
+        if not math.isfinite(price_f) or price_f <= 0:
+            return
+        last = aligned[-1]
+        if last is not None:
+            _, fr, iv, nft = last
+            aligned[-1] = (price_f, fr, iv, nft)
+            return
+        fallback = None
+        for idx in range(len(aligned) - 1, -1, -1):
+            if aligned[idx] is not None:
+                fallback = aligned[idx]
+                break
+        if fallback is not None:
+            _, fr, iv, nft = fallback
+            aligned[-1] = (price_f, fr, iv, nft)
+        else:
+            aligned[-1] = (price_f, None, None, None)
+
+    _override_last_price(aligned_short, override_short_price)
+    _override_last_price(aligned_long, override_long_price)
     meta["short_leg"] = {
         "exchange": short_leg.get("exchange"),
         "symbol": short_leg.get("symbol"),

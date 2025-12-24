@@ -21,6 +21,7 @@ import math
 from orderbook_utils import fetch_orderbook_prices
 from watchlist_pnl_regression_model import predict_bc
 from watchlist_series_factors import SeriesCache, compute_event_series_factors
+from watchlist_v2_infer import infer_v2
 
 
 def _utcnow() -> datetime:
@@ -36,6 +37,7 @@ class PgWriterConfig:
     consecutive_required: int = 2  # N 连续分钟归并事件
     cooldown_minutes: int = 3  # M 分钟冷静期
     enable_event_merge: bool = False
+    orderbook_validation_on_write: bool = False
 
 
 class PgWriter:
@@ -142,6 +144,14 @@ class PgWriter:
                     spread_est = row.get("spread_rel")
                     spread_est_f = float(spread_est) if spread_est is not None else None
                     # Mirror the cheap prefilter in _maybe_add_orderbook_validation (avoid flushing for weak signals).
+                    try:
+                        import config as _cfg  # local import: avoid import side-effects at module load
+
+                        pnl_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("pnl_threshold", 0.0085))
+                        prob_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("win_prob_threshold", 0.85))
+                    except Exception:
+                        pnl_thr = 0.0085
+                        prob_thr = 0.85
                     if (
                         pnl_hat is not None
                         and win_prob is not None
@@ -149,8 +159,8 @@ class PgWriter:
                         and math.isfinite(pnl_hat)
                         and math.isfinite(win_prob)
                         and math.isfinite(spread_est_f)
-                        and pnl_hat >= 0.009
-                        and win_prob >= 0.85
+                        and pnl_hat >= pnl_thr
+                        and win_prob >= prob_thr
                         and spread_est_f >= 0.003
                     ):
                         now_ts = time.time()
@@ -571,16 +581,18 @@ class PgWriter:
             with psycopg.connect(self.config.dsn, autocommit=True) as conn:
                 with conn.cursor() as cur:
                     for ins in inserts:
-                        # Best-effort: enrich TypeB events with orderbook-based validation/prediction.
-                        try:
-                            ins = self._maybe_add_orderbook_validation(dict(ins))
-                        except Exception as exc:  # pragma: no cover - best-effort enrichment
-                            self.logger.debug("orderbook validation skipped/failed: %s", exc)
                         # Best-effort: compute series-based factors for the new event.
                         try:
                             ins = self._maybe_add_series_factors(dict(ins))
                         except Exception as exc:  # pragma: no cover - best-effort enrichment
                             self.logger.debug("series factor enrichment skipped/failed: %s", exc)
+                        # Best-effort: enrich TypeB events with orderbook-based validation/prediction.
+                        # NOTE: This adds network I/O latency; default off.
+                        if bool(getattr(self.config, "orderbook_validation_on_write", False)):
+                            try:
+                                ins = self._maybe_add_orderbook_validation(dict(ins))
+                            except Exception as exc:  # pragma: no cover - best-effort enrichment
+                                self.logger.debug("orderbook validation skipped/failed: %s", exc)
 
                         # Persist enrichment into in-memory event state so subsequent UPDATE payloads
                         # keep these fields (otherwise later updates overwrite features_agg.meta_last).
@@ -598,6 +610,14 @@ class PgWriter:
                                     enrich["factors_v2"] = meta_last.get("factors_v2")
                                 if meta_last.get("factors_v2_meta") is not None:
                                     enrich["factors_v2_meta"] = meta_last.get("factors_v2_meta")
+                                if meta_last.get("pred_v2") is not None:
+                                    enrich["pred_v2"] = meta_last.get("pred_v2")
+                                if meta_last.get("pred_v2_meta") is not None:
+                                    enrich["pred_v2_meta"] = meta_last.get("pred_v2_meta")
+                                if meta_last.get("pred_v2_ob") is not None:
+                                    enrich["pred_v2_ob"] = meta_last.get("pred_v2_ob")
+                                if meta_last.get("pred_v2_ob_meta") is not None:
+                                    enrich["pred_v2_ob_meta"] = meta_last.get("pred_v2_ob_meta")
                             if enrich and key in self._event_state:
                                 st = self._event_state.get(key) or {}
                                 agg = st.get("agg")
@@ -773,7 +793,8 @@ class PgWriter:
                 return ins
 
             # Wider-than-live threshold to decide whether to spend orderbook calls.
-            if pnl_hat_240_f < 0.009 or win_prob_240_f < 0.85:
+            # Keep it slightly looser than LIVE_TRADING thresholds so we don't miss borderline candidates.
+            if pnl_hat_240_f < 0.0075 or win_prob_240_f < 0.82:
                 return ins
 
             # Another cheap filter: require spread estimate >= 0.3% (from trigger/factors).
@@ -821,6 +842,7 @@ class PgWriter:
                 live_pnl_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("pnl_threshold") or 0.0)
                 live_prob_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("win_prob_threshold") or 0.0)
             except Exception:
+                _cfg = None
                 # Safe defaults when config import fails.
                 allowed_set = set()
                 notional = 50.0
@@ -993,6 +1015,8 @@ class PgWriter:
                             best = {
                                 "long_exchange": str(cand.get("long_ex") or ""),
                                 "short_exchange": str(cand.get("short_ex") or ""),
+                                "long_px": float(long_f),
+                                "short_px": float(short_f),
                                 "pnl_hat_ob": float(pnl_hat_ob),
                                 "win_prob_ob": float(win_prob_ob),
                                 "tradable_spread": float(tradable_spread),
@@ -1028,6 +1052,8 @@ class PgWriter:
                 "chosen": {
                     "long_exchange": best["long_exchange"],
                     "short_exchange": best["short_exchange"],
+                    "long_px": best.get("long_px"),
+                    "short_px": best.get("short_px"),
                     "tradable_spread": best["tradable_spread"],
                     "entry_spread_metric": best["entry_spread_metric"],
                     "pnl_hat": best["pnl_hat_ob"],
@@ -1039,6 +1065,113 @@ class PgWriter:
                 "fee_threshold": ((pnl_reg or {}).get("fee_threshold") if isinstance(pnl_reg, dict) else None),
                 "pred": {"240": {"pnl_hat": best["pnl_hat_ob"], "win_prob": best["win_prob_ob"]}},
             }
+            try:
+                if _cfg is None:
+                    raise RuntimeError("config_not_available")
+                v2_cfg = getattr(_cfg, "WATCHLIST_V2_PRED_CONFIG", {}) or {}
+                if bool(v2_cfg.get("enabled")) and isinstance(meta_last.get("factors_v2"), dict):
+                    max_missing = float(v2_cfg.get("max_missing_ratio") or 0.2)
+
+                    def _dt(val: Any) -> Optional[datetime]:
+                        if isinstance(val, datetime):
+                            return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+                        if isinstance(val, str):
+                            try:
+                                ts = datetime.fromisoformat(val)
+                                return ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+                            except Exception:
+                                return None
+                        return None
+
+                    event_ts = _dt(ins.get("start_ts")) or _dt(ins.get("end_ts")) or _utcnow()
+                    leg_a = {
+                        "exchange": ins.get("leg_a_exchange"),
+                        "symbol": ins.get("leg_a_symbol") or ins.get("symbol"),
+                        "kind": ins.get("leg_a_kind") or "perp",
+                        "funding_interval_hours": ins.get("leg_a_funding_interval_hours"),
+                        "next_funding_time": ins.get("leg_a_next_funding_time"),
+                    }
+                    leg_b = {
+                        "exchange": ins.get("leg_b_exchange"),
+                        "symbol": ins.get("leg_b_symbol") or ins.get("symbol"),
+                        "kind": ins.get("leg_b_kind") or "perp",
+                        "funding_interval_hours": ins.get("leg_b_funding_interval_hours"),
+                        "next_funding_time": ins.get("leg_b_next_funding_time"),
+                    }
+
+                    def _leg_for_exchange(ex: str) -> Optional[Dict[str, Any]]:
+                        if ex and str(leg_a.get("exchange") or "") == ex:
+                            return leg_a
+                        if ex and str(leg_b.get("exchange") or "") == ex:
+                            return leg_b
+                        sym = ins.get("symbol")
+                        if ex and sym:
+                            return {
+                                "exchange": ex,
+                                "symbol": sym,
+                                "kind": "perp",
+                                "funding_interval_hours": None,
+                                "next_funding_time": None,
+                            }
+                        return None
+
+                    short_leg = _leg_for_exchange(str(best.get("short_exchange") or ""))
+                    long_leg = _leg_for_exchange(str(best.get("long_exchange") or ""))
+                    short_px = best.get("short_px")
+                    long_px = best.get("long_px")
+                    if short_leg and long_leg and short_px is not None and long_px is not None:
+                        metrics_cfg = _cfg.WATCHLIST_METRICS_CONFIG if hasattr(_cfg, "WATCHLIST_METRICS_CONFIG") else {}
+                        sqlite_path = _cfg.WATCHLIST_CONFIG.get("db_path", "market_data.db")
+                        lookback_min = int(metrics_cfg.get("series_lookback_min", 240))
+                        tol_sec = int(metrics_cfg.get("series_asof_tol_sec", 90))
+                        ffill_bars = int(metrics_cfg.get("series_forward_fill_bars", 2))
+                        min_valid_ratio = float(metrics_cfg.get("series_min_valid_ratio", 0.8))
+                        max_backfill_bars = int(metrics_cfg.get("series_max_backfill_bars", ffill_bars))
+                        cache_entries = int(metrics_cfg.get("series_cache_entries", 64))
+                        if cache_entries > 0:
+                            if self._series_cache is None or self._series_cache.max_entries != cache_entries:
+                                self._series_cache = SeriesCache(max_entries=cache_entries)
+                        else:
+                            self._series_cache = None
+
+                        factors_ob, meta_ob = compute_event_series_factors(
+                            sqlite_path,
+                            event_ts,
+                            short_leg,
+                            long_leg,
+                            lookback_min=lookback_min,
+                            tol_sec=tol_sec,
+                            ffill_bars=ffill_bars,
+                            min_valid_ratio=min_valid_ratio,
+                            max_backfill_bars=max_backfill_bars,
+                            override_short_price=float(short_px),
+                            override_long_price=float(long_px),
+                            series_cache=self._series_cache,
+                        )
+                        pred_v2_ob: Dict[str, Any] = {}
+                        pred_v2_ob_meta: Dict[str, Any] = {
+                            "ts": _utcnow().isoformat(),
+                            "max_missing_ratio": max_missing,
+                            "source": "orderbook_override",
+                            "meta": meta_ob,
+                        }
+                        for horizon_key in ("240", "1440"):
+                            model_key = f"model_path_{horizon_key}"
+                            model_path = str(v2_cfg.get(model_key) or "").strip()
+                            if not model_path:
+                                continue
+                            res = infer_v2(model_path=model_path, factors=factors_ob, max_missing_ratio=max_missing)
+                            pred_v2_ob[horizon_key] = res
+                        if pred_v2_ob:
+                            meta_last["pred_v2_ob"] = pred_v2_ob
+                            meta_last["pred_v2_ob_meta"] = pred_v2_ob_meta
+            except Exception as exc:
+                meta_last["pred_v2_ob_meta"] = {
+                    "ok": False,
+                    "reason": "v2_ob_exception",
+                    "ts": _utcnow().isoformat(),
+                    "exception": f"{type(exc).__name__}: {exc}",
+                }
             features_agg["meta_last"] = meta_last
             ins["features_agg"] = features_agg
         except Exception as exc:
@@ -1214,6 +1347,29 @@ class PgWriter:
                 "ts": _utcnow().isoformat(),
                 **(meta or {}),
             }
+            try:
+                v2_cfg = getattr(_cfg, "WATCHLIST_V2_PRED_CONFIG", {}) or {}
+                if bool(v2_cfg.get("enabled")) and isinstance(factors, dict):
+                    max_missing = float(v2_cfg.get("max_missing_ratio") or 0.2)
+                    pred_v2: Dict[str, Any] = {}
+                    pred_v2_meta: Dict[str, Any] = {"ts": _utcnow().isoformat(), "max_missing_ratio": max_missing}
+                    for horizon_key in ("240", "1440"):
+                        model_key = f"model_path_{horizon_key}"
+                        model_path = str(v2_cfg.get(model_key) or "").strip()
+                        if not model_path:
+                            continue
+                        res = infer_v2(model_path=model_path, factors=factors, max_missing_ratio=max_missing)
+                        pred_v2[horizon_key] = res
+                    if pred_v2:
+                        meta_last["pred_v2"] = pred_v2
+                        meta_last["pred_v2_meta"] = pred_v2_meta
+            except Exception as exc:
+                meta_last["pred_v2_meta"] = {
+                    "ok": False,
+                    "reason": "v2_exception",
+                    "ts": _utcnow().isoformat(),
+                    "exception": f"{type(exc).__name__}: {exc}",
+                }
             features_agg["meta_last"] = meta_last
             ins["features_agg"] = features_agg
         except Exception as exc:
