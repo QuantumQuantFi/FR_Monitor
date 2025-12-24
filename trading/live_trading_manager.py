@@ -135,6 +135,15 @@ class LiveTradingConfig:
     # small slippage may fail to cross the spread ("could not immediately match...").
     # Keep it configurable so we can tune without changing code.
     hyperliquid_close_slippage: float = 0.03
+    # Scale-in (spread widening rescue) for Type B.
+    scale_in_enabled: bool = True
+    scale_in_max_entries: int = 4
+    scale_in_trigger_mult: float = 1.5
+    scale_in_min_interval_minutes: int = 30
+    scale_in_signal_max_age_minutes: int = 30
+    # Safety cap: max total notional per leg for a single symbol across all entries.
+    # Default allows max_entries * per_leg_notional_usdt.
+    scale_in_max_total_notional_usdt: Optional[float] = None
 
 
 class LiveTradingManager:
@@ -4646,8 +4655,8 @@ class LiveTradingManager:
             ).fetchall()
         except Exception:
             open_rows = []
-        long_notional = per_leg
-        short_notional = per_leg
+        long_notional = 0.0
+        short_notional = 0.0
         for orow in open_rows or []:
             if not isinstance(orow, dict):
                 continue
@@ -4659,9 +4668,13 @@ class LiveTradingManager:
             if val <= 0:
                 continue
             if leg == "long":
-                long_notional = val
+                long_notional += val
             elif leg == "short":
-                short_notional = val
+                short_notional += val
+        if long_notional <= 0:
+            long_notional = per_leg
+        if short_notional <= 0:
+            short_notional = per_leg
 
         end_ms = int(closed_at.astimezone(timezone.utc).timestamp() * 1000)
         long_sum = self._funding_fee_summary_since_open(
@@ -4956,16 +4969,12 @@ class LiveTradingManager:
         else:
             force_close_at = opened_at + timedelta(days=int(self.config.max_hold_days))
 
-        # Canonical entry spread metric for Type B.
-        entry_spread_metric = signal_row.get("entry_spread_metric")
-        if entry_spread_metric is None:
-            payload = signal_row.get("payload") or {}
-            if isinstance(payload, dict):
-                entry_spread_metric = ((payload.get("orderbook_execution") or {}) or {}).get("entry_spread_metric")
-        try:
-            entry_spread_metric_f = float(entry_spread_metric)
-        except Exception:
-            entry_spread_metric_f = None  # type: ignore[assignment]
+        payload = signal_row.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+
+        # Canonical entry spread metric for Type B (supports scale-in weighted average).
+        entry_spread_metric_f = self._compute_entry_spread_metric_for_monitor(signal_row, payload)
 
         if entry_spread_metric_f is None:
             self._record_error(
@@ -5037,7 +5046,7 @@ class LiveTradingManager:
         except Exception:
             pnl_hat_ob_f = None
 
-        entry_long_px, entry_short_px = self._load_open_entry_prices(conn, signal_id)
+        entry_long_px, entry_short_px = self._load_open_entry_prices(conn, signal_id, symbol)
         funding_pnl_missing = False
         funding_pnl_usdt = signal_row.get("funding_pnl_usdt")
         if funding_pnl_usdt is None:
@@ -5101,7 +5110,10 @@ class LiveTradingManager:
 
         stop_loss_total_pct = float(getattr(self.config, "stop_loss_total_pnl_pct", 0.0) or 0.0)
         stop_loss_funding_per_hour_pct = float(getattr(self.config, "stop_loss_funding_per_hour_pct", 0.0) or 0.0)
-        if close_reason is None and stop_loss_total_pct > 0 and total_pnl_pct is not None:
+        scale_in_enabled = bool(getattr(self.config, "scale_in_enabled", True))
+        # When scale-in rescue is enabled, avoid a mechanical PnL stop-loss (your requirement: only
+        # hard-stop on funding turning materially negative). Use max_hold_days + funding stop-loss.
+        if close_reason is None and stop_loss_total_pct > 0 and total_pnl_pct is not None and not scale_in_enabled:
             if float(total_pnl_pct) <= -float(stop_loss_total_pct):
                 decision = "stop_loss_total_pnl"
                 close_reason = "stop_loss_total_pnl"
@@ -5109,6 +5121,36 @@ class LiveTradingManager:
             if float(funding_rate_per_hour) <= -float(stop_loss_funding_per_hour_pct):
                 decision = "stop_loss_funding_rate"
                 close_reason = "stop_loss_funding_rate"
+
+        # Rescue scale-in: when loss is driven by spread widening (pnl_spread < 0) and no funding hard-stop.
+        if (
+            close_reason is None
+            and status == "open"
+            and bool(getattr(self.config, "scale_in_enabled", True))
+            and exit_spread_pct_now is not None
+            and float(pnl_spread_now) < 0
+        ):
+            try:
+                scale_res = self._maybe_scale_in_on_spread_widen(
+                    conn,
+                    signal_row=signal_row,
+                    payload=payload,
+                    now=now,
+                    exit_spread_pct_now=float(exit_spread_pct_now),
+                    spread_now=float(spread_now),
+                    pnl_spread_now=float(pnl_spread_now),
+                )
+                if isinstance(scale_res, dict) and bool(scale_res.get("scaled_in")):
+                    decision = "scale_in_opened"
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="scale_in",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex},
+                )
 
         confirm_take_profit: Optional[Dict[str, Any]] = None
         if (
@@ -5181,6 +5223,8 @@ class LiveTradingManager:
                         "opened_at": opened_at.isoformat(),
                         "force_close_at": force_close_at.isoformat(),
                         "confirm_take_profit": confirm_take_profit,
+                        "entry_spread_metric_monitor": float(entry_spread_metric_f),
+                        "scale_in": payload.get("scale_in") if isinstance(payload, dict) else None,
                         "entry_long_px": float(entry_long_px) if entry_long_px is not None else None,
                         "entry_short_px": float(entry_short_px) if entry_short_px is not None else None,
                         "entry_notional": float(entry_notional) if entry_notional is not None else None,
@@ -5342,7 +5386,10 @@ class LiveTradingManager:
             """,
             (int(signal_id),),
         ).fetchall()
-        qty_long = qty_short = None
+        qty_long = 0.0
+        qty_short = 0.0
+        seen_long = False
+        seen_short = False
         symbol_u = (symbol or "").upper().strip()
         okx_ct_val: Optional[float] = None
 
@@ -5392,43 +5439,670 @@ class LiveTradingManager:
                     qty_val = float(qty_raw)
                 except Exception:
                     continue
-            if leg == "long" and qty_long is None:
-                qty_long = qty_val
-            elif leg == "short" and qty_short is None:
-                qty_short = qty_val
-        return qty_long, qty_short
+            if leg == "long":
+                qty_long += float(qty_val)
+                seen_long = True
+            elif leg == "short":
+                qty_short += float(qty_val)
+                seen_short = True
 
-    def _load_open_entry_prices(self, conn, signal_id: int) -> Tuple[Optional[float], Optional[float]]:
+        return (qty_long if seen_long else None), (qty_short if seen_short else None)
+
+    def _load_open_entry_prices(self, conn, signal_id: int, symbol: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
         rows = conn.execute(
             """
-            SELECT DISTINCT ON (leg)
-                   leg, avg_price, created_at, id
+            SELECT leg, avg_price, filled_qty, quantity, exchange
               FROM watchlist.live_trade_order
              WHERE signal_id=%s
                AND action='open'
                AND leg IN ('long','short')
                AND avg_price IS NOT NULL
-             ORDER BY leg, created_at DESC, id DESC;
+             ORDER BY created_at ASC, id ASC;
             """,
             (int(signal_id),),
         ).fetchall()
-        long_px = None
-        short_px = None
+
+        sym_u = (symbol or "").upper().strip()
+        okx_ct_val: Optional[float] = None
+
+        def _get_okx_ct_val() -> Optional[float]:
+            nonlocal okx_ct_val
+            if okx_ct_val is not None:
+                return okx_ct_val
+            if not sym_u:
+                okx_ct_val = None
+                return None
+            try:
+                okx_ct_val = float(get_okx_swap_contract_value(sym_u))
+            except Exception:
+                okx_ct_val = None
+            return okx_ct_val
+
+        sum_long = 0.0
+        sum_long_qty = 0.0
+        sum_short = 0.0
+        sum_short_qty = 0.0
+
         for r in rows or []:
             if not isinstance(r, dict):
                 continue
             leg = str(r.get("leg") or "")
+            exchange = str(r.get("exchange") or "").lower()
             try:
                 px = float(r.get("avg_price"))  # type: ignore[arg-type]
             except Exception:
                 continue
             if px <= 0:
                 continue
-            if leg == "long" and long_px is None:
-                long_px = px
-            elif leg == "short" and short_px is None:
-                short_px = px
+
+            qty_val: Optional[float] = None
+            filled_qty = r.get("filled_qty")
+            qty_raw = r.get("quantity")
+            if filled_qty is not None:
+                try:
+                    filled_f = float(filled_qty)
+                except Exception:
+                    filled_f = 0.0
+                if filled_f > 0:
+                    qty_val = filled_f
+                    if exchange == "okx" and sym_u:
+                        try:
+                            qty_req = float(qty_raw)
+                        except Exception:
+                            qty_req = None
+                        ct_val = _get_okx_ct_val()
+                        if qty_req and ct_val and ct_val > 0:
+                            candidate = filled_f * ct_val
+                            if abs(candidate - qty_req) < abs(filled_f - qty_req):
+                                qty_val = candidate
+            if qty_val is None:
+                try:
+                    qty_val = float(qty_raw)
+                except Exception:
+                    continue
+            if qty_val <= 0:
+                continue
+
+            if leg == "long":
+                sum_long += float(px) * float(qty_val)
+                sum_long_qty += float(qty_val)
+            elif leg == "short":
+                sum_short += float(px) * float(qty_val)
+                sum_short_qty += float(qty_val)
+
+        long_px = (sum_long / sum_long_qty) if sum_long_qty > 0 else None
+        short_px = (sum_short / sum_short_qty) if sum_short_qty > 0 else None
         return long_px, short_px
+
+    def _compute_entry_spread_metric_for_monitor(self, signal_row: Dict[str, Any], payload: Dict[str, Any]) -> Optional[float]:
+        """
+        Returns the entry spread metric used for pnl_spread monitoring.
+        - Without scale-in: use signal.entry_spread_metric (or payload.orderbook_execution.entry_spread_metric).
+        - With scale-in: use notional-weighted average across all entries.
+        """
+        base_metric = signal_row.get("entry_spread_metric")
+        if base_metric is None:
+            base_metric = ((payload.get("orderbook_execution") or {}) or {}).get("entry_spread_metric")
+        try:
+            base_metric_f = float(base_metric)
+        except Exception:
+            base_metric_f = None
+
+        scale_in = payload.get("scale_in") if isinstance(payload, dict) else None
+        entries = (scale_in or {}).get("entries") if isinstance(scale_in, dict) else None
+        if not isinstance(entries, list) or not entries:
+            return base_metric_f
+
+        per_leg_default = float(getattr(self.config, "per_leg_notional_usdt", 0.0) or 0.0)
+        sum_w = 0.0
+        sum_metric = 0.0
+        seen_k1 = False
+
+        for ent in entries:
+            if not isinstance(ent, dict):
+                continue
+            try:
+                metric = float(ent.get("entry_spread_metric"))
+            except Exception:
+                continue
+            try:
+                w = float(ent.get("per_leg_notional_usdt") or ent.get("per_leg_notional") or per_leg_default)
+            except Exception:
+                w = per_leg_default
+            if w <= 0:
+                w = per_leg_default
+            if w <= 0:
+                continue
+            try:
+                if int(ent.get("k") or 0) == 1:
+                    seen_k1 = True
+            except Exception:
+                pass
+            sum_w += w
+            sum_metric += metric * w
+
+        if not seen_k1 and base_metric_f is not None and per_leg_default > 0:
+            sum_w += per_leg_default
+            sum_metric += float(base_metric_f) * per_leg_default
+
+        if sum_w <= 0:
+            return base_metric_f
+        return float(sum_metric) / float(sum_w)
+
+    def _fetch_recent_scale_in_events(
+        self, conn, *, symbol: str, max_age_minutes: int, limit_n: int = 20
+    ) -> List[Dict[str, Any]]:
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            return []
+        return conn.execute(
+            """
+            SELECT
+              e.id,
+              e.start_ts,
+              e.end_ts,
+              e.exchange,
+              e.symbol,
+              e.signal_type,
+              e.leg_a_exchange,
+              e.leg_b_exchange,
+              e.leg_a_price_last,
+              e.leg_b_price_last,
+              COALESCE(
+                (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+              ) AS pnl_hat_240,
+              COALESCE(
+                (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
+                (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+              ) AS win_prob_240,
+              (e.features_agg #>> '{meta_last,pred_v2,240,pnl_hat}')::double precision AS v2_pnl_hat_240,
+              (e.features_agg #>> '{meta_last,pred_v2,240,win_prob}')::double precision AS v2_win_prob_240,
+              CASE
+                WHEN (e.features_agg #>> '{meta_last,pred_v2,240,error}') IS NOT NULL THEN FALSE
+                WHEN (e.features_agg #>> '{meta_last,pred_v2,240,missing_rate}') IS NULL
+                  THEN (e.features_agg #>> '{meta_last,pred_v2,240,ok}')::boolean
+                ELSE (
+                  (e.features_agg #>> '{meta_last,pred_v2,240,missing_rate}')::double precision
+                  <= COALESCE(
+                    (e.features_agg #>> '{meta_last,pred_v2_meta,max_missing_ratio}')::double precision,
+                    0.2
+                  )
+                )
+              END AS v2_ok_240,
+              (e.features_agg #>> '{meta_last,pred_v2,1440,pnl_hat}')::double precision AS v2_pnl_hat_1440,
+              (e.features_agg #>> '{meta_last,pred_v2,1440,win_prob}')::double precision AS v2_win_prob_1440,
+              CASE
+                WHEN (e.features_agg #>> '{meta_last,pred_v2,1440,error}') IS NOT NULL THEN FALSE
+                WHEN (e.features_agg #>> '{meta_last,pred_v2,1440,missing_rate}') IS NULL
+                  THEN (e.features_agg #>> '{meta_last,pred_v2,1440,ok}')::boolean
+                ELSE (
+                  (e.features_agg #>> '{meta_last,pred_v2,1440,missing_rate}')::double precision
+                  <= COALESCE(
+                    (e.features_agg #>> '{meta_last,pred_v2_meta,max_missing_ratio}')::double precision,
+                    0.2
+                  )
+                )
+              END AS v2_ok_1440,
+              (e.features_agg #> '{meta_last,pred_v2_ob}') AS pred_v2_ob,
+              (e.features_agg #> '{meta_last,factors}') AS factors,
+              (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details,
+              (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
+            FROM watchlist.watch_signal_event e
+            WHERE e.signal_type='B'
+              AND e.symbol=%s
+              AND e.start_ts >= now() - (%s || ' minutes')::interval
+              AND (e.features_agg #> '{meta_last,factors}') IS NOT NULL
+            ORDER BY e.start_ts DESC
+            LIMIT %s;
+            """,
+            (sym, int(max_age_minutes), int(limit_n)),
+        ).fetchall()
+
+    def _maybe_scale_in_on_spread_widen(
+        self,
+        conn,
+        *,
+        signal_row: Dict[str, Any],
+        payload: Dict[str, Any],
+        now: datetime,
+        exit_spread_pct_now: float,
+        spread_now: float,
+        pnl_spread_now: float,
+    ) -> Dict[str, Any]:
+        signal_id = int(signal_row.get("id") or 0)
+        symbol = str(signal_row.get("symbol") or "").upper().strip()
+        long_ex = str(signal_row.get("leg_long_exchange") or "").strip()
+        short_ex = str(signal_row.get("leg_short_exchange") or "").strip()
+        if not (signal_id and symbol and long_ex and short_ex):
+            return {"scaled_in": False, "reason": "missing_ids"}
+
+        max_entries = max(1, int(getattr(self.config, "scale_in_max_entries", 4) or 4))
+        trigger_mult = float(getattr(self.config, "scale_in_trigger_mult", 1.5) or 1.5)
+        min_interval_min = max(0, int(getattr(self.config, "scale_in_min_interval_minutes", 30) or 0))
+        max_age_min = max(1, int(getattr(self.config, "scale_in_signal_max_age_minutes", 30) or 30))
+
+        scale_in = payload.get("scale_in")
+        if not isinstance(scale_in, dict):
+            scale_in = {}
+        entries = scale_in.get("entries")
+        if not isinstance(entries, list):
+            entries = []
+
+        def _parse_dt(val: Any) -> Optional[datetime]:
+            if isinstance(val, datetime):
+                return val if val.tzinfo else val.replace(tzinfo=timezone.utc)
+            if isinstance(val, str):
+                try:
+                    dt = datetime.fromisoformat(val)
+                    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    return None
+            return None
+
+        last_scale_at = _parse_dt(scale_in.get("last_scale_in_at"))
+        if last_scale_at is not None and min_interval_min > 0:
+            if (now - last_scale_at).total_seconds() < float(min_interval_min) * 60.0:
+                return {"scaled_in": False, "reason": "cooldown"}
+
+        # Determine the first-entry spread pct baseline.
+        entry_spread_pct_first = scale_in.get("entry_spread_pct_first")
+        try:
+            entry_spread_pct_first_f = float(entry_spread_pct_first) if entry_spread_pct_first is not None else None
+        except Exception:
+            entry_spread_pct_first_f = None
+        if entry_spread_pct_first_f is None or entry_spread_pct_first_f <= 0:
+            try:
+                entry_spread_pct_first_f = float(signal_row.get("entry_spread_pct_actual"))  # from fills (best-effort)
+            except Exception:
+                entry_spread_pct_first_f = None
+        if entry_spread_pct_first_f is None or entry_spread_pct_first_f <= 0:
+            base_metric = signal_row.get("entry_spread_metric")
+            if base_metric is None:
+                base_metric = ((payload.get("orderbook_execution") or {}) or {}).get("entry_spread_metric")
+            try:
+                entry_spread_pct_first_f = float(math.exp(float(base_metric)) - 1.0)
+            except Exception:
+                entry_spread_pct_first_f = None
+        if entry_spread_pct_first_f is None or entry_spread_pct_first_f <= 0:
+            return {"scaled_in": False, "reason": "missing_entry_spread_pct_first"}
+
+        # Ensure entries list contains the first entry for correct averaging and triggering.
+        try:
+            has_k1 = any(int((e or {}).get("k") or 0) == 1 for e in entries if isinstance(e, dict))
+        except Exception:
+            has_k1 = False
+        if not has_k1:
+            base_metric = signal_row.get("entry_spread_metric")
+            if base_metric is None:
+                base_metric = ((payload.get("orderbook_execution") or {}) or {}).get("entry_spread_metric")
+            try:
+                base_metric_f = float(base_metric)
+            except Exception:
+                base_metric_f = None
+            if base_metric_f is not None:
+                entries.insert(
+                    0,
+                    {
+                        "k": 1,
+                        "opened_at": (signal_row.get("opened_at") or signal_row.get("created_at") or now).isoformat()
+                        if isinstance((signal_row.get("opened_at") or signal_row.get("created_at") or now), datetime)
+                        else _utcnow().isoformat(),
+                        "per_leg_notional_usdt": float(getattr(self.config, "per_leg_notional_usdt", 0.0) or 0.0),
+                        "entry_spread_metric": float(base_metric_f),
+                        "entry_spread_pct": float(math.exp(float(base_metric_f)) - 1.0),
+                        "source": "initial",
+                    },
+                )
+
+        entries_count = len([e for e in entries if isinstance(e, dict)])
+        if entries_count >= max_entries:
+            scale_in["entries"] = entries
+            payload["scale_in"] = scale_in
+            return {"scaled_in": False, "reason": "max_entries"}
+
+        next_trigger_pct = float(entry_spread_pct_first_f) * (float(trigger_mult) ** float(entries_count))
+        if float(exit_spread_pct_now) < float(next_trigger_pct):
+            scale_in["entries"] = entries
+            scale_in["entry_spread_pct_first"] = float(entry_spread_pct_first_f)
+            scale_in["next_trigger_spread_pct"] = float(next_trigger_pct)
+            payload["scale_in"] = scale_in
+            return {"scaled_in": False, "reason": "not_triggered", "next_trigger_spread_pct": float(next_trigger_pct)}
+
+        # Notional safety cap (per-leg).
+        per_leg = float(getattr(self.config, "per_leg_notional_usdt", 0.0) or 0.0)
+        current_notional = 0.0
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            try:
+                current_notional += float(e.get("per_leg_notional_usdt") or e.get("per_leg_notional") or per_leg)
+            except Exception:
+                current_notional += per_leg
+        cap = getattr(self.config, "scale_in_max_total_notional_usdt", None)
+        try:
+            cap_f = float(cap) if cap is not None else float(max_entries) * per_leg
+        except Exception:
+            cap_f = float(max_entries) * per_leg
+        if per_leg > 0 and (current_notional + per_leg) > cap_f:
+            return {"scaled_in": False, "reason": "notional_cap", "cap": cap_f, "current": current_notional}
+
+        # Require a recent watchlist event that still passes v1/v2 thresholds.
+        used_ids = scale_in.get("used_event_ids")
+        if not isinstance(used_ids, list):
+            used_ids = []
+        used_set = {int(x) for x in used_ids if str(x).isdigit()}
+
+        events = self._fetch_recent_scale_in_events(conn, symbol=symbol, max_age_minutes=max_age_min, limit_n=20)
+        chosen_event: Optional[Dict[str, Any]] = None
+        chosen_pred: Optional[Dict[str, Any]] = None
+        chosen_factors: Optional[Dict[str, Any]] = None
+        chosen_reval: Optional[Dict[str, Any]] = None
+        chosen_confirm: Optional[Dict[str, Any]] = None
+
+        for ev in events or []:
+            if not isinstance(ev, dict):
+                continue
+            eid = int(ev.get("id") or 0)
+            if eid <= 0 or eid in used_set:
+                continue
+            pred_choice = self._pick_pred_choice(ev)
+            if not isinstance(pred_choice, dict):
+                continue
+            factors = ev.get("factors")
+            if isinstance(factors, str):
+                try:
+                    factors = json.loads(factors)
+                except Exception:
+                    factors = {}
+            if not isinstance(factors, dict):
+                continue
+
+            # If the event already picked a chosen pair/direction, require it to match the current trade pair.
+            obv = ev.get("orderbook_validation")
+            if isinstance(obv, dict):
+                chosen = obv.get("chosen")
+                if isinstance(chosen, dict):
+                    ce_long = str(chosen.get("long_exchange") or "")
+                    ce_short = str(chosen.get("short_exchange") or "")
+                    if ce_long and ce_short and (ce_long != str(long_ex) or ce_short != str(short_ex)):
+                        continue
+
+            # Prefer event's chosen orderbook_validation if available; still confirm direction stability.
+            reval0 = self._chosen_reval_from_event(ev, pred_choice)
+            confirm = self._confirm_open_signal_with_orderbook(
+                symbol=symbol,
+                ex_a=str(short_ex),
+                ex_b=str(long_ex),
+                base_factors=factors,
+                initial_reval=reval0,
+                pred_choice=pred_choice,
+            )
+            if not (isinstance(confirm, dict) and confirm.get("ok")):
+                continue
+            if str(confirm.get("long_exchange") or "") != str(long_ex) or str(confirm.get("short_exchange") or "") != str(short_ex):
+                continue
+
+            chosen_event = ev
+            chosen_pred = pred_choice
+            chosen_factors = factors
+            chosen_reval = reval0
+            chosen_confirm = confirm
+            break
+
+        if not chosen_event:
+            return {"scaled_in": False, "reason": "no_recent_signal"}
+
+        # Acquire symbol lock to avoid racing with scan-loop actions.
+        lock = self._get_symbol_lock(symbol)
+        if not lock.acquire(blocking=False):
+            return {"scaled_in": False, "reason": "symbol_lock_busy"}
+        try:
+            # Re-read payload to avoid double scale-in on concurrent monitor ticks.
+            fresh = conn.execute(
+                "SELECT payload FROM watchlist.live_trade_signal WHERE id=%s;",
+                (int(signal_id),),
+            ).fetchone()
+            if isinstance(fresh, dict) and isinstance(fresh.get("payload"), dict):
+                payload = dict(fresh.get("payload") or {})
+                scale_in = payload.get("scale_in") if isinstance(payload.get("scale_in"), dict) else scale_in
+                entries = (scale_in or {}).get("entries") if isinstance(scale_in, dict) else entries
+                if not isinstance(entries, list):
+                    entries = []
+                try:
+                    entries_count = len([e for e in entries if isinstance(e, dict)])
+                except Exception:
+                    entries_count = len(entries or [])
+                if entries_count >= max_entries:
+                    return {"scaled_in": False, "reason": "max_entries"}
+
+            # Use the initial take-profit target (same percentage rule as initial trade).
+            take_profit_pnl = signal_row.get("take_profit_pnl")
+            try:
+                take_profit_pnl_f = float(take_profit_pnl) if take_profit_pnl is not None else None
+            except Exception:
+                take_profit_pnl_f = None
+            if take_profit_pnl_f is None:
+                try:
+                    take_profit_pnl_f = float(self.config.take_profit_ratio) * float(signal_row.get("pnl_hat_ob") or 0.0)
+                except Exception:
+                    take_profit_pnl_f = None
+            if take_profit_pnl_f is None or take_profit_pnl_f <= 0:
+                return {"scaled_in": False, "reason": "missing_take_profit_pnl"}
+
+            entry_k = entries_count + 1
+            client_base = f"wl{signal_id}A{entry_k}{int(time.time())}"
+            opened = self._open_scale_in_entry(
+                conn,
+                signal_row=signal_row,
+                symbol=symbol,
+                long_ex=str(long_ex),
+                short_ex=str(short_ex),
+                client_base=client_base,
+                take_profit_pnl=float(take_profit_pnl_f),
+            )
+
+            # Persist scale-in state into payload.
+            entry_rec = {
+                "k": int(entry_k),
+                "opened_at": (opened.get("opened_at") or now).isoformat() if isinstance((opened.get("opened_at") or now), datetime) else _utcnow().isoformat(),
+                "per_leg_notional_usdt": float(per_leg),
+                "entry_spread_metric": float(opened.get("entry_spread_metric")),
+                "entry_spread_pct": float(opened.get("entry_spread_pct")),
+                "orderbook_execution": opened.get("orderbook_execution"),
+                "client_base": str(client_base),
+                "event_id": int(chosen_event.get("id") or 0),
+                "pred_choice": chosen_pred,
+                "confirm": chosen_confirm,
+            }
+            entries.append(entry_rec)
+            used_ids.append(int(chosen_event.get("id") or 0))
+
+            scale_in["enabled"] = True
+            scale_in["entries"] = entries
+            scale_in["entries_count"] = int(len([e for e in entries if isinstance(e, dict)]))
+            scale_in["max_entries"] = int(max_entries)
+            scale_in["trigger_mult"] = float(trigger_mult)
+            scale_in["entry_spread_pct_first"] = float(entry_spread_pct_first_f)
+            scale_in["last_scale_in_at"] = now.isoformat()
+            scale_in["used_event_ids"] = used_ids[-20:]
+            scale_in["next_trigger_spread_pct"] = float(entry_spread_pct_first_f) * (float(trigger_mult) ** float(scale_in["entries_count"]))
+
+            payload["scale_in"] = scale_in
+            conn.execute(
+                """
+                UPDATE watchlist.live_trade_signal
+                   SET payload=%s,
+                       updated_at=now()
+                 WHERE id=%s;
+                """,
+                (_jsonb(payload), int(signal_id)),
+            )
+            return {"scaled_in": True, "entry_k": int(entry_k), "event_id": int(chosen_event.get("id") or 0)}
+        finally:
+            lock.release()
+
+    def _open_scale_in_entry(
+        self,
+        conn,
+        *,
+        signal_row: Dict[str, Any],
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        client_base: str,
+        take_profit_pnl: float,
+    ) -> Dict[str, Any]:
+        """
+        Place an additional open entry for an already-open trade (same pair/direction).
+        Uses the same execution-time orderbook sweep and order placement logic as the initial open,
+        but does not overwrite the trade-level TP fields (TP remains based on the initial trade rule).
+        """
+        signal_id = int(signal_row.get("id") or 0)
+        if not signal_id:
+            raise TradeExecutionError("missing_signal_id_for_scale_in")
+
+        # Best-effort leverage=1
+        for ex in {long_ex, short_ex}:
+            try:
+                self._maybe_set_leverage_1x(symbol, ex)
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="set_leverage_scale_in",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"symbol": symbol, "exchange": ex, "leverage": 1},
+                )
+
+        per_leg = float(self.config.per_leg_notional_usdt)
+        ob_long = fetch_orderbook_prices(long_ex, symbol, self.config.orderbook_market_type, notional=float(per_leg)) or {}
+        ob_short = fetch_orderbook_prices(short_ex, symbol, self.config.orderbook_market_type, notional=float(per_leg)) or {}
+        if ob_long.get("error") or ob_short.get("error"):
+            raise TradeExecutionError(f"Orderbook unavailable for scale-in: long={ob_long.get('error')} short={ob_short.get('error')}")
+        long_px = ob_long.get("buy")
+        short_px = ob_short.get("sell")
+        if not long_px or not short_px:
+            raise TradeExecutionError("Orderbook missing buy/sell prices for scale-in execution")
+        if float(short_px) <= float(long_px):
+            raise TradeExecutionError(
+                f"Non-tradable entry spread for scale-in: short_sell_px={short_px} <= long_buy_px={long_px} "
+                f"(symbol={symbol} long_ex={long_ex} short_ex={short_ex})"
+            )
+
+        entry_spread_metric = float(math.log(float(short_px) / float(long_px)))
+        entry_spread_pct = float(math.exp(float(entry_spread_metric)) - 1.0)
+        long_qty = float(per_leg) / float(long_px)
+        short_qty = float(per_leg) / float(short_px)
+
+        # Same guardrail as initial open: entry spread must not be smaller than TP target.
+        if float(entry_spread_metric) < float(take_profit_pnl):
+            raise TradeExecutionError(
+                f"Scale-in entry spread too small for TP target: entry_spread_metric={entry_spread_metric:.6f} "
+                f"< tp_pnl={float(take_profit_pnl):.6f} (symbol={symbol} long_ex={long_ex} short_ex={short_ex})"
+            )
+
+        legs = [
+            {"exchange": long_ex, "side": "long", "quantity": long_qty, "order_kwargs": {"client_order_id": f"{client_base}-L"}},
+            {"exchange": short_ex, "side": "short", "quantity": short_qty, "order_kwargs": {"client_order_id": f"{client_base}-S"}},
+        ]
+
+        opened: List[Dict[str, Any]] = []
+        fill_by_side: Dict[str, Dict[str, Any]] = {}
+        try:
+            for leg in legs:
+                leg_opened_at = _utcnow()
+                order = execute_perp_market_order(
+                    str(leg["exchange"]),
+                    symbol,
+                    float(leg["quantity"]),
+                    side=str(leg["side"]),
+                    order_kwargs=dict(leg.get("order_kwargs") or {}),
+                )
+                opened.append(
+                    {"exchange": str(leg["exchange"]), "side": str(leg["side"]), "quantity": float(leg["quantity"]), "order": order}
+                )
+
+                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order)
+                fill_by_side[str(leg["side"])] = dict(fill or {})
+
+                conn.execute(
+                    """
+                    INSERT INTO watchlist.live_trade_order(
+                        signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
+                        filled_qty, avg_price, cum_quote, exchange_order_id,
+                        client_order_id, submitted_at, order_resp, status
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                    """,
+                    (
+                        int(signal_id),
+                        "open",
+                        "long" if str(leg["side"]) == "long" else "short",
+                        str(leg["exchange"]),
+                        str(leg["side"]),
+                        "perp",
+                        float(per_leg),
+                        str(leg["quantity"]),
+                        float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
+                        float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
+                        float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                        str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
+                        str((leg.get("order_kwargs") or {}).get("client_order_id") or ""),
+                        leg_opened_at,
+                        _jsonb(order) if order is not None else None,
+                        str(fill.get("status") or "submitted"),
+                    ),
+                )
+
+                ex_l = str(leg["exchange"]).lower()
+                if ex_l == "hyperliquid":
+                    self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
+                else:
+                    self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
+        except Exception as exc:
+            # Best-effort rollback: close any legs that were opened before a failure.
+            rollback_base = f"wl{signal_id}SR{int(time.time())}"
+            for opened_leg in reversed(opened):
+                try:
+                    pos_leg = str(opened_leg.get("side") or "")
+                    qty = float(opened_leg.get("quantity") or 0.0)
+                    if qty <= 0:
+                        continue
+                    exchange = str(opened_leg.get("exchange") or "")
+                    close_client_id = f"{rollback_base}-{'L' if pos_leg == 'long' else 'S'}"
+                    _ = self._place_close_order(
+                        exchange=exchange,
+                        symbol=symbol,
+                        position_leg=pos_leg,
+                        quantity=qty,
+                        client_order_id=close_client_id,
+                    )
+                except Exception:
+                    continue
+            raise TradeExecutionError(f"scale_in_open_failed: {type(exc).__name__}: {exc}")
+
+        return {
+            "opened_at": _utcnow(),
+            "entry_spread_metric": float(entry_spread_metric),
+            "entry_spread_pct": float(entry_spread_pct),
+            "orderbook_execution": {
+                "ts": _utcnow().isoformat(),
+                "long_exchange": str(long_ex),
+                "short_exchange": str(short_ex),
+                "long_buy_px": float(long_px),
+                "short_sell_px": float(short_px),
+                "entry_spread_metric": float(entry_spread_metric),
+                "entry_spread_pct": float(entry_spread_pct),
+                "take_profit_pnl": float(take_profit_pnl),
+                "long_qty": float(long_qty),
+                "short_qty": float(short_qty),
+                "orderbook_long": ob_long,
+                "orderbook_short": ob_short,
+            },
+            "fills": fill_by_side,
+        }
 
     def _attempt_close(
         self,
