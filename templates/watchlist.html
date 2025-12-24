@@ -288,6 +288,17 @@
                 <div class="info-item"><strong>图表</strong>：近 12 小时价差；蓝线=价差，绿虚线=15m 中线，黄虚线=基线；青色散点=开仓，绿色=TP，红色=SL，紫色=资金费提醒；橙色虚线=资金费结算。</div>
             </div>
         </div>
+        <div class="info-block" id="v2-info">
+            <h3>v2 因子说明（定量定义）</h3>
+            <div class="info-grid">
+                <div class="info-item"><strong>序列</strong>：spread_t = ln(P_short/P_long)（两腿 1min close，对齐容忍 ≤90s，最多 forward-fill 2 bars）；funding_edge_t = FR_short − FR_long（若某腿为 spot，则 funding=0）。</div>
+                <div class="info-item"><strong>收益/斜率</strong>：spread_ret_60m = spread_t − spread_{t−60m}；spread_slope_240m = OLS 斜率（窗口 241 个点，x=分钟索引，y=spread）。</div>
+                <div class="info-item"><strong>波动/形态</strong>：spread_vol_30m = std(Δspread) over 30m；spread_zscore_4h = (spread_t−mean_4h)/std_4h；exhaustion=1 当 |slope_5|&lt;|slope_30| 且 ret_5 与 ret_30 反向。</div>
+                <div class="info-item"><strong>资金费</strong>：funding_edge_short_minus_long = funding_edge_t；carry_net_cost_horizon_240m = funding_edge_t × (240 / funding_interval_min)。</div>
+                <div class="info-item"><strong>质量门槛</strong>：missing_rate≤max_missing_ratio（默认 0.2），缺失来自 1min K 对齐；细节见 factors_v2_meta.short_quality/long_quality。</div>
+                <div class="info-item"><strong>模型系数（Top）</strong><br><span id="v2-model-coefs" class="muted">加载中...</span></div>
+            </div>
+        </div>
         <div class="muted" style="margin:8px 0 14px;">图表已移动到独立页面，点击“图表窗口”或行内“图表”按钮将在新标签页打开。</div>
         <div class="charts-grid" id="charts-grid" style="display:none;"></div>
     </div>
@@ -316,6 +327,7 @@
         let chartsLoaded = false;
         let lastActiveEntries = [];
         const SPREAD_ABS_BASELINE = 0.05; // 与后端 WATCHLIST_METRICS_CONFIG 保持一致
+        let v2ModelInfoLoaded = false;
 
         const summaryEls = {
             active: document.getElementById('active-count'),
@@ -409,7 +421,179 @@
             'signal_persistence': '连续满足基线触发的分钟数（越大代表持续性越强）。',
         };
 
+        const formatMinutes = (min) => {
+            const n = toNumber(min);
+            if (n === null) return String(min ?? '');
+            if (n % 1440 === 0) return `${n / 1440}d`;
+            if (n % 60 === 0) return `${n / 60}h`;
+            return `${n}m`;
+        };
+
+        const describeV2Factor = (key) => {
+            if (!key) return null;
+            const k = String(key);
+            const mRet = k.match(/^spread_ret_(\d+)m$/);
+            if (mRet) {
+                const dm = Number(mRet[1]);
+                return {
+                    title: "价差收益",
+                    explain: `Δ=${formatMinutes(dm)} 的价差变化（对数价差）`,
+                    formula: `spread_ret_${dm}m = spread(t0) − spread(t0−Δ)`,
+                };
+            }
+            const mSlope = k.match(/^spread_slope_(\d+)m$/);
+            if (mSlope) {
+                const wm = Number(mSlope[1]);
+                return {
+                    title: "价差斜率",
+                    explain: `窗口=${formatMinutes(wm)}，OLS 每分钟斜率（对数价差）`,
+                    formula: `spread_slope_${wm}m = OLS_slope(x=0..N−1, y=spread)`,
+                };
+            }
+            const mCross = k.match(/^spread_crossings_(\d+)m$/);
+            if (mCross) {
+                const wm = Number(mCross[1]);
+                return {
+                    title: "穿越次数",
+                    explain: `窗口=${formatMinutes(wm)}，围绕均值的符号翻转次数`,
+                    formula: `count sign(spread − mean(spread_window)) flips`,
+                };
+            }
+            const mVol = k.match(/^spread_vol_(\d+)m$/);
+            if (mVol) {
+                const wm = Number(mVol[1]);
+                return {
+                    title: "价差波动",
+                    explain: `窗口=${formatMinutes(wm)}，对 1m 差分的标准差`,
+                    formula: `spread_vol_${wm}m = std(Δspread)`,
+                };
+            }
+            const mZ = k.match(/^spread_zscore_(.+)$/);
+            if (mZ) {
+                const label = mZ[1];
+                return {
+                    title: "Z 分数",
+                    explain: `窗口=${label}，当前价差相对均值的标准化偏离`,
+                    formula: `spread_zscore_${label} = (spread−mean)/std`,
+                };
+            }
+            const mEdgeChg = k.match(/^funding_edge_change_(\d+)m$/);
+            if (mEdgeChg) {
+                const dm = Number(mEdgeChg[1]);
+                return {
+                    title: "资金费差变化",
+                    explain: `Δ=${formatMinutes(dm)} 的资金费差（short−long）变化`,
+                    formula: `funding_edge_change_${dm}m = edge(t0) − edge(t0−Δ)`,
+                };
+            }
+
+            const docs = {
+                spread_reversal_15m: {
+                    title: "反转信号",
+                    explain: "短期与中期方向是否相反（1=反转）",
+                    formula: "sign(slope_5m) != sign(slope_30m) 或 spread_ret_5m*spread_ret_30m < 0",
+                },
+                spread_vol_ratio_30_over_240: {
+                    title: "波动比值",
+                    explain: "短波动/长波动（越大说明短期更活跃）",
+                    formula: "spread_vol_ratio_30_over_240 = spread_vol_30m / spread_vol_240m",
+                },
+                spread_drawdown_240m: {
+                    title: "最大回撤",
+                    explain: "窗口内最大 peak-to-trough（对数价差水平）",
+                    formula: "max_t(peak(spread)-spread(t)) over 240m",
+                },
+                spread_skew_240m: {
+                    title: "偏度",
+                    explain: "对 Δspread 的偏度（尾部方向）",
+                    formula: "skew(Δspread) over 240m",
+                },
+                spread_kurt_240m: {
+                    title: "峰度",
+                    explain: "对 Δspread 的峰度（尾部厚度）",
+                    formula: "kurt(Δspread) over 240m",
+                },
+                spread_rsi_14: {
+                    title: "RSI",
+                    explain: "基于 Δspread 的 RSI(14)",
+                    formula: "RSI_14(Δspread)",
+                },
+                spread_macd_hist: {
+                    title: "MACD Histogram",
+                    explain: "价差序列的 DIF-DEA（12,26,9）",
+                    formula: "EMA12(spread)−EMA26(spread) − EMA9(MACD)",
+                },
+                spread_boll_pct_b: {
+                    title: "%B",
+                    explain: "价差在布林带中的位置（可超界）",
+                    formula: "(spread−(ma20−2σ)) / (4σ)",
+                },
+                funding_edge_vol_240m: {
+                    title: "资金费差波动",
+                    explain: "资金费差 edge 的标准差（稳定性）",
+                    formula: "std(edge) over 240m",
+                },
+                funding_edge_short_minus_long: {
+                    title: "资金费差",
+                    explain: "当前资金费差（short−long）",
+                    formula: "edge(t)=FR_short(t) − FR_long(t)（spot 腿 funding=0）",
+                },
+                carry_net_cost_horizon_240m: {
+                    title: "净成本(240m)",
+                    explain: "把资金费差按结算周期折算到 240 分钟",
+                    formula: "edge(t0) × (240 / funding_interval_min)",
+                },
+                funding_regime_quantile: {
+                    title: "资金费分位",
+                    explain: "edge(t0) 在历史窗口内的分位（0..1）",
+                    formula: "percentile_rank(edge_series, edge_now)",
+                },
+                funding_edge_regime: {
+                    title: "资金费 Regime",
+                    explain: "资金费差分层（数值标签；文字见 factors_v2_meta.funding_edge_regime_label）",
+                    formula: "按 mean±std 与 jump 规则离散化",
+                },
+                exhaustion: {
+                    title: "衰竭",
+                    explain: "短期动能衰竭 + 方向反转（1=更可能拐点）",
+                    formula: "abs(slope_5m)<abs(slope_30m) 且 spread_ret_5m 与 spread_ret_30m 反向",
+                },
+                turning_point_score: {
+                    title: "拐点强度",
+                    explain: "二阶差分的 zscore（越大越像加速拐点）",
+                    formula: "zscore(Δ²spread) over 60m",
+                },
+                hurst_proxy: {
+                    title: "Hurst Proxy",
+                    explain: "均值回归/趋势的轻量 proxy（<0.5 更偏回归）",
+                    formula: "log(std(Δ2m)/std(Δ1m))/log(2)",
+                },
+                time_to_next_funding_min: {
+                    title: "距下次资金费",
+                    explain: "距离最近一次资金费结算的分钟数（仅 perp 腿）",
+                    formula: "min(next_funding_time) − decision_ts（分钟）",
+                },
+            };
+            return docs[k] || null;
+        };
+
+        const formatV2Value = (key, value) => {
+            const k = String(key || "");
+            const n = toNumber(value);
+            if (n === null) return "-";
+            if (k.includes("crossings_")) return String(Math.round(n));
+            if (k.endsWith("_min")) return formatNumber(n, 1);
+            if (k.includes("rsi_")) return formatNumber(n, 2);
+            if (k.includes("quantile") || k.includes("pct_b")) return formatNumber(n, 4);
+            if (k.includes("regime")) return formatNumber(n, 2);
+            return formatNumber(n, 6);
+        };
+
+        let lastLiveTradingThr = null;
+
         const buildFactorHtml = (symbol) => {
+            const entry = (lastActiveEntries || []).find((e) => e && e.symbol === symbol) || {};
+            const entryType = entry.entry_type || 'A';
             const m = metricsCache[symbol] || {};
             const factors = m.extra_factors || {};
             const baseRows = [
@@ -425,17 +609,108 @@
                 return [k, display, k];
             });
             const rows = [...baseRows, ...factorRows];
-            if (!rows.length) return '<div class="muted">暂无因子数据</div>';
+            const hasBase = rows.length > 0;
             const descList = rows
                 .map(([, , key]) => key)
                 .filter((k) => factorDescriptions[k])
                 .map((k) => `<li><strong>${k}</strong>: ${factorDescriptions[k]}</li>`)
                 .join('');
+
+            const v2 = (() => {
+                if (entryType !== 'B' && entryType !== 'C') return null;
+                const ev = (eventV2 && eventV2[symbol] && eventV2[symbol][entryType]) ? eventV2[symbol][entryType] : null;
+                if (!ev) return null;
+                return ev;
+            })();
+
+            const v2Section = (() => {
+                if (!v2) return '';
+                const pred = v2.pred_v2 || {};
+                const meta = v2.pred_v2_meta || {};
+                const fmeta = v2.factors_v2_meta || {};
+                const f2 = v2.factors_v2 || {};
+                const missMax = toNumber(meta.max_missing_ratio) ?? 0.2;
+                const thr = lastLiveTradingThr || {};
+                const renderPred = (hKey) => {
+                    const r = pred ? pred[hKey] : null;
+                    if (!r) return `<div class="info-item"><strong>v2 ${hKey}</strong><br>-</div>`;
+                    const pnl = toNumber(r.pnl_hat);
+                    const prob = toNumber(r.win_prob);
+                    const miss = toNumber(r.missing_rate);
+                    const ok = r.ok === true;
+                    const pass = (() => {
+                        const thrP = hKey === '240' ? toNumber(thr.v2_pnl_threshold_240) : toNumber(thr.v2_pnl_threshold_1440);
+                        const thrW = hKey === '240' ? toNumber(thr.v2_win_prob_threshold_240) : toNumber(thr.v2_win_prob_threshold_1440);
+                        if (thrP === null || thrW === null || pnl === null || prob === null) return null;
+                        if (miss !== null && miss > missMax) return false;
+                        return pnl >= thrP && prob >= thrW;
+                    })();
+                    const passTxt = pass === null ? '' : (pass ? ' PASS' : ' FAIL');
+                    return `<div class="info-item"><strong>v2 ${hKey}${passTxt}</strong><br>pnl ${formatPct(pnl)} / prob ${formatPct(prob)}<br>ok=${ok ? 'true' : 'false'} miss=${miss !== null ? formatPct(miss) : '-'} (max ${formatPct(missMax)})</div>`;
+                };
+                const shortMiss = toNumber((fmeta.short_quality || {}).missing_rate);
+                const longMiss = toNumber((fmeta.long_quality || {}).missing_rate);
+                const factorsLine = `factors_v2_meta: ok=${fmeta.ok === true ? 'true' : 'false'} short_miss=${shortMiss !== null ? formatPct(shortMiss) : '-'} long_miss=${longMiss !== null ? formatPct(longMiss) : '-'}`;
+                const factorsV2Table = (() => {
+                    const entries = Object.entries(f2 || {}).sort(([a], [b]) => String(a).localeCompare(String(b)));
+                    if (!entries.length) return '<div class="muted">-</div>';
+                    const rows = entries.map(([k, v]) => {
+                        const doc = describeV2Factor(k);
+                        const docHtml = doc
+                            ? `<div style="line-height:1.45;"><div><strong>${doc.title}</strong>：${doc.explain}</div><div class="muted" style="margin-top:2px;">${doc.formula}</div></div>`
+                            : '<span class="muted">（暂无说明）</span>';
+                        return `
+                            <tr>
+                                <td style="padding:6px 8px; border:1px solid var(--border); font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace; font-size:12px;">${k}</td>
+                                <td style="padding:6px 8px; border:1px solid var(--border); white-space:nowrap; text-align:right;">${formatV2Value(k, v)}</td>
+                                <td style="padding:6px 8px; border:1px solid var(--border);">${docHtml}</td>
+                            </tr>
+                        `;
+                    }).join('');
+                    return `
+                        <div class="muted" style="margin:6px 0;">
+                            spread = ln(P_short/P_long)，funding_edge = FR_short − FR_long（spot 腿 funding=0）
+                        </div>
+                        <div style="max-height:520px; overflow:auto; border:1px solid var(--border); border-radius:8px;">
+                            <table style="border-collapse:collapse; width:100%;">
+                                <thead>
+                                    <tr style="position:sticky; top:0; background:var(--panel);">
+                                        <th style="padding:6px 8px; border:1px solid var(--border); text-align:left;">factor</th>
+                                        <th style="padding:6px 8px; border:1px solid var(--border); text-align:right; width:110px;">value</th>
+                                        <th style="padding:6px 8px; border:1px solid var(--border); text-align:left;">解释 / 计算方式</th>
+                                    </tr>
+                                </thead>
+                                <tbody>${rows}</tbody>
+                            </table>
+                        </div>
+                    `;
+                })();
+                const ob = v2.orderbook_validation || {};
+                const obLine = ob.ts ? `orderbook_validation: ok=${ob.ok === true ? 'true' : 'false'} reason=${ob.reason || '-'} ts=${formatTime(ob.ts)}` : '';
+                return `
+                    <div style="margin-top:14px;">
+                        <div style="font-weight:700;margin-bottom:6px;">v2 信号（来自 PG watch_signal_event）</div>
+                        <div class="info-grid">
+                            <div class="info-item"><strong>event</strong><br>#${v2.event_id || '-'} ${entryType}<br>decision_ts ${formatTime(v2.decision_ts || v2.start_ts)}</div>
+                            ${renderPred('240')}
+                            ${renderPred('1440')}
+                            <div class="info-item"><strong>v2 meta</strong><br>${factorsLine}${obLine ? `<br>${obLine}` : ''}</div>
+                            <div class="info-item"><strong>v2 factors（数量）</strong><br>${Object.keys(f2 || {}).length}</div>
+                        </div>
+                        <details style="margin-top:10px;" open>
+                            <summary style="cursor:pointer; font-weight:700;">v2 factors（全部）</summary>
+                            <div style="margin-top:8px;">${factorsV2Table}</div>
+                        </details>
+                    </div>
+                `;
+            })();
+
+            if (!hasBase && !v2Section) return '<div class="muted">暂无因子数据</div>';
+
             return `
-                <div class="info-grid">
-                    ${rows.map(([k, v]) => `<div class="info-item"><strong>${k}</strong><br>${v}</div>`).join('')}
-                </div>
+                ${hasBase ? `<div class="info-grid">${rows.map(([k, v]) => `<div class="info-item"><strong>${k}</strong><br>${v}</div>`).join('')}</div>` : '<div class="muted">暂无 Type A 指标因子</div>'}
                 ${descList ? `<div style="margin-top:12px;"><div style="font-weight:700;margin-bottom:6px;">计算说明</div><ul style="padding-left:18px;line-height:1.5;">${descList}</ul></div>` : ''}
+                ${v2Section}
             `;
         };
 
@@ -584,8 +859,34 @@
             return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
         };
 
+        const loadV2ModelInfo = async () => {
+            const el = document.getElementById('v2-model-coefs');
+            if (!el) return;
+            try {
+                const resp = await fetch('/api/watchlist/v2_model_info');
+                const data = await resp.json();
+                const models = data.models || {};
+                const renderOne = (h) => {
+                    const m = models[h] || {};
+                    if (!m.ok) return `${h}m: model_not_loaded`;
+                    const fmt = (rows) =>
+                        (rows || [])
+                            .slice(0, 6)
+                            .map((r) => `${(r.coef >= 0 ? '+' : '')}${Number(r.coef).toFixed(4)}·${r.feature}`)
+                            .join('；');
+                    const ridge = (m.ridge || {}).top_coef || [];
+                    const logi = (m.logistic || {}).top_coef || [];
+                    return `${h}m ridge: ${fmt(ridge)}<br>${h}m logit: ${fmt(logi)}`;
+                };
+                el.innerHTML = `${renderOne('240')}<br>${renderOne('1440')}`;
+            } catch (e) {
+                el.textContent = '加载失败';
+            }
+        };
+
             const render = (payload) => {
             const { summary, entries, timestamp, live_trading_thresholds: ltThr } = payload;
+            lastLiveTradingThr = ltThr || null;
             summaryEls.active.textContent = summary.active_count;
             summaryEls.total.textContent = summary.total_tracked;
             summaryEls.threshold.textContent = formatPct(summary.threshold);
@@ -593,11 +894,18 @@
             summaryEls.refresh.textContent = summary.refresh_seconds + 's';
             summaryEls.updatedAt.textContent = formatTime(timestamp);
 
-            const activeEntries = (entries || []).filter((item) => item.status === 'active');
+            const activeEntries = (entries || []).filter(
+                (item) => String((item || {}).status || '').trim().toLowerCase() === 'active'
+            );
 
             if (!activeEntries.length) {
-                bodyEl.innerHTML = '<tr><td colspan="19" class="muted">暂无活跃符号满足条件</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="20" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
+            }
+
+            if (!v2ModelInfoLoaded) {
+                v2ModelInfoLoaded = true;
+                loadV2ModelInfo();
             }
 
             const rows = activeEntries.map((item) => {
@@ -623,16 +931,51 @@
                         ].filter(Boolean).join(' ') || '-';
                     }
                     // Type B/C: show regression-based entry signal (horizon=240m)
-                    if (!pred240) return '-';
-                    const pnlHat = pred240.pnl_hat;
-                    const winProb = pred240.win_prob;
-                    if (pnlHat === null || pnlHat === undefined || winProb === null || winProb === undefined) return '-';
-                    const pnlTxt = `${formatPct(pnlHat)}`;
-                    const probTxt = `${formatPct(winProb)}`;
-                    const thrPnl = ltThr && ltThr.pnl_threshold !== undefined ? Number(ltThr.pnl_threshold) : null;
-                    const thrProb = ltThr && ltThr.win_prob_threshold !== undefined ? Number(ltThr.win_prob_threshold) : null;
-                    const ok = (thrPnl !== null && thrProb !== null) ? (Number(pnlHat) >= thrPnl && Number(winProb) >= thrProb) : false;
-                    return `${ok ? 'SIG✔' : 'SIG'} ${pnlTxt}/${probTxt}`;
+                    const lines = [];
+                    if (pred240 && pred240.pnl_hat !== null && pred240.pnl_hat !== undefined && pred240.win_prob !== null && pred240.win_prob !== undefined) {
+                        const pnlHat = pred240.pnl_hat;
+                        const winProb = pred240.win_prob;
+                        const pnlTxt = `${formatPct(pnlHat)}`;
+                        const probTxt = `${formatPct(winProb)}`;
+                        const thrPnl = ltThr && ltThr.pnl_threshold !== undefined ? Number(ltThr.pnl_threshold) : null;
+                        const thrProb = ltThr && ltThr.win_prob_threshold !== undefined ? Number(ltThr.win_prob_threshold) : null;
+                        const ok = (thrPnl !== null && thrProb !== null) ? (Number(pnlHat) >= thrPnl && Number(winProb) >= thrProb) : false;
+                        lines.push(`${ok ? 'SIG✔' : 'SIG'} ${pnlTxt}/${probTxt}`);
+                    } else {
+                        lines.push('SIG -');
+                    }
+
+                    const ev = (eventV2 && eventV2[item.symbol] && eventV2[item.symbol][entryType]) ? eventV2[item.symbol][entryType] : null;
+                    const v2 = ev ? (ev.pred_v2 || null) : null;
+                    const v2Meta = ev ? (ev.pred_v2_meta || {}) : {};
+                    const missMax = toNumber(v2Meta.max_missing_ratio) ?? 0.2;
+
+                    const formatV2Line = (hKey, pnlThr, probThr) => {
+                        const r = v2 ? v2[hKey] : null;
+                        if (!r) return null;
+                        const pnl = toNumber(r.pnl_hat);
+                        const prob = toNumber(r.win_prob);
+                        const miss = toNumber(r.missing_rate);
+                        if (pnl === null || prob === null) return `V2-${hKey} -`;
+                        const missOk = miss === null ? true : (miss <= missMax);
+                        const pass = pnlThr !== null && probThr !== null ? (missOk && pnl >= pnlThr && prob >= probThr) : null;
+                        const tag = pass === null ? `V2-${hKey}` : (pass ? `V2-${hKey}✔` : `V2-${hKey}`);
+                        const missTxt = miss !== null ? ` miss${formatPct(miss)}` : '';
+                        const maxTxt = miss !== null ? `/${formatPct(missMax)}` : '';
+                        return `${tag} ${formatPct(pnl)}/${formatPct(prob)}${missTxt}${maxTxt}`;
+                    };
+
+                    const v2Thr240P = ltThr && ltThr.v2_pnl_threshold_240 !== undefined ? toNumber(ltThr.v2_pnl_threshold_240) : null;
+                    const v2Thr240W = ltThr && ltThr.v2_win_prob_threshold_240 !== undefined ? toNumber(ltThr.v2_win_prob_threshold_240) : null;
+                    const v2Thr1440P = ltThr && ltThr.v2_pnl_threshold_1440 !== undefined ? toNumber(ltThr.v2_pnl_threshold_1440) : null;
+                    const v2Thr1440W = ltThr && ltThr.v2_win_prob_threshold_1440 !== undefined ? toNumber(ltThr.v2_win_prob_threshold_1440) : null;
+
+                    const l240 = formatV2Line('240', v2Thr240P, v2Thr240W);
+                    const l1440 = formatV2Line('1440', v2Thr1440P, v2Thr1440W);
+                    if (l240) lines.push(l240);
+                    if (l1440) lines.push(l1440);
+
+                    return lines.filter(Boolean).join('<br>') || '-';
                 })();
 
                 const entryTitle = (() => {
@@ -647,12 +990,28 @@
                         ? `实盘阈值(用于参考)：h=${ltThr.horizon_min}m pnl>=${formatPct(ltThr.pnl_threshold)} prob>=${formatPct(ltThr.win_prob_threshold)}`
                         : '实盘阈值(用于参考)：未知';
                     if (!pred240) return `Type ${entryType}: 触发来自跨交易所价差；回归预测未就绪\\n${thrLine}`;
-                    return [
+                    const baseLines = [
                         `Type ${entryType}: 回归预测(240m)`,
                         `pnl_hat=${formatPct(pred240.pnl_hat)} win_prob=${formatPct(pred240.win_prob)} fee_thr=${formatPct(pred240.fee_threshold)}`,
                         thrLine,
                         '说明：win_prob 是 P(pnl>fee_threshold) 的近似，不含完整手续费/滑点/资金费；Type B 的资金费准入在 watchlist 侧单独过滤（默认净成本模式，可通过环境变量切换）。'
-                    ].join('\\n');
+                    ];
+
+                    const ev = (eventV2 && eventV2[item.symbol] && eventV2[item.symbol][entryType]) ? eventV2[item.symbol][entryType] : null;
+                    if (!ev) return baseLines.join('\\n');
+                    const v2 = ev.pred_v2 || {};
+                    const meta = ev.pred_v2_meta || {};
+                    const missMax = toNumber(meta.max_missing_ratio) ?? 0.2;
+                    const add = [];
+                    if (ev.event_id) add.push(`PG event_id=${ev.event_id} decision_ts=${ev.decision_ts || ev.start_ts || '-'}`);
+                    if (ltThr && ltThr.v2_enabled) {
+                        add.push(`v2阈值：240 pnl>=${formatPct(ltThr.v2_pnl_threshold_240)} prob>=${formatPct(ltThr.v2_win_prob_threshold_240)}；1440 pnl>=${formatPct(ltThr.v2_pnl_threshold_1440)} prob>=${formatPct(ltThr.v2_win_prob_threshold_1440)}；max_missing=${formatPct(missMax)}`);
+                    }
+                    const r240 = v2['240'];
+                    if (r240) add.push(`v2(240): pnl=${formatPct(r240.pnl_hat)} prob=${formatPct(r240.win_prob)} ok=${r240.ok} missing_rate=${formatPct(r240.missing_rate)}`);
+                    const r1440 = v2['1440'];
+                    if (r1440) add.push(`v2(1440): pnl=${formatPct(r1440.pnl_hat)} prob=${formatPct(r1440.win_prob)} ok=${r1440.ok} missing_rate=${formatPct(r1440.missing_rate)}`);
+                    return [...baseLines, ...add].join('\\n');
                 })();
                 const exitFlags = entryType === 'A'
                     ? [
@@ -1123,6 +1482,7 @@
 
         let seriesLoading = false;
         const loadSeriesData = async () => {};
+        let eventV2 = {};
 
         const loadWatchlist = async () => {
             btn.disabled = true;
@@ -1133,6 +1493,7 @@
                 window.__exchangeDetails = data.exchange_details || {};
                 exchangeOverview = data.exchange_overview || {};
                 crossSpreads = data.cross_spreads || {};
+                eventV2 = data.event_v2 || {};
                 const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
                 const activeSymbols = activeEntries.map((i) => i.symbol);
                 lastActiveEntries = activeEntries;
@@ -1156,7 +1517,7 @@
                 if (refreshTimer) clearInterval(refreshTimer);
                 refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
-                bodyEl.innerHTML = `<tr><td colspan="19" class="muted">加载失败: ${err}</td></tr>`;
+                bodyEl.innerHTML = `<tr><td colspan="20" class="muted">加载失败: ${err}</td></tr>`;
             } finally {
                 btn.disabled = false;
             }
