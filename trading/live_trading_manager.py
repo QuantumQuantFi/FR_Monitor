@@ -3193,6 +3193,7 @@ class LiveTradingManager:
               s.reason AS last_reason,
               e.start_ts,
               e.end_ts,
+              e.status AS event_status,
               e.exchange,
               e.signal_type,
               e.leg_a_exchange,
@@ -3222,13 +3223,16 @@ class LiveTradingManager:
               ON e.id = s.event_id
             WHERE s.status='skipped'
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
-              AND COALESCE(
-                (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                e.end_ts,
-                e.start_ts
-              ) >= now() - make_interval(mins := %s)
+              AND (
+                e.status = 'open'
+                OR COALESCE(
+                  (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                  (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                  (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                  e.end_ts,
+                  e.start_ts
+                ) >= now() - make_interval(mins := %s)
+              )
             ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
             LIMIT %s;
             """,
