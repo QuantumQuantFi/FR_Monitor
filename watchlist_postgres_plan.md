@@ -214,7 +214,7 @@
 - 止盈：当 `pnl_spread_now >= take_profit_pnl` 触发“平仓候选”，其中：
   - `take_profit_pnl` 默认 `take_profit_ratio * pnl_hat_ob`（例如 0.8×）
   - 为防止盘口瞬时跳变导致“触发即打回”，会做短间隔多次确认（默认 3 次、间隔约 0.7s），全部通过才真正进入平仓下单
-- 强平：持有时间超过 `max_hold_days` 强制平仓（不依赖 pnl）。当前业务要求为 **1 天**；如果配置从 7 天缩短到 1 天，已开仓的单也应同步缩短其 `force_close_at`（避免旧仓位继续按 7 天滞留）。
+- 强平：持有时间超过 `max_hold_days` 强制平仓（不依赖 pnl）。当前业务要求为 **7 天**；如果配置从 7 天缩短到更短周期，已开仓的单也应同步缩短其 `force_close_at`（避免旧仓位继续按旧周期滞留）。
 
 ### 7.1 开仓前订单簿复核（两段：watchlist‑event 选 pair + live trading 执行确认；已落地）
 **目标**：避免“watchlist last 价差很大但盘口不可成交”的假信号，并防止只验证一对交易所导致漏掉更可成交的 pair。
@@ -244,6 +244,87 @@
 - 仍保留执行前的确认：在真正下单前会做一次 execution 级别的扫盘确认（与下单名义金额一致），防止“选 pair 时刻 OK，但执行时价差已消失”。
 - skipped 复盘：若确认失败/不可成交，会以 `skipped` 记录并在 payload 中保存当时的复核证据，便于解释“为什么没成交”。
 
+### 7.2 分类止损 + 价差扩张补救加仓（最多 4 次开仓，推荐）
+你提出的核心思想：不要机械“止损”，而是先判断亏损来自 **资金费（funding）** 还是 **价差扩大（spread widening）**。  
+结论：资金费变负属于“结构性风险”，应立即止损；价差扩大属于“可均值回归”的主场景，可用有限次数加仓补救以提高最终平仓概率。
+
+#### 7.2.1 概念与目标
+- **第一笔开仓**：例如在 `entry_spread_pct≈3%` 开仓，原计划在 `exit_spread_pct≈2%` 平仓（价差回落 1%）。
+- **补救加仓触发（不平仓）**：当价差扩大到开仓价差的 `1.5×`（例：`4.5%`）允许第二次开仓；再扩大到 `1.5×`（例：`6.75%`）允许第三次；最多 4 次（总 4 笔/同一对冲方向）。
+- **共享平仓时间与目标**：所有仓位共享同一个 `force_close_at`（最大持仓 7 天），并使用“整体盈利达到初始预计盈利 70~80%”作为止盈阈值（更容易尽快平掉并锁定收益）。
+
+#### 7.2.2 决策分类（monitor loop）
+在每次 `PositionMonitor` 采样里（约 1min），把“当前不利”拆成两类：
+- **资金费亏损（硬止损）**：任一条件成立立刻触发平仓
+  - `funding_rate_per_hour <= -stop_loss_funding_per_hour_pct`（已实现的硬阈值）
+  - 或（可选增强）`funding_pnl_usdt < -max_funding_loss_usdt` / `funding_pnl_pct < -max_funding_loss_pct`
+- **价差扩大（允许补救）**：`exit_spread_pct_now` 持续上行导致 `pnl_spread_now < 0`，但 funding 未触发硬止损；此时不直接平仓，而是进入“补救加仓判定”。
+
+#### 7.2.3 补救加仓触发规则（核心）
+1) **基准**：以第一笔开仓的 `entry_spread_pct_first` 为基准（用 execution 扫盘得到的 `exit_spread_pct_now` 同口径比较）。
+2) **阈值序列**：
+   - `trigger_mult = 1.5`
+   - `trigger_k = 1..(max_entries-1)`
+   - `trigger_spread_pct_k = entry_spread_pct_first * (trigger_mult ** trigger_k)`
+3) **触发条件（建议全都满足）**：
+   - 当前 `exit_spread_pct_now >= trigger_spread_pct_next`
+   - 当前总开仓次数 `entries_count < max_entries`（默认 4）
+   - funding 未触发硬止损（见 7.2.2）
+   - `hedge_health == ok`（两腿都在、数量一致；避免 unhedged 时加仓）
+   - 两次加仓之间满足最小间隔 `min_scale_in_interval_minutes`（防止震荡频繁加仓）
+4) **watchlist 信号 gating（你要求“由 watchlist 信号触发二次开仓”）**：
+   - 只有当 watchlist 侧在最近 `scale_in_signal_max_age_minutes` 内产出“同方向/同交易所组合”的 event，并且 `pnl_hat/win_prob`（v1/v2 任一路）仍达标，才允许执行加仓。
+   - 推荐一期先做 **同 pair 加仓**（必须匹配当前 `long_ex/short_ex`），避免变成多 pair 混仓导致监控/平仓复杂度爆炸；二期再讨论“允许切换 pair”的方案。
+5) **每次加仓规模**：
+   - 推荐每次加仓使用与首笔相同的 `per_leg_notional_usdt`（等额加仓，最多 4 笔），并设置 `max_total_notional_usdt_per_symbol` 兜底。
+
+#### 7.2.4 平仓规则（整体仓位）
+目标：让“补救仓位”更容易在回归后整体出场，而不是等到回到首笔的原始止盈阈值。
+- **共享强平时间**：`force_close_at = opened_at_first + max_hold_days`（默认 7 天），后续加仓不延长 `force_close_at`。
+- **整体止盈阈值**（推荐采用“初始预计盈利的 70~80%”）：
+  - 以首笔的 `take_profit_pnl_initial` 为基准（对应“初始预计盈利/止盈参数”）。
+  - 当整体收益达到 `rescue_take_profit_ratio * take_profit_pnl_initial`（`rescue_take_profit_ratio` 推荐 0.7~0.8，可配置）则触发平仓候选。
+- **整体收益的计算口径（一期/二期）**：
+  - 一期（快速落地）：用“名义额加权的平均入场价差”计算整体 `pnl_spread_total`：  
+    `entry_spread_metric_avg = Σ(entry_spread_metric_i * notional_i) / Σ(notional_i)`，  
+    `pnl_spread_total = entry_spread_metric_avg - spread_now`
+  - 二期（更精确）：同时计算 `total_pnl_usdt_est = position_pnl_usdt_est + funding_pnl_usdt`，并以 USDT 口径做最终平仓判定（更贴近真实）。
+
+#### 7.2.5 落库与可观测性（必须做，否则无法审计）
+建议把 scale-in 状态写进 `watchlist.live_trade_signal.payload`（避免一期就改表结构），结构建议：
+```json
+{
+  "scale_in": {
+    "enabled": true,
+    "entries_count": 2,
+    "max_entries": 4,
+    "trigger_mult": 1.5,
+    "entry_spread_pct_first": 0.030,
+    "next_trigger_spread_pct": 0.045,
+    "rescue_take_profit_ratio": 0.75,
+    "take_profit_pnl_initial": 0.0082,
+    "entries": [
+      {"k": 1, "opened_at": "...", "per_leg_notional": 50, "entry_spread_metric": 0.0296, "entry_spread_pct": 0.0301, "orders": {"long": 123, "short": 124}},
+      {"k": 2, "opened_at": "...", "per_leg_notional": 50, "entry_spread_metric": 0.0448, "entry_spread_pct": 0.0458, "orders": {"long": 125, "short": 126}}
+    ]
+  }
+}
+```
+同时在 `live_trade_spread_sample.context` 里补充：
+- `loss_cause`：`funding` / `spread` / `none`
+- `scale_in`：当前 `entries_count/next_trigger_spread_pct/trigger_hit`
+- `close_target`：`take_profit_pnl_initial/rescue_take_profit_ratio/target_now`
+
+#### 7.2.6 实现落点（代码改动范围）
+- `trading/live_trading_manager.py`
+  - 放开“同 symbol 去重”的逻辑：当已 `open` 时允许进入 `scale_in` 流程（而不是一律忽略新信号）。
+  - 在 monitor loop 增加 `loss_cause` 判定与 `scale_in` 状态机（pending/confirmed/executing）。
+  - 新增“加仓执行”路径：复用现有两腿市价单执行与回滚逻辑，产生新 `live_trade_order` 记录；并将新 entry 写入 `payload.scale_in.entries`。
+- `watchlist_pg_writer.py` / `watch_signal_event` 接口
+  - 提供“最近 N 分钟 event（含 pred v1/v2 + chosen）”的快速查询，供 scale-in gating 使用（避免 live trading 侧做复杂聚合）。
+- `simple_app.py` + `templates/`
+  - `/live_trading` 列表新增：`entries_count`、`next_trigger_spread_pct`、`loss_cause`、`force_close_at`（7 天）与“手动触发加仓/禁用加仓”开关（必要时人工干预）。
+
 ---
 
 ## 8. 手动交易按钮与测试（你提出的第 6 条）
@@ -263,7 +344,8 @@ Phase 1（最小可用，先跑通）：
 5) UI：增加 `/live_trading` 页面展示信号与执行状态；加 BTC 20U 手动按钮（复用现有交易面板）。
 
 Phase 2（监控与平仓闭环）：
-6) 1min 订单簿监听与 `last_pnl_spread` 计算；达到 `take_profit_ratio * pnl_hat_ob` 止盈（默认 0.8×）；>`max_hold_days` 强平（当前 1 天）。
+6) 1min 订单簿监听与 `last_pnl_spread` 计算；达到 `take_profit_ratio * pnl_hat_ob` 止盈（默认 0.8×）；>`max_hold_days` 强平（当前 7 天）。
+6b) 分类止损 + 价差扩张补救加仓：资金费亏损立刻平仓；价差扩大按 `1.5×` 阶梯最多加仓 4 次；整体盈利达到首笔预计盈利的 70~80% 触发平仓。
 7) 完善失败回滚、重试、告警日志；补齐 open orders 查询（若确实需要展示委托）。
 
 Phase 3（策略与质量）：
@@ -514,13 +596,17 @@ Phase 3（策略与质量）：
 - spread 序列定义（canonical，避免方向混乱）：
   - `spread(t) = ln(P_short(t) / P_long(t))`
   - `P_short/P_long` 来自 event 中 **选定方向** 的两条腿（perp 用 `futures_price_close`）
-  - 5min 版本：`P_5m` 取 5m 窗口最后一个有效价格；`funding_edge_5m` 取窗口内均值（更稳健）
 - funding edge 定义（净成本模式）：
   - `edge(t) = fr_short(t) - fr_long(t)`（允许盈利为正，亏损为负）
   - 若 funding interval 缺失：用交易所默认值，并记录 `quality_flag=assumed_interval`
 - spread 的 “收益/变化” 统一用差分：
   - `spread_ret_Δm = spread(t0) - spread(t0-Δ)`
   - `spread_diff(t) = spread(t) - spread(t-1m)`
+
+**实现状态（已完成）**
+- 事件写入：所有 Type B/C event 在写入时自动计算并保存 `features_agg.meta_last.factors_v2`。
+- 回填：近 30 天 Type B/C event 已完成回填（`factors_v2` 全覆盖）。
+- 质量元信息：`features_agg.meta_last.factors_v2_meta` 记录 `missing_rate/ffill_points/max_gap_sec/series_start/series_end/interval_assumed` 等。
 
 **T1：实现 Core 因子（先 30~45 个）**
 - 价差反转/趋势（全部基于 1min spread 序列；必要时并行计算 5min 版本做稳健性对照）：
@@ -533,8 +619,8 @@ Phase 3（策略与质量）：
   - `spread_drawdown_240m`：对 `cum_ret(t)=spread(t)-spread(t0-240m)` 做 `max_peak_to_trough` 回撤
   - `spread_skew_240m/spread_kurt_240m`：对 `spread_diff` 的偏度/峰度（样本不足置空）
 - 传统指标（先少量，避免过拟合；全部基于 spread 序列）：
-  - `spread_rsi_14`：对 `spread_diff` 计算 RSI（14 period），1min 主、5min 对照
-  - `spread_macd_hist`：`EMA12(spread) - EMA26(spread) - EMA9(MACD)`；优先 5min 版本
+  - `spread_rsi_14`：对 `spread_diff` 计算 RSI（14 period）
+  - `spread_macd_hist`：`EMA12(spread) - EMA26(spread) - EMA9(MACD)`（1min 口径）
   - `spread_boll_pct_b`：`(spread - (ma20-2σ)) / (4σ)`，超界可 >1 或 <0
 - 资金费“净成本模式”（基于 1min funding_rate 序列）：
   - `funding_edge_short_minus_long(t)`：`edge(t)=fr_short(t)-fr_long(t)`
@@ -543,15 +629,16 @@ Phase 3（策略与质量）：
   - `funding_edge_vol_240m`：`std(edge)`（资金费稳定性）
 
 **T2：扩展 Plus 因子（“银子越多越好”但要可控）**
-- 多时间框动量：补齐 `spread_ret/slope` 在 90/120/180/360/720/1440m 的版本。
+- 多时间框动量：补齐 `spread_ret/slope` 在 90/120/180/360/720/1440/4320/10080/21600m 的版本。
 - 更多反转/形态：
   - `exhaustion`：`abs(slope_5m) < abs(slope_30m)` 且 `spread_ret_5m` 与 `spread_ret_30m` 反向
   - `turning_point_score`：`-diff2(spread)` 在窗口内的 zscore（拐点强度）
-  - `zscore_{1h,4h,12h}`：`(spread(t0)-mean)/std`
+  - `spread_zscore_{1h,4h,12h,3d,7d,15d}`：`(spread(t0)-mean)/std`
   - `hurst_proxy`：`log(std(spread_diff_2m)/std(spread_diff_1m)) / log(2)`（轻量 proxy）
 - 更多资金费结构：
   - `funding_regime_quantile`：`edge(t0)` 在过去 30d/60d 分位（Q1..Q5）
-  - `funding_edge_regime`：按 `edge` 的均值±1σ 切分（low/mid/high）或突变（`abs(edge_change_1h) > k*std`）
+  - `funding_edge_regime`：按分位或均值±σ 切分（low/mid/high），文字标签写入 `factors_v2_meta.funding_edge_regime_label`
+  - `funding_edge_change_{1440,4320,10080,21600}m`：1/3/7/15d 变动
   - `time_to_next_funding_min`：`min(next_funding_time - decision_ts)`（仅 perp leg 可得）
 
 **T3：回测评估与报告模板升级**
@@ -564,7 +651,53 @@ Phase 3（策略与质量）：
 **T4（可选）：策略级事件回测**
 - 用事件驱动模拟（entry@decision_ts，exit@tp/stop/time），手续费/滑点/资金费均参数化；用于回答“IC 好不等于可交易收益”的落地问题。
 
-#### 4.1.7 第二版因子落库策略（先回测，后落库）
+#### 4.1.7 第二版回测：Ridge + Logistic 训练链路（24h 为主）
+目标：用 v2 因子预测 **综合收益**（价差收敛 + 资金费净收益），同时输出回归值与胜率，满足“训练后可快速上线”的要求。
+
+**标签定义（默认）**
+- `pnl_total = future_outcome.pnl`（当前已包含 `pnl_spread + pnl_funding`）
+- 可选费用：`pnl_total -= 2 * fee_bps_per_leg / 10000`（训练脚本可配置）
+- 分类标签：`win = (pnl_total > 0)`
+
+**模型选择（已确认）**
+- 回归：Ridge（L2 正则，稳定、可解释）
+- 分类：Logistic（L2 正则，输出胜率）
+
+**T1：构建训练数据集（落地脚本）**
+- 来源：
+  - `watch_signal_event.features_agg.meta_last.factors_v2`（因子）
+  - `future_outcome.pnl`（24h 标签；可改 horizon）
+- 过滤：
+  - `factors_v2` 存在且可解析；可选 `factors_v2_meta.ok = true`
+  - 缺失率过滤（默认 `max_missing<=0.2`）
+- 时间切分：按 `start_ts` 排序，最近 N 天作为验证集
+- 产出：
+  - 训练矩阵（缺失率统计 + 中位数填充 + 标准化）
+  - 可选 CSV（用于外部分析）
+
+**T2：训练 Ridge + Logistic（落地脚本）**
+- 训练脚本：`backtest/v2_ridge_logistic.py`
+- 输出：
+  - `reports/v2_ridge_logistic_model.json`（特征、缩放参数、系数）
+  - `reports/v2_ridge_logistic_metrics.md`（训练/验证指标）
+  - 多 horizon 训练会输出 `*_h{horizon}.json/.md` + `v2_ridge_logistic_summary.md`
+- 评估指标：
+  - 回归：MAE/RMSE/Corr/Sign-Acc
+  - 分类：AUC/Logloss/Acc
+  - 解释：在 metrics 中列出 Ridge/Logistic 的 Top 正/负/低权重特征（标准化后可比较）
+
+**示例命令**
+```
+venv/bin/python backtest/v2_ridge_logistic.py \
+  --days 60 \
+  --valid-days 7 \
+  --horizons 60,240,480,1440 \
+  --signal-types B,C \
+  --fee-bps-per-leg 0 \
+  --out-dir reports
+```
+
+#### 4.1.8 第二版因子落库策略（先回测，后落库）
 - v2 阶段优先“回测脚本内计算”，避免 PG 表膨胀。
 - 当确认某些因子对 240m 的增量稳定后，再选择：
   - **开列落库**：少量核心因子（例如 `spread_ret_15m/spread_slope_30m/funding_edge/carry_net_cost_horizon`）
