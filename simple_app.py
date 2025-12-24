@@ -13,6 +13,7 @@ import sys
 import decimal
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from functools import lru_cache
 from typing import Any, Dict, List, Optional
 from concurrent.futures import ThreadPoolExecutor, wait
 from exchange_connectors import ExchangeDataCollector
@@ -123,6 +124,10 @@ WATCHLIST_METRICS_SNAPSHOT = {
     'error': None,
     'stale_reason': 'not_ready',
 }
+
+WATCHLIST_BOOTSTRAP_LOCK = threading.Lock()
+WATCHLIST_BOOTSTRAP_LAST_TS = 0.0
+WATCHLIST_BOOTSTRAP_MIN_INTERVAL_SEC = 15.0
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -1137,6 +1142,11 @@ live_trading_manager = LiveTradingManager(
         horizon_min=int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
         pnl_threshold=float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.012)),
         win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.93)),
+        v2_enabled=bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
+        v2_pnl_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.012)),
+        v2_win_prob_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.92)),
+        v2_pnl_threshold_1440=float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_1440', 0.014)),
+        v2_win_prob_threshold_1440=float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.93)),
         max_concurrent_trades=int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
         scan_interval_seconds=float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
         monitor_interval_seconds=float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
@@ -1144,6 +1154,8 @@ live_trading_manager = LiveTradingManager(
         orderbook_confirm_samples=int(LIVE_TRADING_CONFIG.get('orderbook_confirm_samples', 3)),
         orderbook_confirm_sleep_seconds=float(LIVE_TRADING_CONFIG.get('orderbook_confirm_sleep_seconds', 0.7)),
         max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 1)),
+        stop_loss_total_pnl_pct=float(LIVE_TRADING_CONFIG.get('stop_loss_total_pnl_pct', 0.01)),
+        stop_loss_funding_per_hour_pct=float(LIVE_TRADING_CONFIG.get('stop_loss_funding_per_hour_pct', 0.003)),
         max_abs_funding=float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.001)),
         close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
@@ -1154,17 +1166,78 @@ live_trading_manager = LiveTradingManager(
         kick_driven=bool(LIVE_TRADING_CONFIG.get('kick_driven', True)),
     )
 )
-try:
-    # Create tables even when auto-trading is disabled, so UI/API can inspect status.
-    live_trading_manager.ensure_schema()
-    live_trading_manager.start()
-    # When a new watchlist event is inserted into PG, wake live trading immediately (kick-driven).
+
+
+def _start_live_trading_components() -> bool:
+    logger = logging.getLogger("live_trading")
+    live_enabled = bool(live_trading_manager.config.enabled)
+    pg_writer = watchlist_manager.pg_writer
+    pg_writer_enabled = bool(pg_writer and pg_writer.config.enabled)
+
+    if not live_enabled and not pg_writer_enabled:
+        # Best-effort: keep tables for UI even when auto-trading is disabled.
+        try:
+            live_trading_manager.ensure_schema()
+        except Exception as exc:
+            logger.warning("live trading schema init failed: %s", exc)
+        return True
+
+    errors: List[str] = []
+    schema_ok = True
     try:
-        watchlist_manager.set_live_trading_kick(lambda reason: live_trading_manager.kick(reason=reason))
-    except Exception:
-        pass
-except Exception as exc:
-    logging.getLogger('live_trading').warning("live trading start failed: %s", exc)
+        live_trading_manager.ensure_schema()
+    except Exception as exc:
+        schema_ok = False
+        errors.append(f"schema: {exc}")
+
+    if live_enabled and schema_ok:
+        try:
+            live_trading_manager.start()
+        except Exception as exc:
+            errors.append(f"start: {exc}")
+        if not (live_trading_manager._thread_scan and live_trading_manager._thread_monitor):
+            errors.append("not running after start")
+
+    if pg_writer_enabled:
+        try:
+            pg_writer.start()
+        except Exception as exc:
+            errors.append(f"pg writer: {exc}")
+        if not getattr(pg_writer, "_thread", None):
+            errors.append("pg writer not running after start")
+
+    if live_enabled and live_trading_manager._thread_scan and live_trading_manager._thread_monitor:
+        # When a new watchlist event is inserted into PG, wake live trading immediately (kick-driven).
+        try:
+            watchlist_manager.set_live_trading_kick(lambda reason: live_trading_manager.kick(reason=reason))
+        except Exception:
+            pass
+
+    if errors:
+        logger.warning("live trading/pg writer start failed: %s", "; ".join(errors))
+        return False
+    return True
+
+
+def _live_trading_self_heal_worker() -> None:
+    logger = logging.getLogger("live_trading")
+    delay = float(os.getenv("LIVE_TRADING_RETRY_BASE_SECONDS", "2.0"))
+    max_delay = float(os.getenv("LIVE_TRADING_RETRY_MAX_SECONDS", "60.0"))
+    while True:
+        if _start_live_trading_components():
+            logger.info("live trading self-heal completed")
+            return
+        logger.warning("live trading/pg writer retry in %.1fs", delay)
+        time.sleep(delay)
+        delay = min(max_delay, delay * 2.0)
+
+
+if not _start_live_trading_components():
+    threading.Thread(
+        target=_live_trading_self_heal_worker,
+        name="live-trading-self-heal",
+        daemon=True,
+    ).start()
 
 # 优化的内存数据结构 - 减少内存占用
 class MemoryDataManager:
@@ -2198,15 +2271,21 @@ def cold_start_watchlist_from_db(limit_minutes: int = 1) -> None:
         if not latest:
             logger.info("cold start skipped: no recent rows in price_data_1min")
             return
-        # 检查是否有 funding_rate 列，兼容旧版 SQLite
+        # 检查 funding 列名，兼容旧版 SQLite（1min 表常见为 funding_rate_avg）
         cur.execute("PRAGMA table_info(price_data_1min)")
         cols = [row[1] for row in cur.fetchall()]
-        has_funding = "funding_rate" in cols
+        funding_col = None
+        if "funding_rate" in cols:
+            funding_col = "funding_rate"
+        elif "funding_rate_avg" in cols:
+            funding_col = "funding_rate_avg"
         select_sql = """
             SELECT symbol, exchange, spot_price_close, futures_price_close, {funding}, timestamp
             FROM price_data_1min
             WHERE timestamp >= datetime(?, ?)
-        """.format(funding="funding_rate" if has_funding else "NULL AS funding_rate")
+        """.format(
+            funding=(f"{funding_col} AS funding_rate" if funding_col else "NULL AS funding_rate")
+        )
         cur.execute(select_sql, (latest, f"-{limit_minutes} minutes"))
         rows = cur.fetchall()
         if not rows:
@@ -2337,12 +2416,39 @@ def get_all_data():
 def get_watchlist():
     """获取基于资金费率的Binance关注列表"""
     payload = watchlist_manager.snapshot()
+
+    # On cold start, background threads may not have finished the first refresh yet.
+    # If the watchlist is empty, do a best-effort one-shot bootstrap so UI isn't blank.
+    try:
+        summary0 = payload.get("summary") if isinstance(payload, dict) else None
+        total0 = int((summary0 or {}).get("total_tracked") or 0)
+        if total0 <= 0:
+            global WATCHLIST_BOOTSTRAP_LAST_TS
+            now_s = time.time()
+            if now_s - float(WATCHLIST_BOOTSTRAP_LAST_TS) >= float(WATCHLIST_BOOTSTRAP_MIN_INTERVAL_SEC):
+                if WATCHLIST_BOOTSTRAP_LOCK.acquire(blocking=False):
+                    try:
+                        WATCHLIST_BOOTSTRAP_LAST_TS = now_s
+                        watchlist_manager.preload_from_database(db.db_path)
+                        all_data = data_collector.get_all_data()
+                        exchange_symbols = getattr(data_collector, "exchange_symbols", {}) or {}
+                        watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
+                        payload = watchlist_manager.snapshot()
+                    finally:
+                        WATCHLIST_BOOTSTRAP_LOCK.release()
+    except Exception as exc:
+        logging.getLogger("watchlist").warning("watchlist bootstrap failed: %s", exc)
     # Expose live trading thresholds so watchlist UI can show “Type B/C 入场信号”状态。
     try:
         payload['live_trading_thresholds'] = {
             'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
-            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.011)),
-            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.91)),
+            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
+            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+            'v2_enabled': bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
+            'v2_pnl_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.0065)),
+            'v2_win_prob_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.72)),
+            'v2_pnl_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_1440', 0.0055)),
+            'v2_win_prob_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.75)),
         }
     except Exception:
         payload['live_trading_thresholds'] = None
@@ -2413,6 +2519,139 @@ def get_watchlist():
                     }
             overview[sym] = {'rows': rows, 'best_perp_spread': best}
         payload['exchange_overview'] = overview
+
+        # Attach the latest v2 inference snapshot for active Type B/C symbols (from PG watch_signal_event).
+        # This keeps watchlist UI lightweight while still exposing v2 signals/meta.
+        payload["event_v2"] = {}
+        if psycopg is not None:
+            try:
+                v2_syms = sorted(
+                    {
+                        str(e.get("symbol") or "").upper()
+                        for e in active_entries
+                        if str(e.get("entry_type") or "").upper() in ("B", "C") and e.get("symbol")
+                    }
+                )
+
+                def _summarize_factors_v2_meta(meta: Any) -> Optional[Dict[str, Any]]:
+                    if not isinstance(meta, dict):
+                        return None
+                    out: Dict[str, Any] = {}
+                    for k in ("ok", "ts", "reason", "lookback_min", "series_start", "series_end", "funding_edge_regime_label"):
+                        if meta.get(k) is not None:
+                            out[k] = meta.get(k)
+                    for side in ("short_quality", "long_quality"):
+                        q = meta.get(side)
+                        if isinstance(q, dict):
+                            out[side] = {
+                                "missing_rate": q.get("missing_rate"),
+                                "missing_points": q.get("missing_points"),
+                                "total_points": q.get("total_points"),
+                                "ffill_points": q.get("ffill_points"),
+                                "max_gap_sec": q.get("max_gap_sec"),
+                            }
+                    # Keep leg identity (helpful for interpreting missing/series mapping).
+                    for leg_k in ("short_leg", "long_leg"):
+                        leg = meta.get(leg_k)
+                        if isinstance(leg, dict):
+                            out[leg_k] = {
+                                "exchange": leg.get("exchange"),
+                                "symbol": leg.get("symbol"),
+                                "kind": leg.get("kind"),
+                            }
+                    return out or None
+
+                def _summarize_orderbook_validation(ob: Any) -> Optional[Dict[str, Any]]:
+                    if not isinstance(ob, dict):
+                        return None
+                    out: Dict[str, Any] = {}
+                    for k in ("ok", "reason", "ts", "notional_usdt", "market_type", "topk_exchanges", "picked_high_low"):
+                        if ob.get(k) is not None:
+                            out[k] = ob.get(k)
+                    return out or None
+
+                def _summarize_factors_v2(factors: Any) -> Optional[Dict[str, Any]]:
+                    if isinstance(factors, (str, bytes, bytearray)):
+                        try:
+                            factors = json.loads(factors)
+                        except Exception:
+                            return None
+                    if not isinstance(factors, dict):
+                        return None
+
+                    def _clean_number(value: Any) -> Optional[float]:
+                        if value is None:
+                            return None
+                        try:
+                            f = float(value)
+                        except Exception:
+                            return None
+                        if f != f or f == float("inf") or f == float("-inf"):
+                            return None
+                        return f
+
+                    # Return the full v2 factor set (PG stored JSONB can include 30~100+ keys).
+                    out: Dict[str, Any] = {}
+                    for k in sorted(factors.keys(), key=lambda x: str(x)):
+                        out[str(k)] = _clean_number(factors.get(k))
+                    return out or None
+
+                if v2_syms:
+                    conn_kwargs: Dict[str, Any] = {"autocommit": True}
+                    if dict_row:
+                        conn_kwargs["row_factory"] = dict_row
+                    with psycopg.connect(WATCHLIST_PG_CONFIG["dsn"], **conn_kwargs) as conn:
+                        rows = conn.execute(
+                            """
+                            SELECT DISTINCT ON (e.symbol, btrim(e.signal_type))
+                              e.symbol,
+                              btrim(e.signal_type) AS signal_type,
+                              e.id AS event_id,
+                              e.exchange,
+                              e.start_ts,
+                              e.end_ts,
+                              e.status,
+                              COALESCE(
+                                  (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                                  (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                                  (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                                  e.start_ts
+                              ) AS decision_ts,
+                              (e.features_agg #> '{meta_last,factors_v2}') AS factors_v2,
+                              (e.features_agg #> '{meta_last,pred_v2}') AS pred_v2,
+                              (e.features_agg #> '{meta_last,pred_v2_meta}') AS pred_v2_meta,
+                              (e.features_agg #> '{meta_last,factors_v2_meta}') AS factors_v2_meta,
+                              (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
+                            FROM watchlist.watch_signal_event e
+                            WHERE e.symbol = ANY(%s)
+                              AND e.signal_type IN ('B','C')
+                            ORDER BY e.symbol, btrim(e.signal_type), e.start_ts DESC, e.id DESC;
+                            """,
+                            (v2_syms,),
+                        ).fetchall()
+                    for r in rows or []:
+                        sym = str(r.get("symbol") or "").upper()
+                        st = str(r.get("signal_type") or "").upper()
+                        if not sym or st not in ("B", "C"):
+                            continue
+                        start_ts = r.get("start_ts")
+                        end_ts = r.get("end_ts")
+                        decision_ts = r.get("decision_ts")
+                        payload["event_v2"].setdefault(sym, {})[st] = {
+                            "event_id": int(r.get("event_id") or 0),
+                            "exchange": r.get("exchange"),
+                            "status": r.get("status"),
+                            "start_ts": start_ts.isoformat() if hasattr(start_ts, "isoformat") else start_ts,
+                            "end_ts": end_ts.isoformat() if hasattr(end_ts, "isoformat") else end_ts,
+                            "decision_ts": decision_ts.isoformat() if hasattr(decision_ts, "isoformat") else decision_ts,
+                            "factors_v2": _summarize_factors_v2(r.get("factors_v2")),
+                            "pred_v2": r.get("pred_v2") if isinstance(r.get("pred_v2"), dict) else None,
+                            "pred_v2_meta": r.get("pred_v2_meta") if isinstance(r.get("pred_v2_meta"), dict) else None,
+                            "factors_v2_meta": _summarize_factors_v2_meta(r.get("factors_v2_meta")),
+                            "orderbook_validation": _summarize_orderbook_validation(r.get("orderbook_validation")),
+                        }
+            except Exception as exc:
+                payload["event_v2_error"] = str(exc)
 
         # 更完整的交易所指标（资金费上限/下限、OI、24h 额等），直接调用公开 REST
         try:
@@ -2542,6 +2781,75 @@ def get_watchlist_metrics():
     if not snap.get('metrics') and not snap.get('error'):
         payload['message'] = snap.get('stale_reason') or 'metrics cache not ready'
     return jsonify(payload), status_code
+
+
+@lru_cache(maxsize=8)
+def _load_json_file_cached(path: str) -> Optional[Dict[str, Any]]:
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        return payload if isinstance(payload, dict) else None
+    except Exception:
+        return None
+
+
+@app.route('/api/watchlist/v2_model_info')
+def get_watchlist_v2_model_info():
+    """
+    v2 模型结构说明（用于 watchlist 页面展示）：
+    - Ridge: 预测 pnl_hat
+    - Logistic: 预测 win_prob
+    """
+    try:
+        import config as _cfg  # local import
+
+        cfg = getattr(_cfg, "WATCHLIST_V2_PRED_CONFIG", {}) or {}
+        out: Dict[str, Any] = {"timestamp": now_utc_iso(), "enabled": bool(cfg.get("enabled"))}
+        horizons = (("240", cfg.get("model_path_240")), ("1440", cfg.get("model_path_1440")))
+
+        def _top(features: List[str], coefs: List[Any], top_n: int = 12) -> List[Dict[str, Any]]:
+            rows: List[Dict[str, Any]] = []
+            for name, coef in zip(features, coefs):
+                try:
+                    c = float(coef)
+                except Exception:
+                    continue
+                rows.append({"feature": str(name), "coef": c, "abs": abs(c)})
+            rows.sort(key=lambda r: float(r.get("abs") or 0.0), reverse=True)
+            for r in rows:
+                r.pop("abs", None)
+            return rows[:top_n]
+
+        models: Dict[str, Any] = {}
+        for h, path_raw in horizons:
+            path = str(path_raw or "").strip()
+            payload = _load_json_file_cached(path) if path else None
+            if not payload:
+                models[h] = {"ok": False, "path": path, "error": "model_not_loaded"}
+                continue
+            features = payload.get("features") or []
+            ridge = payload.get("ridge") or {}
+            logreg = payload.get("logistic") or {}
+            models[h] = {
+                "ok": True,
+                "path": path,
+                "feature_count": len(features) if isinstance(features, list) else 0,
+                "ridge": {
+                    "intercept": ridge.get("intercept"),
+                    "top_coef": _top(list(features), list(ridge.get("coef") or [])),
+                },
+                "logistic": {
+                    "intercept": logreg.get("intercept"),
+                    "top_coef": _top(list(features), list(logreg.get("coef") or [])),
+                },
+            }
+        out["models"] = models
+        out["max_missing_ratio"] = cfg.get("max_missing_ratio")
+        return jsonify(out), 200
+    except Exception as exc:
+        return jsonify({"timestamp": now_utc_iso(), "error": str(exc)}), 500
 
 @app.route('/api/watchlist/series')
 def get_watchlist_series():
@@ -2805,15 +3113,20 @@ def live_trading_overview():
             'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
             'live_trading_config': {
                 'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
-                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.013)),
-                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.94)),
+                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
+                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+                'v2_enabled': bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
+                'v2_pnl_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.0065)),
+                'v2_win_prob_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.72)),
+                'v2_pnl_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_1440', 0.0055)),
+                'v2_win_prob_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.75)),
                 'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
                 'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
                 'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
                 'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
                 'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
                 'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
-                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
+                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
                 'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
             },
             'signals': signals_out,
