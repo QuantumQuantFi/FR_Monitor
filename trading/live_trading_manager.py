@@ -93,8 +93,13 @@ class LiveTradingConfig:
     dsn: str
     allowed_exchanges: Tuple[str, ...] = ("binance", "bybit", "okx", "bitget", "hyperliquid", "lighter", "grvt")
     horizon_min: int = 240
-    pnl_threshold: float = 0.013
-    win_prob_threshold: float = 0.94
+    pnl_threshold: float = 0.0085
+    win_prob_threshold: float = 0.85
+    v2_enabled: bool = True
+    v2_pnl_threshold_240: float = 0.0065
+    v2_win_prob_threshold_240: float = 0.72
+    v2_pnl_threshold_1440: float = 0.0055
+    v2_win_prob_threshold_1440: float = 0.75
     max_concurrent_trades: int = 10
     scan_interval_seconds: float = 20.0
     # If True, only evaluate new events when kicked (e.g. by watchlist event insert),
@@ -116,10 +121,12 @@ class LiveTradingConfig:
     # 该上限用于控制 Binance/OKX 等深度接口压力，避免 418 ban。
     max_symbols_per_scan: int = 8
     monitor_interval_seconds: float = 60.0
-    take_profit_ratio: float = 0.8
+    take_profit_ratio: float = 0.7
     orderbook_confirm_samples: int = 3
     orderbook_confirm_sleep_seconds: float = 0.7
     max_hold_days: int = 7
+    stop_loss_total_pnl_pct: float = 0.01
+    stop_loss_funding_per_hour_pct: float = 0.003
     # Type B funding guard: require both legs' current funding to satisfy abs(funding_rate) <= max_abs_funding.
     # Set to 0 to disable.
     max_abs_funding: float = 0.0
@@ -264,6 +271,8 @@ class LiveTradingManager:
         win_prob: float,
         pnl_hat_ob: Optional[float],
         win_prob_ob: Optional[float],
+        horizon_min: int,
+        pred_source: str,
     ) -> None:
         payload_param = _jsonb(payload) if payload is not None else None
         conn.execute(
@@ -275,6 +284,8 @@ class LiveTradingManager:
                    client_order_id_base=%s,
                    leg_long_exchange=%s,
                    leg_short_exchange=%s,
+                   horizon_min=%s,
+                   pred_source=%s,
                    pnl_hat=%s,
                    win_prob=%s,
                    pnl_hat_ob=%s,
@@ -291,6 +302,8 @@ class LiveTradingManager:
                 str(client_order_id_base or ""),
                 str(leg_long_exchange or ""),
                 str(leg_short_exchange or ""),
+                int(horizon_min),
+                str(pred_source or "v1_240"),
                 float(pnl_hat) if pnl_hat is not None else None,
                 float(win_prob) if win_prob is not None else None,
                 float(pnl_hat_ob) if pnl_hat_ob is not None else None,
@@ -737,6 +750,7 @@ class LiveTradingManager:
           win_prob double precision,
           pnl_hat_ob double precision,
           win_prob_ob double precision,
+          pred_source text,
           leg_long_exchange text,
           leg_short_exchange text,
           status text NOT NULL DEFAULT 'new',
@@ -908,6 +922,8 @@ class LiveTradingManager:
           ADD COLUMN IF NOT EXISTS last_short_funding_rate double precision;
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS last_funding_rate_at timestamptz;
+        ALTER TABLE watchlist.live_trade_signal
+          ADD COLUMN IF NOT EXISTS pred_source text;
 
         -- Funding PnL persistence (signals table stores latest snapshot; closed signals are finalized).
         ALTER TABLE watchlist.live_trade_signal
@@ -1874,12 +1890,21 @@ class LiveTradingManager:
         win_prob: float,
         pnl_hat_ob: Optional[float],
         win_prob_ob: Optional[float],
+        horizon_min: int,
+        pred_source: str,
         payload: Dict[str, Any],
         status: str,
         reason: Optional[str],
         client_order_id_base: str,
     ) -> Optional[int]:
         try:
+            if payload is None:
+                payload = {}
+            if isinstance(payload, dict):
+                try:
+                    payload.setdefault("pred_pass", self._pred_pass_summary(event))
+                except Exception:
+                    pass
             payload_param = _jsonb(payload) if payload is not None else None
             row = conn.execute(
                 """
@@ -1888,16 +1913,17 @@ class LiveTradingManager:
                     pnl_hat, win_prob, pnl_hat_ob, win_prob_ob,
                     leg_long_exchange, leg_short_exchange,
                     status, reason, payload, client_order_id_base,
+                    pred_source,
                     updated_at
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
                 RETURNING id;
                 """,
                 (
                     int(event["id"]),
                     str(event["symbol"]),
                     str(event["signal_type"]),
-                    int(self.config.horizon_min),
+                    int(horizon_min),
                     float(pnl_hat),
                     float(win_prob),
                     float(pnl_hat_ob) if pnl_hat_ob is not None else None,
@@ -1908,12 +1934,124 @@ class LiveTradingManager:
                     reason,
                     payload_param,
                     client_order_id_base,
+                    str(pred_source or "v1_240"),
                 ),
             ).fetchone()
             return int(row["id"]) if row else None
         except Exception as exc:
             self.logger.warning("insert signal failed: %s", exc)
             return None
+
+    def _pred_pass_summary(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        def _safe_float(v: Any) -> Optional[float]:
+            if v is None:
+                return None
+            try:
+                out = float(v)
+            except Exception:
+                return None
+            return out if math.isfinite(out) else None
+
+        def _safe_bool(v: Any) -> Optional[bool]:
+            if v is None:
+                return None
+            if isinstance(v, bool):
+                return v
+            if isinstance(v, (int, float)):
+                return bool(v)
+            s = str(v).strip().lower()
+            if s in ("true", "t", "1", "yes", "y"):
+                return True
+            if s in ("false", "f", "0", "no", "n"):
+                return False
+            return None
+
+        v1_pnl = _safe_float(event.get("pnl_hat_240"))
+        v1_prob = _safe_float(event.get("win_prob_240"))
+        v1_thr_pnl = float(self.config.pnl_threshold)
+        v1_thr_prob = float(self.config.win_prob_threshold)
+        v1_pass = bool(
+            v1_pnl is not None
+            and v1_prob is not None
+            and float(v1_pnl) >= v1_thr_pnl
+            and float(v1_prob) >= v1_thr_prob
+        )
+
+        v2_enabled = bool(getattr(self.config, "v2_enabled", True))
+        v2_240_thr_pnl = float(getattr(self.config, "v2_pnl_threshold_240", self.config.pnl_threshold))
+        v2_240_thr_prob = float(getattr(self.config, "v2_win_prob_threshold_240", self.config.win_prob_threshold))
+        v2_1440_thr_pnl = float(getattr(self.config, "v2_pnl_threshold_1440", self.config.pnl_threshold))
+        v2_1440_thr_prob = float(getattr(self.config, "v2_win_prob_threshold_1440", self.config.win_prob_threshold))
+
+        v2_ok_240 = _safe_bool(event.get("v2_ok_240"))
+        v2_ok_1440 = _safe_bool(event.get("v2_ok_1440"))
+        v2_pnl_240 = _safe_float(event.get("v2_pnl_hat_240"))
+        v2_prob_240 = _safe_float(event.get("v2_win_prob_240"))
+        v2_pnl_1440 = _safe_float(event.get("v2_pnl_hat_1440"))
+        v2_prob_1440 = _safe_float(event.get("v2_win_prob_1440"))
+
+        v2_240_pass = bool(
+            v2_enabled
+            and (v2_ok_240 is not False)
+            and v2_pnl_240 is not None
+            and v2_prob_240 is not None
+            and float(v2_pnl_240) >= v2_240_thr_pnl
+            and float(v2_prob_240) >= v2_240_thr_prob
+        )
+        v2_1440_pass = bool(
+            v2_enabled
+            and (v2_ok_1440 is not False)
+            and v2_pnl_1440 is not None
+            and v2_prob_1440 is not None
+            and float(v2_pnl_1440) >= v2_1440_thr_pnl
+            and float(v2_prob_1440) >= v2_1440_thr_prob
+        )
+
+        any_v2_pass = bool(v2_240_pass or v2_1440_pass)
+        if v1_pass and any_v2_pass:
+            combo = "both"
+        elif v1_pass:
+            combo = "v1_only"
+        elif any_v2_pass:
+            combo = "v2_only"
+        else:
+            combo = "none"
+
+        sources: List[str] = []
+        if v1_pass:
+            sources.append("v1_240")
+        if v2_240_pass:
+            sources.append("v2_240")
+        if v2_1440_pass:
+            sources.append("v2_1440")
+
+        return {
+            "combo": combo,
+            "sources": sources,
+            "v1_240": {
+                "pnl_hat": v1_pnl,
+                "win_prob": v1_prob,
+                "thr_pnl": v1_thr_pnl,
+                "thr_prob": v1_thr_prob,
+                "pass": v1_pass,
+            },
+            "v2_240": {
+                "pnl_hat": v2_pnl_240,
+                "win_prob": v2_prob_240,
+                "thr_pnl": v2_240_thr_pnl,
+                "thr_prob": v2_240_thr_prob,
+                "v2_ok": v2_ok_240,
+                "pass": v2_240_pass,
+            },
+            "v2_1440": {
+                "pnl_hat": v2_pnl_1440,
+                "win_prob": v2_prob_1440,
+                "thr_pnl": v2_1440_thr_pnl,
+                "thr_prob": v2_1440_thr_prob,
+                "v2_ok": v2_ok_1440,
+                "pass": v2_1440_pass,
+            },
+        }
 
     def _update_signal_status(self, conn, signal_id: int, status: str, *, reason: Optional[str] = None) -> None:
         conn.execute(
@@ -1942,15 +2080,20 @@ class LiveTradingManager:
         leg_short_exchange: str,
         reason: str,
         payload: Dict[str, Any],
+        pred_choice: Optional[Dict[str, Any]] = None,
     ) -> Optional[int]:
+        if pred_choice is None:
+            pred_choice = self._pick_pred_choice(event)
         try:
-            pnl_hat = float(event.get("pnl_hat_240") or 0.0)
+            pnl_hat = float((pred_choice or {}).get("pnl_hat") or event.get("pnl_hat_240") or 0.0)
         except Exception:
             pnl_hat = 0.0
         try:
-            win_prob = float(event.get("win_prob_240") or 0.0)
+            win_prob = float((pred_choice or {}).get("win_prob") or event.get("win_prob_240") or 0.0)
         except Exception:
             win_prob = 0.0
+        pred_source = str((pred_choice or {}).get("source") or "v1_240")
+        horizon_min = int((pred_choice or {}).get("horizon_min") or self.config.horizon_min)
 
         # Keep a deterministic base for easier debugging; uniqueness is still enforced by event_id.
         client_order_id_base = f"skip-{int(event.get('id') or 0)}"
@@ -1963,6 +2106,8 @@ class LiveTradingManager:
             win_prob=win_prob,
             pnl_hat_ob=None,
             win_prob_ob=None,
+            horizon_min=horizon_min,
+            pred_source=pred_source,
             payload=payload,
             status="skipped",
             reason=str(reason or "skipped"),
@@ -1996,12 +2141,26 @@ class LiveTradingManager:
         )
 
     def _fetch_candidates(self, conn) -> List[Dict[str, Any]]:
+        v2_enabled = bool(getattr(self.config, "v2_enabled", True))
+        v2_pnl_240 = float(getattr(self.config, "v2_pnl_threshold_240", self.config.pnl_threshold))
+        v2_prob_240 = float(getattr(self.config, "v2_win_prob_threshold_240", self.config.win_prob_threshold))
+        v2_pnl_1440 = float(getattr(self.config, "v2_pnl_threshold_1440", self.config.pnl_threshold))
+        v2_prob_1440 = float(getattr(self.config, "v2_win_prob_threshold_1440", self.config.win_prob_threshold))
+        if not v2_enabled:
+            v2_pnl_240 = v2_pnl_1440 = 1e9
+            v2_prob_240 = v2_prob_1440 = 1e9
         return conn.execute(
             """
-            WITH cand AS (
+            WITH base AS (
               SELECT
                 e.id,
                 e.start_ts,
+                COALESCE(
+                    (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                    (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                    (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                    e.start_ts
+                ) AS decision_ts,
                 e.exchange,
                 e.symbol,
                 e.signal_type,
@@ -2017,6 +2176,35 @@ class LiveTradingManager:
                     (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
                     (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
                 ) AS win_prob_240,
+                (e.features_agg #>> '{meta_last,pred_v2,240,pnl_hat}')::double precision AS v2_pnl_hat_240,
+                (e.features_agg #>> '{meta_last,pred_v2,240,win_prob}')::double precision AS v2_win_prob_240,
+                CASE
+                  WHEN (e.features_agg #>> '{meta_last,pred_v2,240,error}') IS NOT NULL THEN FALSE
+                  WHEN (e.features_agg #>> '{meta_last,pred_v2,240,missing_rate}') IS NULL
+                    THEN (e.features_agg #>> '{meta_last,pred_v2,240,ok}')::boolean
+                  ELSE (
+                    (e.features_agg #>> '{meta_last,pred_v2,240,missing_rate}')::double precision
+                    <= COALESCE(
+                      (e.features_agg #>> '{meta_last,pred_v2_meta,max_missing_ratio}')::double precision,
+                      0.2
+                    )
+                  )
+                END AS v2_ok_240,
+                (e.features_agg #>> '{meta_last,pred_v2,1440,pnl_hat}')::double precision AS v2_pnl_hat_1440,
+                (e.features_agg #>> '{meta_last,pred_v2,1440,win_prob}')::double precision AS v2_win_prob_1440,
+                CASE
+                  WHEN (e.features_agg #>> '{meta_last,pred_v2,1440,error}') IS NOT NULL THEN FALSE
+                  WHEN (e.features_agg #>> '{meta_last,pred_v2,1440,missing_rate}') IS NULL
+                    THEN (e.features_agg #>> '{meta_last,pred_v2,1440,ok}')::boolean
+                  ELSE (
+                    (e.features_agg #>> '{meta_last,pred_v2,1440,missing_rate}')::double precision
+                    <= COALESCE(
+                      (e.features_agg #>> '{meta_last,pred_v2_meta,max_missing_ratio}')::double precision,
+                      0.2
+                    )
+                  )
+                END AS v2_ok_1440,
+                (e.features_agg #> '{meta_last,pred_v2_ob}') AS pred_v2_ob,
                 (e.features_agg #> '{meta_last,factors}') AS factors,
                 (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details,
                 (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
@@ -2025,7 +2213,6 @@ class LiveTradingManager:
                 ON s.event_id = e.id
               WHERE s.event_id IS NULL
                 AND e.signal_type = 'B'
-                AND e.start_ts >= now() - make_interval(mins := %s)
                 AND (e.features_agg #> '{meta_last,factors}') IS NOT NULL
                 AND COALESCE(
                     (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}'),
@@ -2035,24 +2222,39 @@ class LiveTradingManager:
                     (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}'),
                     (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')
                 ) IS NOT NULL
-                AND COALESCE(
-                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
-                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
-                ) >= %s
-                AND COALESCE(
-                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
-                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
-                ) >= %s
+            ),
+            cand AS (
+              SELECT *
+              FROM base
+              WHERE decision_ts >= now() - make_interval(mins := %s)
+                AND (
+                  (
+                    pnl_hat_240 >= %s
+                    AND win_prob_240 >= %s
+                  )
+                  OR (
+                    v2_ok_240 IS TRUE
+                    AND v2_pnl_hat_240 >= %s
+                    AND v2_win_prob_240 >= %s
+                  )
+                  OR (
+                    v2_ok_1440 IS TRUE
+                    AND v2_pnl_hat_1440 >= %s
+                    AND v2_win_prob_1440 >= %s
+                  )
+                )
               ORDER BY
-                COALESCE(
-                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
-                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
+                GREATEST(
+                    pnl_hat_240,
+                    v2_pnl_hat_240,
+                    v2_pnl_hat_1440
                 ) DESC NULLS LAST,
-                COALESCE(
-                    (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
-                    (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
+                GREATEST(
+                    win_prob_240,
+                    v2_win_prob_240,
+                    v2_win_prob_1440
                 ) DESC NULLS LAST,
-                e.start_ts DESC
+                decision_ts DESC
               LIMIT %s
             )
             SELECT * FROM cand;
@@ -2061,6 +2263,10 @@ class LiveTradingManager:
                 int(self.config.event_lookback_minutes),
                 float(self.config.pnl_threshold),
                 float(self.config.win_prob_threshold),
+                float(v2_pnl_240),
+                float(v2_prob_240),
+                float(v2_pnl_1440),
+                float(v2_prob_1440),
                 int(self.config.candidate_limit),
             ),
         ).fetchall()
@@ -2410,7 +2616,7 @@ class LiveTradingManager:
             return str(high), str(low)
         return None
 
-    def _chosen_reval_from_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _chosen_reval_from_event(self, event: Dict[str, Any], pred_choice: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         obv = event.get("orderbook_validation")
         if not isinstance(obv, dict):
             return None
@@ -2435,11 +2641,31 @@ class LiveTradingManager:
         except Exception:
             return None
 
-        ok = bool(
-            pnl_hat >= float(self.config.pnl_threshold)
-            and win_prob >= float(self.config.win_prob_threshold)
-            and tradable_spread > 0
-        )
+        eval_pnl = pnl_hat
+        eval_prob = win_prob
+        thr_pnl = float(self.config.pnl_threshold)
+        thr_prob = float(self.config.win_prob_threshold)
+        pred_source = "v1_240"
+        pred_horizon = int(self.config.horizon_min)
+        if isinstance(pred_choice, dict):
+            ob_pnl = pred_choice.get("ob_pnl_hat")
+            ob_prob = pred_choice.get("ob_win_prob")
+            eval_pnl = float(ob_pnl if ob_pnl is not None else pred_choice.get("pnl_hat") or eval_pnl)
+            eval_prob = float(ob_prob if ob_prob is not None else pred_choice.get("win_prob") or eval_prob)
+            thr_pnl = float(pred_choice.get("thr_pnl") or thr_pnl)
+            thr_prob = float(pred_choice.get("thr_prob") or thr_prob)
+            pred_source = str(pred_choice.get("source") or pred_source)
+            pred_horizon = int(pred_choice.get("horizon_min") or pred_horizon)
+
+        tp_needed = None
+        try:
+            tp_needed = float(self.config.take_profit_ratio) * float(eval_pnl)
+        except Exception:
+            tp_needed = None
+
+        ok = bool(eval_pnl >= thr_pnl and eval_prob >= thr_prob and tradable_spread > 0)
+        if ok and tp_needed is not None and tp_needed > 0 and float(entry_spread_metric) < float(tp_needed):
+            ok = False
         return {
             "ok": ok,
             "reason": None if ok else "not_ok",
@@ -2447,11 +2673,110 @@ class LiveTradingManager:
             "short_exchange": short_ex,
             "pnl_hat": pnl_hat,
             "win_prob": win_prob,
+            "pnl_hat_eval": float(eval_pnl),
+            "win_prob_eval": float(eval_prob),
+            "pred_source": pred_source,
+            "pred_horizon_min": pred_horizon,
             "tradable_spread": tradable_spread,
             "entry_spread_metric": entry_spread_metric,
             "orderbook": {"source": "event", "topk_exchanges": obv.get("topk_exchanges"), "orderbooks": obv.get("orderbooks")},
             "candidates": obv.get("candidates"),
         }
+
+    def _collect_pred_candidates(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+
+        def _add_candidate(
+            source: str,
+            horizon_min: int,
+            pnl_hat: Any,
+            win_prob: Any,
+            thr_pnl: float,
+            thr_prob: float,
+            *,
+            ob_pnl_hat: Any = None,
+            ob_win_prob: Any = None,
+        ) -> None:
+            try:
+                pnl_f = float(pnl_hat)
+                prob_f = float(win_prob)
+            except Exception:
+                return
+            if not (math.isfinite(pnl_f) and math.isfinite(prob_f)):
+                return
+            if pnl_f >= float(thr_pnl) and prob_f >= float(thr_prob):
+                payload = {
+                    "source": source,
+                    "horizon_min": int(horizon_min),
+                    "pnl_hat": float(pnl_f),
+                    "win_prob": float(prob_f),
+                    "thr_pnl": float(thr_pnl),
+                    "thr_prob": float(thr_prob),
+                }
+                try:
+                    ob_pnl_f = float(ob_pnl_hat) if ob_pnl_hat is not None else None
+                    ob_prob_f = float(ob_win_prob) if ob_win_prob is not None else None
+                except Exception:
+                    ob_pnl_f = None
+                    ob_prob_f = None
+                if ob_pnl_f is not None and ob_prob_f is not None:
+                    payload["ob_pnl_hat"] = ob_pnl_f
+                    payload["ob_win_prob"] = ob_prob_f
+                candidates.append(payload)
+
+        _add_candidate(
+            "v1_240",
+            int(self.config.horizon_min),
+            event.get("pnl_hat_240"),
+            event.get("win_prob_240"),
+            float(self.config.pnl_threshold),
+            float(self.config.win_prob_threshold),
+        )
+
+        if bool(getattr(self.config, "v2_enabled", True)):
+            pred_v2_ob = event.get("pred_v2_ob")
+            if isinstance(pred_v2_ob, str):
+                try:
+                    pred_v2_ob = json.loads(pred_v2_ob)
+                except Exception:
+                    pred_v2_ob = {}
+            pred_v2_ob = pred_v2_ob if isinstance(pred_v2_ob, dict) else {}
+            if event.get("v2_ok_240") is not False:
+                ob_240 = pred_v2_ob.get("240") if isinstance(pred_v2_ob, dict) else None
+                _add_candidate(
+                    "v2_240",
+                    240,
+                    event.get("v2_pnl_hat_240"),
+                    event.get("v2_win_prob_240"),
+                    float(getattr(self.config, "v2_pnl_threshold_240", self.config.pnl_threshold)),
+                    float(getattr(self.config, "v2_win_prob_threshold_240", self.config.win_prob_threshold)),
+                    ob_pnl_hat=(ob_240 or {}).get("pnl_hat") if isinstance(ob_240, dict) else None,
+                    ob_win_prob=(ob_240 or {}).get("win_prob") if isinstance(ob_240, dict) else None,
+                )
+            if event.get("v2_ok_1440") is not False:
+                ob_1440 = pred_v2_ob.get("1440") if isinstance(pred_v2_ob, dict) else None
+                _add_candidate(
+                    "v2_1440",
+                    1440,
+                    event.get("v2_pnl_hat_1440"),
+                    event.get("v2_win_prob_1440"),
+                    float(getattr(self.config, "v2_pnl_threshold_1440", self.config.pnl_threshold)),
+                    float(getattr(self.config, "v2_win_prob_threshold_1440", self.config.win_prob_threshold)),
+                    ob_pnl_hat=(ob_1440 or {}).get("pnl_hat") if isinstance(ob_1440, dict) else None,
+                    ob_win_prob=(ob_1440 or {}).get("win_prob") if isinstance(ob_1440, dict) else None,
+                )
+        return candidates
+
+    def _pick_pred_choice(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        candidates = self._collect_pred_candidates(event)
+        if not candidates:
+            return None
+        # Prefer higher pnl, then win_prob, then smaller horizon for tie-break.
+        candidates.sort(
+            key=lambda c: (float(c["pnl_hat"]), float(c["win_prob"]), -int(c["horizon_min"])),
+            reverse=True,
+        )
+        return candidates[0]
 
     def _revalidate_with_orderbook(
         self,
@@ -2460,6 +2785,7 @@ class LiveTradingManager:
         high_exchange: str,
         low_exchange: str,
         base_factors: Dict[str, Any],
+        pred_choice: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
         # 注意：watchlist 的触发信息里 “高/低交易所” 可能来自 last/mark 等价格口径；
         # 这里必须以可成交的 bid/ask（按同名义金额扫盘）来重新选择开仓方向，
@@ -2498,6 +2824,7 @@ class LiveTradingManager:
         best: Optional[Dict[str, Any]] = None
         best_score: Tuple[float, float] = (-1e9, -1e9)
         evaluated: List[Dict[str, Any]] = []
+        tp_blocked: List[Dict[str, Any]] = []
 
         for cand in candidates:
             short_px = cand.get("short_px")
@@ -2569,29 +2896,64 @@ class LiveTradingManager:
             hpred = pred_map.get(str(int(self.config.horizon_min))) or {}
             pnl_hat = hpred.get("pnl_hat")
             win_prob = hpred.get("win_prob")
-            if pnl_hat is None or win_prob is None:
-                continue
 
             # Guardrail: our TP logic uses pnl_spread = entry_spread_metric - spread_now and
             # triggers at `take_profit_ratio * pnl_hat_ob`. If the entry spread is already
             # smaller than the TP target, the trade is very likely a false-positive caused
             # by trigger-time spreads collapsing before execution (i.e. "成交时刻无价差").
             # Reject such candidates early so we don't open trades that can never hit TP.
+            eval_pnl = pnl_hat
+            eval_prob = win_prob
+            thr_pnl = float(self.config.pnl_threshold)
+            thr_prob = float(self.config.win_prob_threshold)
+            pred_source = "v1_240"
+            pred_horizon = int(self.config.horizon_min)
+            if isinstance(pred_choice, dict) and str(pred_choice.get("source", "")).startswith("v2"):
+                ob_pnl = pred_choice.get("ob_pnl_hat")
+                ob_prob = pred_choice.get("ob_win_prob")
+                eval_pnl = ob_pnl if ob_pnl is not None else pred_choice.get("pnl_hat")
+                eval_prob = ob_prob if ob_prob is not None else pred_choice.get("win_prob")
+                thr_pnl = float(pred_choice.get("thr_pnl") or thr_pnl)
+                thr_prob = float(pred_choice.get("thr_prob") or thr_prob)
+                pred_source = str(pred_choice.get("source") or pred_source)
+                pred_horizon = int(pred_choice.get("horizon_min") or pred_horizon)
+
             try:
-                tp_needed = float(self.config.take_profit_ratio) * float(pnl_hat)
+                tp_needed = float(self.config.take_profit_ratio) * float(eval_pnl)
             except Exception:
                 tp_needed = None
             if tp_needed is not None and tp_needed > 0 and float(entry_spread_metric) < float(tp_needed):
+                tp_blocked.append(
+                    {
+                        "short_exchange": str(cand.get("short_ex") or ""),
+                        "long_exchange": str(cand.get("long_ex") or ""),
+                        "tradable_spread": float(tradable_spread),
+                        "entry_spread_metric": float(entry_spread_metric),
+                        "tp_needed": float(tp_needed),
+                        "pred_source": str(pred_source or ""),
+                        "pnl_hat_eval": float(eval_pnl) if eval_pnl is not None else None,
+                        "win_prob_eval": float(eval_prob) if eval_prob is not None else None,
+                    }
+                )
                 continue
 
-            score = (float(pnl_hat), float(win_prob))
+            if isinstance(pred_choice, dict) and str(pred_choice.get("source", "")).startswith("v2"):
+                score = (float(tradable_spread), float(entry_spread_metric))
+            else:
+                if pnl_hat is None or win_prob is None:
+                    continue
+                score = (float(pnl_hat), float(win_prob))
             if score > best_score:
                 best_score = score
                 best = {
                     "short_exchange": str(cand["short_ex"]),
                     "long_exchange": str(cand["long_ex"]),
-                    "pnl_hat": float(pnl_hat),
-                    "win_prob": float(win_prob),
+                    "pnl_hat": float(pnl_hat) if pnl_hat is not None else None,
+                    "win_prob": float(win_prob) if win_prob is not None else None,
+                    "pnl_hat_eval": float(eval_pnl) if eval_pnl is not None else None,
+                    "win_prob_eval": float(eval_prob) if eval_prob is not None else None,
+                    "pred_source": pred_source,
+                    "pred_horizon_min": pred_horizon,
                     "tradable_spread": float(tradable_spread),
                     "entry_spread_metric": float(entry_spread_metric),
                     "orderbook": {"a": ob_a, "b": ob_b},
@@ -2601,6 +2963,27 @@ class LiveTradingManager:
                 }
 
         if not best:
+            if tp_blocked:
+                tp_blocked.sort(
+                    key=lambda r: (
+                        float(r.get("entry_spread_metric") or -1e9),
+                        float(r.get("tradable_spread") or -1e9),
+                    ),
+                    reverse=True,
+                )
+                top = tp_blocked[0]
+                return {
+                    "ok": False,
+                    "reason": "entry_spread_too_small",
+                    "orderbook": {"a": ob_a, "b": ob_b},
+                    "candidates": evaluated,
+                    "notional_usdt": notional_usdt,
+                    "tp_blocked": tp_blocked[:4],
+                    "tp_needed": top.get("tp_needed"),
+                    "entry_spread_metric": top.get("entry_spread_metric"),
+                    "tradable_spread": top.get("tradable_spread"),
+                    "pred_source": top.get("pred_source"),
+                }
             return {
                 "ok": False,
                 "reason": "no_tradable_direction",
@@ -2609,9 +2992,22 @@ class LiveTradingManager:
                 "notional_usdt": notional_usdt,
             }
 
-        best["ok"] = bool(
-            float(best["pnl_hat"]) > self.config.pnl_threshold and float(best["win_prob"]) > self.config.win_prob_threshold
-        )
+        eval_pnl = best.get("pnl_hat_eval")
+        eval_prob = best.get("win_prob_eval")
+        thr_pnl = float(self.config.pnl_threshold)
+        thr_prob = float(self.config.win_prob_threshold)
+        if isinstance(pred_choice, dict):
+            thr_pnl = float(pred_choice.get("thr_pnl") or thr_pnl)
+            thr_prob = float(pred_choice.get("thr_prob") or thr_prob)
+        ok = False
+        try:
+            ok = float(eval_pnl) >= float(thr_pnl) and float(eval_prob) >= float(thr_prob)
+        except Exception:
+            ok = False
+        best["ok"] = bool(ok)
+        if not ok:
+            best["reason"] = "below_threshold_after_reval"
+            best["thresholds"] = {"pnl": float(thr_pnl), "win_prob": float(thr_prob)}
         return best
 
     def _confirm_open_signal_with_orderbook(
@@ -2622,6 +3018,7 @@ class LiveTradingManager:
         ex_b: str,
         base_factors: Dict[str, Any],
         initial_reval: Optional[Dict[str, Any]] = None,
+        pred_choice: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         samples = max(1, int(self.config.orderbook_confirm_samples or 1))
         sleep_s = float(self.config.orderbook_confirm_sleep_seconds or 0.0)
@@ -2641,6 +3038,7 @@ class LiveTradingManager:
                     high_exchange=ex_a,
                     low_exchange=ex_b,
                     base_factors=base_factors,
+                    pred_choice=pred_choice,
                 )
             if not reval:
                 ok_all = False
@@ -2679,6 +3077,10 @@ class LiveTradingManager:
                         "short_exchange": short_ex or None,
                         "pnl_hat": float(pnl_hat) if pnl_hat is not None else None,
                         "win_prob": float(win_prob) if win_prob is not None else None,
+                        "pnl_hat_eval": float(reval.get("pnl_hat_eval")) if reval.get("pnl_hat_eval") is not None else None,
+                        "win_prob_eval": float(reval.get("win_prob_eval")) if reval.get("win_prob_eval") is not None else None,
+                        "pred_source": reval.get("pred_source"),
+                        "pred_horizon_min": reval.get("pred_horizon_min"),
                         "tradable_spread": float(tradable_spread) if tradable_spread is not None else None,
                         # Save the raw orderbook sweep snapshot for each confirm sample.
                         # This is critical for post-mortem analysis when we end up with
@@ -2736,6 +3138,9 @@ class LiveTradingManager:
             max_symbols = max(1, int(getattr(self.config, "max_symbols_per_scan", 8) or 8))
 
             def _base_score(r: Dict[str, Any]) -> Tuple[float, float]:
+                pred_choice = self._pick_pred_choice(r)
+                if isinstance(pred_choice, dict):
+                    return (float(pred_choice.get("pnl_hat") or -1e9), float(pred_choice.get("win_prob") or -1e9))
                 try:
                     pnl = float(r.get("pnl_hat_240") or -1e9)
                 except Exception:
@@ -2802,6 +3207,13 @@ class LiveTradingManager:
                 (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,win_prob}')::double precision,
                 (e.features_agg #>> '{meta_last,pnl_regression,pred,240,win_prob}')::double precision
               ) AS win_prob_240,
+              (e.features_agg #>> '{meta_last,pred_v2,240,pnl_hat}')::double precision AS v2_pnl_hat_240,
+              (e.features_agg #>> '{meta_last,pred_v2,240,win_prob}')::double precision AS v2_win_prob_240,
+              (e.features_agg #>> '{meta_last,pred_v2,240,ok}')::boolean AS v2_ok_240,
+              (e.features_agg #>> '{meta_last,pred_v2,1440,pnl_hat}')::double precision AS v2_pnl_hat_1440,
+              (e.features_agg #>> '{meta_last,pred_v2,1440,win_prob}')::double precision AS v2_win_prob_1440,
+              (e.features_agg #>> '{meta_last,pred_v2,1440,ok}')::boolean AS v2_ok_1440,
+              (e.features_agg #> '{meta_last,pred_v2_ob}') AS pred_v2_ob,
               (e.features_agg #> '{meta_last,factors}') AS factors,
               (e.features_agg #> '{meta_last,trigger_details}') AS trigger_details,
               (e.features_agg #> '{meta_last,orderbook_validation}') AS orderbook_validation
@@ -2810,7 +3222,13 @@ class LiveTradingManager:
               ON e.id = s.event_id
             WHERE s.status='skipped'
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
-              AND e.start_ts >= now() - make_interval(mins := %s)
+              AND COALESCE(
+                (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                e.end_ts,
+                e.start_ts
+              ) >= now() - make_interval(mins := %s)
             ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
             LIMIT %s;
             """,
@@ -2876,6 +3294,13 @@ class LiveTradingManager:
             "leg_b_price_last": row.get("leg_b_price_last"),
             "pnl_hat_240": row.get("pnl_hat_240"),
             "win_prob_240": row.get("win_prob_240"),
+            "v2_pnl_hat_240": row.get("v2_pnl_hat_240"),
+            "v2_win_prob_240": row.get("v2_win_prob_240"),
+            "v2_ok_240": row.get("v2_ok_240"),
+            "v2_pnl_hat_1440": row.get("v2_pnl_hat_1440"),
+            "v2_win_prob_1440": row.get("v2_win_prob_1440"),
+            "v2_ok_1440": row.get("v2_ok_1440"),
+            "pred_v2_ob": row.get("pred_v2_ob"),
         }
 
         base_factors = event.get("factors") or {}
@@ -2888,7 +3313,17 @@ class LiveTradingManager:
             )
             return
 
-        chosen_reval = self._chosen_reval_from_event(event)
+        pred_choice = self._pick_pred_choice(event)
+        if not pred_choice:
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason="below_threshold",
+                payload={"decision": "retry_skipped", "reason": "below_threshold"},
+            )
+            return
+
+        chosen_reval = self._chosen_reval_from_event(event, pred_choice)
         if chosen_reval and chosen_reval.get("ok"):
             high_ex = str(chosen_reval.get("short_exchange") or "")
             low_ex = str(chosen_reval.get("long_exchange") or "")
@@ -2925,7 +3360,11 @@ class LiveTradingManager:
                 return
 
             reval = self._revalidate_with_orderbook(
-                symbol=symbol, high_exchange=str(high_ex), low_exchange=str(low_ex), base_factors=base_factors
+                symbol=symbol,
+                high_exchange=str(high_ex),
+                low_exchange=str(low_ex),
+                base_factors=base_factors,
+                pred_choice=pred_choice,
             )
             if not reval or not reval.get("ok"):
                 r = None
@@ -2950,6 +3389,7 @@ class LiveTradingManager:
             ex_b=str(low_ex),
             base_factors=base_factors,
             initial_reval=reval if isinstance(reval, dict) else None,
+            pred_choice=pred_choice,
         )
         if not confirm.get("ok"):
             self._bump_signal_retry(
@@ -2995,15 +3435,20 @@ class LiveTradingManager:
                 "trigger_details": event.get("trigger_details"),
             },
             "threshold": {
-                "horizon_min": int(self.config.horizon_min),
-                "pnl_threshold": float(self.config.pnl_threshold),
-                "win_prob_threshold": float(self.config.win_prob_threshold),
+                "horizon_min": int(pred_choice.get("horizon_min") or self.config.horizon_min),
+                "pnl_threshold": float(pred_choice.get("thr_pnl") or self.config.pnl_threshold),
+                "win_prob_threshold": float(pred_choice.get("thr_prob") or self.config.win_prob_threshold),
                 "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
                 "max_abs_funding": float(getattr(self.config, "max_abs_funding", 0.0) or 0.0),
             },
+            "pred_choice": pred_choice,
             "orderbook_revalidation": {
                 "pnl_hat": reval.get("pnl_hat"),
                 "win_prob": reval.get("win_prob"),
+                "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                "win_prob_eval": reval.get("win_prob_eval"),
+                "pred_source": reval.get("pred_source"),
+                "pred_horizon_min": reval.get("pred_horizon_min"),
                 "orderbook": reval.get("orderbook"),
             },
             "orderbook_confirm_open": confirm,
@@ -3024,10 +3469,12 @@ class LiveTradingManager:
             client_order_id_base=client_base,
             leg_long_exchange=low_ex,
             leg_short_exchange=high_ex,
-            pnl_hat=float(event.get("pnl_hat_240") or 0.0),
-            win_prob=float(event.get("win_prob_240") or 0.0),
-            pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
-            win_prob_ob=float(reval.get("win_prob") or 0.0),
+            pnl_hat=float(pred_choice.get("pnl_hat") or 0.0),
+            win_prob=float(pred_choice.get("win_prob") or 0.0),
+            pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+            win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+            horizon_min=int(pred_choice.get("horizon_min") or self.config.horizon_min),
+            pred_source=str(pred_choice.get("source") or "v1_240"),
         )
 
         try:
@@ -3038,7 +3485,7 @@ class LiveTradingManager:
                 low_ex,
                 high_ex,
                 client_base,
-                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
             )
             self._update_signal_status(conn, signal_id, "open")
         except TradeExecutionError as exc:
@@ -3094,8 +3541,24 @@ class LiveTradingManager:
         for event in rows:
             try:
                 event_id = int(event.get("id") or 0)
+                pred_choice = self._pick_pred_choice(event)
+                if not pred_choice:
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange="",
+                        leg_short_exchange="",
+                        reason="below_threshold",
+                        payload={
+                            "decision": "skipped",
+                            "reason": "below_threshold",
+                            "symbol": symbol,
+                            "event_id": event_id,
+                        },
+                    )
+                    continue
 
-                chosen_reval = self._chosen_reval_from_event(event)
+                chosen_reval = self._chosen_reval_from_event(event, pred_choice)
                 if chosen_reval and chosen_reval.get("ok"):
                     base_factors = event.get("factors") or {}
                     if not isinstance(base_factors, dict):
@@ -3115,8 +3578,8 @@ class LiveTradingManager:
                         )
                         continue
                     score = (
-                        float(chosen_reval.get("pnl_hat") or -1e9),
-                        float(chosen_reval.get("win_prob") or -1e9),
+                        float(chosen_reval.get("pnl_hat_eval") or chosen_reval.get("pnl_hat") or -1e9),
+                        float(chosen_reval.get("win_prob_eval") or chosen_reval.get("win_prob") or -1e9),
                     )
                     if score > best_score:
                         best_score = score
@@ -3125,6 +3588,7 @@ class LiveTradingManager:
                             "short_ex": str(chosen_reval.get("short_exchange") or ""),
                             "long_ex": str(chosen_reval.get("long_exchange") or ""),
                             "reval": chosen_reval,
+                            "pred_choice": pred_choice,
                         }
                     continue
                 high_low = self._pick_high_low(
@@ -3202,6 +3666,7 @@ class LiveTradingManager:
                     high_exchange=high_ex,
                     low_exchange=low_ex,
                     base_factors=base_factors,
+                    pred_choice=pred_choice,
                 )
                 if not reval or not reval.get("ok"):
                     # Do not retry this event immediately; apply short backoff.
@@ -3232,7 +3697,10 @@ class LiveTradingManager:
                     )
                     self._bump_event_backoff(event_id, str(reason or "revalidate_not_ok"))
                     continue
-                score = (float(reval.get("pnl_hat") or -1e9), float(reval.get("win_prob") or -1e9))
+                score = (
+                    float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or -1e9),
+                    float(reval.get("win_prob_eval") or reval.get("win_prob") or -1e9),
+                )
                 if score > best_score:
                     best_score = score
                     best = {
@@ -3240,6 +3708,7 @@ class LiveTradingManager:
                         "short_ex": str(reval.get("short_exchange") or high_ex),
                         "long_ex": str(reval.get("long_exchange") or low_ex),
                         "reval": reval,
+                        "pred_choice": pred_choice,
                     }
             except Exception as exc:
                 try:
@@ -3257,6 +3726,7 @@ class LiveTradingManager:
         high_ex = best["short_ex"]
         low_ex = best["long_ex"]
         reval = best["reval"]
+        pred_choice = best.get("pred_choice") or self._pick_pred_choice(event)
 
         confirm = self._confirm_open_signal_with_orderbook(
             symbol=symbol,
@@ -3264,6 +3734,7 @@ class LiveTradingManager:
             ex_b=str(low_ex),
             base_factors=event.get("factors") or {},
             initial_reval=reval if isinstance(reval, dict) else None,
+            pred_choice=pred_choice,
         )
         if not confirm.get("ok"):
             client_base = f"wl{int(event['id'])}O{int(time.time())}"
@@ -3276,14 +3747,19 @@ class LiveTradingManager:
                     "trigger_details": event.get("trigger_details"),
                 },
                 "threshold": {
-                    "horizon_min": int(self.config.horizon_min),
-                    "pnl_threshold": float(self.config.pnl_threshold),
-                    "win_prob_threshold": float(self.config.win_prob_threshold),
+                    "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                    "pnl_threshold": float((pred_choice or {}).get("thr_pnl") or self.config.pnl_threshold),
+                    "win_prob_threshold": float((pred_choice or {}).get("thr_prob") or self.config.win_prob_threshold),
                     "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
                 },
+                "pred_choice": pred_choice,
                 "orderbook_revalidation": {
                     "pnl_hat": reval.get("pnl_hat"),
                     "win_prob": reval.get("win_prob"),
+                    "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                    "win_prob_eval": reval.get("win_prob_eval"),
+                    "pred_source": reval.get("pred_source"),
+                    "pred_horizon_min": reval.get("pred_horizon_min"),
                     "orderbook": reval.get("orderbook"),
                 },
                 "orderbook_confirm_open": confirm,
@@ -3293,10 +3769,12 @@ class LiveTradingManager:
                 event=event,
                 leg_long_exchange=str(confirm.get("long_exchange") or low_ex),
                 leg_short_exchange=str(confirm.get("short_exchange") or high_ex),
-                pnl_hat=float(event.get("pnl_hat_240") or 0.0),
-                win_prob=float(event.get("win_prob_240") or 0.0),
-                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
-                win_prob_ob=float(reval.get("win_prob") or 0.0),
+                pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+                win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                pred_source=str((pred_choice or {}).get("source") or "v1_240"),
                 payload=payload,
                 status="skipped",
                 reason=str(confirm.get("reason") or "orderbook_unstable"),
@@ -3330,15 +3808,20 @@ class LiveTradingManager:
                     "trigger_details": event.get("trigger_details"),
                 },
                 "threshold": {
-                    "horizon_min": int(self.config.horizon_min),
-                    "pnl_threshold": float(self.config.pnl_threshold),
-                    "win_prob_threshold": float(self.config.win_prob_threshold),
+                    "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                    "pnl_threshold": float((pred_choice or {}).get("thr_pnl") or self.config.pnl_threshold),
+                    "win_prob_threshold": float((pred_choice or {}).get("thr_prob") or self.config.win_prob_threshold),
                     "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
                     "max_abs_funding": float(getattr(self.config, "max_abs_funding", 0.0) or 0.0),
                 },
+                "pred_choice": pred_choice,
                 "orderbook_revalidation": {
                     "pnl_hat": reval.get("pnl_hat"),
                     "win_prob": reval.get("win_prob"),
+                    "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                    "win_prob_eval": reval.get("win_prob_eval"),
+                    "pred_source": reval.get("pred_source"),
+                    "pred_horizon_min": reval.get("pred_horizon_min"),
                     "orderbook": reval.get("orderbook"),
                 },
                 "orderbook_confirm_open": confirm,
@@ -3349,10 +3832,12 @@ class LiveTradingManager:
                 event=event,
                 leg_long_exchange=low_ex,
                 leg_short_exchange=high_ex,
-                pnl_hat=float(event.get("pnl_hat_240") or 0.0),
-                win_prob=float(event.get("win_prob_240") or 0.0),
-                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
-                win_prob_ob=float(reval.get("win_prob") or 0.0),
+                pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+                win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                pred_source=str((pred_choice or {}).get("source") or "v1_240"),
                 payload=payload,
                 status="skipped",
                 reason=str(f_reason or "funding_guard"),
@@ -3379,14 +3864,19 @@ class LiveTradingManager:
                 "trigger_details": event.get("trigger_details"),
             },
             "threshold": {
-                "horizon_min": int(self.config.horizon_min),
-                "pnl_threshold": float(self.config.pnl_threshold),
-                "win_prob_threshold": float(self.config.win_prob_threshold),
+                "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                "pnl_threshold": float((pred_choice or {}).get("thr_pnl") or self.config.pnl_threshold),
+                "win_prob_threshold": float((pred_choice or {}).get("thr_prob") or self.config.win_prob_threshold),
                 "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
             },
+            "pred_choice": pred_choice,
             "orderbook_revalidation": {
                 "pnl_hat": reval.get("pnl_hat"),
                 "win_prob": reval.get("win_prob"),
+                "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                "win_prob_eval": reval.get("win_prob_eval"),
+                "pred_source": reval.get("pred_source"),
+                "pred_horizon_min": reval.get("pred_horizon_min"),
                 "orderbook": reval.get("orderbook"),
             },
             "orderbook_confirm_open": confirm,
@@ -3398,10 +3888,12 @@ class LiveTradingManager:
             event=event,
             leg_long_exchange=low_ex,
             leg_short_exchange=high_ex,
-            pnl_hat=float(event.get("pnl_hat_240") or 0.0),
-            win_prob=float(event.get("win_prob_240") or 0.0),
-            pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
-            win_prob_ob=float(reval.get("win_prob") or 0.0),
+            pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+            win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+            pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+            win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+            horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+            pred_source=str((pred_choice or {}).get("source") or "v1_240"),
             payload=payload,
             status="opening",
             reason=None,
@@ -3418,7 +3910,7 @@ class LiveTradingManager:
                 low_ex,
                 high_ex,
                 client_base,
-                pnl_hat_ob=float(reval.get("pnl_hat") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
             )
             self._update_signal_status(conn, signal_id, "open")
         except TradeExecutionError as exc:
@@ -3449,7 +3941,7 @@ class LiveTradingManager:
         elif ex == "okx":
             set_okx_swap_leverage(symbol=f"{symbol}-USDT-SWAP", leverage=1, td_mode="cross")
         elif ex == "bybit":
-            set_bybit_linear_leverage(symbol=f"{symbol}USDT", leverage=1, category="linear")
+            set_bybit_linear_leverage(symbol=f"{symbol}USDT", leverage=1, category="linear", allow_no_change=True)
         elif ex == "bitget":
             set_bitget_usdt_perp_leverage(symbol=f"{symbol}USDT", leverage=1, margin_coin="USDT")
 
@@ -4216,18 +4708,20 @@ class LiveTradingManager:
             return
 
         now = _utcnow()
+        long_info: Dict[str, Any] = {}
+        short_info: Dict[str, Any] = {}
         fr_long = None
         fr_short = None
         try:
-            info = self._get_public_funding_mark(str(long_ex), symbol)
-            if info.get("funding_rate") is not None:
-                fr_long = float(info.get("funding_rate"))
+            long_info = self._get_public_funding_mark(str(long_ex), symbol)
+            if long_info.get("funding_rate") is not None:
+                fr_long = float(long_info.get("funding_rate"))
         except Exception:
             fr_long = None
         try:
-            info = self._get_public_funding_mark(str(short_ex), symbol)
-            if info.get("funding_rate") is not None:
-                fr_short = float(info.get("funding_rate"))
+            short_info = self._get_public_funding_mark(str(short_ex), symbol)
+            if short_info.get("funding_rate") is not None:
+                fr_short = float(short_info.get("funding_rate"))
         except Exception:
             fr_short = None
         if fr_long is not None or fr_short is not None:
@@ -4480,7 +4974,7 @@ class LiveTradingManager:
             )
             return
 
-        qty_long, qty_short = self._load_open_quantities(conn, signal_id)
+        qty_long, qty_short = self._load_open_quantities(conn, signal_id, symbol)
         if qty_long is None or qty_short is None:
             self._record_error(
                 conn,
@@ -4539,6 +5033,54 @@ class LiveTradingManager:
         except Exception:
             pnl_hat_ob_f = None
 
+        entry_long_px, entry_short_px = self._load_open_entry_prices(conn, signal_id)
+        funding_pnl_missing = False
+        funding_pnl_usdt = signal_row.get("funding_pnl_usdt")
+        if funding_pnl_usdt is None:
+            long_fp = signal_row.get("funding_long_pnl_usdt")
+            short_fp = signal_row.get("funding_short_pnl_usdt")
+            if long_fp is not None or short_fp is not None:
+                try:
+                    funding_pnl_usdt = float(long_fp or 0.0) + float(short_fp or 0.0)
+                except Exception:
+                    funding_pnl_usdt = None
+        if funding_pnl_usdt is None:
+            funding_pnl_missing = True
+            funding_pnl_usdt = 0.0
+
+        position_pnl_usdt = None
+        total_pnl_usdt = None
+        total_pnl_pct = None
+        entry_notional = None
+        if entry_long_px and entry_short_px:
+            try:
+                entry_notional = (float(entry_long_px) * float(qty_long)) + (float(entry_short_px) * float(qty_short))
+            except Exception:
+                entry_notional = None
+            if entry_notional and entry_notional > 0:
+                position_pnl_usdt = (
+                    (float(long_sell) - float(entry_long_px)) * float(qty_long)
+                    + (float(entry_short_px) - float(short_buy)) * float(qty_short)
+                )
+                total_pnl_usdt = float(position_pnl_usdt) + float(funding_pnl_usdt)
+                total_pnl_pct = float(total_pnl_usdt) / float(entry_notional)
+
+        funding_rate_long_per_hour = None
+        funding_rate_short_per_hour = None
+        funding_rate_per_hour = None
+        try:
+            if long_info.get("funding_rate") is not None and long_info.get("funding_interval_hours"):
+                funding_rate_long_per_hour = -float(long_info["funding_rate"]) / float(long_info["funding_interval_hours"])
+        except Exception:
+            funding_rate_long_per_hour = None
+        try:
+            if short_info.get("funding_rate") is not None and short_info.get("funding_interval_hours"):
+                funding_rate_short_per_hour = float(short_info["funding_rate"]) / float(short_info["funding_interval_hours"])
+        except Exception:
+            funding_rate_short_per_hour = None
+        if funding_rate_long_per_hour is not None and funding_rate_short_per_hour is not None:
+            funding_rate_per_hour = float(funding_rate_long_per_hour) + float(funding_rate_short_per_hour)
+
         take_profit_pnl = signal_row.get("take_profit_pnl")
         try:
             take_profit_pnl_f = float(take_profit_pnl) if take_profit_pnl is not None else None
@@ -4552,6 +5094,17 @@ class LiveTradingManager:
 
         if take_profit_pnl_f is None and pnl_hat_ob_f is not None:
             take_profit_pnl_f = float(self.config.take_profit_ratio) * float(pnl_hat_ob_f)
+
+        stop_loss_total_pct = float(getattr(self.config, "stop_loss_total_pnl_pct", 0.0) or 0.0)
+        stop_loss_funding_per_hour_pct = float(getattr(self.config, "stop_loss_funding_per_hour_pct", 0.0) or 0.0)
+        if close_reason is None and stop_loss_total_pct > 0 and total_pnl_pct is not None:
+            if float(total_pnl_pct) <= -float(stop_loss_total_pct):
+                decision = "stop_loss_total_pnl"
+                close_reason = "stop_loss_total_pnl"
+        if close_reason is None and stop_loss_funding_per_hour_pct > 0 and funding_rate_per_hour is not None:
+            if float(funding_rate_per_hour) <= -float(stop_loss_funding_per_hour_pct):
+                decision = "stop_loss_funding_rate"
+                close_reason = "stop_loss_funding_rate"
 
         confirm_take_profit: Optional[Dict[str, Any]] = None
         if (
@@ -4624,6 +5177,23 @@ class LiveTradingManager:
                         "opened_at": opened_at.isoformat(),
                         "force_close_at": force_close_at.isoformat(),
                         "confirm_take_profit": confirm_take_profit,
+                        "entry_long_px": float(entry_long_px) if entry_long_px is not None else None,
+                        "entry_short_px": float(entry_short_px) if entry_short_px is not None else None,
+                        "entry_notional": float(entry_notional) if entry_notional is not None else None,
+                        "position_pnl_usdt": float(position_pnl_usdt) if position_pnl_usdt is not None else None,
+                        "funding_pnl_usdt": float(funding_pnl_usdt),
+                        "funding_pnl_missing": bool(funding_pnl_missing),
+                        "total_pnl_usdt": float(total_pnl_usdt) if total_pnl_usdt is not None else None,
+                        "total_pnl_pct": float(total_pnl_pct) if total_pnl_pct is not None else None,
+                        "funding_rate_long_per_hour": float(funding_rate_long_per_hour)
+                        if funding_rate_long_per_hour is not None
+                        else None,
+                        "funding_rate_short_per_hour": float(funding_rate_short_per_hour)
+                        if funding_rate_short_per_hour is not None
+                        else None,
+                        "funding_rate_per_hour": float(funding_rate_per_hour) if funding_rate_per_hour is not None else None,
+                        "stop_loss_total_pnl_pct": float(stop_loss_total_pct),
+                        "stop_loss_funding_per_hour_pct": float(stop_loss_funding_per_hour_pct),
                     }
                 ),
             ),
@@ -4756,10 +5326,10 @@ class LiveTradingManager:
             ob_short = fut_short.result() or {"error": "no_data"}
             return ob_long, ob_short
 
-    def _load_open_quantities(self, conn, signal_id: int) -> Tuple[Optional[float], Optional[float]]:
+    def _load_open_quantities(self, conn, signal_id: int, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         rows = conn.execute(
             """
-            SELECT leg, quantity, filled_qty
+            SELECT leg, quantity, filled_qty, exchange
               FROM watchlist.live_trade_order
              WHERE signal_id=%s
                AND action='open'
@@ -4769,12 +5339,30 @@ class LiveTradingManager:
             (int(signal_id),),
         ).fetchall()
         qty_long = qty_short = None
+        symbol_u = (symbol or "").upper().strip()
+        okx_ct_val: Optional[float] = None
+
+        def _get_okx_ct_val() -> Optional[float]:
+            nonlocal okx_ct_val
+            if okx_ct_val is not None:
+                return okx_ct_val
+            if not symbol_u:
+                okx_ct_val = None
+                return None
+            try:
+                okx_ct_val = float(get_okx_swap_contract_value(symbol_u))
+            except Exception:
+                okx_ct_val = None
+            return okx_ct_val
+
         for r in rows or []:
             if not isinstance(r, dict):
                 continue
             leg = str(r.get("leg") or "")
+            exchange = str(r.get("exchange") or "").lower()
             qty_val: Optional[float] = None
             filled_qty = r.get("filled_qty")
+            qty_raw = r.get("quantity")
             if filled_qty is not None:
                 try:
                     filled_f = float(filled_qty)
@@ -4782,9 +5370,20 @@ class LiveTradingManager:
                     filled_f = 0.0
                 if filled_f > 0:
                     qty_val = filled_f
+                    # Safety: OKX fills are in contracts; if a legacy row still stores contracts,
+                    # convert to base when that matches the originally requested size better.
+                    if exchange == "okx" and symbol_u:
+                        try:
+                            qty_req = float(qty_raw)
+                        except Exception:
+                            qty_req = None
+                        ct_val = _get_okx_ct_val()
+                        if qty_req and ct_val and ct_val > 0:
+                            candidate = filled_f * ct_val
+                            if abs(candidate - qty_req) < abs(filled_f - qty_req):
+                                qty_val = candidate
 
             if qty_val is None:
-                qty_raw = r.get("quantity")
                 try:
                     qty_val = float(qty_raw)
                 except Exception:
@@ -4794,6 +5393,38 @@ class LiveTradingManager:
             elif leg == "short" and qty_short is None:
                 qty_short = qty_val
         return qty_long, qty_short
+
+    def _load_open_entry_prices(self, conn, signal_id: int) -> Tuple[Optional[float], Optional[float]]:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT ON (leg)
+                   leg, avg_price, created_at, id
+              FROM watchlist.live_trade_order
+             WHERE signal_id=%s
+               AND action='open'
+               AND leg IN ('long','short')
+               AND avg_price IS NOT NULL
+             ORDER BY leg, created_at DESC, id DESC;
+            """,
+            (int(signal_id),),
+        ).fetchall()
+        long_px = None
+        short_px = None
+        for r in rows or []:
+            if not isinstance(r, dict):
+                continue
+            leg = str(r.get("leg") or "")
+            try:
+                px = float(r.get("avg_price"))  # type: ignore[arg-type]
+            except Exception:
+                continue
+            if px <= 0:
+                continue
+            if leg == "long" and long_px is None:
+                long_px = px
+            elif leg == "short" and short_px is None:
+                short_px = px
+        return long_px, short_px
 
     def _attempt_close(
         self,
@@ -4838,6 +5469,20 @@ class LiveTradingManager:
         short_ex = str(signal_row.get("leg_short_exchange") or "")
         # Keep client order IDs short enough for venues like Binance (<=36 chars).
         # Use signal_id instead of the (potentially longer) event/symbol base.
+        # Prefer live positions to avoid unit mismatches or partial-fill drift.
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol)
+                fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol)
+                pos_long = fut_l.result()
+                pos_short = fut_s.result()
+            if pos_long is not None and float(pos_long) > 0:
+                qty_long = abs(float(pos_long))
+            if pos_short is not None and float(pos_short) < 0:
+                qty_short = abs(float(pos_short))
+        except Exception:
+            pass
+
         close_base = f"wl{signal_id}C{int(time.time())}"
         close_specs = [
             {

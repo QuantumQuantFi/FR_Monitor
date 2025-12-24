@@ -53,7 +53,7 @@
       <span class="muted" style="margin-left: 12px;">刷新间隔(s)：</span>
       <input id="refreshSec" type="number" min="2" max="300" value="10" style="width: 90px;" />
       <span class="muted" style="margin-left: 12px;">信号条数：</span>
-      <input id="signalsLimit" type="number" min="10" max="2000" value="500" style="width: 90px;" />
+      <input id="signalsLimit" type="number" min="10" max="2000" value="30" style="width: 90px;" />
       <span class="muted" style="margin-left: 12px;">筛选：</span>
       <input id="filterSymbol" placeholder="symbol(可选)" style="width: 110px;" />
       <div id="statusFilterWrap" style="position: relative;">
@@ -72,9 +72,9 @@
             <label class="muted"><input class="status-cb" type="checkbox" value="new"> new</label>
             <label class="muted"><input class="status-cb" type="checkbox" value="skipped"> skipped</label>
             <label class="muted"><input class="status-cb" type="checkbox" value="opening"> opening</label>
-            <label class="muted"><input class="status-cb" type="checkbox" value="open"> open</label>
-            <label class="muted"><input class="status-cb" type="checkbox" value="closing"> closing</label>
-            <label class="muted"><input class="status-cb" type="checkbox" value="closed"> closed</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="open" checked> open</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="closing" checked> closing</label>
+            <label class="muted"><input class="status-cb" type="checkbox" value="closed" checked> closed</label>
             <label class="muted"><input class="status-cb" type="checkbox" value="failed"> failed</label>
           </div>
         </div>
@@ -115,6 +115,9 @@
               <th style="width: 90px;">event_id</th>
               <th style="width: 90px;">Symbol</th>
               <th style="width: 90px;">Type</th>
+              <th style="width: 90px;">
+                <span class="hint" title="预测来源：v1_240 / v2_240 / v2_1440。开仓与跳过均记录触发来源。">Source</span>
+              </th>
               <th style="width: 200px;">Exchanges</th>
               <th style="width: 120px;">
                 <span class="hint" title="交易所A（Long腿）开仓成交均价：来自订单回执/订单查询的 best-effort avg_price（可能为空）。">A Long 开仓价</span>
@@ -165,8 +168,8 @@
               <th style="width: 110px;">
                 <span class="hint" title="last_pnl：最近一次 1min 监控样本计算的“订单簿估算PnL指标”（小数，口径为价差变化而非账户真实收益）。计算：last_pnl = entry_spread_metric - now_spread_metric，其中 entry_spread_metric=log(short_sell_entry/long_buy_entry)，now_spread_metric=log(short_buy_now/long_sell_now)。注意：不包含手续费/资金费/滑点/成交延迟，且若订单簿/合约口径与实际下单不一致，可能与 realized_pnl_usdt 显著偏离。">last_pnl</span>
               </th>
-              <th style="width: 130px;">
-                <span class="hint" title="实时平仓价差%：最近一次 1min 监控中，为“平仓方向”用订单簿扫盘得到的可成交价差（百分比）。计算：last_exit_spread_pct = (short_buy_px / long_sell_px) - 1，其中 long_sell_px=Long腿卖出(Bid扫盘价)，short_buy_px=Short腿买入(Ask扫盘价)。用于判断当前平仓可成交价差是否已明显收敛。">实时平仓价差%</span>
+              <th style="width: 140px;">
+                <span class="hint" title="平仓触发价差%：以触发平仓时的订单簿价差为准。计算：close_exit_spread_pct = exp(entry_spread_metric - close_pnl_spread) - 1。若尚未触发平仓，则显示最近一次监控的 last_exit_spread_pct（short_buy/long_sell - 1）。">平仓触发价差%</span>
               </th>
               <th style="width: 170px;">created_at</th>
               <th style="width: 170px;">opened_at</th>
@@ -177,13 +180,15 @@
               <th style="width: 170px;">close_short_at</th>
               <th style="width: 170px;">closed_at</th>
               <th style="width: 170px;">force_close_at</th>
-              <th style="width: 140px;">close_reason</th>
+              <th style="width: 140px;">
+                <span class="hint" title="平仓触发原因；若已触发会附带简短中文说明。">close_reason</span>
+              </th>
               <th style="width: 200px;">reason</th>
               <th style="width: 90px;">Details</th>
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="35" class="muted">loading...</td></tr>
+            <tr><td colspan="36" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -310,6 +315,14 @@
       return (n * 100).toFixed(nd) + '%';
     }
 
+    function calcCloseExitSpreadPct(s) {
+      if (!s) return null;
+      const entry = Number(s.entry_spread_metric);
+      const closePnl = Number(s.close_pnl_spread);
+      if (!Number.isFinite(entry) || !Number.isFinite(closePnl)) return null;
+      return Math.exp(entry - closePnl) - 1;
+    }
+
     function fmtTsBJ(iso) {
       if (!iso || iso === '-') return '-';
       const t = Date.parse(String(iso));
@@ -431,6 +444,21 @@
         return;
       }
 
+      const closeReasonLabel = (reason) => {
+        const key = (reason || '').toLowerCase();
+        if (!key) return '';
+        const map = {
+          take_profit: '止盈触发',
+          max_hold_days: '超时强平',
+          stop_loss_total_pnl: '总亏损止损',
+          stop_loss_funding_rate: '资金费率止损',
+          unhedged: '单腿风险',
+          manual: '手动平仓',
+          retry_close: '重试平仓',
+        };
+        return map[key] || '';
+      };
+
       body.innerHTML = signals.map(s => {
         const [stText, stCls] = pillForStatus(s.status);
         const ex = `${s.leg_long_exchange || '-'}(long) / ${s.leg_short_exchange || '-'}(short)`;
@@ -441,7 +469,9 @@
         const entrySpreadPct = fmtPct(s.entry_spread_pct_actual, 4);
         const tpExitSpreadPct = fmtPct(s.take_profit_exit_spread_pct, 4);
         const realized = fmt(s.realized_pnl_usdt, 6);
-        const exitSpreadPctNow = fmtPct(s.last_exit_spread_pct, 4);
+        const closeExitSpreadPct = calcCloseExitSpreadPct(s);
+        const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
+        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
         const src = s.funding_source || {};
         const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate');
         const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
@@ -479,7 +509,9 @@
         const closeShortAt = fmtTsBJ(closeShortAtUtc);
         const closedAt = fmtTsBJ(closedAtUtc);
         const forceAt = fmtTsBJ(forceAtUtc);
-        const closeReason = s.close_reason || '-';
+        const closeReasonRaw = s.close_reason || '';
+        const closeReasonNote = closeReasonLabel(closeReasonRaw);
+        const closeReason = closeReasonRaw ? (closeReasonNote ? `${closeReasonRaw} (${closeReasonNote})` : closeReasonRaw) : '-';
         const reason = s.reason || '-';
         return `
 	          <tr>
@@ -487,6 +519,7 @@
             <td class="muted">${s.event_id || '-'}</td>
             <td>${s.symbol || '-'}</td>
             <td class="muted">${s.signal_type || '-'}</td>
+            <td class="muted">${s.pred_source || '-'}</td>
             <td class="muted">${ex}</td>
             <td class="muted">${aOpen}</td>
             <td class="muted">${aClose}</td>
@@ -505,7 +538,7 @@
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
             <td>${fmt(s.last_pnl_spread, 6)}</td>
-            <td class="muted">${exitSpreadPctNow}</td>
+            <td class="muted" title="${closeExitSpreadPct !== null ? 'close_exit_spread_pct' : 'last_exit_spread_pct'}">${exitSpreadPctNow}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(createdAtUtc)}">${createdAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(openAtUtc)}">${openAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(openLongAtUtc)}">${openLongAt}</td>
@@ -918,10 +951,18 @@
     }
 
     document.getElementById('refreshBtn').addEventListener('click', () => refresh().catch(err => console.error(err)));
+    function applyDefaultStatusFilter() {
+      for (const cb of document.querySelectorAll('.status-cb')) cb.checked = false;
+      const defaults = new Set(['open', 'closing', 'closed']);
+      for (const cb of document.querySelectorAll('.status-cb')) {
+        if (defaults.has(String(cb.value || '').toLowerCase())) cb.checked = true;
+      }
+      updateStatusLabel();
+    }
+
     document.getElementById('resetBtn').addEventListener('click', () => {
       document.getElementById('filterSymbol').value = '';
-      for (const cb of document.querySelectorAll('.status-cb')) cb.checked = false;
-      updateStatusLabel();
+      applyDefaultStatusFilter();
       document.getElementById('filterType').value = '';
       document.getElementById('filterExchange').value = '';
       document.getElementById('filterPnlMin').value = '';

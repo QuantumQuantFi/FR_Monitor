@@ -2776,6 +2776,7 @@ def set_bybit_linear_leverage(
     sell_leverage: Optional[Union[int, float, str]] = None,
     category: str = "linear",
     position_idx: Optional[int] = None,
+    allow_no_change: bool = False,
     recv_window: int = 5000,
     api_key: Optional[str] = None,
     secret_key: Optional[str] = None,
@@ -2827,7 +2828,11 @@ def set_bybit_linear_leverage(
     url = f"{base_url}/v5/position/set-leverage"
     response = _send_request("POST", url, data=body_str, headers=headers)
     data = _json_or_error(response)
-    if response.status_code != 200 or data.get("retCode") != 0:
+    ret_code = data.get("retCode")
+    if response.status_code != 200 or ret_code != 0:
+        if allow_no_change and response.status_code == 200 and str(ret_code) == "110043":
+            LOGGER.info("Bybit leverage not modified; treating as OK for %s.", symbol_id)
+            return data
         raise TradeExecutionError(f"Bybit leverage reject: {data}")
     return data
 

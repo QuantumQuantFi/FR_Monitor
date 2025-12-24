@@ -243,6 +243,10 @@ WATCHLIST_PG_CONFIG = {
     'cooldown_minutes': int(float(_get_private('WATCHLIST_PG_COOLDOWN_MIN', 'WATCHLIST_PG_COOLDOWN_MIN', '3'))),
     # 默认开启事件合并；如需关闭可设置 WATCHLIST_PG_EVENT_MERGE=0
     'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '1')),
+    # 写入 event 时是否同步做订单簿验算：会显著增加写入延迟（网络 I/O），默认关闭，由 live trading 自己复核即可。
+    'orderbook_validation_on_write': _is_truthy(
+        _get_private('WATCHLIST_PG_OB_VALIDATION', 'WATCHLIST_PG_OB_VALIDATION', '0')
+    ),
 }
 
 # Watchlist 价差指标配置（仅计算，不做交易决策）
@@ -271,22 +275,45 @@ WATCHLIST_METRICS_CONFIG = {
     'series_cache_entries': int(_get_private('WATCHLIST_SERIES_CACHE_ENTRIES', 'WATCHLIST_SERIES_CACHE_ENTRIES', '64')),
 }
 
+# Watchlist v2 推断配置（Ridge + Logistic）
+WATCHLIST_V2_PRED_CONFIG = {
+    'enabled': _is_truthy(_get_private('WATCHLIST_V2_ENABLED', 'WATCHLIST_V2_ENABLED', '1')),
+    'model_path_240': _get_private(
+        'WATCHLIST_V2_MODEL_240',
+        'WATCHLIST_V2_MODEL_240',
+        'reports/v2_ridge_logistic_model_h240.json',
+    ),
+    'model_path_1440': _get_private(
+        'WATCHLIST_V2_MODEL_1440',
+        'WATCHLIST_V2_MODEL_1440',
+        'reports/v2_ridge_logistic_model_h1440.json',
+    ),
+    'max_missing_ratio': float(_get_private('WATCHLIST_V2_MAX_MISSING', 'WATCHLIST_V2_MAX_MISSING', '0.2')),
+}
+
 # Live trading (Phase 1: Type B only, perp-perp)
 LIVE_TRADING_CONFIG = {
     # 默认开启自动实盘；如需关闭请设置 LIVE_TRADING_ENABLED=0
     'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
     'horizon_min': int(float(_get_private('LIVE_TRADING_HORIZON_MIN', 'LIVE_TRADING_HORIZON_MIN', '240'))),
     # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
-    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.01')),
-    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.89')),
+    'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.0085')),
+    'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.85')),
+    # v2 预测触发阈值（默认更严格，避免频率暴涨；可用环境变量微调）
+    'v2_enabled': _is_truthy(_get_private('LIVE_TRADING_V2_ENABLED', 'LIVE_TRADING_V2_ENABLED', '1')),
+    # v2 阈值：默认与 v1 同步（更易触发）。如需分 horizon 调整，可用环境变量覆盖。
+    'v2_pnl_threshold_240': float(_get_private('LIVE_TRADING_V2_PNL_240', 'LIVE_TRADING_V2_PNL_240', '0.0085')),
+    'v2_win_prob_threshold_240': float(_get_private('LIVE_TRADING_V2_PROB_240', 'LIVE_TRADING_V2_PROB_240', '0.85')),
+    'v2_pnl_threshold_1440': float(_get_private('LIVE_TRADING_V2_PNL_1440', 'LIVE_TRADING_V2_PNL_1440', '0.0085')),
+    'v2_win_prob_threshold_1440': float(_get_private('LIVE_TRADING_V2_PROB_1440', 'LIVE_TRADING_V2_PROB_1440', '0.85')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
     # 扫描周期：建议使用 watchlist → kick 的事件驱动作为 fast-path，
     # 定时扫描作为兜底即可，避免频繁订单簿复核导致交易所 ban。
-    'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '60')),
+    'scan_interval_seconds': float(_get_private('LIVE_TRADING_SCAN_SEC', 'LIVE_TRADING_SCAN_SEC', '10')),
     # 以 kick 为主：watchlist 写入 event 后立即唤醒 live trading；同时保留 scan_interval_seconds 作为兜底。
     'kick_driven': _is_truthy(_get_private('LIVE_TRADING_KICK_DRIVEN', 'LIVE_TRADING_KICK_DRIVEN', '1')),
     'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
-    'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.8')),
+    'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.7')),
     # Optional guard for Type B: require both legs' current funding rates to satisfy
     # abs(funding_rate) <= max_abs_funding before opening a trade.
     # Default disabled (0) because watchlist already filters funding and we want maximum entry speed.
@@ -298,6 +325,18 @@ LIVE_TRADING_CONFIG = {
     'orderbook_confirm_sleep_seconds': float(_get_private('LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', 'LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', '0.7')),
     # 强制平仓：开仓后最大持仓天数（默认 1 天）
     'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '1'))),
+    # 止损：仓位盈亏 + 已收取资金费率亏损超过阈值（百分比，小数）
+    'stop_loss_total_pnl_pct': float(
+        _get_private('LIVE_TRADING_STOP_LOSS_TOTAL_PCT', 'LIVE_TRADING_STOP_LOSS_TOTAL_PCT', '0.01')
+    ),
+    # 止损：当前资金费率折算到 1h 后的净亏损超过阈值（百分比，小数）
+    'stop_loss_funding_per_hour_pct': float(
+        _get_private(
+            'LIVE_TRADING_STOP_LOSS_FUNDING_PER_HOUR_PCT',
+            'LIVE_TRADING_STOP_LOSS_FUNDING_PER_HOUR_PCT',
+            '0.003',
+        )
+    ),
     'close_retry_cooldown_seconds': float(
         _get_private('LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', 'LIVE_TRADING_CLOSE_RETRY_COOLDOWN_SEC', '120')
     ),
