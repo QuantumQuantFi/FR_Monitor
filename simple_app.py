@@ -1153,11 +1153,21 @@ live_trading_manager = LiveTradingManager(
         take_profit_ratio=float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
         orderbook_confirm_samples=int(LIVE_TRADING_CONFIG.get('orderbook_confirm_samples', 3)),
         orderbook_confirm_sleep_seconds=float(LIVE_TRADING_CONFIG.get('orderbook_confirm_sleep_seconds', 0.7)),
-        max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 1)),
+        max_hold_days=int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
         stop_loss_total_pnl_pct=float(LIVE_TRADING_CONFIG.get('stop_loss_total_pnl_pct', 0.01)),
         stop_loss_funding_per_hour_pct=float(LIVE_TRADING_CONFIG.get('stop_loss_funding_per_hour_pct', 0.003)),
         max_abs_funding=float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.001)),
         close_retry_cooldown_seconds=float(LIVE_TRADING_CONFIG.get('close_retry_cooldown_seconds', 120.0)),
+        scale_in_enabled=bool(LIVE_TRADING_CONFIG.get('scale_in_enabled', True)),
+        scale_in_max_entries=int(LIVE_TRADING_CONFIG.get('scale_in_max_entries', 4)),
+        scale_in_trigger_mult=float(LIVE_TRADING_CONFIG.get('scale_in_trigger_mult', 1.5)),
+        scale_in_min_interval_minutes=int(LIVE_TRADING_CONFIG.get('scale_in_min_interval_minutes', 30)),
+        scale_in_signal_max_age_minutes=int(LIVE_TRADING_CONFIG.get('scale_in_signal_max_age_minutes', 30)),
+        scale_in_max_total_notional_usdt=(
+            float(LIVE_TRADING_CONFIG.get('scale_in_max_total_notional_usdt'))
+            if float(LIVE_TRADING_CONFIG.get('scale_in_max_total_notional_usdt') or 0.0) > 0
+            else None
+        ),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
         per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
         candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 50)),

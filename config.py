@@ -323,8 +323,8 @@ LIVE_TRADING_CONFIG = {
     # 临时策略：仅保留 i0（单次）复核，降低 skipped（后续可再改回 3 次复核）。
     'orderbook_confirm_samples': int(float(_get_private('LIVE_TRADING_OB_CONFIRM_SAMPLES', 'LIVE_TRADING_OB_CONFIRM_SAMPLES', '1'))),
     'orderbook_confirm_sleep_seconds': float(_get_private('LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', 'LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', '0.7')),
-    # 强制平仓：开仓后最大持仓天数（默认 1 天）
-    'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '1'))),
+    # 强制平仓：开仓后最大持仓天数（默认 7 天）
+    'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '7'))),
     # 止损：仓位盈亏 + 已收取资金费率亏损超过阈值（百分比，小数）
     'stop_loss_total_pnl_pct': float(
         _get_private('LIVE_TRADING_STOP_LOSS_TOTAL_PCT', 'LIVE_TRADING_STOP_LOSS_TOTAL_PCT', '0.01')
@@ -343,6 +343,21 @@ LIVE_TRADING_CONFIG = {
     # Hyperliquid reduce-only close uses IOC limit internally; too small slippage may fail to cross the spread.
     'hyperliquid_close_slippage': float(
         _get_private('LIVE_TRADING_HL_CLOSE_SLIPPAGE', 'LIVE_TRADING_HL_CLOSE_SLIPPAGE', '0.03')
+    ),
+    # 价差扩大补救加仓（scale-in rescue）：默认开启。
+    'scale_in_enabled': _is_truthy(_get_private('LIVE_TRADING_SCALE_IN_ENABLED', 'LIVE_TRADING_SCALE_IN_ENABLED', '1')),
+    'scale_in_max_entries': int(float(_get_private('LIVE_TRADING_SCALE_IN_MAX_ENTRIES', 'LIVE_TRADING_SCALE_IN_MAX_ENTRIES', '4'))),
+    'scale_in_trigger_mult': float(_get_private('LIVE_TRADING_SCALE_IN_TRIGGER_MULT', 'LIVE_TRADING_SCALE_IN_TRIGGER_MULT', '1.5')),
+    'scale_in_min_interval_minutes': int(
+        float(_get_private('LIVE_TRADING_SCALE_IN_MIN_INTERVAL_MIN', 'LIVE_TRADING_SCALE_IN_MIN_INTERVAL_MIN', '30'))
+    ),
+    'scale_in_signal_max_age_minutes': int(
+        float(_get_private('LIVE_TRADING_SCALE_IN_SIGNAL_MAX_AGE_MIN', 'LIVE_TRADING_SCALE_IN_SIGNAL_MAX_AGE_MIN', '30'))
+    ),
+    # Safety cap: max total notional per leg per symbol across entries.
+    # 留空/0 表示默认使用 max_entries * per_leg_notional_usdt。
+    'scale_in_max_total_notional_usdt': float(
+        _get_private('LIVE_TRADING_SCALE_IN_MAX_TOTAL_NOTIONAL', 'LIVE_TRADING_SCALE_IN_MAX_TOTAL_NOTIONAL', '0')
     ),
     # 只处理“最近”的 event，避免对历史候选重复做订单簿复核。
     'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '3'))),
