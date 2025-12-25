@@ -19,15 +19,18 @@ class PriceDatabase:
         self._wal_configured = False
         self.init_database()
 
-    def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=self.connection_timeout)
+    def _get_connection(self, timeout_seconds: float = None):
+        timeout = self.connection_timeout if timeout_seconds is None else float(timeout_seconds)
+        conn = sqlite3.connect(self.db_path, timeout=timeout)
         if not self._wal_configured:
             try:
                 conn.execute("PRAGMA journal_mode=WAL")
                 conn.execute("PRAGMA synchronous=NORMAL")
-                self._wal_configured = True
             except sqlite3.DatabaseError:
                 pass
+            finally:
+                # WAL 可能已在历史连接/进程中设置完成；避免在高并发场景下反复尝试 PRAGMA 导致阻塞。
+                self._wal_configured = True
         return conn
 
     def _ensure_column(self, cursor, table: str, column: str, definition: str):
@@ -248,10 +251,10 @@ class PriceDatabase:
         except Exception as e:
             print(f"数据库批量写入错误: {e}")
     
-    def get_historical_data(self, symbol, exchange=None, hours=24, interval='1min', raise_on_error=False):
+    def get_historical_data(self, symbol, exchange=None, hours=24, interval='1min', raise_on_error=False, timeout_seconds: float = None):
         """获取历史数据"""
         try:
-            with self._get_connection() as conn:
+            with self._get_connection(timeout_seconds=timeout_seconds) as conn:
                 cursor = conn.cursor()
                 
                 # 根据间隔选择表
