@@ -3,9 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <title>Watchlist 数据库浏览</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <style>
         * { box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; padding: 16px; background: #f7f9fb; color: #111; }
+        body { font-family: Arial, sans-serif; padding: 0; background: #f7f9fb; color: #111; }
+        .page-container { padding: 16px; }
         h2 { margin-top: 0; }
         form { margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
         .table-wrap {
@@ -38,6 +40,16 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
+    <div class="page-container">
+    {# 兼容 psycopg 未安装等“仅显示错误提示”的场景：避免模板变量缺失导致 500 #}
+    {% set table_key = table_key|default('raw') %}
+    {% set limit = limit|default(10) %}
+    {% set page = page|default(1) %}
+    {% set has_next = has_next|default(false) %}
+    {% set total_count = total_count|default(None) %}
+    {% set rows = rows|default([]) %}
+    {% set columns = columns|default([]) %}
     <h2>Watchlist 数据库浏览</h2>
     <form method="get">
         <label>表：
@@ -106,6 +118,7 @@
         {% if has_next %}
             <a href="?table={{ table_key }}&limit={{ limit }}&page={{ page + 1 }}">下一页</a>
         {% endif %}
+    </div>
     </div>
 </body>
 </html>
