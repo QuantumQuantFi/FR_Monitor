@@ -2333,7 +2333,9 @@ def index():
     """主页 - 增强版按币种聚合展示所有可用币种"""
     return render_template('enhanced_aggregated.html', 
                          symbols=data_collector.supported_symbols,
-                         exchange_order=EXCHANGE_DISPLAY_ORDER)
+                         exchange_order=EXCHANGE_DISPLAY_ORDER,
+                         active_page='aggregated',
+                         current_symbol=data_collector.current_symbol)
 
 @app.route('/exchanges')
 def exchanges_view():
@@ -2341,14 +2343,17 @@ def exchanges_view():
     return render_template('simple_index.html', 
                          symbols=data_collector.supported_symbols,
                          current_symbol=data_collector.current_symbol,
-                         exchange_order=EXCHANGE_DISPLAY_ORDER)
+                         exchange_order=EXCHANGE_DISPLAY_ORDER,
+                         active_page='exchanges')
 
 @app.route('/aggregated')
 def aggregated_index():
     """聚合页面（兼容路由）- 使用增强版聚合视图"""
     return render_template('enhanced_aggregated.html', 
                          symbols=data_collector.supported_symbols,
-                         exchange_order=EXCHANGE_DISPLAY_ORDER)
+                         exchange_order=EXCHANGE_DISPLAY_ORDER,
+                         active_page='aggregated',
+                         current_symbol=data_collector.current_symbol)
 
 @app.route('/charts')
 def charts():
@@ -2370,25 +2375,26 @@ def charts():
                          exchange_order=EXCHANGE_DISPLAY_ORDER,
                          chart_intervals=CHART_INTERVAL_OPTIONS,
                          default_chart_interval=DEFAULT_CHART_INTERVAL,
-                         chart_interval_label_map=CHART_INTERVAL_LABEL_MAP)
+                         chart_interval_label_map=CHART_INTERVAL_LABEL_MAP,
+                         active_page='charts')
 
 
 @app.route('/watchlist')
 def watchlist_view():
     """Binance 资金费率驱动的关注列表页面"""
-    return render_template('watchlist.html')
+    return render_template('watchlist.html', active_page='watchlist')
 
 
 @app.route('/watchlist/charts')
 def watchlist_charts():
     """关注列表的独立图表页面"""
-    return render_template('watchlist_charts.html')
+    return render_template('watchlist_charts.html', active_page='watchlist_charts')
 
 
 @app.route('/live_trading')
 def live_trading_view():
     """实盘交易（Type B）状态页：信号、订单、价差监听与平仓状态。"""
-    return render_template('live_trading.html')
+    return render_template('live_trading.html', active_page='live_trading')
 
 
 @app.route('/api/data')
@@ -2699,7 +2705,7 @@ def watchlist_db_view():
     - 默认每页 10 条，可通过 ?page=2&limit=20 翻页。
     """
     if psycopg is None:
-        return render_template('watchlist_db_view.html', error='psycopg 未安装，无法连接 PG')
+        return render_template('watchlist_db_view.html', error='psycopg 未安装，无法连接 PG', active_page='watchlist_db')
 
     table_key = request.args.get('table', 'raw')
     page = max(1, int(request.args.get('page', 1) or 1))
@@ -2773,6 +2779,7 @@ def watchlist_db_view():
         has_next=has_next,
         total_count=total_count,
         error=error,
+        active_page='watchlist_db',
     )
 
 @app.route('/api/watchlist/metrics')

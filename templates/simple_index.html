@@ -4,15 +4,17 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>多交易所实时价格监控</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: 0;
             background-color: #0d1421;
             color: #ffffff;
         }
+        .page-container { padding: 20px; }
         
         .header {
             display: flex;
@@ -176,6 +178,8 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
+    <div class="page-container">
     <div class="header">
         <div class="title">多交易所实时价格监控</div>
         <div class="symbol-selector">
@@ -270,6 +274,8 @@
     </div>
     
     <div class="timestamp" id="lastUpdate">等待数据更新...</div>
+
+    </div>
 
     <script>
         let currentSymbol = '{{ current_symbol }}';

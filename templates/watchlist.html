@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Binance 关注列表</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- 时间轴需要日期适配器，否则 time scale 无法解析 -->
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
@@ -50,8 +51,9 @@
             color: var(--text);
             font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
             line-height: 1.5;
-            padding: 24px;
+            padding: 0;
         }
+        .page-container { padding: 24px; }
         h1 { margin: 0 0 12px; font-size: 24px; }
         .container {
             max-width: 1180px;
@@ -161,7 +163,7 @@
             max-height: 240px;
         }
         @media (max-width: 900px) {
-            body { padding: 12px; }
+            .page-container { padding: 12px; }
             th:nth-child(8), td:nth-child(8),
             th:nth-child(9), td:nth-child(9),
             th:nth-child(10), td:nth-child(10) { display: none; }
@@ -210,6 +212,8 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
+    <div class="page-container">
     <div class="container">
         <div class="meta">
             <div>
@@ -1566,5 +1570,6 @@
         });
         loadWatchlist();
     </script>
+    </div>
 </body>
 </html>

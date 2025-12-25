@@ -1,0 +1,18 @@
+{# Shared top navigation. Keep it dumb: render-only, no JS dependencies. #}
+{% set nav_symbol = (current_symbol or 'BTC') %}
+<nav class="app-nav">
+  <div class="app-nav__brand">
+    <a href="/">FR Monitor</a>
+    <span class="app-nav__subtitle">watchlist · live trading · charts</span>
+  </div>
+  <div class="app-nav__links">
+    <a class="app-nav__link {% if active_page == 'aggregated' %}active{% endif %}" href="/">聚合</a>
+    <a class="app-nav__link {% if active_page == 'exchanges' %}active{% endif %}" href="/exchanges">交易所</a>
+    <a class="app-nav__link {% if active_page == 'charts' %}active{% endif %}" href="/charts?symbol={{ nav_symbol }}">图表<span class="badge">{{ nav_symbol }}</span></a>
+    <a class="app-nav__link {% if active_page == 'watchlist' %}active{% endif %}" href="/watchlist">Watchlist</a>
+    <a class="app-nav__link {% if active_page == 'watchlist_charts' %}active{% endif %}" href="/watchlist/charts">Watchlist 图表</a>
+    <a class="app-nav__link {% if active_page == 'watchlist_db' %}active{% endif %}" href="/watchlist/db">Watchlist DB</a>
+    <a class="app-nav__link {% if active_page == 'live_trading' %}active{% endif %}" href="/live_trading">Live Trading</a>
+  </div>
+</nav>
+

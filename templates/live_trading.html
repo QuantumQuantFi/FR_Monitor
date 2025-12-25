@@ -4,9 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>实盘交易（Type B）</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
   <style>
     * { box-sizing: border-box; }
-    body { font-family: Arial, sans-serif; padding: 16px; background: #0d1421; color: #e6edf3; }
+    body { font-family: Arial, sans-serif; padding: 0; background: #0d1421; color: #e6edf3; }
+    .page-container { padding: 16px; }
     a { color: #58a6ff; text-decoration: none; }
     .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
     .card { background: #111a2a; border: 1px solid #263040; border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
@@ -34,6 +36,8 @@
   </style>
 </head>
 <body>
+  {% include '_app_nav.html' %}
+  <div class="page-container">
   <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
     <div>
       <div style="font-size: 18px; font-weight: 700;">实盘交易（Type B）</div>
@@ -1041,5 +1045,6 @@
     refresh().catch(err => console.error(err));
     schedule();
   </script>
+  </div>
 </body>
 </html>

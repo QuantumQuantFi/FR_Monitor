@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>多交易所币种聚合监控 - 增强版</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         * {
@@ -481,6 +482,7 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
     <div class="header">
         <div class="header-top">
             <h1 class="title">🚀 多交易所实时监控</h1>

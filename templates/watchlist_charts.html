@@ -4,12 +4,14 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Watchlist 图表</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3"></script>
     <style>
         :root { color-scheme: dark; }
-        body { margin: 0; padding: 16px; background: #0b1020; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif; }
+        body { margin: 0; padding: 0; background: #0b1020; color: #e5e7eb; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif; }
+        .page-container { padding: 16px; }
         h1 { margin: 0 0 8px; font-size: 22px; }
         .muted { color: #9ca3af; font-size: 13px; }
         .panel { background: #0f172a; border: 1px solid #1f2937; border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
@@ -24,6 +26,8 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
+    <div class="page-container">
     <div class="panel">
         <h1>Watchlist 图表</h1>
         <div class="muted" id="subtitle">基于关注列表的 12h 价差与价格时序，支持按 Symbol 过滤。</div>
@@ -34,6 +38,7 @@
         </div>
     </div>
     <div class="grid" id="charts-grid"></div>
+    </div>
 
 <script>
     const urlParams = new URLSearchParams(window.location.search);
