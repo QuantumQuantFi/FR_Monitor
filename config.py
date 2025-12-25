@@ -299,13 +299,13 @@ LIVE_TRADING_CONFIG = {
     # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
     'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.0085')),
     'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.85')),
-    # v2 预测触发阈值（默认更严格，避免频率暴涨；可用环境变量微调）
+    # v2 预测触发阈值（v2 的 win_prob 分布整体低于 v1；默认适度放宽以确保能触发）
     'v2_enabled': _is_truthy(_get_private('LIVE_TRADING_V2_ENABLED', 'LIVE_TRADING_V2_ENABLED', '1')),
-    # v2 阈值：默认与 v1 同步（更易触发）。如需分 horizon 调整，可用环境变量覆盖。
-    'v2_pnl_threshold_240': float(_get_private('LIVE_TRADING_V2_PNL_240', 'LIVE_TRADING_V2_PNL_240', '0.0085')),
-    'v2_win_prob_threshold_240': float(_get_private('LIVE_TRADING_V2_PROB_240', 'LIVE_TRADING_V2_PROB_240', '0.85')),
-    'v2_pnl_threshold_1440': float(_get_private('LIVE_TRADING_V2_PNL_1440', 'LIVE_TRADING_V2_PNL_1440', '0.0085')),
-    'v2_win_prob_threshold_1440': float(_get_private('LIVE_TRADING_V2_PROB_1440', 'LIVE_TRADING_V2_PROB_1440', '0.85')),
+    # v2 阈值：可按 horizon 独立配置；默认值以“每天触发量可控 + 不至于长期 0 v2 开仓”为目标。
+    'v2_pnl_threshold_240': float(_get_private('LIVE_TRADING_V2_PNL_240', 'LIVE_TRADING_V2_PNL_240', '0.0080')),
+    'v2_win_prob_threshold_240': float(_get_private('LIVE_TRADING_V2_PROB_240', 'LIVE_TRADING_V2_PROB_240', '0.82')),
+    'v2_pnl_threshold_1440': float(_get_private('LIVE_TRADING_V2_PNL_1440', 'LIVE_TRADING_V2_PNL_1440', '0.0080')),
+    'v2_win_prob_threshold_1440': float(_get_private('LIVE_TRADING_V2_PROB_1440', 'LIVE_TRADING_V2_PROB_1440', '0.81')),
     'max_concurrent_trades': int(float(_get_private('LIVE_TRADING_MAX_CONCURRENT', 'LIVE_TRADING_MAX_CONCURRENT', '10'))),
     # 扫描周期：建议使用 watchlist → kick 的事件驱动作为 fast-path，
     # 定时扫描作为兜底即可，避免频繁订单簿复核导致交易所 ban。
