@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{{ current_symbol }} - 时序图表监控</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom"></script>
@@ -11,9 +12,13 @@
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', sans-serif;
             margin: 0;
-            padding: 20px;
+            padding: 0;
             background-color: #0d1421;
             color: #ffffff;
+        }
+
+        .page-container {
+            padding: 20px;
         }
         
         .header {
@@ -52,6 +57,116 @@
         }
         .search-input:focus { outline: none; border-color: #f0b90b; }
         .symbol-list { display: flex; gap: 8px; max-width: 100%; overflow-x: auto; padding-bottom: 6px; }
+
+        .symbol-picker-btn {
+            padding: 8px 12px;
+            background: #2b2f36;
+            border: 1px solid #3c4043;
+            color: #ffffff;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+        .symbol-picker-btn:hover { border-color: #f0b90b; }
+
+        /* 币种选择弹窗：避免在 header 内渲染上千个按钮造成页面“顶端拉长/很丑” + DOM 负担 */
+        .modal {
+            position: fixed;
+            inset: 0;
+            display: none;
+            align-items: center;
+            justify-content: center;
+            padding: 18px;
+            background: rgba(0, 0, 0, 0.65);
+            z-index: 100;
+        }
+        .modal.open { display: flex; }
+        .modal-card {
+            width: min(980px, 96vw);
+            max-height: min(80vh, 780px);
+            overflow: hidden;
+            background: linear-gradient(135deg, #1e2329 0%, #2b2f36 100%);
+            border: 1px solid #3c4043;
+            border-radius: 14px;
+            box-shadow: 0 14px 60px rgba(0,0,0,0.55);
+            display: flex;
+            flex-direction: column;
+        }
+        .modal-header {
+            padding: 14px 16px;
+            border-bottom: 1px solid #2f343b;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+        }
+        .modal-title {
+            font-size: 14px;
+            font-weight: 700;
+            color: #f0b90b;
+        }
+        .modal-close {
+            border: 1px solid #3c4043;
+            background: rgba(43,47,54,0.75);
+            color: #ffffff;
+            border-radius: 10px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 12px;
+        }
+        .modal-close:hover { border-color: #f0b90b; }
+        .modal-body {
+            padding: 14px 16px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 12px;
+            overflow: auto;
+        }
+        .modal-search-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .modal-hint {
+            color: #8e9297;
+            font-size: 12px;
+        }
+        .chips {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .chip {
+            padding: 6px 10px;
+            border: 1px solid #3c4043;
+            background: rgba(43,47,54,0.6);
+            color: #ffffff;
+            border-radius: 999px;
+            cursor: pointer;
+            font-size: 12px;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+        }
+        .chip:hover { border-color: #f0b90b; color: #f0b90b; }
+        .symbol-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
+            gap: 8px;
+        }
+        .symbol-grid a {
+            padding: 8px 10px;
+            border: 1px solid #3c4043;
+            background: rgba(43,47,54,0.35);
+            color: #ffffff;
+            border-radius: 10px;
+            text-decoration: none;
+            font-size: 12px;
+            text-align: center;
+        }
+        .symbol-grid a:hover { border-color: #f0b90b; background: rgba(240,185,11,0.1); }
         
         .control-group {
             display: flex;
@@ -472,23 +587,16 @@
     </style>
 </head>
 <body>
+    {% include '_app_nav.html' %}
+    <div class="page-container">
     <div class="header">
         <div class="title">{{ current_symbol }} - 时序图表监控</div>
         <div class="controls">
             <div class="control-group" style="flex: 1 1 100%; align-items: flex-start; gap: 10px;">
                 <span class="control-label" style="margin-top: 6px;">币种:</span>
-                <input id="symbolSearch" class="search-input" list="symbolsList" placeholder="搜索并跳转 (如: BTC, ETH, ARB)" />
-                <datalist id="symbolsList">
-                    {% for symbol in symbols %}
-                    <option value="{{ symbol }}"></option>
-                    {% endfor %}
-                </datalist>
+                <input id="symbolSearch" class="search-input" placeholder="搜索并跳转 (如: BTC, ETH, ARB)" />
                 <button class="refresh-btn" onclick="goSearch()">跳转</button>
-                <div id="symbolButtons" class="symbol-list">
-                    {% for symbol in symbols %}
-                    <a class="symbol-btn {% if symbol == current_symbol %}active{% endif %}" href="/charts?symbol={{ symbol }}" data-symbol="{{ symbol }}">{{ symbol }}</a>
-                    {% endfor %}
-                </div>
+                <button class="symbol-picker-btn" onclick="openSymbolPicker()">选择币种</button>
             </div>
             <div class="control-group">
                 <span class="control-label">时间范围:</span>
@@ -518,7 +626,26 @@
                 </select>
             </div>
             <button class="refresh-btn" onclick="updateCharts()">刷新</button>
-            <a href="/" class="refresh-btn" style="text-decoration: none; display: inline-block;">← 返回主页</a>
+        </div>
+    </div>
+
+    <div id="symbolModal" class="modal" onclick="closeSymbolPickerOnBackdrop(event)">
+        <div class="modal-card" role="dialog" aria-modal="true" aria-label="选择币种">
+            <div class="modal-header">
+                <div>
+                    <div class="modal-title">选择币种</div>
+                    <div class="modal-hint">输入过滤后回车或点击币种；最多展示前 240 个匹配结果</div>
+                </div>
+                <button class="modal-close" onclick="closeSymbolPicker()">关闭</button>
+            </div>
+            <div class="modal-body">
+                <div class="modal-search-row">
+                    <input id="symbolModalSearch" class="search-input" placeholder="过滤 (如: BTC / 1000 / DOGE)" oninput="renderSymbolPicker()" onkeydown="onSymbolPickerKeydown(event)" />
+                    <span class="modal-hint" id="symbolModalCount"></span>
+                </div>
+                <div class="chips" id="symbolQuickChips"></div>
+                <div class="symbol-grid" id="symbolModalList"></div>
+            </div>
         </div>
     </div>
     
@@ -630,6 +757,7 @@
     <script>
         let currentSymbol = '{{ current_symbol }}';
         const allSymbols = {{ symbols|tojson }};
+        const QUICK_SYMBOLS = ['BTC', 'ETH', 'BNB', 'SOL', 'XRP', 'ARB', 'OP', 'TIA', 'SUI', 'DOGE'];
         let charts = {};
         let chartData = {};
         const TRADE_LEG_ACTIONS = [
@@ -2243,18 +2371,7 @@
         // 切换币种 => 直接跳转
         function switchSymbol(symbol) {
             if (!symbol) return;
-            window.location.href = `/charts?symbol=${symbol.toUpperCase()}`;
-        }
-
-        // 搜索框交互：过滤按钮 + 回车跳转
-        function filterButtons(term) {
-            const t = (term || '').trim().toLowerCase();
-            const container = document.getElementById('symbolButtons');
-            const items = container.querySelectorAll('[data-symbol]');
-            items.forEach(el => {
-                const sym = el.getAttribute('data-symbol');
-                el.style.display = (!t || sym.toLowerCase().includes(t)) ? '' : 'none';
-            });
+            window.location.href = `/charts?symbol=${encodeURIComponent(symbol.toUpperCase())}`;
         }
 
         function goSearch() {
@@ -2265,6 +2382,72 @@
             if (allSymbols.includes(sym)) { switchSymbol(sym); return; }
             const match = allSymbols.find(s => s.toLowerCase().includes(v.toLowerCase()));
             if (match) { switchSymbol(match); }
+        }
+
+        function openSymbolPicker() {
+            const modal = document.getElementById('symbolModal');
+            modal.classList.add('open');
+            const input = document.getElementById('symbolModalSearch');
+            input.value = '';
+            buildQuickChips();
+            renderSymbolPicker();
+            setTimeout(() => input.focus(), 0);
+        }
+
+        function closeSymbolPicker() {
+            const modal = document.getElementById('symbolModal');
+            modal.classList.remove('open');
+        }
+
+        function closeSymbolPickerOnBackdrop(event) {
+            if (event.target && event.target.id === 'symbolModal') closeSymbolPicker();
+        }
+
+        function onSymbolPickerKeydown(event) {
+            if (event.key === 'Escape') { closeSymbolPicker(); return; }
+            if (event.key !== 'Enter') return;
+            const v = (event.target.value || '').trim();
+            if (!v) return;
+            const sym = v.toUpperCase();
+            if (allSymbols.includes(sym)) { switchSymbol(sym); return; }
+            const match = allSymbols.find(s => s.toLowerCase() === v.toLowerCase());
+            if (match) switchSymbol(match);
+        }
+
+        function buildQuickChips() {
+            const container = document.getElementById('symbolQuickChips');
+            container.innerHTML = '';
+            QUICK_SYMBOLS.forEach(sym => {
+                if (!allSymbols.includes(sym)) return;
+                const a = document.createElement('a');
+                a.className = 'chip';
+                a.href = `/charts?symbol=${encodeURIComponent(sym)}`;
+                a.textContent = sym;
+                container.appendChild(a);
+            });
+        }
+
+        function renderSymbolPicker() {
+            const query = (document.getElementById('symbolModalSearch').value || '').trim().toLowerCase();
+            const maxItems = 240;
+            let list = allSymbols;
+            if (query) list = allSymbols.filter(s => s.toLowerCase().includes(query));
+            const total = list.length;
+            list = list.slice(0, maxItems);
+
+            const countEl = document.getElementById('symbolModalCount');
+            countEl.textContent = query
+                ? `匹配 ${total} 个（展示前 ${list.length} 个）`
+                : `共 ${total} 个（展示前 ${list.length} 个）`;
+
+            const grid = document.getElementById('symbolModalList');
+            grid.innerHTML = '';
+            list.forEach(sym => {
+                const a = document.createElement('a');
+                a.href = `/charts?symbol=${encodeURIComponent(sym)}`;
+                a.textContent = sym;
+                grid.appendChild(a);
+            });
         }
         
         // 更新图表
@@ -2310,8 +2493,8 @@
                 });
             }
             const input = document.getElementById('symbolSearch');
-            input.addEventListener('input', (e) => filterButtons(e.target.value));
             input.addEventListener('keydown', (e) => { if (e.key === 'Enter') goSearch(); });
+            document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeSymbolPicker(); });
             
             // 设置定时刷新（窗口越大刷新越慢，7天按15分钟刷新）
             scheduleChartRefresh();
@@ -2334,5 +2517,6 @@
             }
         });
     </script>
+    </div>
 </body>
 </html>
