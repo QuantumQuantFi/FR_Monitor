@@ -243,9 +243,9 @@ WATCHLIST_PG_CONFIG = {
     'cooldown_minutes': int(float(_get_private('WATCHLIST_PG_COOLDOWN_MIN', 'WATCHLIST_PG_COOLDOWN_MIN', '3'))),
     # 默认开启事件合并；如需关闭可设置 WATCHLIST_PG_EVENT_MERGE=0
     'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '1')),
-    # 写入 event 时是否同步做订单簿验算：会显著增加写入延迟（网络 I/O），默认关闭，由 live trading 自己复核即可。
+    # 写入 event 时是否同步做订单簿验算：会显著增加写入延迟（网络 I/O），默认开启（但内部有阈值预筛选），live trading 仍会下单前二次复核。
     'orderbook_validation_on_write': _is_truthy(
-        _get_private('WATCHLIST_PG_OB_VALIDATION', 'WATCHLIST_PG_OB_VALIDATION', '0')
+        _get_private('WATCHLIST_PG_OB_VALIDATION', 'WATCHLIST_PG_OB_VALIDATION', '1')
     ),
 }
 

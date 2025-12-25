@@ -37,7 +37,7 @@ class PgWriterConfig:
     consecutive_required: int = 2  # N 连续分钟归并事件
     cooldown_minutes: int = 3  # M 分钟冷静期
     enable_event_merge: bool = False
-    orderbook_validation_on_write: bool = False
+    orderbook_validation_on_write: bool = True
 
 
 class PgWriter:
@@ -780,21 +780,79 @@ class PgWriter:
                             if exs and exs not in candidate_exchanges_norm:
                                 candidate_exchanges_norm.append(exs)
 
+            # Only spend orderbook calls for events that already pass live trading thresholds
+            # (v1 or v2). This keeps write-time orderbook validation selective and bounded.
+            try:
+                import config as _cfg  # local import: avoid import side-effects at module load
+
+                lt_cfg = getattr(_cfg, "LIVE_TRADING_CONFIG", {}) or {}
+                v1_thr_pnl = float(lt_cfg.get("pnl_threshold", 0.0085))
+                v1_thr_prob = float(lt_cfg.get("win_prob_threshold", 0.85))
+                v2_enabled = bool(lt_cfg.get("v2_enabled", True))
+                v2_thr_pnl_240 = float(lt_cfg.get("v2_pnl_threshold_240", v1_thr_pnl))
+                v2_thr_prob_240 = float(lt_cfg.get("v2_win_prob_threshold_240", v1_thr_prob))
+                v2_thr_pnl_1440 = float(lt_cfg.get("v2_pnl_threshold_1440", v1_thr_pnl))
+                v2_thr_prob_1440 = float(lt_cfg.get("v2_win_prob_threshold_1440", v1_thr_prob))
+            except Exception:
+                v1_thr_pnl = 0.0085
+                v1_thr_prob = 0.85
+                v2_enabled = True
+                v2_thr_pnl_240 = v1_thr_pnl
+                v2_thr_prob_240 = v1_thr_prob
+                v2_thr_pnl_1440 = v1_thr_pnl
+                v2_thr_prob_1440 = v1_thr_prob
+
+            v1_pass = False
             pnl_reg = meta_last.get("pnl_regression") or {}
             pred_240 = ((pnl_reg or {}).get("pred") or {}).get("240") if isinstance(pnl_reg, dict) else None
-            if not isinstance(pred_240, dict):
-                return ins
-            pnl_hat_240 = pred_240.get("pnl_hat")
-            win_prob_240 = pred_240.get("win_prob")
-            try:
-                pnl_hat_240_f = float(pnl_hat_240)
-                win_prob_240_f = float(win_prob_240)
-            except Exception:
-                return ins
+            if isinstance(pred_240, dict):
+                try:
+                    pnl_hat_240_f = float(pred_240.get("pnl_hat"))
+                    win_prob_240_f = float(pred_240.get("win_prob"))
+                    v1_pass = (
+                        math.isfinite(pnl_hat_240_f)
+                        and math.isfinite(win_prob_240_f)
+                        and pnl_hat_240_f >= v1_thr_pnl
+                        and win_prob_240_f >= v1_thr_prob
+                    )
+                except Exception:
+                    v1_pass = False
 
-            # Wider-than-live threshold to decide whether to spend orderbook calls.
-            # Keep it slightly looser than LIVE_TRADING thresholds so we don't miss borderline candidates.
-            if pnl_hat_240_f < 0.0075 or win_prob_240_f < 0.82:
+            v2_pass = False
+            if v2_enabled:
+                pv2 = meta_last.get("pred_v2") or {}
+                if isinstance(pv2, dict):
+                    try:
+                        p240 = pv2.get("240") if isinstance(pv2.get("240"), dict) else None
+                        if isinstance(p240, dict) and bool(p240.get("ok")):
+                            pnl2 = float(p240.get("pnl_hat"))
+                            prob2 = float(p240.get("win_prob"))
+                            if (
+                                math.isfinite(pnl2)
+                                and math.isfinite(prob2)
+                                and pnl2 >= v2_thr_pnl_240
+                                and prob2 >= v2_thr_prob_240
+                            ):
+                                v2_pass = True
+                    except Exception:
+                        pass
+                    if not v2_pass:
+                        try:
+                            p1440 = pv2.get("1440") if isinstance(pv2.get("1440"), dict) else None
+                            if isinstance(p1440, dict) and bool(p1440.get("ok")):
+                                pnl2 = float(p1440.get("pnl_hat"))
+                                prob2 = float(p1440.get("win_prob"))
+                                if (
+                                    math.isfinite(pnl2)
+                                    and math.isfinite(prob2)
+                                    and pnl2 >= v2_thr_pnl_1440
+                                    and prob2 >= v2_thr_prob_1440
+                                ):
+                                    v2_pass = True
+                        except Exception:
+                            pass
+
+            if not (v1_pass or v2_pass):
                 return ins
 
             # Another cheap filter: require spread estimate >= 0.3% (from trigger/factors).
