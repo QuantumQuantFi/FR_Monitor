@@ -7,6 +7,8 @@ python-engineio==4.7.1
 python-socketio==5.9.0
 gevent==23.7.0
 gevent-websocket==0.10.1
+psutil==5.9.8
+tenacity==8.2.3
 grvt-pysdk==0.2.1
 psycopg[binary]==3.1.18
 hyperliquid-python-sdk==0.21.0
