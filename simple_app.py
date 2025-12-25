@@ -194,7 +194,8 @@ def prewarm_chart_cache(items=None):
         interval = (item or {}).get('interval', DEFAULT_CHART_INTERVAL)
         try:
             with app.test_request_context(f"/api/chart/{symbol}?hours={hours}&interval={interval}"):
-                resp = get_chart_data(symbol)
+                # get_chart_data 可能返回 (json, status_code)，用 make_response 统一成 Response 便于读 status_code
+                resp = app.make_response(get_chart_data(symbol))
                 status_code = getattr(resp, "status_code", None)
                 if status_code and status_code >= 400:
                     logger.warning("chart prewarm failed symbol=%s hours=%s interval=%s status=%s", symbol, hours, interval, status_code)
@@ -3054,7 +3055,314 @@ def get_chart_data(symbol):
         payload = dict(cached_entry['payload'])
         payload['from_cache'] = True
         payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
-    return precision_jsonify(payload)
+        # 图表序列数据可能很大，precision_jsonify 会逐项格式化浮点数导致极慢；此处直接返回 JSON 数字更合适。
+        return jsonify(payload)
+
+    raw_data = None
+    last_error = None
+    retry_attempts = 3
+    backoff_seconds = 0.4
+    db_seconds = 0.0
+    resample_seconds = 0.0
+    build_seconds = 0.0
+
+    # 图表默认 7 天窗口；如果走 PriceDatabase.get_historical_data 会构造大量 dict（GIL 重）导致偶发卡住。
+    # 这里直接用 sqlite3 + SQL 侧分桶聚合，把数据量压到“每交易所每桶一行”，显著降低 CPU/GIL 占用。
+    interval_minutes = CHART_INTERVAL_MINUTES.get(interval) if interval in CHART_INTERVAL_MINUTES else None
+
+    def _normalize_ts(ts_value: Any) -> Optional[str]:
+        if ts_value is None:
+            return None
+        if isinstance(ts_value, datetime):
+            return ts_value.strftime("%Y-%m-%d %H:%M:%S")
+        if not isinstance(ts_value, str):
+            return None
+        text = ts_value.strip()
+        if not text:
+            return None
+        text = text.replace("T", " ")
+        if text.endswith("Z"):
+            text = text[:-1]
+        if "." in text:
+            text = text.split(".", 1)[0]
+        if len(text) >= 19:
+            return text[:19]
+        return text
+
+    for attempt in range(retry_attempts):
+        try:
+            t0 = time.time()
+            conn = sqlite3.connect(db.db_path, timeout=2.0)
+            cursor = conn.cursor()
+            # 用 DB 内最新时间作为窗口终点，避免 sqlite datetime('now') 与本地写入/时区基准不一致导致取不到数据。
+            if exchange:
+                cursor.execute(
+                    "SELECT MAX(timestamp) FROM price_data_1min WHERE symbol=? AND exchange=?",
+                    (symbol, exchange),
+                )
+            else:
+                cursor.execute(
+                    "SELECT MAX(timestamp) FROM price_data_1min WHERE symbol=?",
+                    (symbol,),
+                )
+            end_ts = cursor.fetchone()[0]
+            if not end_ts:
+                conn.close()
+                rows = []
+                db_seconds += time.time() - t0
+                break
+            end_dt = _parse_db_timestamp(end_ts) or datetime.utcnow()
+            start_dt = end_dt - timedelta(hours=hours)
+            start_ts = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            cols_sql = (
+                "timestamp, exchange, "
+                "spot_price_close, futures_price_close, "
+                "funding_rate_avg, premium_percent_avg, "
+                "funding_interval_hours, next_funding_time"
+            )
+            if interval_minutes and interval_minutes > 1:
+                # 直接在 SQLite 内做分桶，避免拉取 50k 行到 Python 再处理（大币种会非常慢）。
+                bucket_expr = (
+                    "strftime('%Y-%m-%d %H:', timestamp) || "
+                    "printf('%02d', (CAST(strftime('%M', timestamp) AS integer) / :bucket) * :bucket) || ':00'"
+                )
+                # 使用命名参数，避免 tuple 参数顺序错误导致“rows=0”但无异常的隐性 bug。
+                where_exchange_sql = "AND exchange = :exchange" if exchange else ""
+                params = {"bucket": int(interval_minutes), "symbol": symbol}
+                if exchange:
+                    params["exchange"] = exchange
+                params["start_ts"] = start_ts
+                cursor.execute(
+                    f"""
+                    WITH filtered AS (
+                        SELECT
+                            timestamp,
+                            exchange,
+                            spot_price_close,
+                            futures_price_close,
+                            funding_rate_avg,
+                            premium_percent_avg,
+                            funding_interval_hours,
+                            next_funding_time,
+                            ({bucket_expr}) AS bucket_ts
+                        FROM price_data_1min
+                        WHERE symbol = :symbol
+                          {where_exchange_sql}
+                          AND timestamp >= :start_ts
+                    ),
+                    ranked AS (
+                        SELECT
+                            *,
+                            ROW_NUMBER() OVER (PARTITION BY exchange, bucket_ts ORDER BY timestamp DESC) AS rn,
+                            AVG(COALESCE(funding_rate_avg, 0.0)) OVER (PARTITION BY exchange, bucket_ts) AS funding_rate_bucket,
+                            AVG(COALESCE(premium_percent_avg, 0.0)) OVER (PARTITION BY exchange, bucket_ts) AS premium_bucket
+                        FROM filtered
+                    )
+                    SELECT
+                        bucket_ts,
+                        exchange,
+                        spot_price_close,
+                        futures_price_close,
+                        funding_rate_bucket,
+                        premium_bucket,
+                        funding_interval_hours,
+                        next_funding_time
+                    FROM ranked
+                    WHERE rn = 1
+                    ORDER BY bucket_ts ASC;
+                    """,
+                    params,
+                )
+                rows = cursor.fetchall()
+            else:
+                # interval=1min 直接拉取 close 序列
+                if exchange:
+                    cursor.execute(
+                        f"""
+                        SELECT {cols_sql}
+                          FROM price_data_1min
+                         WHERE symbol = ?
+                           AND exchange = ?
+                           AND timestamp >= ?
+                         ORDER BY timestamp DESC
+                         LIMIT 50000;
+                        """,
+                        (symbol, exchange, start_ts),
+                    )
+                else:
+                    cursor.execute(
+                        f"""
+                        SELECT {cols_sql}
+                          FROM price_data_1min
+                         WHERE symbol = ?
+                           AND timestamp >= ?
+                         ORDER BY timestamp DESC
+                         LIMIT 50000;
+                        """,
+                        (symbol, start_ts),
+                    )
+                rows = cursor.fetchall()
+            conn.close()
+            fetch_dt = time.time() - t0
+            db_seconds += fetch_dt
+            if hours >= 24 and fetch_dt > 2.0:
+                chart_logger.warning(
+                    "chart db slow symbol=%s hours=%s interval=%s rows=%s dt=%.3fs attempt=%s",
+                    symbol,
+                    hours,
+                    interval,
+                    len(rows),
+                    fetch_dt,
+                    attempt + 1,
+                )
+
+            if not rows:
+                raw_data = []
+                break
+
+            # interval=1min: 直接返回每分钟 close；interval>1min: 分桶聚合（close=桶内最新，rate/premium=桶内均值）
+            if not interval_minutes or interval_minutes <= 1:
+                raw_data = []
+                for (ts, ex, spot_close, fut_close, fund, prem, fund_int, next_ft) in rows:
+                    ts_text = _normalize_ts(ts)
+                    if not ts_text:
+                        continue
+                    raw_data.append({
+                        "timestamp": ts_text,
+                        "exchange": ex,
+                        "spot_price_close": spot_close,
+                        "futures_price_close": fut_close,
+                        "funding_rate_avg": fund,
+                        "premium_percent_avg": prem,
+                        "funding_interval_hours": fund_int,
+                        "next_funding_time": next_ft,
+                    })
+                break
+
+            t1 = time.time()
+            raw_data = []
+            for (bucket_ts, ex, spot_close, fut_close, fund_bucket, prem_bucket, fund_int, next_ft) in rows:
+                ts_text = _normalize_ts(bucket_ts)
+                if not ts_text:
+                    continue
+                raw_data.append({
+                    "timestamp": ts_text,
+                    "exchange": ex,
+                    "spot_price_close": spot_close,
+                    "futures_price_close": fut_close,
+                    "funding_rate_avg": fund_bucket,
+                    "premium_percent_avg": prem_bucket,
+                    "funding_interval_hours": fund_int,
+                    "next_funding_time": next_ft,
+                })
+            resample_seconds += time.time() - t1
+            break
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if 'locked' in str(exc).lower():
+                time.sleep(backoff_seconds * (attempt + 1))
+                continue
+            break
+        except Exception as exc:
+            last_error = exc
+            break
+
+    if raw_data is None:
+        if last_error:
+            return jsonify({'error': 'database temporarily unavailable', 'details': str(last_error)}), 503
+        return jsonify({'error': 'no chart data available'}), 404
+
+    try:
+        def to_utc_iso(ts: str) -> str:
+            """Ensure timestamp string is UTC ISO8601.
+            If no timezone offset is present, treat as UTC and append 'Z'.
+            Also normalize space to 'T'.
+            """
+            if not isinstance(ts, str):
+                return ts
+            has_offset = ts.endswith('Z') or ('+' in ts[-6:] or '-' in ts[-6:])
+            base = ts.replace(' ', 'T')
+            return base if has_offset else (base + 'Z')
+
+        t_build = time.time()
+        # 按交易所组织数据
+        chart_data = {}
+        for row in raw_data:
+            exchange_name = row['exchange']
+            if exchange_name not in chart_data:
+                chart_data[exchange_name] = {
+                    'labels': [],
+                    'spot_prices': [],
+                    'futures_prices': [],
+                    'funding_rates': [],
+                    'premiums': [],
+                    'funding_intervals': [],
+                    'next_funding_times': []
+                }
+
+            # 使用时间戳作为标签
+            timestamp = row['timestamp']
+            chart_data[exchange_name]['labels'].append(to_utc_iso(timestamp))
+
+            # 添加价格数据，优先使用聚合字段，缺失时回退到原始字段
+            spot_close = row.get('spot_price_close')
+            if spot_close is None:
+                spot_close = row.get('spot_price')
+            futures_close = row.get('futures_price_close')
+            if futures_close is None:
+                futures_close = row.get('futures_price')
+            funding_value = row.get('funding_rate_avg')
+            if funding_value is None:
+                funding_value = row.get('funding_rate')
+            premium_value = row.get('premium_percent_avg')
+            if premium_value is None:
+                premium_value = row.get('premium_percent')
+
+            chart_data[exchange_name]['spot_prices'].append(spot_close or 0)
+            chart_data[exchange_name]['futures_prices'].append(futures_close or 0)
+            chart_data[exchange_name]['funding_rates'].append(funding_value or 0)
+            chart_data[exchange_name]['premiums'].append(premium_value or 0)
+            chart_data[exchange_name]['funding_intervals'].append(row.get('funding_interval_hours'))
+            chart_data[exchange_name]['next_funding_times'].append(row.get('next_funding_time'))
+        build_seconds += time.time() - t_build
+
+        response_payload = {
+            'symbol': symbol,
+            'hours': hours,
+            'interval': interval,
+            'chart_data': chart_data,
+            'timestamp': now_utc_iso()
+        }
+        total_points = sum(len(v['labels']) for v in chart_data.values())
+        if total_points <= 0:
+            # 启动初期/聚合尚未就绪时避免缓存空结果（否则会把空数据缓存 15 分钟导致前端一直空白）。
+            return jsonify({'error': 'no chart data available', 'symbol': symbol, 'hours': hours, 'interval': interval}), 404
+
+        _set_chart_cache_entry(cache_key, response_payload)
+        chart_logger.warning(
+            "chart response built symbol=%s hours=%s interval=%s rows=%s elapsed=%.3fs db=%.3fs resample=%.3fs build=%.3fs from_cache=%s",
+            symbol,
+            hours,
+            interval,
+            total_points,
+            time.time() - request_start,
+            db_seconds,
+            resample_seconds,
+            build_seconds,
+            False,
+        )
+        return jsonify(response_payload)
+
+    except Exception as exc:
+        chart_logger.warning(
+            "chart response failed symbol=%s hours=%s interval=%s elapsed=%.3fs error=%s",
+            symbol,
+            hours,
+            interval,
+            time.time() - request_start,
+            exc,
+        )
+        return jsonify({'error': str(exc)}), 500
 
 
 @app.route('/api/live_trading/overview')
@@ -4346,119 +4654,6 @@ def live_trading_orders():
             out.append(r)
     return jsonify({'timestamp': now_utc_iso(), 'orders': out})
 
-    raw_data = None
-    last_error = None
-    retry_attempts = 3
-    backoff_seconds = 0.4
-    
-    for attempt in range(retry_attempts):
-        try:
-            raw_data = db.get_historical_data(symbol, exchange, hours, db_interval, raise_on_error=True)
-            if interval in CHART_INTERVAL_MINUTES and interval != '1min':
-                raw_data = resample_price_rows(raw_data, interval)
-            break
-        except sqlite3.OperationalError as exc:
-            last_error = exc
-            if 'locked' in str(exc).lower():
-                time.sleep(backoff_seconds * (attempt + 1))
-                continue
-            break
-        except Exception as exc:
-            last_error = exc
-            break
-
-    if raw_data is None:
-        if cached_entry:
-            payload = dict(cached_entry['payload'])
-            payload['from_cache'] = True
-            payload['cache_age_seconds'] = round(time.time() - cached_entry['timestamp'], 1)
-            return precision_jsonify(payload)
-        if last_error:
-            return jsonify({'error': 'database temporarily unavailable', 'details': str(last_error)}), 503
-        return jsonify({'error': 'no chart data available'}), 404
-
-    try:
-        def to_utc_iso(ts: str) -> str:
-            """Ensure timestamp string is UTC ISO8601.
-            If no timezone offset is present, treat as UTC and append 'Z'.
-            Also normalize space to 'T'.
-            """
-            if not isinstance(ts, str):
-                return ts
-            has_offset = ts.endswith('Z') or ('+' in ts[-6:] or '-' in ts[-6:])
-            base = ts.replace(' ', 'T')
-            return base if has_offset else (base + 'Z')
-        
-        # 按交易所组织数据
-        chart_data = {}
-        for row in raw_data:
-            exchange_name = row['exchange']
-            if exchange_name not in chart_data:
-                chart_data[exchange_name] = {
-                    'labels': [],
-                    'spot_prices': [],
-                    'futures_prices': [],
-                    'funding_rates': [],
-                    'premiums': [],
-                    'funding_intervals': [],
-                    'next_funding_times': []
-                }
-            
-            # 使用时间戳作为标签
-            timestamp = row['timestamp']
-            chart_data[exchange_name]['labels'].append(to_utc_iso(timestamp))
-            
-            # 添加价格数据，优先使用聚合字段，缺失时回退到原始字段
-            spot_close = row.get('spot_price_close')
-            if spot_close is None:
-                spot_close = row.get('spot_price')
-            futures_close = row.get('futures_price_close')
-            if futures_close is None:
-                futures_close = row.get('futures_price')
-            funding_value = row.get('funding_rate_avg')
-            if funding_value is None:
-                funding_value = row.get('funding_rate')
-            premium_value = row.get('premium_percent_avg')
-            if premium_value is None:
-                premium_value = row.get('premium_percent')
-
-            chart_data[exchange_name]['spot_prices'].append(spot_close or 0)
-            chart_data[exchange_name]['futures_prices'].append(futures_close or 0)
-            chart_data[exchange_name]['funding_rates'].append(funding_value or 0)
-            chart_data[exchange_name]['premiums'].append(premium_value or 0)
-            chart_data[exchange_name]['funding_intervals'].append(row.get('funding_interval_hours'))
-            chart_data[exchange_name]['next_funding_times'].append(row.get('next_funding_time'))
-        
-        response_payload = {
-            'symbol': symbol,
-            'hours': hours,
-            'interval': interval,
-            'chart_data': chart_data,
-            'timestamp': now_utc_iso()
-        }
-        _set_chart_cache_entry(cache_key, response_payload)
-        chart_logger.warning(
-            "chart response built symbol=%s hours=%s interval=%s rows=%s elapsed=%.3fs from_cache=%s",
-            symbol,
-            hours,
-            interval,
-            sum(len(v['labels']) for v in chart_data.values()),
-            time.time() - request_start,
-            False,
-        )
-        return precision_jsonify(response_payload)
-        
-    except Exception as e:
-        chart_logger.warning(
-            "chart response failed symbol=%s hours=%s interval=%s elapsed=%.3fs error=%s",
-            symbol,
-            hours,
-            interval,
-            time.time() - request_start,
-            e,
-        )
-        return jsonify({'error': str(e)}), 500
-
 @app.route('/api/latest/<symbol>')
 def get_latest_prices(symbol):
     """获取最新价格数据API"""
@@ -4724,12 +4919,15 @@ if __name__ == '__main__':
     # 启动数据收集
     data_collector.start_all_connections()
 
-    # 用最近 1 分钟数据库数据做一次冷启动，避免跨所列表长时间为空
-    try:
-        cold_start_watchlist_from_db(limit_minutes=1)
-        _kick_live_trading("cold_start_watchlist")
-    except Exception as exc:
-        logging.getLogger('watchlist').warning("cold start at bootstrap failed: %s", exc)
+    # 用最近 1 分钟数据库数据做一次冷启动，避免跨所列表长时间为空（放到后台线程，避免阻塞 Web 启动）
+    def _cold_start_bootstrap():
+        try:
+            cold_start_watchlist_from_db(limit_minutes=1)
+            _kick_live_trading("cold_start_watchlist")
+        except Exception as exc:
+            logging.getLogger('watchlist').warning("cold start at bootstrap failed: %s", exc)
+
+    threading.Thread(target=_cold_start_bootstrap, name="cold-start", daemon=True).start()
     
     print("🔄 启动后台数据处理...")
     # 启动后台数据收集线程
