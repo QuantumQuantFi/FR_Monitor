@@ -209,6 +209,30 @@
         .detail-grid .detail-cell:last-child {
             border-bottom: none;
         }
+        .sym-cell {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .mini-btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 26px;
+            height: 22px;
+            padding: 0 8px;
+            border-radius: 999px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.02);
+            color: var(--text);
+            font-size: 12px;
+            line-height: 20px;
+            text-decoration: none;
+        }
+        .mini-btn:hover {
+            border-color: rgba(96,165,250,0.6);
+            color: var(--accent);
+        }
     </style>
 </head>
 <body>
@@ -1187,7 +1211,12 @@
 
                 return `
                     <tr>
-                        <td class="mono">${item.symbol}</td>
+                        <td class="mono">
+                            <span class="sym-cell">
+                                <span>${item.symbol}</span>
+                                <a class="mini-btn" href="/charts?symbol=${encodeURIComponent(item.symbol)}" target="_blank" rel="noopener" title="打开图表">图</a>
+                            </span>
+                        </td>
                         <td title="${triggerDetails}">${entryType}</td>
                         <td><span class="${statusCls}">${item.status}</span></td>
                         <td class="mono" title="${intervalTitle}">${intervalDisplay}</td>

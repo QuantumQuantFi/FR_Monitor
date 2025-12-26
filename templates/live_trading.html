@@ -33,6 +33,23 @@
     .sort-btn { display: inline-block; padding: 0 4px; margin-left: 4px; border: 1px solid #263040; border-radius: 6px; color: #8b949e; cursor: pointer; user-select: none; font-size: 11px; line-height: 16px; }
     .sort-btn:hover { color: #e6edf3; border-color: #3b4a60; }
     .sort-btn.active { color: #e6edf3; border-color: #58a6ff; }
+    .mini-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      height: 20px;
+      padding: 0 8px;
+      border-radius: 999px;
+      border: 1px solid #263040;
+      background: #0b1220;
+      color: #e6edf3;
+      font-size: 12px;
+      line-height: 18px;
+      text-decoration: none;
+      margin-left: 6px;
+    }
+    .mini-btn:hover { border-color: #58a6ff; color: #58a6ff; }
   </style>
 </head>
 <body>
@@ -376,6 +393,12 @@
         .replaceAll("'", '&#39;');
     }
 
+    function chartBtn(symbol) {
+      const sym = String(symbol || '').trim();
+      if (!sym) return '';
+      return `<a class="mini-btn" href="/charts?symbol=${encodeURIComponent(sym)}" target="_blank" rel="noopener" title="打开图表">图</a>`;
+    }
+
     function pillForStatus(status) {
       const s = (status || '').toLowerCase();
       if (s === 'open') return ['open', 'ok'];
@@ -517,11 +540,16 @@
         const closeReasonNote = closeReasonLabel(closeReasonRaw);
         const closeReason = closeReasonRaw ? (closeReasonNote ? `${closeReasonRaw} (${closeReasonNote})` : closeReasonRaw) : '-';
         const reason = s.reason || '-';
+        const symbolCell = (() => {
+          const sym = s.symbol || '-';
+          if (!s.symbol) return `${escapeHtml(sym)}`;
+          return `${escapeHtml(sym)}${chartBtn(sym)}`;
+        })();
         return `
 	          <tr>
             <td>${s.id}</td>
             <td class="muted">${s.event_id || '-'}</td>
-            <td>${s.symbol || '-'}</td>
+            <td>${symbolCell}</td>
             <td class="muted">${s.signal_type || '-'}</td>
             <td class="muted">${s.pred_source || '-'}</td>
             <td class="muted">${ex}</td>
@@ -614,10 +642,15 @@
           `source=${feeSrc || '-'}`,
           p.funding_fee_error ? `error=${p.funding_fee_error}` : '',
         ].filter(Boolean).join('\n');
+        const posSymbolCell = (() => {
+          const sym = p.symbol || '-';
+          if (!p.symbol) return `${escapeHtml(sym)}`;
+          return `${escapeHtml(sym)}${chartBtn(sym)}`;
+        })();
         return `
           <tr>
             <td>${p.exchange}</td>
-            <td>${p.symbol}</td>
+            <td>${posSymbolCell}</td>
             <td class="muted">${p.side}</td>
             <td class="muted">${size}</td>
             <td class="muted">${value}</td>
