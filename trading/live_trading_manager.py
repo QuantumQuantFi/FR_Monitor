@@ -71,6 +71,7 @@ from trading.trade_executor import (
     set_bybit_linear_leverage,
     set_bitget_usdt_perp_leverage,
     set_okx_swap_leverage,
+    cancel_okx_swap_order,
     get_supported_trading_backends,
 )
 
@@ -1625,6 +1626,158 @@ class LiveTradingManager:
         raise TradeExecutionError(
             f"Hyperliquid position not detected after open: symbol={symbol} side={side_key} requested_qty={requested_qty}"
         )
+
+    @staticmethod
+    def _extract_okx_order_ids(order: Optional[Dict[str, Any]]) -> Tuple[Optional[str], Optional[str]]:
+        if not isinstance(order, dict):
+            return None, None
+        payload = order.get("data")
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            base = payload[0]
+        elif isinstance(payload, dict):
+            base = payload
+        else:
+            base = {}
+        ord_id = base.get("ordId")
+        cl_id = base.get("clOrdId") or base.get("clientOid")
+        return (str(ord_id) if ord_id else None, str(cl_id) if cl_id else None)
+
+    def _verify_okx_order_after_open(
+        self,
+        conn,
+        *,
+        signal_id: int,
+        symbol: str,
+        side: str,
+        requested_qty: float,
+        order: Optional[Dict[str, Any]],
+        client_order_id: str,
+    ) -> Dict[str, Any]:
+        """
+        OKX risk fix: if we abort an opening leg, we MUST cancel the OKX order, otherwise a later fill can
+        leave an orphaned position (as observed with `state=live` then `state=filled` minutes later).
+        """
+        sym = (symbol or "").upper().strip()
+        side_key = (side or "").lower().strip()
+        if not sym or side_key not in {"long", "short"}:
+            return {}
+
+        ord_id, resp_cl_id = self._extract_okx_order_ids(order)
+        if not ord_id and not resp_cl_id:
+            # Fallback to position-based check if we cannot reference the order.
+            self._verify_position_after_open("okx", sym, side_key, requested_qty)
+            return {}
+
+        expected_okx_side = "buy" if side_key == "long" else "sell"
+        min_abs = max(1e-12, abs(float(requested_qty or 0.0)) * 0.2)
+
+        ct_val: Optional[float]
+        try:
+            ct_val = float(get_okx_swap_contract_value(sym))
+        except Exception:
+            ct_val = None
+
+        def _filled_base(detail: Dict[str, Any]) -> float:
+            raw = detail.get("accFillSz") or detail.get("fillSz") or 0
+            try:
+                filled_contracts = float(raw or 0)
+            except Exception:
+                filled_contracts = 0.0
+            if ct_val and ct_val > 0:
+                return filled_contracts * ct_val
+            return filled_contracts
+
+        detail: Optional[Dict[str, Any]] = None
+        fill_base = 0.0
+        # Market orders should not remain `live` for long; cap the wait to keep single-leg exposure small.
+        for _ in range(10):  # ~2.5s total
+            try:
+                detail = get_okx_swap_order(sym, ord_id=ord_id, client_order_id=resp_cl_id or client_order_id)
+            except Exception:
+                detail = None
+            if isinstance(detail, dict):
+                fill_base = _filled_base(detail)
+                state = str(detail.get("state") or "").lower()
+                okx_side = str(detail.get("side") or "").lower()
+                if okx_side and okx_side != expected_okx_side:
+                    raise TradeExecutionError(
+                        f"OKX open side mismatch: expected={expected_okx_side} got={okx_side} symbol={sym}"
+                    )
+                if fill_base >= min_abs:
+                    break
+                if state in {"filled", "partially_filled"} and fill_base >= min_abs:
+                    break
+            time.sleep(0.25)
+
+        if not (abs(fill_base) >= min_abs):
+            # Cancel to prevent late fills from creating orphaned exposure.
+            cancel_resp = None
+            try:
+                cancel_resp = cancel_okx_swap_order(sym, ord_id=ord_id, client_order_id=resp_cl_id or client_order_id)
+            except Exception:
+                cancel_resp = None
+            if cancel_resp is not None:
+                try:
+                    conn.execute(
+                        """
+                        UPDATE watchlist.live_trade_order
+                           SET order_resp = COALESCE(order_resp, '{}'::jsonb) || jsonb_build_object('cancel_resp', %s::jsonb)
+                         WHERE signal_id=%s AND exchange='okx' AND action='open' AND client_order_id=%s;
+                        """,
+                        (_jsonb(cancel_resp), int(signal_id), str(client_order_id)),
+                    )
+                except Exception:
+                    pass
+            # Re-check: cancellation can race with a fill.
+            try:
+                detail = get_okx_swap_order(sym, ord_id=ord_id, client_order_id=resp_cl_id or client_order_id)
+                if isinstance(detail, dict):
+                    fill_base = _filled_base(detail)
+            except Exception:
+                pass
+            raise TradeExecutionError(
+                f"OKX order not filled quickly; canceled to avoid late fill: symbol={sym} side={side_key} "
+                f"filled_qty={fill_base:.6g} requested_qty={requested_qty}"
+            )
+
+        # Update stored fill/status to avoid UI showing `live`/0.0 when it did fill quickly enough.
+        out: Dict[str, Any] = {"exchange_order_id": ord_id}
+        if isinstance(detail, dict):
+            out["status"] = str(detail.get("state") or "") or None
+            try:
+                out["avg_price"] = float(detail.get("avgPx") or detail.get("fillPx") or 0.0) or None
+            except Exception:
+                out["avg_price"] = None
+            out["filled_qty"] = float(fill_base)
+            try:
+                cum_quote = detail.get("accFillNotional") or detail.get("fillNotional")
+                out["cum_quote"] = float(cum_quote) if cum_quote is not None else None
+            except Exception:
+                out["cum_quote"] = None
+
+        try:
+            conn.execute(
+                """
+                UPDATE watchlist.live_trade_order
+                   SET filled_qty=COALESCE(%s, filled_qty),
+                       avg_price=COALESCE(%s, avg_price),
+                       cum_quote=COALESCE(%s, cum_quote),
+                       status=COALESCE(%s, status)
+                 WHERE signal_id=%s AND exchange='okx' AND action='open' AND client_order_id=%s;
+                """,
+                (
+                    float(out.get("filled_qty")) if out.get("filled_qty") is not None else None,
+                    float(out.get("avg_price")) if out.get("avg_price") is not None else None,
+                    float(out.get("cum_quote")) if out.get("cum_quote") is not None else None,
+                    str(out.get("status")) if out.get("status") is not None else None,
+                    int(signal_id),
+                    str(client_order_id),
+                ),
+            )
+        except Exception:
+            pass
+
+        return {k: v for k, v in out.items() if v is not None}
 
     def _verify_position_after_open(self, exchange: str, symbol: str, side: str, requested_qty: float) -> None:
         """Best-effort: confirm the position exists after an open order."""
@@ -4184,6 +4337,22 @@ class LiveTradingManager:
                 ex_l = str(leg["exchange"]).lower()
                 if ex_l == "hyperliquid":
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
+                elif ex_l == "okx":
+                    client_id = str((leg.get("order_kwargs") or {}).get("client_order_id") or "")
+                    updated = self._verify_okx_order_after_open(
+                        conn,
+                        signal_id=int(signal_id),
+                        symbol=symbol,
+                        side=str(leg["side"]),
+                        requested_qty=float(leg["quantity"]),
+                        order=order,
+                        client_order_id=client_id,
+                    )
+                    if updated and str(leg["side"]) in fill_by_side:
+                        try:
+                            fill_by_side[str(leg["side"])].update(updated)
+                        except Exception:
+                            pass
                 else:
                     self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
 
@@ -4245,6 +4414,12 @@ class LiveTradingManager:
                     if qty <= 0:
                         continue
                     exchange = str(opened_leg.get("exchange") or "")
+                    if exchange.lower() == "okx":
+                        try:
+                            ord_id, cl_id = self._extract_okx_order_ids(opened_leg.get("order"))
+                            _ = cancel_okx_swap_order(symbol, ord_id=ord_id, client_order_id=cl_id)
+                        except Exception:
+                            pass
                     close_client_id = f"{rollback_base}-{'L' if pos_leg == 'long' else 'S'}"
                     close_order = self._place_close_order(
                         exchange=exchange,
@@ -6059,6 +6234,22 @@ class LiveTradingManager:
                 ex_l = str(leg["exchange"]).lower()
                 if ex_l == "hyperliquid":
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
+                elif ex_l == "okx":
+                    client_id = str((leg.get("order_kwargs") or {}).get("client_order_id") or "")
+                    updated = self._verify_okx_order_after_open(
+                        conn,
+                        signal_id=int(signal_id),
+                        symbol=symbol,
+                        side=str(leg["side"]),
+                        requested_qty=float(leg["quantity"]),
+                        order=order,
+                        client_order_id=client_id,
+                    )
+                    if updated and str(leg["side"]) in fill_by_side:
+                        try:
+                            fill_by_side[str(leg["side"])].update(updated)
+                        except Exception:
+                            pass
                 else:
                     self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
         except Exception as exc:
@@ -6071,6 +6262,12 @@ class LiveTradingManager:
                     if qty <= 0:
                         continue
                     exchange = str(opened_leg.get("exchange") or "")
+                    if exchange.lower() == "okx":
+                        try:
+                            ord_id, cl_id = self._extract_okx_order_ids(opened_leg.get("order"))
+                            _ = cancel_okx_swap_order(symbol, ord_id=ord_id, client_order_id=cl_id)
+                        except Exception:
+                            pass
                     close_client_id = f"{rollback_base}-{'L' if pos_leg == 'long' else 'S'}"
                     _ = self._place_close_order(
                         exchange=exchange,
@@ -6417,23 +6614,73 @@ class LiveTradingManager:
                     )
                 raise
         if ex == "okx":
-            if pos == "long":
+            close_qty = float(quantity)
+            pos_side: Optional[str] = "long" if pos == "long" else "short"
+            try:
+                ct_val = float(get_okx_swap_contract_value(symbol))
+            except Exception:
+                ct_val = None
+            try:
+                rows = get_okx_swap_positions(symbol=symbol)
+            except Exception:
+                rows = []
+
+            if rows and ct_val and ct_val > 0:
+                target_contracts = 0.0
+                has_hedge_rows = False
+                for r in rows:
+                    if not isinstance(r, dict):
+                        continue
+                    ps = str(r.get("posSide") or "").lower().strip()
+                    if ps in {"long", "short"}:
+                        has_hedge_rows = True
+                    raw_pos = r.get("pos") or r.get("sz") or 0
+                    try:
+                        contracts = float(raw_pos or 0)
+                    except Exception:
+                        contracts = 0.0
+                    if abs(contracts) <= 0:
+                        continue
+                    if ps == pos_side:
+                        target_contracts = max(target_contracts, abs(contracts))
+                    elif ps == "net":
+                        # Net mode exposure is in `pos` (direction not always explicit).
+                        if pos == "long" and contracts > 0:
+                            target_contracts = max(target_contracts, abs(contracts))
+                        if pos == "short" and contracts < 0:
+                            target_contracts = max(target_contracts, abs(contracts))
+
+                if target_contracts > 0:
+                    close_qty = float(target_contracts) * float(ct_val)
+                if not has_hedge_rows:
+                    pos_side = None
+
+            if close_qty <= 0:
+                raise TradeExecutionError("OKX position already flat; skip close")
+
+            close_side = "sell" if pos == "long" else "buy"
+            try:
                 return place_okx_swap_market_order(
                     symbol,
-                    "sell",
-                    quantity,
-                    pos_side="long",
+                    close_side,
+                    close_qty,
+                    pos_side=pos_side,
                     reduce_only=True,
                     client_order_id=client_order_id,
                 )
-            return place_okx_swap_market_order(
-                symbol,
-                "buy",
-                quantity,
-                pos_side="short",
-                reduce_only=True,
-                client_order_id=client_order_id,
-            )
+            except TradeExecutionError as exc:
+                msg = str(exc).lower()
+                # Account may be in net mode; retry without posSide.
+                if "posside" in msg or "position mode" in msg:
+                    return place_okx_swap_market_order(
+                        symbol,
+                        close_side,
+                        close_qty,
+                        pos_side=None,
+                        reduce_only=True,
+                        client_order_id=client_order_id,
+                    )
+                raise
         if ex == "bybit":
             # Bybit supports hedge-mode (positionIdx=1 long / 2 short) and one-way mode (positionIdx=0).
             # We optimistically try hedge-mode and fallback to one-way if the account is configured accordingly.
