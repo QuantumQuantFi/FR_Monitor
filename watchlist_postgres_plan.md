@@ -16,6 +16,128 @@
 
 ---
 
+## 0.2 外部 BBO/Snapshot 服务（端口 8010/8000）现状与接入价值（待接入）
+
+你给的“Dashboard 同款聚合快照 / 结构化快照 / 动态 watchlist REST”接口设计，目标非常明确：用 **WS 订单簿流**产出**可被外部程序直接消费**的 BBO/分析快照，并通过 TTL watchlist 控制订阅面（避免靠静态配置塞满全市场）。
+
+### 0.2.1 预期接口（你提供的契约）
+- 探活：`GET http://<host>:8010/health`
+- Dashboard 同款聚合快照：`GET http://<host>:8010/ui/data?top_spreads=200&top_opps=50&symbol_like=BTC&min_abs_spread_pct=0.2`
+- 结构化快照（给程序用）：`GET http://<host>:8010/snapshot?include_analysis=true&include_tickers=false`
+  - 过滤：`/snapshot?exchanges=okx&exchanges=binance&symbols=BTC-USDC-PERP&symbols=ETH-USDC-PERP`
+- 动态订阅面（watchlist TTL）：
+  - `GET /watchlist`
+  - `POST /watchlist/add` body：`{"symbol":"BTC-USDC-PERP","exchanges":["okx","binance"],"ttl_seconds":86400,"source":"my-app","reason":"need quotes"}`
+  - `POST /watchlist/touch`、`POST /watchlist/remove`
+
+### 0.2.1.1 重要：USDT 永续的符号归一规则（对接必须遵守）
+8010 服务内部可以订阅到交易所的 **USDT 永续**，但对外 API 的“标准符号”**必须使用** `*-USDC-PERP`：
+- ✅ 订阅交易所的 USDT 永续：已支持（但标准符号仍用 `*-USDC-PERP`）
+  - `binance/okx/grvt` 在将标准符号转交易所符号时，会把 `USDC` 映射成 `USDT`
+  - 所以你传 `BTC-USDC-PERP`，实际订阅的是交易所的 `BTCUSDT` / `BTC-USDT-SWAP` / `BTC_USDT_Perp`
+  - 代码位置：`/root/jerry/open-trading/core/services/arbitrage_monitor/utils/symbol_converter.py:60`、`/root/jerry/open-trading/core/services/arbitrage_monitor/utils/symbol_converter.py:251`
+- ❌ API 直接支持/回传标准符号 `*-USDT-PERP`：当前不支持
+  - 反向转换会把 `USDT` 强制归一到 `USDC`
+  - 这会导致如果你在 watchlist 里 add `BTC-USDT-PERP`，回调数据会被转换成 `BTC-USDC-PERP` 从而被过滤掉
+  - 代码位置：`/root/jerry/open-trading/core/services/arbitrage_monitor/utils/symbol_converter.py:345`
+
+### 0.2.2 本机实测结果（2025-12-26）
+- `127.0.0.1:8010`：未监听（连接失败），因此无法验证 `/health`、`/snapshot` 是否只返回买一卖一（BBO）还是包含多档深度。
+- `127.0.0.1:8000`：当前是 `Hummingbot API`（uvicorn），`/` 返回 `{"name":"Hummingbot API","version":"1.0.1","status":"running"}`；但你给的 `/health`、`/snapshot`、`/watchlist/*`、`/ui/data` 在该端口均为 404。
+
+结论：**这组 8010 端口的 BBO/Snapshot 服务当前在本机未运行（或端口/路径不一致）**；在它上线前，我们只能继续依赖现有 `orderbook_utils.py` 的“按需 REST 扫单”来做成交口径验证。
+
+（待服务上线后）建议用以下最小命令做一次自检，避免“端口 OK 但数据为空/过期”：
+```bash
+curl -fsS http://127.0.0.1:8010/health
+curl -fsS 'http://127.0.0.1:8010/snapshot?include_analysis=true&include_tickers=false' | python -m json.tool | head
+curl -fsS 'http://127.0.0.1:8010/ui/data?top_spreads=10&top_opps=10&symbol_like=BTC&min_abs_spread_pct=0.2' | python -m json.tool | head
+curl -fsS http://127.0.0.1:8010/watchlist | python -m json.tool | head
+```
+
+### 0.2.2.1 复测（同日稍后：8010 已启动且接口可用）
+- `127.0.0.1:8010` 当前由 `python/uvicorn` 监听，以下接口返回 200：
+  - `/health`：包含 `watchlist_pairs`、处理队列与延迟统计（例如 `orderbook_delay_p95_ms`/`ticker_delay_p95_ms`），以及各交易所健康度（healthy/degraded/unhealthy）。
+  - `/watchlist`：返回 `items[]`（exchange+symbol 粒度），当前约 315 pairs（已明显超出你之前提到的 “8 所 45 币”压测阈值，且延迟 p95 已到秒级，符合“扩容会变慢”的预期）。
+  - `/snapshot`：支持 query 参数 `exchanges[]`、`symbols[]`、`include_analysis`、`include_tickers`。
+  - `/ui/data`：返回 `queue_info` 字符串（含 `ob_p95`/`tk_p95`）以及 `top_spread_rows`（用于 dashboard）。
+- `127.0.0.1:8000` 仍是 `Hummingbot API`，与该 8010 服务无关（上述路径仍为 404）。
+
+### 0.2.3 如何验证“只返回买一卖一”以及对我们意味着什么
+待服务跑起来后，用下面的最小检查判断返回的是 **L1 BBO** 还是 **含深度**：
+- L1（买一卖一）：每个 exchange+symbol 只有 `bid/ask`（以及可选 `bid_size/ask_size`），没有 `bids[]/asks[]` 档位数组；适合做**展示/排序/粗略 spread**，不适合估算大额滑点。
+- 含深度：存在 `bids[]/asks[]`（价格+数量，多档），或提供 `sweep_price(notional/qty)` 之类字段；可用于**成交口径**的“扫单价差/滑点”估算，并替换更多 last 价逻辑。
+
+本机实测（`/snapshot?exchanges=okx&symbols=0G-USDC-PERP`）：订单簿对象仅包含
+`bid_price/bid_size/ask_price/ask_size` + timestamps（`exchange_timestamp/received_timestamp/processed_timestamp`），**没有** `bids[]/asks[]` 等深度字段；因此该服务当前更像“L1 BBO +（可选）funding/ticker + analysis”，不能直接替代我们现有的“按名义金额扫盘”滑点估算。
+
+### 0.2.4 “有限替换 last 价”的接入策略（建议分两层落地）
+约束前提：你之前压测发现该服务在“WS 订单簿订阅”模式下 **最多覆盖约 8 个交易所、45 个币种**，再往上会出现订单簿延迟；因此我们必须把它当作 **高精度但容量有限** 的报价源，而不是全量行情源。
+
+**第一层（低成本、收益高）：L1 BBO 替换 watchlist 的 last/mark 用途（用于排序/筛选/展示）**
+- watchlist 当前存在“用 last/mark 补齐价差因子”的路径（例如 `watchlist_manager.py` 构造 `market_snapshots` 时用 `futures.get('price') or futures.get('last_price')`），这会导致 `spread_rel` 与 `trigger_details.prices` 对“可成交价差”偏乐观/偏悲观。
+- 建议改造为：若 BBO 可得，生成 `mid=(bid+ask)/2` 并同时保留 `bid/ask`；用于：
+  - 生成/展示更真实的 `best_buy_high_sell_low`（应使用“高所 bid / 低所 ask”）
+  - 对 `Type B` 的候选 pair 排序与预筛更稳（减少“last 跳价”误触发）
+- 仍保留 last/mark 作为 fallback（BBO 不可得或过期时），并把 `price_source` 与 `staleness` 写入 meta 便于复盘。
+
+**第二层（高成本、必须限流）：扫单价差用于“能不能下单/下多少/是否立刻平仓”**
+- 实盘与验算仍应以“按名义金额/数量扫盘得到的可成交均价”为准（目前我们已有 `orderbook_utils.fetch_orderbook_prices*()` + `watchlist_pg_writer.py` 的 Top‑K 验算链路）。
+- 若外部服务未来提供深度或 `sweep_price`，可把“扫盘动作”从 N 个交易所 REST 拉取，替换为一次 `/snapshot` 或专门的 `/sweep` RPC（但必须做容量隔离、并且仍要有 REST fallback）。
+
+### 0.2.4.1 关键门控（避免“延迟订单簿”污染决策）
+从 `/health` 与 `/ui/data` 暴露的队列与延迟来看，该服务在订阅面较大时会出现明显延迟（p95 可能到 300ms~1s+）。因此接入侧必须显式做门控：
+- `snapshot_age_ms`/`orderbook_delay_p95_ms` 或 `queue_info.ob_p95` 超阈值：禁止用于“触发/下单/平仓”，仅用于展示；触发路径强制回退到 `orderbook_utils` 的 REST 扫盘复核。
+- exchange 级健康度为 `unhealthy`：直接忽略该所的 BBO（例如本机复测中 `binance/hyperliquid` 多次处于 unhealthy，导致 snapshot 中缺失该所 orderbooks）。
+
+### 0.2.5 后续优化方向（分：端口服务、以及 FR_Monitor 侧接入）
+
+**A) 端口服务（8010）建议改造点**
+- 把接口拆成“轻/重”两类：`/bbo`（仅 L1，payload 小）、`/snapshot`（可选 include_analysis/tickers）、`/depth` 或 `/sweep`（按 symbol 请求多档或扫单价）。
+- 订阅面做 TTL 与容量守则：对每个 exchange 设定 `max_symbols`、对全局设定 `max_pairs`；超过上限直接拒绝 `/watchlist/add` 或降级为 L1。
+- 做 backpressure：当处理队列积压时丢弃旧 tick（保留最新），并在 `queue_info` 暴露 `ob_p95/tk_p95`、`dropped_updates`、`snapshot_age_ms`，让调用方能做“数据新鲜度门控”。
+- 深度优化（如果未来需要）：默认只维护 top‑N 档（例如 5/10），或只维护 L1 并按需临时拉 REST 深度；避免全深度 book 的 CPU/内存与延迟爆炸。
+- 覆盖扩展路线：按交易所拆分 worker（进程/容器分片）、或按 symbol shard；让“8 所 45 币”的上限变成可水平扩展的工程约束，而不是硬上限。
+
+**B) FR_Monitor（watchlist/live trading）接入建议**
+- 增加“报价源优先级”配置：`bbo_service -> rest_orderbook -> last/mark`，并把每次计算使用的源与 staleness 记录到 `watch_signal_raw.meta` 与 UI（否则很难定位误差来源）。
+- watchlist 侧先做“有限替换”：只在 **Type B 预筛与展示**替换为 BBO；真正触发 event 与实盘下单仍以 `orderbook_validation`（扫单口径）为准，避免“BBO 很好看但扫单不可成交”。
+- live trading 增加“新鲜度门控”：下单前检查 `ob_p95`/`snapshot_age_ms`，超过阈值则跳过或强制走 REST 扫单复核，避免用延迟订单簿做决策。
+- 用 watchlist TTL 控制订阅面：只给“当前 watchlist active + 近期触发 + 已持仓/待平仓”的符号开 BBO（其余回退 last/REST），把容量用在最需要的地方。
+
+### 0.2.6 落地实现（对齐 open-trading：8010 自己持久化，FR_Monitor 不抢活）
+你在 `/root/jerry/open-trading` 的 Monitor/V2 已经实现：
+- 默认 baseline 仅 `BTC-USDC-PERP`、`ETH-USDC-PERP`
+- watchlist TTL 与持久化：SQLite `data/monitor_v2_watchlist.sqlite3`，重启自动恢复未过期条目并重新订阅
+- REST：`POST /watchlist/add` / `POST /watchlist/touch` / `GET /watchlist`
+
+因此 **FR_Monitor 不应再维护一套独立的 watchlist 持久化/keepalive**（否则会破坏 TTL 语义、导致过期回收失效、并且“抢 8010 的工作”）。
+
+FR_Monitor 的最小责任应是：
+- 在合适时点向 8010 发送 `add/touch` 信号（例如：raw/event 触发时、或你显式调用“继续关注”）
+- 读取 `snapshot/ui/data/health` 作为更精确的 L1 BBO 数据源（并支持降级）
+- 作为调试便利：提供一组 “proxy API” 转发到 8010（便于从 4002 统一查看/操作）
+
+### 0.2.7 已落地（2025-12-27）：RAW 触发后订阅 8010 全量交易所
+目标：当 watchlist 的 RAW 信号触发（开始关注/持续关注）时，`POST /watchlist/add` 覆盖 8010 端口能提供服务的**所有交易所**，而不局限于当前价差的两腿交易所。
+
+落地内容（FR_Monitor 侧）：
+- RAW 触发时机：`watchlist_pg_writer.PgWriter.enqueue_raw()` 对 `triggered=True && signal_type in ('B','C')` 调用 8010 的 `/watchlist/add`（best-effort）。
+- 默认全量交易所：当 `MONITOR_8010_WL_EXCHANGES` 为空（默认）或设置为 `all/*` 时，会先 `GET /health` 解析出 8010 支持的交易所列表，并把该列表作为 `exchanges[]` 发送到 `/watchlist/add`；若 `/health` 不可用则回退到“两腿交易所 + snapshots 推断交易所”的集合。
+- 可控覆盖面：仍支持 `MONITOR_8010_WL_EXCHANGES=binance,okx,bybit,...` 显式指定；此时才会应用 `MONITOR_8010_WL_MAX_EXCH` 的上限（默认已改为 0=不限制）。
+- 前端/接口取全量：`simple_app.py` 拉取 8010 `/snapshot` 时不再带 `exchanges=` 过滤参数，返回“尽可能多的交易所 BBO”；`templates/watchlist.html` 也会展示不在固定排序里的额外交易所。
+
+验证建议：
+- `curl -fsS http://127.0.0.1:8010/health` 确认支持交易所列表存在且可解析。
+- 触发任意 B/C 信号后：`curl -fsS http://127.0.0.1:8010/watchlist | python -m json.tool | head` 检查该 symbol 是否被加到了多交易所订阅面。
+
+目前 FR_Monitor 已改为 proxy（不落盘、不续命）：
+- `GET /api/monitor8010/health` → 8010 `/health`
+- `GET /api/monitor8010/watchlist` → 8010 `/watchlist`
+- `POST /api/monitor8010/watchlist/add|touch|remove` → 8010 对应接口
+
+---
+
 ## 0.1 回归预测审计（潜在失败点/不准确来源）
 
 ### 0.1.1 计算失败（`pnl_hat/win_prob` 为空）的常见原因
@@ -985,3 +1107,13 @@ venv/bin/python backtest/v2_ridge_logistic.py \
   - 可开始：以 `watch_signal_event` + `future_outcome` 做第一版回测/IC（spread 为主），并把 “资金费相关” 先限定在 legs=Binance/OKX/Bybit 且 REST 可回查的事件子集（目前约 1,168 个 event）。
   - 仍阻塞：若要做“资金费严格对齐/跨所全覆盖”的回测与审计，必须先修复采集层对 `funding_interval_hours/next_funding_time` 的写入稳定性与动态周期来源，并对历史样本做回填/重算（至少覆盖 Bybit/OKX/Binance/Bitget 的周期与 next 时间）。
 - 规模偏离：触发写入涉及符号数仍偏大（>300），高于“关注池 <20”假设；需在策略侧继续收敛阈值/限流或增加冷静期。
+
+## 0.2.8 Watchlist 订单簿/BBO（8010）稳定性修复（2025-12-27）
+- 现象：前端“买高卖低/卖高买低”与 8010 BBO 列偶发为空（尤其在重启后数分钟）。
+- 根因：
+  - `refresh_watchlist_orderbook_cache()` 的 sleep 误绑定到 `WATCHLIST_REFRESH_SECONDS`；当 watchlist 刷新被调得很慢（如 10min）且重启时线程先跑到 “无 active” 分支，会导致订单簿缓存长期不刷新，前端显示为空。
+  - 8010 端偶发超时/卡顿时，FR_Monitor 会把 `monitor8010_bbo` 覆盖成 `{}`，导致前端 BBO 列瞬间变空。
+- 已落地修复：
+  - `config.py`：新增 `WATCHLIST_ORDERBOOK_REFRESH_SECONDS`（默认 10s），订单簿缓存刷新与 watchlist 刷新解耦。
+  - `simple_app.py`：Type C 仍使用本地 REST 扫单订单簿（spot+perp）；Type B 使用 8010 perp L1 BBO，避免 Type C 因 8010 不提供 spot 而永远显示 `-`。
+  - `simple_app.py`：若 8010 `/snapshot` 失败，则保留上一份 `monitor8010_bbo`（不让前端 BBO 列“清空”），并在 `/api/watchlist` 暴露 `monitor8010_error`。
