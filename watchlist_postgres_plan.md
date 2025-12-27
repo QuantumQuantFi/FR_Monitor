@@ -223,6 +223,27 @@ FR_Monitor 的最小责任应是：
 - Type C（现货 vs 永续）：一期 **不自动交易**（当前交易模块未实现 spot 下单）。后续加入现货交易后，再实现 Type C 自动开仓与平仓。
 - Type A（同所现货 vs 永续、资金费逻辑）：同样受限于 spot 下单与策略口径，建议先不自动化，先做记录与展示。
 
+### 3.2.2 Type C 当前实现现状（已落地）
+**触发与因子计算**
+- `watchlist_manager.py` 已生成 Type C `trigger_details`，包含 `spot_exchange/futures_exchange/spot_price/futures_price/spread/funding`，并补齐 `candidate_pairs`（spot+perp 组合）、`market_types`（spot/perp 标记）、`candidate_exchanges`，用于后续订单簿复核与可成交方向选择。
+- `watchlist_manager.py` 在 raw 写入前，会基于触发时刻的价格补齐 `spread_log_short_over_long/raw_best_buy_high_sell_low` 等关键因子，并调用 `predict_bc(signal_type='C', horizons=(240,))` 生成 `pnl_regression`（C‑v1）。
+- 模型使用 `watchlist_pnl_regression_model.py` 内 Type C 线性模型（同样 5 因子，spot 视为 0 资金费）。
+
+**订单簿口径复核**
+- `watchlist_pg_writer.py` 在 event 首次 INSERT 时，会对 Type C 做订单簿复算：分别拉 spot/perp 订单簿，固定方向仅允许 `spot long + perp short`，重算 `spread_log_short_over_long/raw_best_buy_high_sell_low` 后再跑 `predict_bc(signal_type='C')`，写入 `features_agg.meta_last.orderbook_validation` 与 `pnl_regression_ob`。
+- 该路径与 Type B 逻辑保持一致（Top‑K 交易所拉盘、内存枚举 pair），但 Type C 禁用 v2 预测与双向方向选择。
+
+**live trading 行为**
+- `trading/live_trading_manager.py` 已接入 Type C 事件筛选与阈值判断，但**仅记录 signal**：当达到阈值时写入 `watchlist.live_trade_signal`，状态为 `skipped`，`reason=signal_only`，不会触发实际开仓/平仓。
+- Type C 的跳过信号目前不会进入 “skipped 重试” 流程（仅 Type B 重试）。
+
+**阈值配置**
+- 新增 `LIVE_TRADING_CONFIG` 的 `type_c_pnl_threshold` / `type_c_win_prob_threshold`，默认与 B‑v1 阈值一致（可独立调参）。
+
+**未完成项（下一步）**
+- spot 下单/平仓接口与 per‑leg `market_type` 处理尚未实现；当前 `_open_trade()` 仍是 “双腿永续” 路径。
+- 需把 Type C 从 `signal_only` 分支切换为真实下单，并增加风控（现货不可做空、仓位复核、成交失败回滚等）。
+
 ### 3.2.1 Watchlist→Event→Live Trading 的“时刻”与延迟来源（重要）
 
 为了复盘“为什么 raw 看到价差、但最终没成交/被 skipped”，需要明确三个不同的时间点（口径不同）：
