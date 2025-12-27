@@ -2663,6 +2663,165 @@ def get_okx_swap_order(
     return data
 
 
+def cancel_okx_swap_order(
+    symbol: str,
+    *,
+    ord_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Cancel an OKX swap order by `ordId` or `clOrdId`."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        inst_id = f"{inst_id}-USDT-SWAP"
+
+    if not ord_id and not client_order_id:
+        raise TradeExecutionError("Either `ord_id` or `client_order_id` is required")
+
+    payload: Dict[str, Any] = {"instId": inst_id}
+    if ord_id:
+        payload["ordId"] = str(ord_id)
+    if client_order_id:
+        sanitized = _sanitize_okx_client_order_id(client_order_id)
+        if sanitized:
+            payload["clOrdId"] = sanitized
+
+    request_path = "/api/v5/trade/cancel-order"
+    timestamp = _iso_timestamp()
+    body_str = _compact_json(payload)
+    message = f"{timestamp}POST{request_path}{body_str}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX cancel reject: {data}")
+    return data
+
+
+def get_okx_trade_fills(
+    symbol: str,
+    *,
+    ord_id: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 100,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> List[Dict[str, Any]]:
+    """Fetch OKX trade fills (executions) for a swap instrument."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT-SWAP"):
+        inst_id = f"{inst_id}-USDT-SWAP"
+
+    request_path = "/api/v5/trade/fills"
+    params: List[tuple[str, str]] = [("instType", "SWAP"), ("instId", inst_id)]
+    if ord_id:
+        params.append(("ordId", str(ord_id)))
+    if start_time_ms is not None:
+        params.append(("begin", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("end", str(int(end_time_ms))))
+    if limit is not None:
+        params.append(("limit", str(min(max(int(limit), 1), 100))))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX fills query reject: {data}")
+    payload = data.get("data") or []
+    out: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                out.append(item)
+    return out
+
+
+def get_okx_account_bills(
+    *,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 100,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> List[Dict[str, Any]]:
+    """Fetch OKX account bills (ledger) for a time range."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    request_path = "/api/v5/account/bills"
+    params: List[tuple[str, str]] = []
+    if start_time_ms is not None:
+        params.append(("begin", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("end", str(int(end_time_ms))))
+    if limit is not None:
+        params.append(("limit", str(min(max(int(limit), 1), 100))))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX account bills query reject: {data}")
+    payload = data.get("data") or []
+    out: List[Dict[str, Any]] = []
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                out.append(item)
+    return out
+
+
 def get_okx_swap_price(
     symbol: str,
     *,
