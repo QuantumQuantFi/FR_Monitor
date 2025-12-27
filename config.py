@@ -212,6 +212,11 @@ WATCHLIST_CONFIG = {
     'lookback_hours': float(_get_private('WATCHLIST_LOOKBACK_HOURS', 'WATCHLIST_LOOKBACK_HOURS', '2')),
     # 刷新频率（秒），用于扫描符合条件的交易对
     'refresh_seconds': float(_get_private('WATCHLIST_REFRESH_SECONDS', 'WATCHLIST_REFRESH_SECONDS', '30')),
+    # 订单簿缓存刷新频率（秒），用于前端展示“买高卖低/卖高买低”等扫单口径数据
+    # 注意：不要与 refresh_seconds 绑定；refresh_seconds 可能被调得很慢（如 10min），会导致前端订单簿长期为空。
+    'orderbook_refresh_seconds': float(
+        _get_private('WATCHLIST_ORDERBOOK_REFRESH_SECONDS', 'WATCHLIST_ORDERBOOK_REFRESH_SECONDS', '10')
+    ),
     # Type B：跨交易所永续价差
     'type_b_spread_threshold': float(_get_private('WATCHLIST_TYPEB_SPREAD', 'WATCHLIST_TYPEB_SPREAD', '0.01')),  # 1%
     'type_b_funding_min': float(_get_private('WATCHLIST_TYPEB_FUNDING_MIN', 'WATCHLIST_TYPEB_FUNDING_MIN', '-0.001')),  # -0.1%
@@ -226,6 +231,30 @@ WATCHLIST_CONFIG = {
     # Type C：现货低于永续
     'type_c_spread_threshold': float(_get_private('WATCHLIST_TYPEC_SPREAD', 'WATCHLIST_TYPEC_SPREAD', '0.01')),  # 1%
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),
+}
+
+# 8010 订单簿聚合服务（open-trading Monitor/V2）：FR_Monitor 侧只做代理/触发信号，不做重复持久化。
+MONITOR_8010_CONFIG = {
+    'base_url': str(_get_private('MONITOR_8010_URL', 'MONITOR_8010_URL', 'http://127.0.0.1:8010')).strip(),
+    'enabled': _is_truthy(_get_private('MONITOR_8010_ENABLED', 'MONITOR_8010_ENABLED', '1')),
+    'timeout_seconds': float(_get_private('MONITOR_8010_TIMEOUT_SEC', 'MONITOR_8010_TIMEOUT_SEC', '3')),
+    # FR_Monitor -> 8010 watchlist/add 默认参数（best-effort）
+    'default_quote': str(_get_private('MONITOR_8010_DEFAULT_QUOTE', 'MONITOR_8010_DEFAULT_QUOTE', 'USDC')).strip().upper(),
+    'watchlist_ttl_seconds': int(float(_get_private('MONITOR_8010_WL_TTL', 'MONITOR_8010_WL_TTL', '86400'))),
+    'watchlist_source': str(_get_private('MONITOR_8010_WL_SOURCE', 'MONITOR_8010_WL_SOURCE', 'FR_Monitor')).strip(),
+    # 去抖：同一 (symbol,exchanges) 最快多久发一次 add（避免每分钟 raw 都打 8010）
+    'watchlist_signal_min_interval_sec': float(
+        _get_private('MONITOR_8010_WL_MIN_INTERVAL_SEC', 'MONITOR_8010_WL_MIN_INTERVAL_SEC', '600')
+    ),
+    # raw 触发时希望 8010 订阅哪些交易所：
+    # - 默认（推荐）：订阅 8010 /health 返回的“全量可用交易所”（以便前端/其他消费者拿到全量 BBO）
+    # - 可显式指定 CSV：MONITOR_8010_WL_EXCHANGES=binance,okx,bybit,...
+    # - 也可显式写 all/*：MONITOR_8010_WL_EXCHANGES=all
+    'watchlist_exchanges': str(_get_private('MONITOR_8010_WL_EXCHANGES', 'MONITOR_8010_WL_EXCHANGES', '')).strip(),
+    # 单次 add 的交易所上限（<=0 表示不限制；若 MONITOR_8010_WL_EXCHANGES=all，则默认不应用该限制）
+    'watchlist_max_exchanges_per_symbol': int(float(_get_private(
+        'MONITOR_8010_WL_MAX_EXCH', 'MONITOR_8010_WL_MAX_EXCH', '0'
+    ))),
 }
 
 # Watchlist PG 写入配置（双写开关）

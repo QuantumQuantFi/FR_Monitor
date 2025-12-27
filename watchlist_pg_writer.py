@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections import deque
@@ -55,6 +56,12 @@ class PgWriter:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._last_priority_flush_ts: float = 0.0
+        # Best-effort: notify external 8010 orderbook service to subscribe symbols on raw triggers.
+        self._monitor_8010_queue: Deque[Dict[str, Any]] = deque()
+        self._monitor_8010_lock = threading.Lock()
+        self._monitor_8010_wakeup = threading.Event()
+        self._monitor_8010_thread: Optional[threading.Thread] = None
+        self._monitor_8010_last_sent: Dict[Tuple[str, Tuple[str, ...]], float] = {}
         # state for event merge: (exchange, symbol, signal_type) -> state dict
         self._event_state: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # 缓存最近一次双腿信息，便于事件聚合时保留首/末腿快照
@@ -83,7 +90,25 @@ class PgWriter:
         self._stop.clear()
         self._thread = threading.Thread(target=self._run_loop, name="pg-writer", daemon=True)
         self._thread.start()
+        self._start_monitor_8010_thread()
         self.logger.info("PG writer started (batch=%s, flush=%ss)", self.config.batch_size, self.config.flush_seconds)
+
+    def _start_monitor_8010_thread(self) -> None:
+        if self._monitor_8010_thread:
+            return
+        try:
+            import config as _cfg  # local import: avoid import side-effects at module load
+
+            enabled = bool((_cfg.MONITOR_8010_CONFIG or {}).get("enabled", True))
+            base_url = str((_cfg.MONITOR_8010_CONFIG or {}).get("base_url") or "").strip()
+            if not enabled or not base_url:
+                return
+        except Exception:
+            return
+        self._monitor_8010_thread = threading.Thread(
+            target=self._monitor_8010_loop, name="pg-writer-monitor8010", daemon=True
+        )
+        self._monitor_8010_thread.start()
 
     def _ensure_event_schedule_columns(self) -> None:
         """
@@ -108,6 +133,7 @@ class PgWriter:
         if not self._thread:
             return
         self._stop.set()
+        self._monitor_8010_wakeup.set()
         self._thread.join(timeout=5)
         self._thread = None
         # final flush
@@ -121,6 +147,10 @@ class PgWriter:
             return
         with self._lock:
             self._queue.append(row)
+            try:
+                self._maybe_notify_monitor_8010(row)
+            except Exception:
+                pass
             # Best-effort: for "high-value" triggered rows, flush immediately to reduce event latency.
             # This matters when consecutive_required=1 and live trading is kick-driven.
             try:
@@ -172,6 +202,173 @@ class PgWriter:
                 pass
             if len(self._queue) >= self.config.batch_size:
                 self._flush_locked()
+
+    @staticmethod
+    def _to_monitor_8010_symbol(symbol: str, *, default_quote: str = "USDC") -> str:
+        s = str(symbol or "").strip().upper()
+        if not s:
+            return ""
+        # If already "BTC-USDC-PERP"/"BTC-USDT-PERP", pass through.
+        if "-" in s:
+            return s
+        base = re.sub(r"[^A-Z0-9]", "", s)
+        if not base:
+            return ""
+        return f"{base}-{default_quote.strip().upper()}-PERP"
+
+    def _monitor_8010_enqueue_add(
+        self,
+        *,
+        monitor_symbol: str,
+        exchanges: List[str],
+        ttl_seconds: int,
+        source: str,
+        reason: str,
+        all_exchanges: bool = False,
+    ) -> None:
+        if not monitor_symbol:
+            return
+        if (not all_exchanges) and (not exchanges):
+            return
+        with self._monitor_8010_lock:
+            self._monitor_8010_queue.append(
+                {
+                    "monitor_symbol": monitor_symbol,
+                    "exchanges": exchanges,
+                    "ttl_seconds": ttl_seconds,
+                    "source": source,
+                    "reason": reason,
+                    "all_exchanges": bool(all_exchanges),
+                }
+            )
+        self._monitor_8010_wakeup.set()
+
+    def _maybe_notify_monitor_8010(self, row: Dict[str, Any]) -> None:
+        # Only act on triggered raw rows: this is the "signal happens" moment.
+        if not bool(row.get("triggered")):
+            return
+        sig_type = str(row.get("signal_type") or "").strip().upper()
+        if sig_type not in ("A", "B", "C"):
+            return
+        symbol = str(row.get("symbol") or "").strip().upper()
+        if not symbol:
+            return
+
+        try:
+            import config as _cfg  # local import: avoid import side-effects at module load
+
+            mcfg = _cfg.MONITOR_8010_CONFIG or {}
+            if not bool(mcfg.get("enabled", True)):
+                return
+            default_quote = str(mcfg.get("default_quote") or "USDC").strip().upper()
+            ttl_seconds = int(float(mcfg.get("watchlist_ttl_seconds") or 86400))
+            source = str(mcfg.get("watchlist_source") or "FR_Monitor").strip() or "FR_Monitor"
+            max_ex = int(float(mcfg.get("watchlist_max_exchanges_per_symbol") or 8))
+            ex_override = str(mcfg.get("watchlist_exchanges") or "").strip()
+        except Exception:
+            default_quote = "USDC"
+            ttl_seconds = 86400
+            source = "FR_Monitor"
+            max_ex = 8
+            ex_override = ""
+
+        # Exchange selection:
+        # - If MONITOR_8010_WL_EXCHANGES is set to a CSV, use it.
+        # - If empty / "all" / "*" → subscribe ALL exchanges configured on 8010 (pass exchanges=null).
+        use_all = False
+        exchanges: List[str] = []
+        if ex_override:
+            ex_override_l = ex_override.strip().lower()
+            if ex_override_l in ("*", "all", "all_exchanges"):
+                use_all = True
+            else:
+                for part in ex_override.split(","):
+                    ex = part.strip().lower()
+                    if ex and ex not in ("unsupported", "none") and ex not in exchanges:
+                        exchanges.append(ex)
+        else:
+            use_all = True
+
+        if (not use_all) and max_ex > 0 and len(exchanges) > max_ex:
+            exchanges = exchanges[:max_ex]
+
+        monitor_symbol = self._to_monitor_8010_symbol(symbol, default_quote=default_quote)
+        if not monitor_symbol:
+            return
+        self._monitor_8010_enqueue_add(
+            monitor_symbol=monitor_symbol,
+            exchanges=exchanges,
+            ttl_seconds=ttl_seconds,
+            source=source,
+            reason=f"raw_trigger:{sig_type}",
+            all_exchanges=use_all,
+        )
+
+    def _monitor_8010_loop(self) -> None:
+        while not self._stop.is_set():
+            self._monitor_8010_wakeup.wait(timeout=1.0)
+            self._monitor_8010_wakeup.clear()
+            if self._stop.is_set():
+                return
+            batch: List[Dict[str, Any]] = []
+            with self._monitor_8010_lock:
+                while self._monitor_8010_queue and len(batch) < 200:
+                    batch.append(self._monitor_8010_queue.popleft())
+            if not batch:
+                continue
+            try:
+                import config as _cfg  # local import: avoid import side-effects at module load
+
+                mcfg = _cfg.MONITOR_8010_CONFIG or {}
+                if not bool(mcfg.get("enabled", True)):
+                    continue
+                base_url = str(mcfg.get("base_url") or "").strip()
+                if not base_url:
+                    continue
+                timeout = float(mcfg.get("timeout_seconds") or 3.0)
+                min_interval_sec = float(mcfg.get("watchlist_signal_min_interval_sec") or 600.0)
+                max_ex = int(float(mcfg.get("watchlist_max_exchanges_per_symbol") or 0))
+            except Exception:
+                continue
+
+            for item in batch:
+                mon_sym = str(item.get("monitor_symbol") or "").strip().upper()
+                want_all = bool(item.get("all_exchanges"))
+                exchanges = [str(x).strip().lower() for x in (item.get("exchanges") or []) if str(x).strip()]
+                exchanges = sorted(set(exchanges))
+                if not mon_sym or ((not want_all) and (not exchanges)):
+                    continue
+
+                # Debounce key: "all exchanges" stays stable even if /health changes ordering.
+                key = (mon_sym, ("__all__",) if want_all else tuple(exchanges))
+                now_s = time.time()
+                last_s = float(self._monitor_8010_last_sent.get(key) or 0.0)
+                if now_s - last_s < min_interval_sec:
+                    continue
+
+                if (not want_all) and max_ex > 0 and len(exchanges) > max_ex:
+                    exchanges = exchanges[:max_ex]
+
+                payload: Dict[str, Any] = {
+                    "symbol": mon_sym,
+                    "ttl_seconds": int(item.get("ttl_seconds") or 86400),
+                    "source": str(item.get("source") or "FR_Monitor"),
+                    "reason": str(item.get("reason") or "raw_trigger"),
+                }
+                if not want_all:
+                    payload["exchanges"] = exchanges
+                try:
+                    resp = requests.post(f"{base_url}/watchlist/add", json=payload, timeout=timeout)
+                    if resp.status_code == 200:
+                        self._monitor_8010_last_sent[key] = now_s
+                    else:
+                        self.logger.debug(
+                            "monitor8010 add failed status=%s body=%s",
+                            resp.status_code,
+                            (resp.text or "")[:200],
+                        )
+                except Exception as exc:  # pragma: no cover - network best-effort
+                    self.logger.debug("monitor8010 add exception: %s", exc)
 
     def _run_loop(self) -> None:
         while not self._stop.wait(timeout=self.config.flush_seconds):

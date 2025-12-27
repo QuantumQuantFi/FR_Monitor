@@ -286,6 +286,7 @@
                     <th>卖高买低</th>
                     <th class="col-cross">跨所永续差价</th>
                     <th class="col-prices">各所资金费&价格</th>
+                    <th class="col-prices">各所订单簿BBO(8010)</th>
                     <th class="col-detail">详尽交易所指标</th>
                     <th>查看</th>
                     <th>因子</th>
@@ -298,7 +299,7 @@
                 </tr>
             </thead>
             <tbody id="watchlist-body">
-                <tr><td colspan="20" class="muted">加载中...</td></tr>
+                <tr><td colspan="21" class="muted">加载中...</td></tr>
             </tbody>
         </table>
         </div>
@@ -349,6 +350,7 @@
         const chartsBtn = document.getElementById('charts-btn');
         let metricsCache = {};
         let orderbookMap = {};
+        let monitorBboMap = {};
         let exchangeOverview = {};
         let crossSpreads = {};
         let charts = {};
@@ -928,7 +930,7 @@
             );
 
             if (!activeEntries.length) {
-                bodyEl.innerHTML = '<tr><td colspan="20" class="muted">暂无活跃符号满足条件</td></tr>';
+                bodyEl.innerHTML = '<tr><td colspan="21" class="muted">暂无活跃符号满足条件</td></tr>';
                 return;
             }
 
@@ -1176,6 +1178,26 @@
                     .join('<br>');
                 const exRowsCell = exRows || '-';
 
+                const bboExMap = monitorBboMap[item.symbol] || {};
+                const bboLines = [];
+                const exOrder = ['binance', 'okx', 'bybit', 'bitget', 'grvt', 'lighter', 'hyperliquid', 'edgex', 'paradex'];
+                const extraEx = Object.keys(bboExMap || {}).filter((ex) => ex && !exOrder.includes(ex)).sort();
+                [...exOrder, ...extraEx].forEach((ex) => {
+                    const obx = bboExMap[ex];
+                    if (!obx) return;
+                    const bid = toNumber(obx.bid_price);
+                    const ask = toNumber(obx.ask_price);
+                    if (bid === null && ask === null) return;
+                    const bidSize = toNumber(obx.bid_size);
+                    const askSize = toNumber(obx.ask_size);
+                    const bidTxt = bid !== null ? formatNumber(bid, 6) : '--';
+                    const askTxt = ask !== null ? formatNumber(ask, 6) : '--';
+                    const bsTxt = bidSize !== null ? `×${formatHuman(bidSize)}` : '';
+                    const asTxt = askSize !== null ? `×${formatHuman(askSize)}` : '';
+                    bboLines.push(`${ex} bid ${bidTxt}${bsTxt} / ask ${askTxt}${asTxt}`);
+                });
+                const bboCell = bboLines.length ? bboLines.join('<br>') : '-';
+
                 const detailCell = detailRows.length
                     ? (() => {
                         const header = `
@@ -1228,6 +1250,7 @@
                         <td class="mono">${reverseCell}</td>
                         <td class="mono col-cross">${bestPerpCell}</td>
                         <td class="mono cell-scroll col-prices">${exRowsCell}</td>
+                        <td class="mono cell-scroll col-prices">${bboCell}</td>
                         <td class="mono cell-scroll col-detail">${detailCell}</td>
                         <td><button class="detail-btn" data-sym="${item.symbol}">查看</button></td>
                         <td><button class="factor-btn" data-sym="${item.symbol}">因子</button></td>
@@ -1524,6 +1547,7 @@
                 const resp = await fetch('/api/watchlist');
                 const data = await resp.json();
                 orderbookMap = data.orderbook || {};
+                monitorBboMap = data.monitor8010_bbo || {};
                 window.__exchangeDetails = data.exchange_details || {};
                 exchangeOverview = data.exchange_overview || {};
                 crossSpreads = data.cross_spreads || {};
@@ -1551,7 +1575,7 @@
                 if (refreshTimer) clearInterval(refreshTimer);
                 refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
-                bodyEl.innerHTML = `<tr><td colspan="20" class="muted">加载失败: ${err}</td></tr>`;
+                bodyEl.innerHTML = `<tr><td colspan="21" class="muted">加载失败: ${err}</td></tr>`;
             } finally {
                 btn.disabled = false;
             }

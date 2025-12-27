@@ -8,6 +8,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import psutil
 import os
+import re
 import builtins
 import sys
 import decimal
@@ -29,6 +30,7 @@ from config import (
     WATCHLIST_CONFIG,
     WATCHLIST_PG_CONFIG,
     LIVE_TRADING_CONFIG,
+    MONITOR_8010_CONFIG,
 )
 from database import PriceDatabase
 from market_info import get_dynamic_symbols, get_market_report
@@ -112,6 +114,7 @@ ORDERBOOK_EXECUTOR = ThreadPoolExecutor(max_workers=8)
 # watchlist 订单簿/跨所价差的后台缓存，避免在请求路径阻塞
 WATCHLIST_ORDERBOOK_SNAPSHOT = {
     'orderbook': {},
+    'monitor8010_bbo': {},
     'cross_spreads': {},
     'timestamp': None,
     'error': None,
@@ -128,6 +131,9 @@ WATCHLIST_METRICS_SNAPSHOT = {
 WATCHLIST_BOOTSTRAP_LOCK = threading.Lock()
 WATCHLIST_BOOTSTRAP_LAST_TS = 0.0
 WATCHLIST_BOOTSTRAP_MIN_INTERVAL_SEC = 15.0
+
+WATCHLIST_BBO_PG_READY = False
+WATCHLIST_BBO_PG_LOCK = threading.Lock()
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -1853,6 +1859,512 @@ def _entry_legs_for_orderbook(entry: Dict[str, Any]) -> List[Dict[str, str]]:
     return []
 
 
+def _monitor_8010_default_quote() -> str:
+    try:
+        return str((MONITOR_8010_CONFIG or {}).get("default_quote") or "USDC").strip().upper()
+    except Exception:
+        return "USDC"
+
+
+def _to_monitor_8010_symbol(symbol: str) -> str:
+    s = str(symbol or "").strip().upper()
+    if not s:
+        return ""
+    if "-" in s:
+        return s
+    base = re.sub(r"[^A-Z0-9]", "", s)
+    if not base:
+        return ""
+    return f"{base}-{_monitor_8010_default_quote()}-PERP"
+
+
+def _fetch_monitor_8010_snapshot(
+    *,
+    symbols: List[str],
+    exchanges: List[str],
+    include_analysis: bool = False,
+    include_tickers: bool = False,
+) -> Optional[Dict[str, Any]]:
+    if not bool(MONITOR_8010_CONFIG.get("enabled", True)):
+        return None
+    base = str(MONITOR_8010_CONFIG.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return None
+    params: List[tuple] = [
+        ("include_analysis", "true" if include_analysis else "false"),
+        ("include_tickers", "true" if include_tickers else "false"),
+    ]
+    for ex in sorted({str(x).strip().lower() for x in (exchanges or []) if str(x).strip()}):
+        params.append(("exchanges", ex))
+    for sym in sorted({str(x).strip().upper() for x in (symbols or []) if str(x).strip()}):
+        params.append(("symbols", sym))
+    try:
+        timeout = float(MONITOR_8010_CONFIG.get("timeout_seconds") or 3.0)
+    except Exception:
+        timeout = 3.0
+    try:
+        resp = requests.get(f"{base}/snapshot", params=params, timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+_MONITOR_8010_KEEPALIVE_LOCK = threading.Lock()
+_MONITOR_8010_KEEPALIVE_LAST_SENT: Dict[str, float] = {}
+_MONITOR_8010_KEEPALIVE_CURSOR = 0
+
+
+def _monitor_8010_keepalive_active_symbols(active_entries: List[Dict[str, Any]]) -> None:
+    """
+    Best-effort keepalive so 8010 can serve BBO for all active watchlist symbols.
+    Important: do not persist locally; 8010 owns TTL and persistence.
+
+    We call 8010 `/watchlist/add` with `exchanges=null` (omitted) so it subscribes all
+    configured exchanges on its side.
+    """
+    if not active_entries:
+        return
+    if not bool(MONITOR_8010_CONFIG.get("enabled", True)):
+        return
+    base = str(MONITOR_8010_CONFIG.get("base_url") or "").strip().rstrip("/")
+    if not base:
+        return
+    try:
+        timeout = float(MONITOR_8010_CONFIG.get("timeout_seconds") or 3.0)
+    except Exception:
+        timeout = 3.0
+    try:
+        ttl_seconds = int(float(MONITOR_8010_CONFIG.get("watchlist_ttl_seconds") or 86400))
+    except Exception:
+        ttl_seconds = 86400
+    try:
+        min_interval_sec = float(MONITOR_8010_CONFIG.get("watchlist_signal_min_interval_sec") or 600.0)
+    except Exception:
+        min_interval_sec = 600.0
+    source = str(MONITOR_8010_CONFIG.get("watchlist_source") or "FR_Monitor").strip() or "FR_Monitor"
+
+    now_s = time.time()
+    mon_syms: List[str] = []
+    for e in active_entries:
+        sym = str((e or {}).get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        mon = _to_monitor_8010_symbol(sym)
+        if mon:
+            mon_syms.append(mon)
+    mon_syms = sorted(set(mon_syms))
+    if not mon_syms:
+        return
+
+    # Safety: cap per refresh cycle, but round-robin so all active symbols are eventually kept alive.
+    cap = 50
+    global _MONITOR_8010_KEEPALIVE_CURSOR
+    total_n = len(mon_syms)
+    if total_n > cap:
+        start = int(_MONITOR_8010_KEEPALIVE_CURSOR) % total_n
+        window = mon_syms[start : start + cap]
+        if len(window) < cap:
+            window = window + mon_syms[: cap - len(window)]
+        mon_syms = window
+        _MONITOR_8010_KEEPALIVE_CURSOR = (start + cap) % total_n
+
+    with _MONITOR_8010_KEEPALIVE_LOCK:
+        for mon_sym in mon_syms:
+            last = float(_MONITOR_8010_KEEPALIVE_LAST_SENT.get(mon_sym) or 0.0)
+            if now_s - last < min_interval_sec:
+                continue
+            payload = {
+                "symbol": mon_sym,
+                # exchanges omitted => 8010 subscribes all configured exchanges
+                "ttl_seconds": ttl_seconds,
+                "source": source,
+                "reason": "watchlist_active_keepalive",
+            }
+            try:
+                resp = requests.post(f"{base}/watchlist/add", json=payload, timeout=timeout)
+                if resp.status_code == 200:
+                    _MONITOR_8010_KEEPALIVE_LAST_SENT[mon_sym] = now_s
+            except Exception:
+                # best-effort
+                pass
+
+
+def _monitor_8010_supported_exchanges_for_display() -> List[str]:
+    # Keep in sync with UI display ordering when possible.
+    try:
+        base = list(EXCHANGE_DISPLAY_ORDER or [])
+    except Exception:
+        base = []
+    extra = []
+    for x in ("edgex", "paradex"):
+        if x not in base:
+            extra.append(x)
+    return [str(x).strip().lower() for x in (base + extra) if str(x).strip()]
+
+
+def build_monitor_8010_bbo_by_exchange(entries: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """
+    Per-symbol per-exchange L1 BBO map for watchlist UI display.
+    Output: { 'BTC': { 'okx': {...}, 'binance': {...} }, ... }
+    Note: 8010 only returns data for (exchange,symbol) that are active in its watchlist.
+    """
+    out: Dict[str, Any] = {}
+    if not entries:
+        return out
+    symbols: List[str] = []
+    for entry in entries:
+        sym = str(entry.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        mon_sym = _to_monitor_8010_symbol(sym)
+        if mon_sym:
+            symbols.append(mon_sym)
+    if not symbols:
+        return out
+    snap = _fetch_monitor_8010_snapshot(
+        symbols=symbols,
+        # Do not filter by exchanges: return "as much as available" for each symbol.
+        exchanges=[],
+        include_analysis=False,
+        include_tickers=False,
+    )
+    if snap is None:
+        return None
+    orderbooks = (snap or {}).get("orderbooks") if isinstance(snap, dict) else None
+    if not isinstance(orderbooks, dict):
+        return out
+
+    for ex, sym_map in orderbooks.items():
+        if not isinstance(sym_map, dict):
+            continue
+        ex_l = str(ex).strip().lower()
+        for mon_sym, ob in sym_map.items():
+            if not isinstance(ob, dict):
+                continue
+            try:
+                base_sym = str(mon_sym).split("-", 1)[0].strip().upper()
+            except Exception:
+                base_sym = ""
+            if not base_sym:
+                continue
+            out.setdefault(base_sym, {})[ex_l] = {
+                "bid_price": ob.get("bid_price"),
+                "bid_size": ob.get("bid_size"),
+                "ask_price": ob.get("ask_price"),
+                "ask_size": ob.get("ask_size"),
+                "exchange_timestamp": ob.get("exchange_timestamp"),
+                "received_timestamp": ob.get("received_timestamp"),
+                "processed_timestamp": ob.get("processed_timestamp"),
+                "monitor_symbol": str(mon_sym).upper(),
+            }
+    return out
+
+
+def _entry_legs_for_monitor_8010_bbo(entry: Dict[str, Any]) -> List[Dict[str, str]]:
+    """
+    Return legs that the watchlist UI should show bid/ask for.
+    Note: 8010 currently provides perp orderbooks only; spot legs will be left empty.
+    """
+    etype = entry.get("entry_type")
+    trigger = entry.get("trigger_details") or {}
+    symbol = entry.get("symbol")
+    if not symbol:
+        return []
+    if etype == "A":
+        return [
+            {"exchange": "binance", "market_type": "spot"},
+            {"exchange": "binance", "market_type": "perp"},
+        ]
+    if etype == "B":
+        pair = trigger.get("pair") or []
+        if len(pair) == 2:
+            return [
+                {"exchange": str(pair[0]).strip().lower(), "market_type": "perp"},
+                {"exchange": str(pair[1]).strip().lower(), "market_type": "perp"},
+            ]
+    if etype == "C":
+        spot_ex = trigger.get("spot_exchange")
+        fut_ex = trigger.get("futures_exchange")
+        if spot_ex and fut_ex:
+            return [
+                {"exchange": str(spot_ex).strip().lower(), "market_type": "spot"},
+                {"exchange": str(fut_ex).strip().lower(), "market_type": "perp"},
+            ]
+    return []
+
+
+def build_monitor_8010_bbo_annotation(entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Use 8010 /snapshot L1 bid/ask to build watchlist 'orderbook' annotation.
+    If 8010 data is missing/unhealthy for a leg, leave buy/sell empty (null) for that leg.
+    """
+    out: Dict[str, Any] = {}
+    if not entries:
+        return out
+    exchanges: List[str] = []
+    symbols_mon: List[str] = []
+    entry_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+    for entry in entries:
+        sym = str(entry.get("symbol") or "").strip().upper()
+        if not sym:
+            continue
+        entry_by_symbol.setdefault(sym, []).append(entry)
+        mon_sym = _to_monitor_8010_symbol(sym)
+        if mon_sym:
+            symbols_mon.append(mon_sym)
+        for leg in _entry_legs_for_monitor_8010_bbo(entry):
+            ex = str(leg.get("exchange") or "").strip().lower()
+            if ex and ex not in exchanges and ex != "unsupported":
+                exchanges.append(ex)
+
+    snap = _fetch_monitor_8010_snapshot(symbols=symbols_mon, exchanges=exchanges, include_analysis=False, include_tickers=False)
+    orderbooks = (snap or {}).get("orderbooks") if isinstance(snap, dict) else None
+    if not isinstance(orderbooks, dict):
+        return out
+
+    for sym, e_list in entry_by_symbol.items():
+        # Choose a "representative" entry: the UI is symbol-centric anyway.
+        entry = e_list[0]
+        mon_sym = _to_monitor_8010_symbol(sym)
+        legs_meta = _entry_legs_for_monitor_8010_bbo(entry)
+        legs: List[Dict[str, Any]] = []
+        for leg in legs_meta:
+            ex = str(leg.get("exchange") or "").strip().lower()
+            mtype = str(leg.get("market_type") or "").strip().lower()
+            price_obj: Dict[str, Any] = {"buy": None, "sell": None, "mid": None}
+            meta_obj: Dict[str, Any] = {}
+            if mtype == "perp" and ex and mon_sym:
+                ob = orderbooks.get(ex, {}).get(mon_sym) if isinstance(orderbooks.get(ex), dict) else None
+                if isinstance(ob, dict):
+                    ask = ob.get("ask_price")
+                    bid = ob.get("bid_price")
+                    try:
+                        ask_f = float(ask) if ask is not None else None
+                        bid_f = float(bid) if bid is not None else None
+                    except Exception:
+                        ask_f = bid_f = None
+                    if ask_f and bid_f and ask_f > 0 and bid_f > 0:
+                        price_obj["buy"] = ask_f
+                        price_obj["sell"] = bid_f
+                        price_obj["mid"] = (ask_f + bid_f) / 2.0
+                    meta_obj = {
+                        "exchange_timestamp": ob.get("exchange_timestamp"),
+                        "received_timestamp": ob.get("received_timestamp"),
+                        "processed_timestamp": ob.get("processed_timestamp"),
+                        "bid_size": ob.get("bid_size"),
+                        "ask_size": ob.get("ask_size"),
+                    }
+            legs.append(
+                {
+                    "exchange": ex,
+                    "market_type": mtype,
+                    "price": price_obj,
+                    "meta": meta_obj or None,
+                }
+            )
+        spread = compute_orderbook_spread(legs) if len(legs) >= 2 else None
+        out[sym] = (
+            {
+                "legs": legs,
+                "forward": (spread or {}).get("forward") if isinstance(spread, dict) else None,
+                "reverse": (spread or {}).get("reverse") if isinstance(spread, dict) else None,
+            }
+            if legs
+            else {"legs": [], "forward": None, "reverse": None}
+        )
+    return out
+
+
+def _ensure_watchlist_bbo_table_pg() -> bool:
+    global WATCHLIST_BBO_PG_READY
+    if WATCHLIST_BBO_PG_READY:
+        return True
+    if psycopg is None:
+        return False
+    if not bool(WATCHLIST_PG_CONFIG.get("enabled", False)):
+        return False
+    dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+    if not dsn:
+        return False
+    with WATCHLIST_BBO_PG_LOCK:
+        if WATCHLIST_BBO_PG_READY:
+            return True
+        try:
+            ddl = """
+            CREATE SCHEMA IF NOT EXISTS watchlist;
+            CREATE TABLE IF NOT EXISTS watchlist.orderbook_bbo (
+              ts timestamptz NOT NULL,
+              symbol text NOT NULL,
+              exchange text NOT NULL,
+              market_type text NOT NULL,
+              bid double precision NULL,
+              ask double precision NULL,
+              source text NOT NULL DEFAULT 'monitor8010',
+              meta jsonb NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_orderbook_bbo_ts ON watchlist.orderbook_bbo (ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_orderbook_bbo_symbol_ts ON watchlist.orderbook_bbo (symbol, ts DESC);
+            CREATE INDEX IF NOT EXISTS idx_orderbook_bbo_exchange_symbol_ts ON watchlist.orderbook_bbo (exchange, symbol, ts DESC);
+            """
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(ddl)
+            WATCHLIST_BBO_PG_READY = True
+            return True
+        except Exception:
+            return False
+
+
+def _persist_monitor_8010_bbo_to_pg(orderbook_map: Dict[str, Any]) -> None:
+    if not orderbook_map:
+        return
+    if psycopg is None:
+        return
+    if not _ensure_watchlist_bbo_table_pg():
+        return
+    dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+    if not dsn:
+        return
+
+    now_dt = datetime.now(timezone.utc)
+    rows: List[tuple] = []
+    for sym, ob in (orderbook_map or {}).items():
+        if not isinstance(ob, dict):
+            continue
+        for leg in (ob.get("legs") or []):
+            if not isinstance(leg, dict):
+                continue
+            ex = str(leg.get("exchange") or "").strip().lower()
+            market_type = str(leg.get("market_type") or "").strip().lower()
+            price = leg.get("price") if isinstance(leg.get("price"), dict) else {}
+            bid = price.get("sell")
+            ask = price.get("buy")
+            try:
+                bid_f = float(bid) if bid is not None else None
+            except Exception:
+                bid_f = None
+            try:
+                ask_f = float(ask) if ask is not None else None
+            except Exception:
+                ask_f = None
+            meta_obj = leg.get("meta") if isinstance(leg.get("meta"), dict) else None
+            meta = dict(meta_obj) if meta_obj else {}
+            meta["monitor_symbol"] = _to_monitor_8010_symbol(sym)
+            if bid_f is None and ask_f is None:
+                meta["missing"] = True
+            rows.append((now_dt, str(sym).upper(), ex, market_type, bid_f, ask_f, "monitor8010", meta or None))
+
+    if not rows:
+        return
+    try:
+        from psycopg.types.json import Json  # type: ignore
+    except Exception:  # pragma: no cover
+        Json = None  # type: ignore
+
+    params = []
+    for ts, sym, ex, mtype, bid_f, ask_f, source, meta in rows:
+        if Json is not None and meta is not None:
+            meta = Json(meta)  # type: ignore[assignment]
+        elif meta is not None and not isinstance(meta, (str, bytes)):
+            try:
+                meta = json.dumps(meta, ensure_ascii=False)
+            except Exception:
+                meta = None
+        params.append((ts, sym, ex, mtype, bid_f, ask_f, source, meta))
+
+    sql = """
+    INSERT INTO watchlist.orderbook_bbo
+      (ts, symbol, exchange, market_type, bid, ask, source, meta)
+    VALUES
+      (%s, %s, %s, %s, %s, %s, %s, %s::jsonb);
+    """
+    try:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, params)
+    except Exception:
+        return
+
+
+def _persist_monitor_8010_bbo_by_exchange_to_pg(bbo_by_exchange: Dict[str, Any]) -> None:
+    """
+    Persist 8010 BBO for all returned exchanges per symbol.
+    This is independent from the UI "legs" notion.
+    """
+    if not bbo_by_exchange:
+        return
+    if psycopg is None:
+        return
+    if not _ensure_watchlist_bbo_table_pg():
+        return
+    dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+    if not dsn:
+        return
+    now_dt = datetime.now(timezone.utc)
+    rows: List[tuple] = []
+    for sym, ex_map in bbo_by_exchange.items():
+        if not isinstance(ex_map, dict):
+            continue
+        for ex, ob in ex_map.items():
+            if not isinstance(ob, dict):
+                continue
+            bid = ob.get("bid_price")
+            ask = ob.get("ask_price")
+            try:
+                bid_f = float(bid) if bid is not None else None
+            except Exception:
+                bid_f = None
+            try:
+                ask_f = float(ask) if ask is not None else None
+            except Exception:
+                ask_f = None
+            meta = dict(ob)
+            meta.pop("bid_price", None)
+            meta.pop("ask_price", None)
+            rows.append(
+                (
+                    now_dt,
+                    str(sym).upper(),
+                    str(ex).strip().lower(),
+                    "perp",
+                    bid_f,
+                    ask_f,
+                    "monitor8010",
+                    meta or None,
+                )
+            )
+    if not rows:
+        return
+    try:
+        from psycopg.types.json import Json  # type: ignore
+    except Exception:  # pragma: no cover
+        Json = None  # type: ignore
+    params = []
+    for ts, sym, ex, mtype, bid_f, ask_f, source, meta in rows:
+        if Json is not None and meta is not None:
+            meta = Json(meta)  # type: ignore[assignment]
+        elif meta is not None and not isinstance(meta, (str, bytes)):
+            try:
+                meta = json.dumps(meta, ensure_ascii=False)
+            except Exception:
+                meta = None
+        params.append((ts, sym, ex, mtype, bid_f, ask_f, source, meta))
+    sql = """
+    INSERT INTO watchlist.orderbook_bbo
+      (ts, symbol, exchange, market_type, bid, ask, source, meta)
+    VALUES
+      (%s, %s, %s, %s, %s, %s, %s, %s::jsonb);
+    """
+    try:
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            with conn.cursor() as cur:
+                cur.executemany(sql, params)
+    except Exception:
+        return
+
+
 def build_orderbook_annotation(entries: List[Dict[str, Any]], sweep_notional: float = DEFAULT_SWEEP_NOTIONAL) -> Dict[str, Any]:
     """
     对 watchlist 条目补充订单簿扫单价格（模拟 sweep 100 USDT），并计算双向价差：
@@ -1987,42 +2499,94 @@ def refresh_watchlist_orderbook_cache():
     """后台刷新 watchlist 订单簿/跨所差价缓存，避免在请求路径阻塞。"""
     logger = logging.getLogger('watchlist')
     min_interval = 10.0  # 不要太频繁
+    try:
+        target_interval = float((WATCHLIST_CONFIG or {}).get("orderbook_refresh_seconds") or min_interval)
+    except Exception:
+        target_interval = min_interval
+    if target_interval <= 0:
+        target_interval = min_interval
     while True:
         start = time.time()
         try:
+            prev_snapshot = WATCHLIST_ORDERBOOK_SNAPSHOT.copy()
             snapshot = watchlist_manager.snapshot()
             active_entries = [e for e in snapshot.get('entries', []) if e.get('status') == 'active']
             if not active_entries:
                 WATCHLIST_ORDERBOOK_SNAPSHOT.update({
                     'orderbook': {},
+                    'monitor8010_bbo': {},
                     'cross_spreads': {},
                     'timestamp': now_utc_iso(),
                     'error': None,
                     'stale_reason': 'no_active_entries',
+                    'monitor8010_error': None,
                 })
             else:
+                try:
+                    _monitor_8010_keepalive_active_symbols(active_entries)
+                except Exception:
+                    pass
                 all_data = data_collector.get_all_data()
-                orderbook = build_orderbook_annotation(active_entries)
+                # 订单簿/扫单口径：
+                # - Type A：本地 REST 扫单订单簿（Binance spot/perp）。
+                # - Type B：使用 8010 的 L1 BBO（perp vs perp）。
+                # - Type C：需要 spot vs perp；8010 目前仅提供 perp 订单簿，所以 Type C 保留本地 REST 扫单订单簿。
+                entries_a = [e for e in active_entries if str(e.get("entry_type") or "").upper() == "A"]
+                entries_b = [e for e in active_entries if str(e.get("entry_type") or "").upper() == "B"]
+                entries_c = [e for e in active_entries if str(e.get("entry_type") or "").upper() == "C"]
+
+                orderbook: Dict[str, Any] = {}
+                if entries_a or entries_c:
+                    try:
+                        orderbook.update(build_orderbook_annotation(entries_a + entries_c))
+                    except Exception:
+                        pass
+
+                orderbook_8010 = build_monitor_8010_bbo_annotation(entries_b) if entries_b else {}
+                orderbook.update(orderbook_8010)
+
+                # For UI/DB: show/persist "as much data as available" per symbol across exchanges.
+                # 8010 /snapshot will only return pairs that are active in its own watchlist, so this stays bounded.
+                monitor8010_error = None
+                bbo_by_exchange = build_monitor_8010_bbo_by_exchange(active_entries) if active_entries else {}
+                if bbo_by_exchange is None:
+                    # 8010 timeout/unreachable: keep last good snapshot so UI doesn't go blank.
+                    monitor8010_error = "monitor8010_snapshot_failed"
+                    bbo_by_exchange = (prev_snapshot.get("monitor8010_bbo") or {}) if isinstance(prev_snapshot, dict) else {}
+                # Persist 8010 BBO snapshots even if UI is not open (best-effort; missing values kept as null).
+                try:
+                    _persist_monitor_8010_bbo_to_pg(orderbook_8010)
+                except Exception:
+                    pass
+                try:
+                    if monitor8010_error is None:
+                        _persist_monitor_8010_bbo_by_exchange_to_pg(bbo_by_exchange)
+                except Exception:
+                    pass
                 cross_spreads = build_cross_spread_matrix(active_entries, all_data)
                 WATCHLIST_ORDERBOOK_SNAPSHOT.update({
                     'orderbook': orderbook,
+                    'monitor8010_bbo': bbo_by_exchange,
                     'cross_spreads': cross_spreads,
                     'timestamp': now_utc_iso(),
                     'error': None,
                     'stale_reason': None,
+                    'monitor8010_error': monitor8010_error,
                 })
         except Exception as exc:
             WATCHLIST_ORDERBOOK_SNAPSHOT.update({
                 'orderbook': WATCHLIST_ORDERBOOK_SNAPSHOT.get('orderbook') or {},
+                'monitor8010_bbo': WATCHLIST_ORDERBOOK_SNAPSHOT.get('monitor8010_bbo') or {},
                 'cross_spreads': WATCHLIST_ORDERBOOK_SNAPSHOT.get('cross_spreads') or {},
                 'timestamp': now_utc_iso(),
                 'error': str(exc),
                 'stale_reason': 'exception',
+                'monitor8010_error': WATCHLIST_ORDERBOOK_SNAPSHOT.get('monitor8010_error'),
             })
             logger.warning("watchlist orderbook cache refresh failed: %s", exc)
-        # 将休眠时间与 watchlist 刷新周期对齐，但保留最小间隔
+        # 订单簿刷新不应与 watchlist refresh_seconds 强绑定：watchlist 刷新可能被调得很慢，会导致前端订单簿长期为空。
         elapsed = time.time() - start
-        sleep_seconds = max(min_interval, watchlist_manager.refresh_seconds - elapsed)
+        sleep_seconds = max(min_interval, target_interval - elapsed)
         time.sleep(sleep_seconds)
 
 def refresh_watchlist_metrics_cache():
@@ -2476,6 +3040,8 @@ def get_watchlist():
         # 使用后台缓存的订单簿/跨所差价，避免请求路径阻塞
         ob_snapshot = WATCHLIST_ORDERBOOK_SNAPSHOT.copy()
         payload['orderbook'] = ob_snapshot.get('orderbook') or {}
+        payload['monitor8010_bbo'] = ob_snapshot.get('monitor8010_bbo') or {}
+        payload['monitor8010_error'] = ob_snapshot.get('monitor8010_error')
         payload['cross_spreads'] = ob_snapshot.get('cross_spreads') or {}
         payload['orderbook_ts'] = ob_snapshot.get('timestamp')
         payload['orderbook_stale_reason'] = ob_snapshot.get('stale_reason')
@@ -2695,6 +3261,89 @@ def trigger_watchlist_refresh():
         return jsonify({'message': 'ok', 'timestamp': now_utc_iso(), 'summary': watchlist_manager.snapshot().get('summary')})
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+
+def _monitor_8010_base_url() -> Optional[str]:
+    if not bool(MONITOR_8010_CONFIG.get("enabled", True)):
+        return None
+    url = str(MONITOR_8010_CONFIG.get("base_url") or "").strip()
+    if not url:
+        return None
+    return url.rstrip("/")
+
+
+def _monitor_8010_timeout() -> float:
+    try:
+        return float(MONITOR_8010_CONFIG.get("timeout_seconds") or 3.0)
+    except Exception:
+        return 3.0
+
+
+def _proxy_get_8010(path: str) -> Any:
+    base = _monitor_8010_base_url()
+    if not base:
+        return {"ok": False, "error": "MONITOR_8010 disabled"}
+    resp = requests.get(f"{base}{path}", timeout=_monitor_8010_timeout())
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {"text": resp.text[:4000]}
+
+
+def _proxy_post_8010(path: str, payload: Dict[str, Any]) -> Any:
+    base = _monitor_8010_base_url()
+    if not base:
+        return {"ok": False, "error": "MONITOR_8010 disabled"}
+    resp = requests.post(f"{base}{path}", json=payload, timeout=_monitor_8010_timeout())
+    resp.raise_for_status()
+    try:
+        return resp.json()
+    except Exception:
+        return {"text": resp.text[:4000]}
+
+
+@app.route('/api/monitor8010/health')
+def api_monitor8010_health():
+    try:
+        return jsonify(_proxy_get_8010("/health"))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route('/api/monitor8010/watchlist')
+def api_monitor8010_watchlist():
+    try:
+        return jsonify(_proxy_get_8010("/watchlist"))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route('/api/monitor8010/watchlist/add', methods=['POST'])
+def api_monitor8010_watchlist_add():
+    try:
+        body = request.get_json(silent=True) or {}
+        return jsonify(_proxy_post_8010("/watchlist/add", body))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route('/api/monitor8010/watchlist/touch', methods=['POST'])
+def api_monitor8010_watchlist_touch():
+    try:
+        body = request.get_json(silent=True) or {}
+        return jsonify(_proxy_post_8010("/watchlist/touch", body))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
+
+
+@app.route('/api/monitor8010/watchlist/remove', methods=['POST'])
+def api_monitor8010_watchlist_remove():
+    try:
+        body = request.get_json(silent=True) or {}
+        return jsonify(_proxy_post_8010("/watchlist/remove", body))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 502
 
 
 @app.route('/watchlist/db')
@@ -4956,7 +5605,7 @@ if __name__ == '__main__':
     print("🔥 启动图表预热线程（7天大窗口）...")
     chart_prewarm_thread = threading.Thread(target=prewarm_chart_cache, name="chart-prewarm", daemon=True)
     chart_prewarm_thread.start()
-    
+
     print("🌐 启动Web服务器...")
     print("📊 系统状态监控: http://localhost:4002/api/system/status")
     

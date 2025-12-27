@@ -651,6 +651,7 @@ class WatchlistManager:
 
         ob_data = orderbook_snapshot or {}
         ob_orderbook = ob_data.get('orderbook') or {}
+        ob_monitor_bbo = ob_data.get('monitor8010_bbo') or {}
         ob_cross = ob_data.get('cross_spreads') or {}
         ob_ts = ob_data.get('timestamp')
         ob_stale = ob_data.get('stale_reason')
@@ -675,6 +676,23 @@ class WatchlistManager:
                 'reverse': pair.get('reverse'),
             }
 
+        def _compact_monitor_bbo(ex_map: Dict[str, Any]) -> Dict[str, Any]:
+            out: Dict[str, Any] = {}
+            for ex, ob in (ex_map or {}).items():
+                if not isinstance(ob, dict):
+                    continue
+                out[str(ex).strip().lower()] = {
+                    'bid_price': ob.get('bid_price'),
+                    'bid_size': ob.get('bid_size'),
+                    'ask_price': ob.get('ask_price'),
+                    'ask_size': ob.get('ask_size'),
+                    'exchange_timestamp': ob.get('exchange_timestamp'),
+                    'received_timestamp': ob.get('received_timestamp'),
+                    'processed_timestamp': ob.get('processed_timestamp'),
+                    'monitor_symbol': ob.get('monitor_symbol'),
+                }
+            return out
+
         rows: List[Dict[str, Any]] = []
         for entry in entries.values():
             if entry.status != 'active':
@@ -696,6 +714,7 @@ class WatchlistManager:
                 meta['snapshots'] = snaps_meta
             ob_entry = ob_orderbook.get(entry.symbol) if isinstance(ob_orderbook, dict) else None
             cs_entry = ob_cross.get(entry.symbol) if isinstance(ob_cross, dict) else None
+            bbo_entry = ob_monitor_bbo.get(entry.symbol) if isinstance(ob_monitor_bbo, dict) else None
             orderbook_meta: Dict[str, Any] = {}
             if ob_entry:
                 orderbook_meta['legs'] = [_compact_leg(l) for l in ob_entry.get('legs', [])]
@@ -708,6 +727,13 @@ class WatchlistManager:
                 orderbook_meta['ts'] = ob_ts
                 orderbook_meta['stale_reason'] = ob_stale
                 meta['orderbook'] = orderbook_meta
+            if isinstance(bbo_entry, dict) and bbo_entry:
+                # Store as many exchanges as available (8010 /snapshot may omit some pairs).
+                meta['monitor8010_bbo'] = {
+                    'ts': ob_ts,
+                    'stale_reason': ob_stale,
+                    'exchanges': _compact_monitor_bbo(bbo_entry),
+                }
             snaps = market_snapshots.get(entry.symbol) or {}
             futures_prices = [v.get('futures_price') for v in snaps.values() if v.get('futures_price')]
             funding_vals = [v.get('funding_rate') for v in snaps.values() if v.get('funding_rate') is not None]
