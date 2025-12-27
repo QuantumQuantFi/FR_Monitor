@@ -440,17 +440,16 @@ class WatchlistManager:
         new_entries: Dict[str, WatchlistEntry] = dict(self._entries)
 
         def _set_entry(symbol: str, entry: WatchlistEntry) -> None:
-            # A 优先，其次 B，再到 C；仅当已有 entry 处于 active 且优先级更高时跳过
+            # B/C 优先于 A（A 仅做展示，不应压制跨所信号）
             existing = new_entries.get(symbol)
-            priority = {'A': 2, 'B': 1, 'C': 0}
+            priority = {'B': 2, 'C': 1, 'A': 0}
             if existing and existing.status == 'active' and priority.get(existing.entry_type, 0) >= priority.get(entry.entry_type, 0):
                 return
             new_entries[symbol] = entry
 
         now_iso = _iso(now)
         for symbol, exch_data in market_snapshots.items():
-            if symbol in new_entries and new_entries[symbol].entry_type == 'A' and new_entries[symbol].status == 'active':
-                continue  # A 触发优先，不再尝试 B/C
+            # A 仅做展示，不阻断 B/C 判断
 
             futures_list = []
             spot_list = []
@@ -554,48 +553,80 @@ class WatchlistManager:
                 # 选 funding 足够的期货
                 futures_ok = [(ex, p, fr) for ex, p, fr in futures_list if fr is not None and fr >= self.type_c_funding_min]
                 if len(futures_ok) >= 2:
-                    # 取最高期货价与最低现货价
                     futures_ok.sort(key=lambda x: x[1], reverse=True)
                     spots_sorted = sorted(spot_list, key=lambda x: x[1])
-                    fut_ex, fut_price, fut_fr = futures_ok[0]
-                    spot_ex, spot_price = spots_sorted[0]
-                    base = spot_price
-                    if base:
-                        diff = (fut_price - spot_price) / base
-                        if diff > self.type_c_spread_threshold:
-                            # 再确认另一家期货资金费也满足
-                            second_fr = futures_ok[1][2]
-                            fut_snap = exch_data.get(fut_ex) or {}
-                            fut_interval = fut_snap.get('funding_interval_hours')
-                            fut_next_ft = fut_snap.get('next_funding_time')
-                            entry = WatchlistEntry(
-                                symbol=symbol,
-                                has_spot=True,
-                                has_perp=True,
-                                last_funding_rate=fut_fr,
-                                last_funding_time=None,
-                                funding_interval_hours=int(round(float(fut_interval))) if fut_interval else None,
-                                next_funding_time=_iso(fut_next_ft) if isinstance(fut_next_ft, datetime) else None,
-                                max_abs_funding=max(abs(fut_fr or 0), abs(second_fr or 0)),
-                                last_above_threshold_at=now_iso,
-                                added_at=now_iso,
-                                status='active',
-                                removal_reason=None,
-                                updated_at=now_iso,
-                                entry_type='C',
-                                trigger_details={
-                                    'spot_exchange': spot_ex,
-                                    'futures_exchange': fut_ex,
-                                    'spot_price': spot_price,
-                                    'futures_price': fut_price,
-                                    'spread': diff,
-                                    'funding': {
-                                        fut_ex: fut_fr,
-                                        futures_ok[1][0]: second_fr,
-                                    },
-                                },
+                    best_c = None
+                    candidate_pairs: List[Dict[str, Any]] = []
+                    for fut_ex, fut_price, fut_fr in futures_ok:
+                        for spot_ex, spot_price in spots_sorted:
+                            base = spot_price
+                            if not base:
+                                continue
+                            diff = (fut_price - spot_price) / base
+                            if diff <= 0:
+                                continue
+                            candidate_pairs.append(
+                                {
+                                    "pair": [spot_ex, fut_ex],
+                                    "spread": diff,
+                                    "prices": {spot_ex: spot_price, fut_ex: fut_price},
+                                    "funding": {fut_ex: fut_fr},
+                                    "market_types": {spot_ex: "spot", fut_ex: "perp"},
+                                }
                             )
-                            _set_entry(symbol, entry)
+                            if diff > self.type_c_spread_threshold and (best_c is None or diff > best_c["spread"]):
+                                best_c = {
+                                    "spot_exchange": spot_ex,
+                                    "futures_exchange": fut_ex,
+                                    "spot_price": spot_price,
+                                    "futures_price": fut_price,
+                                    "spread": diff,
+                                    "funding": {fut_ex: fut_fr},
+                                    "pair": [spot_ex, fut_ex],
+                                    "prices": {spot_ex: spot_price, fut_ex: fut_price},
+                                    "market_types": {spot_ex: "spot", fut_ex: "perp"},
+                                }
+                    if best_c:
+                        # 再确认另一家期货资金费也满足（只做门控，不影响方向）
+                        second_fr = futures_ok[1][2]
+                        best_c["funding"][futures_ok[1][0]] = second_fr
+
+                        candidate_pairs_sorted = sorted(
+                            candidate_pairs, key=lambda x: float(x.get("spread") or 0.0), reverse=True
+                        )
+                        top_n = 10
+                        best_c["candidate_pairs"] = candidate_pairs_sorted[:top_n]
+                        candidate_exchanges: List[str] = []
+                        for c in best_c["candidate_pairs"]:
+                            p = c.get("pair") or []
+                            if isinstance(p, list) and len(p) == 2:
+                                for ex in p:
+                                    exs = str(ex)
+                                    if exs and exs not in candidate_exchanges:
+                                        candidate_exchanges.append(exs)
+                        best_c["candidate_exchanges"] = candidate_exchanges
+
+                        fut_snap = exch_data.get(best_c["futures_exchange"]) or {}
+                        fut_interval = fut_snap.get('funding_interval_hours')
+                        fut_next_ft = fut_snap.get('next_funding_time')
+                        entry = WatchlistEntry(
+                            symbol=symbol,
+                            has_spot=True,
+                            has_perp=True,
+                            last_funding_rate=best_c["funding"].get(best_c["futures_exchange"]),
+                            last_funding_time=None,
+                            funding_interval_hours=int(round(float(fut_interval))) if fut_interval else None,
+                            next_funding_time=_iso(fut_next_ft) if isinstance(fut_next_ft, datetime) else None,
+                            max_abs_funding=max(abs(best_c["funding"].get(best_c["futures_exchange"]) or 0), abs(second_fr or 0)),
+                            last_above_threshold_at=now_iso,
+                            added_at=now_iso,
+                            status='active',
+                            removal_reason=None,
+                            updated_at=now_iso,
+                            entry_type='C',
+                            trigger_details=best_c,
+                        )
+                        _set_entry(symbol, entry)
 
         self._entries = new_entries
         self._emit_pg_raw(new_entries, market_snapshots, now, orderbook_snapshot or {})

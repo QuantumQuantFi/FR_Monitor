@@ -328,6 +328,9 @@ LIVE_TRADING_CONFIG = {
     # 入场阈值：同时满足 pnl_hat 与 win_prob（默认 240min）
     'pnl_threshold': float(_get_private('LIVE_TRADING_PNL_THRESHOLD', 'LIVE_TRADING_PNL_THRESHOLD', '0.0085')),
     'win_prob_threshold': float(_get_private('LIVE_TRADING_WIN_PROB_THRESHOLD', 'LIVE_TRADING_WIN_PROB_THRESHOLD', '0.85')),
+    # Type C v1 阈值：仅用于 signal-only（默认与 Type B v1 保持一致）
+    'type_c_pnl_threshold': float(_get_private('LIVE_TRADING_C_PNL_THRESHOLD', 'LIVE_TRADING_C_PNL_THRESHOLD', '0.0085')),
+    'type_c_win_prob_threshold': float(_get_private('LIVE_TRADING_C_WIN_PROB_THRESHOLD', 'LIVE_TRADING_C_WIN_PROB_THRESHOLD', '0.85')),
     # v2 预测触发阈值（v2 的 win_prob 分布整体低于 v1；默认适度放宽以确保能触发）
     'v2_enabled': _is_truthy(_get_private('LIVE_TRADING_V2_ENABLED', 'LIVE_TRADING_V2_ENABLED', '1')),
     # v2 阈值：可按 horizon 独立配置；默认值以“每天触发量可控 + 不至于长期 0 v2 开仓”为目标。
