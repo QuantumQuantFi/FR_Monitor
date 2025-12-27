@@ -96,6 +96,8 @@ class LiveTradingConfig:
     horizon_min: int = 240
     pnl_threshold: float = 0.0085
     win_prob_threshold: float = 0.85
+    type_c_pnl_threshold: float = 0.0085
+    type_c_win_prob_threshold: float = 0.85
     v2_enabled: bool = True
     v2_pnl_threshold_240: float = 0.0065
     v2_win_prob_threshold_240: float = 0.72
@@ -150,9 +152,10 @@ class LiveTradingConfig:
 class LiveTradingManager:
     """
     Minimal live trading loop (Phase 1):
-    - Read Type B candidates from watchlist.watch_signal_event (PG).
+    - Read Type B/C candidates from watchlist.watch_signal_event (PG).
     - Apply thresholds (pnl_hat/win_prob at horizon=240).
     - Revalidate using orderbook sweep prices with per-leg notional.
+    - Type C: signal-only (recorded as skipped) until spot trading is enabled.
     - Enforce: max 10 concurrent, one active trade per symbol.
     - Execute 2-leg perp market orders (long low, short high).
     - Record signals/orders/errors in PG tables under schema=watchlist.
@@ -2132,6 +2135,10 @@ class LiveTradingManager:
         v1_prob = _safe_float(event.get("win_prob_240"))
         v1_thr_pnl = float(self.config.pnl_threshold)
         v1_thr_prob = float(self.config.win_prob_threshold)
+        signal_type = str(event.get("signal_type") or "").strip().upper()
+        if signal_type == "C":
+            v1_thr_pnl = float(getattr(self.config, "type_c_pnl_threshold", v1_thr_pnl))
+            v1_thr_prob = float(getattr(self.config, "type_c_win_prob_threshold", v1_thr_prob))
         v1_pass = bool(
             v1_pnl is not None
             and v1_prob is not None
@@ -2139,7 +2146,7 @@ class LiveTradingManager:
             and float(v1_prob) >= v1_thr_prob
         )
 
-        v2_enabled = bool(getattr(self.config, "v2_enabled", True))
+        v2_enabled = bool(getattr(self.config, "v2_enabled", True)) and signal_type != "C"
         v2_240_thr_pnl = float(getattr(self.config, "v2_pnl_threshold_240", self.config.pnl_threshold))
         v2_240_thr_prob = float(getattr(self.config, "v2_win_prob_threshold_240", self.config.win_prob_threshold))
         v2_1440_thr_pnl = float(getattr(self.config, "v2_pnl_threshold_1440", self.config.pnl_threshold))
@@ -2374,7 +2381,7 @@ class LiveTradingManager:
               LEFT JOIN watchlist.live_trade_signal s
                 ON s.event_id = e.id
               WHERE s.event_id IS NULL
-                AND e.signal_type = 'B'
+                AND e.signal_type IN ('B','C')
                 AND (e.features_agg #> '{meta_last,factors}') IS NOT NULL
                 AND COALESCE(
                     (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}'),
@@ -2391,16 +2398,24 @@ class LiveTradingManager:
               WHERE decision_ts >= now() - make_interval(mins := %s)
                 AND (
                   (
-                    pnl_hat_240 >= %s
+                    signal_type = 'C'
+                    AND pnl_hat_240 >= %s
                     AND win_prob_240 >= %s
                   )
                   OR (
-                    v2_ok_240 IS TRUE
+                    signal_type = 'B'
+                    AND pnl_hat_240 >= %s
+                    AND win_prob_240 >= %s
+                  )
+                  OR (
+                    signal_type = 'B'
+                    AND v2_ok_240 IS TRUE
                     AND v2_pnl_hat_240 >= %s
                     AND v2_win_prob_240 >= %s
                   )
                   OR (
-                    v2_ok_1440 IS TRUE
+                    signal_type = 'B'
+                    AND v2_ok_1440 IS TRUE
                     AND v2_pnl_hat_1440 >= %s
                     AND v2_win_prob_1440 >= %s
                   )
@@ -2423,6 +2438,8 @@ class LiveTradingManager:
             """,
             (
                 int(self.config.event_lookback_minutes),
+                float(getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)),
+                float(getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)),
                 float(self.config.pnl_threshold),
                 float(self.config.win_prob_threshold),
                 float(v2_pnl_240),
@@ -2847,6 +2864,7 @@ class LiveTradingManager:
 
     def _collect_pred_candidates(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
         candidates: List[Dict[str, Any]] = []
+        signal_type = str(event.get("signal_type") or "").strip().upper()
 
         def _add_candidate(
             source: str,
@@ -2885,6 +2903,17 @@ class LiveTradingManager:
                     payload["ob_pnl_hat"] = ob_pnl_f
                     payload["ob_win_prob"] = ob_prob_f
                 candidates.append(payload)
+
+        if signal_type == "C":
+            _add_candidate(
+                "v1_240",
+                int(self.config.horizon_min),
+                event.get("pnl_hat_240"),
+                event.get("win_prob_240"),
+                float(getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)),
+                float(getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)),
+            )
+            return candidates
 
         _add_candidate(
             "v1_240",
@@ -3384,6 +3413,7 @@ class LiveTradingManager:
             JOIN watchlist.watch_signal_event e
               ON e.id = s.event_id
             WHERE s.status='skipped'
+              AND e.signal_type = 'B'
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
               AND (
                 e.status = 'open'
@@ -3720,6 +3750,49 @@ class LiveTradingManager:
                             "reason": "below_threshold",
                             "symbol": symbol,
                             "event_id": event_id,
+                        },
+                    )
+                    continue
+
+                signal_type = str(event.get("signal_type") or "").strip().upper()
+                if signal_type == "C":
+                    chosen_reval = self._chosen_reval_from_event(event, pred_choice)
+                    long_ex = str(chosen_reval.get("long_exchange") or "") if isinstance(chosen_reval, dict) else ""
+                    short_ex = str(chosen_reval.get("short_exchange") or "") if isinstance(chosen_reval, dict) else ""
+                    if not (long_ex and short_ex):
+                        td = event.get("trigger_details") if isinstance(event.get("trigger_details"), dict) else {}
+                        spot_ex = td.get("spot_exchange")
+                        perp_ex = td.get("futures_exchange")
+                        if not spot_ex or not perp_ex:
+                            pair = td.get("pair") or []
+                            mtypes = td.get("market_types") or {}
+                            if (
+                                isinstance(pair, list)
+                                and len(pair) == 2
+                                and isinstance(mtypes, dict)
+                            ):
+                                a, b = str(pair[0]), str(pair[1])
+                                mt_a = str(mtypes.get(a) or "").lower()
+                                mt_b = str(mtypes.get(b) or "").lower()
+                                if mt_a == "spot" and mt_b == "perp":
+                                    spot_ex, perp_ex = a, b
+                                elif mt_a == "perp" and mt_b == "spot":
+                                    spot_ex, perp_ex = b, a
+                        long_ex = str(spot_ex or "")
+                        short_ex = str(perp_ex or "")
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange=long_ex,
+                        leg_short_exchange=short_ex,
+                        reason="signal_only",
+                        payload={
+                            "decision": "signal_only",
+                            "reason": "signal_only",
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "pred_choice": pred_choice,
+                            "orderbook_validation": event.get("orderbook_validation"),
                         },
                     )
                     continue

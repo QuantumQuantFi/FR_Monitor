@@ -1136,7 +1136,7 @@ def _watchlist_preload_worker() -> None:
 if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"0", "false", "no", "off"}:
     threading.Thread(target=_watchlist_preload_worker, name="watchlist-preload", daemon=True).start()
 
-# Live trading manager (Phase 1: Type B only). Default disabled via LIVE_TRADING_CONFIG.
+# Live trading manager (Phase 1: Type B trading + Type C signal-only). Default disabled via LIVE_TRADING_CONFIG.
 live_trading_manager = LiveTradingManager(
     LiveTradingConfig(
         enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
@@ -1149,6 +1149,8 @@ live_trading_manager = LiveTradingManager(
         horizon_min=int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
         pnl_threshold=float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.012)),
         win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.93)),
+        type_c_pnl_threshold=float(LIVE_TRADING_CONFIG.get('type_c_pnl_threshold', 0.012)),
+        type_c_win_prob_threshold=float(LIVE_TRADING_CONFIG.get('type_c_win_prob_threshold', 0.93)),
         v2_enabled=bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
         v2_pnl_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.012)),
         v2_win_prob_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.92)),
