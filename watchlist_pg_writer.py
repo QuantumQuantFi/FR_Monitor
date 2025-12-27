@@ -156,7 +156,7 @@ class PgWriter:
             try:
                 is_triggered = bool(row.get("triggered"))
                 sig_type = str(row.get("signal_type") or "").strip().upper()
-                if is_triggered and sig_type == "B":
+                if is_triggered and sig_type in ("B", "C"):
                     meta = row.get("meta") if isinstance(row.get("meta"), dict) else {}
                     pnl_reg = meta.get("pnl_regression") if isinstance(meta, dict) else None
                     pred = (pnl_reg or {}).get("pred") if isinstance(pnl_reg, dict) else None
@@ -179,6 +179,9 @@ class PgWriter:
 
                         pnl_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("pnl_threshold", 0.0085))
                         prob_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("win_prob_threshold", 0.85))
+                        if sig_type == "C":
+                            pnl_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("type_c_pnl_threshold", pnl_thr))
+                            prob_thr = float((_cfg.LIVE_TRADING_CONFIG or {}).get("type_c_win_prob_threshold", prob_thr))
                     except Exception:
                         pnl_thr = 0.0085
                         prob_thr = 0.85
@@ -895,7 +898,7 @@ class PgWriter:
 
     def _maybe_add_orderbook_validation(self, ins: Dict[str, Any]) -> Dict[str, Any]:
         """
-        在写入 watch_signal_event 的“首次 INSERT”时，按需补齐订单簿口径的验证结果与预测（TypeB）。
+        在写入 watch_signal_event 的“首次 INSERT”时，按需补齐订单簿口径的验证结果与预测（Type B/C）。
 
         目标：
         - 使用与 live trading 一致的 “按名义金额扫订单簿 buy/sell 可成交价” 口径，重算
@@ -903,8 +906,10 @@ class PgWriter:
         - 只对“高概率存在价差”的信号做订单簿请求，避免每个 raw 都打订单簿。
         """
         try:
-            if str(ins.get("signal_type") or "").strip().upper() != "B":
+            stype = str(ins.get("signal_type") or "").strip().upper()
+            if stype not in ("B", "C"):
                 return ins
+            is_type_c = stype == "C"
 
             features_agg = ins.get("features_agg")
             if not isinstance(features_agg, dict):
@@ -919,9 +924,10 @@ class PgWriter:
                 return ins
             pair = trigger.get("pair") or []
             if not (isinstance(pair, list) and len(pair) == 2):
-                return ins
-            ex1, ex2 = str(pair[0]), str(pair[1])
-            if not ex1 or not ex2:
+                if not is_type_c:
+                    return ins
+            ex1, ex2 = (str(pair[0]), str(pair[1])) if isinstance(pair, list) and len(pair) == 2 else ("", "")
+            if not is_type_c and (not ex1 or not ex2):
                 return ins
 
             # Candidate exchanges/pairs: best-effort context for Top-K orderbook validation.
@@ -948,6 +954,7 @@ class PgWriter:
                         "spread": sp,
                         "prices": cp.get("prices") if isinstance(cp.get("prices"), dict) else None,
                         "funding": cp.get("funding") if isinstance(cp.get("funding"), dict) else None,
+                        "market_types": cp.get("market_types") if isinstance(cp.get("market_types"), dict) else None,
                     }
                 )
             if not candidate_pairs_norm:
@@ -957,6 +964,7 @@ class PgWriter:
                         "spread": float(trigger.get("spread")) if trigger.get("spread") is not None else None,
                         "prices": trigger.get("prices") if isinstance(trigger.get("prices"), dict) else None,
                         "funding": trigger.get("funding") if isinstance(trigger.get("funding"), dict) else None,
+                        "market_types": trigger.get("market_types") if isinstance(trigger.get("market_types"), dict) else None,
                     }
                 ]
 
@@ -985,7 +993,10 @@ class PgWriter:
                 lt_cfg = getattr(_cfg, "LIVE_TRADING_CONFIG", {}) or {}
                 v1_thr_pnl = float(lt_cfg.get("pnl_threshold", 0.0085))
                 v1_thr_prob = float(lt_cfg.get("win_prob_threshold", 0.85))
-                v2_enabled = bool(lt_cfg.get("v2_enabled", True))
+                if is_type_c:
+                    v1_thr_pnl = float(lt_cfg.get("type_c_pnl_threshold", v1_thr_pnl))
+                    v1_thr_prob = float(lt_cfg.get("type_c_win_prob_threshold", v1_thr_prob))
+                v2_enabled = bool(lt_cfg.get("v2_enabled", True)) and (not is_type_c)
                 v2_thr_pnl_240 = float(lt_cfg.get("v2_pnl_threshold_240", v1_thr_pnl))
                 v2_thr_prob_240 = float(lt_cfg.get("v2_win_prob_threshold_240", v1_thr_prob))
                 v2_thr_pnl_1440 = float(lt_cfg.get("v2_pnl_threshold_1440", v1_thr_pnl))
@@ -993,7 +1004,7 @@ class PgWriter:
             except Exception:
                 v1_thr_pnl = 0.0085
                 v1_thr_prob = 0.85
-                v2_enabled = True
+                v2_enabled = not is_type_c
                 v2_thr_pnl_240 = v1_thr_pnl
                 v2_thr_prob_240 = v1_thr_prob
                 v2_thr_pnl_1440 = v1_thr_pnl
@@ -1096,6 +1107,9 @@ class PgWriter:
                 topk_exchanges = max(2, min(10, topk_exchanges))
                 live_pnl_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("pnl_threshold") or 0.0)
                 live_prob_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("win_prob_threshold") or 0.0)
+                if is_type_c:
+                    live_pnl_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("type_c_pnl_threshold") or live_pnl_threshold)
+                    live_prob_threshold = float(_cfg.LIVE_TRADING_CONFIG.get("type_c_win_prob_threshold") or live_prob_threshold)
             except Exception:
                 _cfg = None
                 # Safe defaults when config import fails.
@@ -1108,6 +1122,249 @@ class PgWriter:
 
             symbol = str(ins.get("symbol") or "")
             if not symbol:
+                return ins
+
+            if is_type_c:
+                def _extract_c_pair(cp: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+                    spot_ex = None
+                    perp_ex = None
+                    if isinstance(cp, dict):
+                        spot_ex = cp.get("spot_exchange")
+                        perp_ex = cp.get("futures_exchange") or cp.get("perp_exchange")
+                        pair = cp.get("pair") or []
+                        mtypes = cp.get("market_types") or {}
+                        if (
+                            (not spot_ex or not perp_ex)
+                            and isinstance(pair, list)
+                            and len(pair) == 2
+                            and isinstance(mtypes, dict)
+                        ):
+                            a, b = str(pair[0]), str(pair[1])
+                            mt_a = str(mtypes.get(a) or "").lower()
+                            mt_b = str(mtypes.get(b) or "").lower()
+                            if mt_a == "spot" and mt_b == "perp":
+                                spot_ex, perp_ex = a, b
+                            elif mt_a == "perp" and mt_b == "spot":
+                                spot_ex, perp_ex = b, a
+                    return (str(spot_ex) if spot_ex else None, str(perp_ex) if perp_ex else None)
+
+                spot_ranked: List[str] = []
+                perp_ranked: List[str] = []
+                cps_sorted = sorted(candidate_pairs_norm, key=lambda x: float(x.get("spread") or 0.0), reverse=True)
+                for cp in cps_sorted:
+                    spot_ex, perp_ex = _extract_c_pair(cp)
+                    if spot_ex and spot_ex not in spot_ranked:
+                        spot_ranked.append(spot_ex)
+                    if perp_ex and perp_ex not in perp_ranked:
+                        perp_ranked.append(perp_ex)
+                    if len(spot_ranked) >= topk_exchanges and len(perp_ranked) >= topk_exchanges:
+                        break
+
+                if not spot_ranked or not perp_ranked:
+                    spot_ex = str(trigger.get("spot_exchange") or "").strip()
+                    perp_ex = str(trigger.get("futures_exchange") or "").strip()
+                    if spot_ex and spot_ex not in spot_ranked:
+                        spot_ranked.append(spot_ex)
+                    if perp_ex and perp_ex not in perp_ranked:
+                        perp_ranked.append(perp_ex)
+
+                if allowed_set:
+                    spot_ranked = [ex for ex in spot_ranked if ex.lower() in allowed_set]
+                    perp_ranked = [ex for ex in perp_ranked if ex.lower() in allowed_set]
+
+                if not spot_ranked or not perp_ranked:
+                    return ins
+
+                orderbooks: Dict[str, Any] = {}
+                spot_ok: List[str] = []
+                perp_ok: List[str] = []
+                for ex in spot_ranked:
+                    try:
+                        ob = fetch_orderbook_prices(ex, symbol, "spot", notional=notional)
+                    except Exception as exc:
+                        ob = {"error": "exception", "exception": f"{type(exc).__name__}: {exc}"}
+                    ex_row = orderbooks.get(ex)
+                    if not isinstance(ex_row, dict):
+                        ex_row = {}
+                    ex_row["spot"] = ob
+                    orderbooks[ex] = ex_row
+                    try:
+                        if ob and not ob.get("error") and ob.get("buy") is not None and ob.get("sell") is not None:
+                            spot_ok.append(ex)
+                    except Exception:
+                        continue
+
+                for ex in perp_ranked:
+                    try:
+                        ob = fetch_orderbook_prices(ex, symbol, "perp", notional=notional)
+                    except Exception as exc:
+                        ob = {"error": "exception", "exception": f"{type(exc).__name__}: {exc}"}
+                    ex_row = orderbooks.get(ex)
+                    if not isinstance(ex_row, dict):
+                        ex_row = {}
+                    ex_row["perp"] = ob
+                    orderbooks[ex] = ex_row
+                    try:
+                        if ob and not ob.get("error") and ob.get("buy") is not None and ob.get("sell") is not None:
+                            perp_ok.append(ex)
+                    except Exception:
+                        continue
+
+                if not spot_ok or not perp_ok:
+                    meta_last["orderbook_validation"] = {
+                        "ok": False,
+                        "reason": "orderbook_unavailable",
+                        "ts": _utcnow().isoformat(),
+                        "notional_usdt": notional,
+                        "market_type": "spot-perp",
+                        "spot_exchanges": spot_ranked,
+                        "perp_exchanges": perp_ranked,
+                        "orderbooks": orderbooks,
+                    }
+                    features_agg["meta_last"] = meta_last
+                    ins["features_agg"] = features_agg
+                    return ins
+
+                base_factors = meta_last.get("factors") or {}
+                if not isinstance(base_factors, dict):
+                    base_factors = {}
+
+                evaluated: List[Dict[str, Any]] = []
+                best: Optional[Dict[str, Any]] = None
+                best_score: Tuple[float, float] = (-1e9, -1e9)
+
+                for spot_ex in spot_ok:
+                    for perp_ex in perp_ok:
+                        ob_spot = (orderbooks.get(spot_ex) or {}).get("spot") or {}
+                        ob_perp = (orderbooks.get(perp_ex) or {}).get("perp") or {}
+                        long_px = ob_spot.get("buy")
+                        short_px = ob_perp.get("sell")
+                        try:
+                            short_f = float(short_px)
+                            long_f = float(long_px)
+                        except Exception:
+                            evaluated.append(
+                                {
+                                    "spot_exchange": str(spot_ex),
+                                    "perp_exchange": str(perp_ex),
+                                    "short_px": short_px,
+                                    "long_px": long_px,
+                                    "tradable_spread": None,
+                                    "entry_spread_metric": None,
+                                    "note": "px_parse_error",
+                                }
+                            )
+                            continue
+                        if short_f <= 0 or long_f <= 0:
+                            evaluated.append(
+                                {
+                                    "spot_exchange": str(spot_ex),
+                                    "perp_exchange": str(perp_ex),
+                                    "short_px": float(short_f),
+                                    "long_px": float(long_f),
+                                    "tradable_spread": None,
+                                    "entry_spread_metric": None,
+                                    "note": "non_positive_px",
+                                }
+                            )
+                            continue
+
+                        tradable_spread = (short_f - long_f) / long_f
+                        entry_spread_metric = float(math.log(short_f / long_f))
+
+                        factors = dict(base_factors)
+                        factors["spread_log_short_over_long"] = float(entry_spread_metric)
+                        factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
+                        pred = predict_bc(signal_type="C", factors=factors, horizons=(240,))
+                        pred_map = (pred or {}).get("pred") or {}
+                        hpred = pred_map.get("240") or {}
+                        pnl_hat_ob = hpred.get("pnl_hat")
+                        win_prob_ob = hpred.get("win_prob")
+
+                        evaluated.append(
+                            {
+                                "spot_exchange": str(spot_ex),
+                                "perp_exchange": str(perp_ex),
+                                "short_px": float(short_f),
+                                "long_px": float(long_f),
+                                "tradable_spread": float(tradable_spread),
+                                "entry_spread_metric": float(entry_spread_metric),
+                                "pnl_hat": float(pnl_hat_ob) if pnl_hat_ob is not None else None,
+                                "win_prob": float(win_prob_ob) if win_prob_ob is not None else None,
+                                "ok": bool(
+                                    pnl_hat_ob is not None
+                                    and win_prob_ob is not None
+                                    and float(pnl_hat_ob) >= float(live_pnl_threshold)
+                                    and float(win_prob_ob) >= float(live_prob_threshold)
+                                    and tradable_spread > 0
+                                ),
+                            }
+                        )
+
+                        if pnl_hat_ob is None or win_prob_ob is None:
+                            continue
+                        if tradable_spread <= 0:
+                            continue
+                        score = (float(pnl_hat_ob), float(win_prob_ob))
+                        if score > best_score:
+                            best_score = score
+                            best = {
+                                "long_exchange": str(spot_ex),
+                                "short_exchange": str(perp_ex),
+                                "long_px": float(long_f),
+                                "short_px": float(short_f),
+                                "pnl_hat_ob": float(pnl_hat_ob),
+                                "win_prob_ob": float(win_prob_ob),
+                                "tradable_spread": float(tradable_spread),
+                                "entry_spread_metric": float(entry_spread_metric),
+                                "factors": factors,
+                            }
+
+                if not best:
+                    meta_last["orderbook_validation"] = {
+                        "ok": False,
+                        "reason": "no_tradable_direction",
+                        "ts": _utcnow().isoformat(),
+                        "notional_usdt": notional,
+                        "market_type": "spot-perp",
+                        "spot_exchanges": spot_ranked,
+                        "perp_exchanges": perp_ranked,
+                        "orderbooks": orderbooks,
+                        "candidates": evaluated,
+                    }
+                    features_agg["meta_last"] = meta_last
+                    ins["features_agg"] = features_agg
+                    return ins
+
+                meta_last["orderbook_validation"] = {
+                    "ok": bool(best["pnl_hat_ob"] >= live_pnl_threshold and best["win_prob_ob"] >= live_prob_threshold),
+                    "reason": None,
+                    "ts": _utcnow().isoformat(),
+                    "notional_usdt": notional,
+                    "market_type": "spot-perp",
+                    "threshold": {"pnl": live_pnl_threshold, "win_prob": live_prob_threshold},
+                    "spot_exchanges": spot_ranked,
+                    "perp_exchanges": perp_ranked,
+                    "orderbooks": orderbooks,
+                    "candidates": evaluated,
+                    "chosen": {
+                        "long_exchange": best["long_exchange"],
+                        "short_exchange": best["short_exchange"],
+                        "long_px": best.get("long_px"),
+                        "short_px": best.get("short_px"),
+                        "tradable_spread": best["tradable_spread"],
+                        "entry_spread_metric": best["entry_spread_metric"],
+                        "pnl_hat": best["pnl_hat_ob"],
+                        "win_prob": best["win_prob_ob"],
+                    },
+                }
+                meta_last["pnl_regression_ob"] = {
+                    "model": ((pnl_reg or {}).get("model") if isinstance(pnl_reg, dict) else None),
+                    "fee_threshold": ((pnl_reg or {}).get("fee_threshold") if isinstance(pnl_reg, dict) else None),
+                    "pred": {"240": {"pnl_hat": best["pnl_hat_ob"], "win_prob": best["win_prob_ob"]}},
+                }
+                features_agg["meta_last"] = meta_last
+                ins["features_agg"] = features_agg
                 return ins
 
             # Build Top-K exchanges list, so we can evaluate many pairs in-memory while
