@@ -35,18 +35,25 @@ from watchlist_pnl_regression_model import predict_bc
 from trading.trade_executor import (
     TradeExecutionError,
     execute_perp_market_order,
+    execute_spot_market_order,
     place_binance_perp_market_order,
     get_binance_perp_usdt_balance,
     get_binance_perp_positions,
     get_binance_perp_order,
+    get_binance_spot_balance,
+    get_binance_spot_order,
     get_binance_funding_fee_income,
     get_bybit_linear_order,
     get_bybit_linear_positions,
     get_bybit_wallet_balance,
+    get_bybit_spot_balance,
+    get_bybit_spot_order,
     get_bybit_funding_fee_transactions,
     get_bitget_usdt_perp_order_detail,
     get_bitget_usdt_perp_positions,
     get_bitget_usdt_balance,
+    get_bitget_spot_balance,
+    get_bitget_spot_order_detail,
     get_bitget_funding_fee_bills,
     get_hyperliquid_balance_summary,
     get_hyperliquid_perp_positions,
@@ -65,6 +72,8 @@ from trading.trade_executor import (
     place_bybit_linear_market_order,
     place_hyperliquid_perp_market_order,
     get_okx_swap_order,
+    get_okx_spot_order,
+    get_okx_spot_balance,
     place_okx_swap_market_order,
     get_okx_funding_fee_bills,
     set_binance_perp_leverage,
@@ -98,6 +107,9 @@ class LiveTradingConfig:
     win_prob_threshold: float = 0.85
     type_c_pnl_threshold: float = 0.0085
     type_c_win_prob_threshold: float = 0.85
+    spot_trading_enabled: bool = False
+    spot_allowed_exchanges: Tuple[str, ...] = ("binance", "okx", "bybit", "bitget")
+    spot_per_leg_notional_usdt: Optional[float] = None
     v2_enabled: bool = True
     v2_pnl_threshold_240: float = 0.0065
     v2_win_prob_threshold_240: float = 0.72
@@ -155,7 +167,7 @@ class LiveTradingManager:
     - Read Type B/C candidates from watchlist.watch_signal_event (PG).
     - Apply thresholds (pnl_hat/win_prob at horizon=240).
     - Revalidate using orderbook sweep prices with per-leg notional.
-    - Type C: signal-only (recorded as skipped) until spot trading is enabled.
+    - Type C: spot-perp when spot_trading_enabled; otherwise signal-only.
     - Enforce: max 10 concurrent, one active trade per symbol.
     - Execute 2-leg perp market orders (long low, short high).
     - Record signals/orders/errors in PG tables under schema=watchlist.
@@ -391,6 +403,7 @@ class LiveTradingManager:
             long_ex = str(row.get("leg_long_exchange") or "").lower()
             short_ex = str(row.get("leg_short_exchange") or "").lower()
             status = str(row.get("status") or "").lower()
+            signal_type = str(row.get("signal_type") or "").strip().upper()
 
             if not symbol or not long_ex or not short_ex:
                 return {
@@ -433,6 +446,7 @@ class LiveTradingManager:
                     short_ex=short_ex,
                     close_reason="manual",
                     status_before=status,
+                    signal_type=signal_type,
                 )
 
     def manual_flatten_position(self, *, exchange: str, symbol: str) -> Dict[str, Any]:
@@ -561,12 +575,14 @@ class LiveTradingManager:
         short_ex: str,
         close_reason: str,
         status_before: Optional[str] = None,
+        signal_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Close/flatten both legs for a signal using the given DB connection (no external locks)."""
         sid = int(signal_id)
         symbol_u = (symbol or "").upper()
         long_ex_l = (long_ex or "").lower()
         short_ex_l = (short_ex or "").lower()
+        long_mkt, short_mkt = self._resolve_leg_market_types(signal_type or "")
 
         conn.execute(
             """
@@ -583,8 +599,8 @@ class LiveTradingManager:
         )
 
         with ThreadPoolExecutor(max_workers=2) as pool:
-            fut_a = pool.submit(self._get_exchange_position_size, long_ex_l, symbol_u)
-            fut_b = pool.submit(self._get_exchange_position_size, short_ex_l, symbol_u)
+            fut_a = pool.submit(self._get_exchange_position_size, long_ex_l, symbol_u, long_mkt)
+            fut_b = pool.submit(self._get_exchange_position_size, short_ex_l, symbol_u, short_mkt)
             pos_a = fut_a.result()
             pos_b = fut_b.result()
 
@@ -613,14 +629,16 @@ class LiveTradingManager:
             qty = abs(float(size))
             client_id = f"{close_base}-{client_suffix}"
             try:
+                leg_mkt = long_mkt if leg_name == "long" else short_mkt
                 resp = self._place_close_order(
                     exchange=ex,
                     symbol=symbol_u,
                     position_leg=pos_leg,
                     quantity=qty,
                     client_order_id=client_id,
+                    market_type=leg_mkt,
                 )
-                fill = self._parse_fill_fields(ex, symbol_u, resp)
+                fill = self._parse_fill_fields(ex, symbol_u, resp, market_type=leg_mkt)
                 order_param = _jsonb(resp) if resp is not None else None
                 side = "short" if pos_leg == "long" else "long"
                 conn.execute(
@@ -638,7 +656,7 @@ class LiveTradingManager:
                         leg_name,
                         ex,
                         side,
-                        "perp",
+                        leg_mkt,
                         None,
                         str(qty),
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
@@ -677,8 +695,8 @@ class LiveTradingManager:
         for _ in range(6):
             time.sleep(0.6)
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_a2 = pool.submit(self._get_exchange_position_size, long_ex_l, symbol_u)
-                fut_b2 = pool.submit(self._get_exchange_position_size, short_ex_l, symbol_u)
+                fut_a2 = pool.submit(self._get_exchange_position_size, long_ex_l, symbol_u, long_mkt)
+                fut_b2 = pool.submit(self._get_exchange_position_size, short_ex_l, symbol_u, short_mkt)
                 a2 = fut_a2.result()
                 b2 = fut_b2.result()
             after = {"long_exchange": a2, "short_exchange": b2}
@@ -1263,7 +1281,14 @@ class LiveTradingManager:
             ),
         )
 
-    def _parse_fill_fields(self, exchange: str, symbol: str, order: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    def _parse_fill_fields(
+        self,
+        exchange: str,
+        symbol: str,
+        order: Optional[Dict[str, Any]],
+        *,
+        market_type: str = "perp",
+    ) -> Dict[str, Any]:
         """
         Best-effort extraction of actual fill metrics for storage/UI.
 
@@ -1278,6 +1303,7 @@ class LiveTradingManager:
             return {}
 
         ex = (exchange or "").lower().strip()
+        mkt = (market_type or "perp").lower().strip()
 
         def _float_or_none(val: Any) -> Optional[float]:
             if val is None:
@@ -1298,6 +1324,147 @@ class LiveTradingManager:
             return {}
 
         info: Dict[str, Any] = {}
+
+        if mkt == "spot":
+            if ex == "binance":
+                info["exchange_order_id"] = str(order.get("orderId") or "") or None
+                info["filled_qty"] = _float_or_none(order.get("executedQty"))
+                info["cum_quote"] = _float_or_none(
+                    order.get("cummulativeQuoteQty") or order.get("cumQuote") or order.get("cumQuoteQty")
+                )
+                status = order.get("status")
+                info["status"] = str(status) if status is not None else None
+                fills = order.get("fills")
+                if isinstance(fills, list) and fills:
+                    sum_qty = 0.0
+                    sum_quote = 0.0
+                    for f in fills:
+                        if not isinstance(f, dict):
+                            continue
+                        px = _float_or_none(f.get("price"))
+                        qty = _float_or_none(f.get("qty"))
+                        if px is None or qty is None:
+                            continue
+                        sum_qty += qty
+                        sum_quote += px * qty
+                    if sum_qty > 0 and sum_quote > 0:
+                        info["avg_price"] = sum_quote / sum_qty
+                        info["filled_qty"] = info.get("filled_qty") if info.get("filled_qty") is not None else sum_qty
+                        info["cum_quote"] = info.get("cum_quote") if info.get("cum_quote") is not None else sum_quote
+                if info.get("exchange_order_id") and (
+                    info.get("filled_qty") is None or float(info.get("filled_qty") or 0.0) <= 0.0
+                ):
+                    detail = None
+                    for _ in range(3):
+                        try:
+                            detail = get_binance_spot_order(symbol, order_id=info["exchange_order_id"])
+                        except Exception:
+                            detail = None
+                        if isinstance(detail, dict):
+                            filled = _float_or_none(detail.get("executedQty"))
+                            if filled and filled > 0:
+                                break
+                        time.sleep(0.25)
+                    if isinstance(detail, dict):
+                        info["filled_qty"] = _float_or_none(detail.get("executedQty"))
+                        info["cum_quote"] = _float_or_none(
+                            detail.get("cummulativeQuoteQty") or detail.get("cumQuote") or detail.get("cumQuoteQty")
+                        )
+                        if info.get("filled_qty") and info.get("cum_quote"):
+                            try:
+                                info["avg_price"] = float(info["cum_quote"]) / float(info["filled_qty"])
+                            except Exception:
+                                pass
+                        st = detail.get("status")
+                        if st is not None:
+                            info["status"] = str(st)
+                return {k: v for k, v in info.items() if v is not None}
+
+            if ex == "okx":
+                base = _first_dict(order.get("data"))
+                ord_id = base.get("ordId")
+                cl_id = base.get("clOrdId") or base.get("clientOid")
+                info["exchange_order_id"] = str(ord_id or "") or None
+                detail = None
+                for _ in range(3):
+                    try:
+                        detail = get_okx_spot_order(
+                            symbol,
+                            ord_id=str(ord_id) if ord_id else None,
+                            client_order_id=str(cl_id) if cl_id else None,
+                        )
+                    except Exception:
+                        detail = None
+                    if isinstance(detail, dict):
+                        avg_px = _float_or_none(detail.get("avgPx") or detail.get("fillPx"))
+                        acc_fill = _float_or_none(detail.get("accFillSz") or detail.get("fillSz"))
+                        if avg_px and acc_fill and acc_fill > 0:
+                            break
+                    time.sleep(0.25)
+                if isinstance(detail, dict):
+                    info["avg_price"] = _float_or_none(detail.get("avgPx") or detail.get("fillPx"))
+                    info["filled_qty"] = _float_or_none(detail.get("accFillSz") or detail.get("fillSz") or detail.get("sz"))
+                    info["cum_quote"] = _float_or_none(detail.get("accFillNotional") or detail.get("fillNotional"))
+                    status = detail.get("state") or detail.get("status")
+                    info["status"] = str(status) if status is not None else None
+                return {k: v for k, v in info.items() if v is not None}
+
+            if ex == "bybit":
+                base = order.get("result") if isinstance(order.get("result"), dict) else order
+                order_id = base.get("orderId") if isinstance(base, dict) else None
+                info["exchange_order_id"] = str(order_id or "") or None
+                detail = None
+                for _ in range(3):
+                    try:
+                        detail = get_bybit_spot_order(
+                            symbol,
+                            order_id=str(order_id) if order_id else None,
+                            client_order_id=None,
+                        )
+                    except Exception:
+                        detail = None
+                    if isinstance(detail, dict):
+                        avg_px = _float_or_none(detail.get("avgPrice") or detail.get("avgPrice"))
+                        acc_qty = _float_or_none(detail.get("cumExecQty") or detail.get("cumExecQty"))
+                        if avg_px and acc_qty and acc_qty > 0:
+                            break
+                    time.sleep(0.25)
+                if isinstance(detail, dict):
+                    info["avg_price"] = _float_or_none(detail.get("avgPrice"))
+                    info["filled_qty"] = _float_or_none(detail.get("cumExecQty") or detail.get("cumExecQty"))
+                    info["cum_quote"] = _float_or_none(detail.get("cumExecValue"))
+                    status = detail.get("orderStatus") or detail.get("orderStatus")
+                    info["status"] = str(status) if status is not None else None
+                return {k: v for k, v in info.items() if v is not None}
+
+            if ex == "bitget":
+                base = _first_dict(order.get("data"))
+                order_id = base.get("orderId") or base.get("order_id")
+                cl_id = base.get("clientOid") or base.get("client_oid")
+                info["exchange_order_id"] = str(order_id or "") or None
+                detail = None
+                for _ in range(3):
+                    try:
+                        detail = get_bitget_spot_order_detail(
+                            symbol,
+                            order_id=str(order_id) if order_id else None,
+                            client_order_id=str(cl_id) if cl_id else None,
+                        )
+                    except Exception:
+                        detail = None
+                    if isinstance(detail, dict):
+                        avg_px = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice"))
+                        filled_sz = _float_or_none(detail.get("baseVolume") or detail.get("filledQty"))
+                        if avg_px and filled_sz and filled_sz > 0:
+                            break
+                    time.sleep(0.25)
+                if isinstance(detail, dict):
+                    info["avg_price"] = _float_or_none(detail.get("priceAvg") or detail.get("avgPrice"))
+                    info["filled_qty"] = _float_or_none(detail.get("baseVolume") or detail.get("filledQty") or detail.get("size"))
+                    info["cum_quote"] = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
+                    status = detail.get("state") or detail.get("status")
+                    info["status"] = str(status) if status is not None else None
+                return {k: v for k, v in info.items() if v is not None}
 
         if ex == "binance":
             info["exchange_order_id"] = str(order.get("orderId") or "") or None
@@ -1782,15 +1949,24 @@ class LiveTradingManager:
 
         return {k: v for k, v in out.items() if v is not None}
 
-    def _verify_position_after_open(self, exchange: str, symbol: str, side: str, requested_qty: float) -> None:
+    def _verify_position_after_open(
+        self,
+        exchange: str,
+        symbol: str,
+        side: str,
+        requested_qty: float,
+        *,
+        market_type: str = "perp",
+    ) -> None:
         """Best-effort: confirm the position exists after an open order."""
         ex = (exchange or "").lower().strip()
         sym = (symbol or "").upper().strip()
         side_key = (side or "").lower().strip()
+        mkt = (market_type or "perp").lower().strip()
         expected_sign = 1.0 if side_key == "long" else -1.0
         min_abs = max(1e-12, abs(float(requested_qty or 0.0)) * 0.2)
         for _ in range(6):
-            size = self._get_exchange_position_size(ex, sym)
+            size = self._get_exchange_position_size(ex, sym, mkt)
             if size is not None and float(size) * expected_sign > 0 and abs(float(size)) >= min_abs:
                 return
             time.sleep(0.4)
@@ -1798,16 +1974,41 @@ class LiveTradingManager:
             f"Position not detected after open: exchange={ex} symbol={sym} side={side_key} requested_qty={requested_qty}"
         )
 
-    def _get_exchange_position_size(self, exchange: str, symbol: str) -> Optional[float]:
-        """Best-effort signed position size for a single symbol on an exchange (perp only).
+    def _get_exchange_position_size(self, exchange: str, symbol: str, market_type: str = "perp") -> Optional[float]:
+        """Best-effort signed position size for a single symbol on an exchange.
 
-        Positive -> long exposure, negative -> short exposure.
+        Positive -> long exposure, negative -> short exposure. Spot returns holdings (>=0).
         """
         ex = (exchange or "").lower()
         sym = (symbol or "").upper()
         if not ex or not sym:
             return None
+        mkt = (market_type or "perp").lower().strip()
         try:
+            if mkt == "spot":
+                if ex == "binance":
+                    bal = get_binance_spot_balance(coin=sym)
+                    raw = bal.get("free") if isinstance(bal, dict) else None
+                    if raw is None:
+                        raw = bal.get("total") if isinstance(bal, dict) else None
+                    return float(raw or 0.0)
+                if ex == "okx":
+                    bal = get_okx_spot_balance(ccy=sym)
+                    raw = bal.get("available_balance") if isinstance(bal, dict) else None
+                    if raw is None:
+                        raw = bal.get("cash_bal") if isinstance(bal, dict) else None
+                    return float(raw or 0.0)
+                if ex == "bybit":
+                    bal = get_bybit_spot_balance(coin=sym)
+                    raw = bal.get("available_balance") if isinstance(bal, dict) else None
+                    if raw is None:
+                        raw = bal.get("wallet_balance") if isinstance(bal, dict) else None
+                    return float(raw or 0.0)
+                if ex == "bitget":
+                    bal = get_bitget_spot_balance(coin=sym)
+                    raw = bal.get("available_balance") if isinstance(bal, dict) else None
+                    return float(raw or 0.0)
+                return None
             if ex == "hyperliquid":
                 return float(self._get_hyperliquid_position_szi(sym))
             if ex == "binance":
@@ -1940,9 +2141,17 @@ class LiveTradingManager:
             return None
         return None
 
-    def _post_fail_safety_flatten(self, conn, signal_id: int, symbol: str, exchange: str) -> None:
+    def _post_fail_safety_flatten(
+        self,
+        conn,
+        signal_id: int,
+        symbol: str,
+        exchange: str,
+        *,
+        market_type: str = "perp",
+    ) -> None:
         """After an open failure, ensure the exchange-side symbol position is flat (best-effort)."""
-        size = self._get_exchange_position_size(exchange, symbol)
+        size = self._get_exchange_position_size(exchange, symbol, market_type)
         if size is None:
             self._record_error(
                 conn,
@@ -1966,9 +2175,10 @@ class LiveTradingManager:
                 position_leg=pos_leg,
                 quantity=qty,
                 client_order_id=client_id,
+                market_type=market_type,
             )
             close_order_param = _jsonb(close_order) if close_order is not None else None
-            fill = self._parse_fill_fields(exchange, symbol, close_order)
+            fill = self._parse_fill_fields(exchange, symbol, close_order, market_type=market_type)
             conn.execute(
                 """
                 INSERT INTO watchlist.live_trade_order(
@@ -1984,7 +2194,7 @@ class LiveTradingManager:
                     "long" if pos_leg == "long" else "short",
                     str(exchange),
                     "short" if pos_leg == "long" else "long",
-                    "perp",
+                    str(market_type or "perp"),
                     None,
                     str(qty),
                     float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
@@ -2455,6 +2665,45 @@ class LiveTradingManager:
         if not allowed:
             allowed = {"binance", "bybit", "okx", "bitget", "hyperliquid", "lighter", "grvt"}
         return (exchange or "").lower() in allowed
+
+    def _supported_spot_exchange(self, exchange: str) -> bool:
+        allowed = {str(x).lower() for x in (self.config.spot_allowed_exchanges or ()) if str(x).strip()}
+        if not allowed:
+            allowed = {"binance", "okx", "bybit", "bitget"}
+        return (exchange or "").lower() in allowed
+
+    def _resolve_leg_market_types(self, signal_type: str) -> Tuple[str, str]:
+        st = (signal_type or "").strip().upper()
+        if st == "C":
+            return ("spot", "perp")
+        return ("perp", "perp")
+
+    def _resolve_type_c_exchanges(self, event: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
+        """Resolve (spot_exchange, perp_exchange) for Type C from event payload."""
+        obv = event.get("orderbook_validation")
+        if isinstance(obv, dict) and str(obv.get("market_type") or "").lower() == "spot-perp":
+            chosen = obv.get("chosen")
+            if isinstance(chosen, dict):
+                long_ex = str(chosen.get("long_exchange") or "")
+                short_ex = str(chosen.get("short_exchange") or "")
+                if long_ex and short_ex:
+                    return long_ex, short_ex, "orderbook_validation"
+
+        td = event.get("trigger_details") if isinstance(event.get("trigger_details"), dict) else {}
+        spot_ex = td.get("spot_exchange")
+        perp_ex = td.get("futures_exchange")
+        if not spot_ex or not perp_ex:
+            pair = td.get("pair") or []
+            mtypes = td.get("market_types") or {}
+            if isinstance(pair, list) and len(pair) == 2 and isinstance(mtypes, dict):
+                a, b = str(pair[0]), str(pair[1])
+                mt_a = str(mtypes.get(a) or "").lower()
+                mt_b = str(mtypes.get(b) or "").lower()
+                if mt_a == "spot" and mt_b == "perp":
+                    spot_ex, perp_ex = a, b
+                elif mt_a == "perp" and mt_b == "spot":
+                    spot_ex, perp_ex = b, a
+        return (str(spot_ex or "") or None), (str(perp_ex or "") or None), "trigger_details"
 
     def _get_public_funding_mark(self, exchange: str, symbol: str) -> Dict[str, Any]:
         """
@@ -3201,6 +3450,211 @@ class LiveTradingManager:
             best["thresholds"] = {"pnl": float(thr_pnl), "win_prob": float(thr_prob)}
         return best
 
+    def _revalidate_with_orderbook_type_c(
+        self,
+        *,
+        symbol: str,
+        spot_exchange: str,
+        perp_exchange: str,
+        base_factors: Dict[str, Any],
+        pred_choice: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        notional_usdt = float(self.config.spot_per_leg_notional_usdt or self.config.per_leg_notional_usdt)
+        ob_spot = fetch_orderbook_prices(spot_exchange, symbol, "spot", notional=notional_usdt)
+        ob_perp = fetch_orderbook_prices(perp_exchange, symbol, "perp", notional=notional_usdt)
+        if not ob_spot or ob_spot.get("error") or not ob_perp or ob_perp.get("error"):
+            return {
+                "ok": False,
+                "reason": "orderbook_unavailable",
+                "orderbook": {"spot": ob_spot, "perp": ob_perp},
+                "notional_usdt": notional_usdt,
+            }
+
+        long_px = ob_spot.get("buy")
+        short_px = ob_perp.get("sell")
+        try:
+            short_f = float(short_px)
+            long_f = float(long_px)
+        except Exception:
+            return {
+                "ok": False,
+                "reason": "px_parse_error",
+                "orderbook": {"spot": ob_spot, "perp": ob_perp},
+                "notional_usdt": notional_usdt,
+            }
+        if short_f <= 0 or long_f <= 0:
+            return {
+                "ok": False,
+                "reason": "non_positive_px",
+                "orderbook": {"spot": ob_spot, "perp": ob_perp},
+                "notional_usdt": notional_usdt,
+            }
+
+        tradable_spread = (short_f - long_f) / long_f
+        entry_spread_metric = float(math.log(short_f / long_f))
+
+        factors = dict(base_factors or {})
+        factors["spread_log_short_over_long"] = float(entry_spread_metric)
+        factors["raw_best_buy_high_sell_low"] = float(tradable_spread)
+
+        pred = predict_bc(signal_type="C", factors=factors, horizons=(int(self.config.horizon_min),))
+        pred_map = (pred or {}).get("pred") or {}
+        hpred = pred_map.get(str(int(self.config.horizon_min))) or {}
+        pnl_hat = hpred.get("pnl_hat")
+        win_prob = hpred.get("win_prob")
+
+        eval_pnl = pnl_hat
+        eval_prob = win_prob
+        pred_source = "v1_240"
+        pred_horizon = int(self.config.horizon_min)
+        if isinstance(pred_choice, dict) and str(pred_choice.get("source") or "").startswith("v2"):
+            ob_pnl = pred_choice.get("ob_pnl_hat")
+            ob_prob = pred_choice.get("ob_win_prob")
+            eval_pnl = ob_pnl if ob_pnl is not None else pred_choice.get("pnl_hat")
+            eval_prob = ob_prob if ob_prob is not None else pred_choice.get("win_prob")
+            pred_source = str(pred_choice.get("source") or pred_source)
+            pred_horizon = int(pred_choice.get("horizon_min") or pred_horizon)
+
+        thr_pnl = float(getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold))
+        thr_prob = float(getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold))
+
+        ok = False
+        try:
+            ok = (
+                float(eval_pnl) >= float(thr_pnl)
+                and float(eval_prob) >= float(thr_prob)
+                and float(tradable_spread) > 0
+            )
+        except Exception:
+            ok = False
+
+        tp_needed = None
+        try:
+            tp_needed = float(self.config.take_profit_ratio) * float(eval_pnl)
+        except Exception:
+            tp_needed = None
+        if ok and tp_needed is not None and tp_needed > 0 and float(entry_spread_metric) < float(tp_needed):
+            ok = False
+
+        out = {
+            "ok": bool(ok),
+            "reason": None if ok else "not_ok",
+            "long_exchange": str(spot_exchange),
+            "short_exchange": str(perp_exchange),
+            "pnl_hat": float(pnl_hat) if pnl_hat is not None else None,
+            "win_prob": float(win_prob) if win_prob is not None else None,
+            "pnl_hat_eval": float(eval_pnl) if eval_pnl is not None else None,
+            "win_prob_eval": float(eval_prob) if eval_prob is not None else None,
+            "pred_source": pred_source,
+            "pred_horizon_min": pred_horizon,
+            "tradable_spread": float(tradable_spread),
+            "entry_spread_metric": float(entry_spread_metric),
+            "orderbook": {"spot": ob_spot, "perp": ob_perp},
+            "notional_usdt": notional_usdt,
+            "factors": factors,
+            "candidates": [
+                {
+                    "spot_exchange": str(spot_exchange),
+                    "perp_exchange": str(perp_exchange),
+                    "short_px": float(short_f),
+                    "long_px": float(long_f),
+                    "tradable_spread": float(tradable_spread),
+                    "entry_spread_metric": float(entry_spread_metric),
+                }
+            ],
+            "thresholds": {"pnl": float(thr_pnl), "win_prob": float(thr_prob)},
+        }
+        if not ok:
+            if tp_needed is not None and float(entry_spread_metric) < float(tp_needed):
+                out["reason"] = "entry_spread_too_small"
+                out["tp_needed"] = float(tp_needed)
+            else:
+                out["reason"] = "below_threshold_after_reval"
+        return out
+
+    def _confirm_open_signal_with_orderbook_type_c(
+        self,
+        *,
+        symbol: str,
+        spot_exchange: str,
+        perp_exchange: str,
+        base_factors: Dict[str, Any],
+        initial_reval: Optional[Dict[str, Any]] = None,
+        pred_choice: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        samples = max(1, int(self.config.orderbook_confirm_samples or 1))
+        sleep_s = float(self.config.orderbook_confirm_sleep_seconds or 0.0)
+
+        series: List[Dict[str, Any]] = []
+        chosen_long: Optional[str] = None
+        chosen_short: Optional[str] = None
+        ok_all = True
+        fail_reason: Optional[str] = None
+
+        for i in range(samples):
+            if i == 0 and initial_reval is not None:
+                reval = dict(initial_reval)
+            else:
+                reval = self._revalidate_with_orderbook_type_c(
+                    symbol=symbol,
+                    spot_exchange=spot_exchange,
+                    perp_exchange=perp_exchange,
+                    base_factors=base_factors,
+                    pred_choice=pred_choice,
+                )
+            if not reval:
+                ok_all = False
+                fail_reason = fail_reason or "revalidate_none"
+                series.append({"i": i, "ts": _utcnow().isoformat(), "ok": False, "reason": "revalidate_none"})
+            else:
+                long_ex = str(reval.get("long_exchange") or "")
+                short_ex = str(reval.get("short_exchange") or "")
+                ok = bool(reval.get("ok"))
+                reason = str(reval.get("reason") or "")
+
+                if not (long_ex and short_ex):
+                    ok = False
+                    reason = reason or "missing_direction"
+
+                if chosen_long is None and chosen_short is None and long_ex and short_ex:
+                    chosen_long, chosen_short = long_ex, short_ex
+                elif chosen_long and chosen_short and (long_ex != chosen_long or short_ex != chosen_short):
+                    ok = False
+                    reason = "direction_changed"
+
+                if not ok:
+                    ok_all = False
+                    fail_reason = fail_reason or reason
+
+                series.append(
+                    {
+                        "i": i,
+                        "ts": _utcnow().isoformat(),
+                        "ok": bool(ok),
+                        "reason": reason,
+                        "long_exchange": long_ex,
+                        "short_exchange": short_ex,
+                        "pnl_hat": reval.get("pnl_hat"),
+                        "win_prob": reval.get("win_prob"),
+                        "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                        "win_prob_eval": reval.get("win_prob_eval"),
+                        "tradable_spread": reval.get("tradable_spread"),
+                        "entry_spread_metric": reval.get("entry_spread_metric"),
+                        "orderbook": reval.get("orderbook"),
+                    }
+                )
+
+            if i < samples - 1 and sleep_s > 0:
+                time.sleep(sleep_s)
+
+        return {
+            "ok": bool(ok_all and chosen_long and chosen_short),
+            "reason": None if ok_all else (fail_reason or "orderbook_unstable"),
+            "long_exchange": chosen_long or str(spot_exchange),
+            "short_exchange": chosen_short or str(perp_exchange),
+            "series": series,
+        }
+
     def _confirm_open_signal_with_orderbook(
         self,
         *,
@@ -3373,7 +3827,8 @@ class LiveTradingManager:
             return []
         # Keep the lookback at least a few minutes so the retry schedule (up to ~240s) has time to apply.
         lookback_min = max(5, int(getattr(self.config, "event_lookback_minutes", 30) or 30))
-        return conn.execute(
+        signal_types = "('B','C')" if bool(getattr(self.config, "spot_trading_enabled", False)) else "('B')"
+        query = (
             """
             SELECT
               s.id AS signal_id,
@@ -3413,7 +3868,9 @@ class LiveTradingManager:
             JOIN watchlist.watch_signal_event e
               ON e.id = s.event_id
             WHERE s.status='skipped'
-              AND e.signal_type = 'B'
+              AND e.signal_type IN """
+            + signal_types
+            + """
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
               AND (
                 e.status = 'open'
@@ -3427,9 +3884,9 @@ class LiveTradingManager:
               )
             ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
             LIMIT %s;
-            """,
-            (int(lookback_min), int(limit_n)),
-        ).fetchall()
+            """
+        )
+        return conn.execute(query, (int(lookback_min), int(limit_n))).fetchall()
 
     def _retry_skipped_signals(self, conn) -> None:
         rows = self._fetch_retry_skipped_signals(conn)
@@ -3517,6 +3974,208 @@ class LiveTradingManager:
                 reason="below_threshold",
                 payload={"decision": "retry_skipped", "reason": "below_threshold"},
             )
+            return
+
+        signal_type = str(event.get("signal_type") or "").strip().upper()
+        if signal_type == "C":
+            if pred_choice:
+                pred_choice = dict(pred_choice)
+                pred_choice["thr_pnl"] = float(
+                    getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                )
+                pred_choice["thr_prob"] = float(
+                    getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                )
+
+            if not bool(getattr(self.config, "spot_trading_enabled", False)):
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason="spot_trading_disabled",
+                    payload={"decision": "retry_skipped", "reason": "spot_trading_disabled"},
+                )
+                return
+
+            spot_ex, perp_ex, ex_source = self._resolve_type_c_exchanges(event)
+            if not (spot_ex and perp_ex):
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason="missing_spot_perp_exchange",
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": "missing_spot_perp_exchange",
+                        "exchange_source": ex_source,
+                    },
+                )
+                return
+
+            if not (self._supported_spot_exchange(spot_ex) and self._supported_exchange(perp_ex)):
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason="unsupported_exchange",
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": "unsupported_exchange",
+                        "spot_exchange": spot_ex,
+                        "perp_exchange": perp_ex,
+                        "exchange_source": ex_source,
+                    },
+                )
+                return
+
+            reval = self._revalidate_with_orderbook_type_c(
+                symbol=symbol,
+                spot_exchange=str(spot_ex),
+                perp_exchange=str(perp_ex),
+                base_factors=base_factors,
+                pred_choice=pred_choice,
+            )
+            if not reval or not reval.get("ok"):
+                r = None
+                if isinstance(reval, dict):
+                    r = reval.get("reason") or reval.get("error")
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason=str(r or "not_ok"),
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": str(r or "not_ok"),
+                        "exchange_source": ex_source,
+                        "orderbook_revalidation": reval,
+                    },
+                )
+                return
+
+            confirm = self._confirm_open_signal_with_orderbook_type_c(
+                symbol=symbol,
+                spot_exchange=str(spot_ex),
+                perp_exchange=str(perp_ex),
+                base_factors=base_factors,
+                initial_reval=reval if isinstance(reval, dict) else None,
+                pred_choice=pred_choice,
+            )
+            if not confirm.get("ok"):
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason=str(confirm.get("reason") or "orderbook_unstable"),
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": str(confirm.get("reason") or "orderbook_unstable"),
+                        "orderbook_revalidation": reval,
+                        "orderbook_confirm_open": confirm,
+                    },
+                )
+                return
+
+            client_base = f"wl{int(event['id'])}O{int(time.time())}"
+            payload = {
+                "event": {
+                    "id": int(event["id"]),
+                    "start_ts": str(event.get("start_ts")),
+                    "symbol": symbol,
+                    "signal_type": event.get("signal_type"),
+                    "trigger_details": event.get("trigger_details"),
+                },
+                "threshold": {
+                    "horizon_min": int(pred_choice.get("horizon_min") or self.config.horizon_min),
+                    "pnl_threshold": float(
+                        pred_choice.get("thr_pnl")
+                        or getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                    ),
+                    "win_prob_threshold": float(
+                        pred_choice.get("thr_prob")
+                        or getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                    ),
+                    "per_leg_notional_usdt": float(
+                        self.config.spot_per_leg_notional_usdt or self.config.per_leg_notional_usdt
+                    ),
+                },
+                "pred_choice": pred_choice,
+                "orderbook_revalidation": {
+                    "pnl_hat": reval.get("pnl_hat"),
+                    "win_prob": reval.get("win_prob"),
+                    "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                    "win_prob_eval": reval.get("win_prob_eval"),
+                    "pred_source": reval.get("pred_source"),
+                    "pred_horizon_min": reval.get("pred_horizon_min"),
+                    "orderbook": reval.get("orderbook"),
+                },
+                "orderbook_confirm_open": confirm,
+                "retry": {
+                    "from_signal_id": signal_id,
+                    "retry_attempts": int(row.get("retry_attempts") or 0),
+                    "ts": _utcnow().isoformat(),
+                },
+            }
+
+            self._update_signal_open_attempt(
+                conn,
+                signal_id=signal_id,
+                status="opening",
+                reason=None,
+                payload=payload,
+                client_order_id_base=client_base,
+                leg_long_exchange=str(confirm.get("long_exchange") or spot_ex),
+                leg_short_exchange=str(confirm.get("short_exchange") or perp_ex),
+                pnl_hat=float(pred_choice.get("pnl_hat") or 0.0),
+                win_prob=float(pred_choice.get("win_prob") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                horizon_min=int(pred_choice.get("horizon_min") or self.config.horizon_min),
+                pred_source=str(pred_choice.get("source") or "v1_240"),
+            )
+
+            try:
+                self._open_trade(
+                    conn,
+                    signal_id,
+                    symbol,
+                    str(confirm.get("long_exchange") or spot_ex),
+                    str(confirm.get("short_exchange") or perp_ex),
+                    client_base,
+                    pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
+                    signal_type=signal_type,
+                )
+                self._update_signal_status(conn, signal_id, "open")
+            except TradeExecutionError as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="open_trade",
+                    error_type="TradeExecutionError",
+                    message=str(exc),
+                    context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": spot_ex, "short_ex": perp_ex},
+                )
+                msg = str(exc)
+                msg_l = msg.lower()
+                status = (
+                    "skipped"
+                    if any(
+                        key in msg_l
+                        for key in (
+                            "entry spread too small",
+                            "non-tradable entry spread",
+                            "orderbook unavailable",
+                            "orderbook missing",
+                        )
+                    )
+                    else "failed"
+                )
+                self._update_signal_status(conn, signal_id, status, reason=msg)
+            except Exception as exc:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="open_trade",
+                    error_type=type(exc).__name__,
+                    message=str(exc),
+                    context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": spot_ex, "short_ex": perp_ex},
+                )
+                self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
             return
 
         chosen_reval = self._chosen_reval_from_event(event, pred_choice)
@@ -3682,6 +4341,7 @@ class LiveTradingManager:
                 high_ex,
                 client_base,
                 pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
+                signal_type=signal_type,
             )
             self._update_signal_status(conn, signal_id, "open")
         except TradeExecutionError as exc:
@@ -3756,45 +4416,326 @@ class LiveTradingManager:
 
                 signal_type = str(event.get("signal_type") or "").strip().upper()
                 if signal_type == "C":
-                    chosen_reval = self._chosen_reval_from_event(event, pred_choice)
-                    long_ex = str(chosen_reval.get("long_exchange") or "") if isinstance(chosen_reval, dict) else ""
-                    short_ex = str(chosen_reval.get("short_exchange") or "") if isinstance(chosen_reval, dict) else ""
+                    if pred_choice:
+                        pred_choice = dict(pred_choice)
+                        pred_choice["thr_pnl"] = float(
+                            getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                        )
+                        pred_choice["thr_prob"] = float(
+                            getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                        )
+
+                    spot_ex, perp_ex, ex_source = self._resolve_type_c_exchanges(event)
+                    long_ex = str(spot_ex or "")
+                    short_ex = str(perp_ex or "")
                     if not (long_ex and short_ex):
-                        td = event.get("trigger_details") if isinstance(event.get("trigger_details"), dict) else {}
-                        spot_ex = td.get("spot_exchange")
-                        perp_ex = td.get("futures_exchange")
-                        if not spot_ex or not perp_ex:
-                            pair = td.get("pair") or []
-                            mtypes = td.get("market_types") or {}
-                            if (
-                                isinstance(pair, list)
-                                and len(pair) == 2
-                                and isinstance(mtypes, dict)
-                            ):
-                                a, b = str(pair[0]), str(pair[1])
-                                mt_a = str(mtypes.get(a) or "").lower()
-                                mt_b = str(mtypes.get(b) or "").lower()
-                                if mt_a == "spot" and mt_b == "perp":
-                                    spot_ex, perp_ex = a, b
-                                elif mt_a == "perp" and mt_b == "spot":
-                                    spot_ex, perp_ex = b, a
-                        long_ex = str(spot_ex or "")
-                        short_ex = str(perp_ex or "")
-                    self._insert_skipped_event(
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason="missing_spot_perp_exchange",
+                            payload={
+                                "decision": "skipped",
+                                "reason": "missing_spot_perp_exchange",
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "pred_choice": pred_choice,
+                                "exchange_source": ex_source,
+                                "orderbook_validation": event.get("orderbook_validation"),
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
+                    if not self.config.spot_trading_enabled:
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason="signal_only",
+                            payload={
+                                "decision": "signal_only",
+                                "reason": "signal_only",
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "pred_choice": pred_choice,
+                                "exchange_source": ex_source,
+                                "orderbook_validation": event.get("orderbook_validation"),
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
+                    if not (self._supported_spot_exchange(long_ex) and self._supported_exchange(short_ex)):
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason="unsupported_exchange",
+                            payload={
+                                "decision": "skipped",
+                                "reason": "unsupported_exchange",
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "exchange_source": ex_source,
+                                "spot_allowed_exchanges": sorted(
+                                    {str(x).lower() for x in (self.config.spot_allowed_exchanges or ()) if str(x).strip()}
+                                ),
+                                "perp_allowed_exchanges": sorted(
+                                    {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
+                                ),
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
+                    base_factors = event.get("factors") or {}
+                    if not isinstance(base_factors, dict):
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason="missing_factors",
+                            payload={
+                                "decision": "skipped",
+                                "reason": "missing_factors",
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "exchange_source": ex_source,
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
+                    reval = self._revalidate_with_orderbook_type_c(
+                        symbol=symbol,
+                        spot_exchange=long_ex,
+                        perp_exchange=short_ex,
+                        base_factors=base_factors,
+                        pred_choice=pred_choice,
+                    )
+                    if not reval or not reval.get("ok"):
+                        reason = None
+                        if isinstance(reval, dict):
+                            reason = reval.get("reason") or reval.get("error")
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason=str(reason or "not_ok"),
+                            payload={
+                                "decision": "skipped",
+                                "reason": str(reason or "not_ok"),
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "exchange_source": ex_source,
+                                "orderbook_revalidation": reval,
+                                "config": {
+                                    "spot_per_leg_notional_usdt": float(
+                                        self.config.spot_per_leg_notional_usdt or self.config.per_leg_notional_usdt
+                                    ),
+                                    "horizon_min": int(self.config.horizon_min),
+                                    "pnl_threshold": float(
+                                        getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                                    ),
+                                    "win_prob_threshold": float(
+                                        getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                                    ),
+                                },
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        self._bump_event_backoff(event_id, str(reason or "revalidate_not_ok"))
+                        continue
+
+                    confirm = self._confirm_open_signal_with_orderbook_type_c(
+                        symbol=symbol,
+                        spot_exchange=long_ex,
+                        perp_exchange=short_ex,
+                        base_factors=base_factors,
+                        initial_reval=reval if isinstance(reval, dict) else None,
+                        pred_choice=pred_choice,
+                    )
+                    if not confirm.get("ok"):
+                        client_base = f"wl{int(event['id'])}O{int(time.time())}"
+                        payload = {
+                            "event": {
+                                "id": int(event["id"]),
+                                "start_ts": str(event.get("start_ts")),
+                                "symbol": symbol,
+                                "signal_type": event.get("signal_type"),
+                                "trigger_details": event.get("trigger_details"),
+                            },
+                            "threshold": {
+                                "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                                "pnl_threshold": float(
+                                    (pred_choice or {}).get("thr_pnl")
+                                    or getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                                ),
+                                "win_prob_threshold": float(
+                                    (pred_choice or {}).get("thr_prob")
+                                    or getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                                ),
+                                "per_leg_notional_usdt": float(
+                                    self.config.spot_per_leg_notional_usdt or self.config.per_leg_notional_usdt
+                                ),
+                            },
+                            "pred_choice": pred_choice,
+                            "orderbook_revalidation": {
+                                "pnl_hat": reval.get("pnl_hat"),
+                                "win_prob": reval.get("win_prob"),
+                                "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                                "win_prob_eval": reval.get("win_prob_eval"),
+                                "pred_source": reval.get("pred_source"),
+                                "pred_horizon_min": reval.get("pred_horizon_min"),
+                                "orderbook": reval.get("orderbook"),
+                            },
+                            "orderbook_confirm_open": confirm,
+                        }
+                        signal_id = self._insert_signal(
+                            conn,
+                            event=event,
+                            leg_long_exchange=str(confirm.get("long_exchange") or long_ex),
+                            leg_short_exchange=str(confirm.get("short_exchange") or short_ex),
+                            pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+                            win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+                            pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                            win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                            horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                            pred_source=str((pred_choice or {}).get("source") or "v1_240"),
+                            payload=payload,
+                            status="skipped",
+                            reason=str(confirm.get("reason") or "orderbook_unstable"),
+                            client_order_id_base=client_base,
+                        )
+                        if signal_id:
+                            self._record_error(
+                                conn,
+                                signal_id=signal_id,
+                                stage="orderbook_confirm_open",
+                                error_type="unstable",
+                                message=str(confirm.get("reason") or "orderbook_unstable"),
+                                context={"symbol": symbol, "event_id": int(event["id"]), "confirm": confirm},
+                            )
+                        continue
+
+                    client_base = f"wl{int(event['id'])}O{int(time.time())}"
+                    payload = {
+                        "event": {
+                            "id": int(event["id"]),
+                            "start_ts": str(event.get("start_ts")),
+                            "symbol": symbol,
+                            "signal_type": event.get("signal_type"),
+                            "trigger_details": event.get("trigger_details"),
+                        },
+                        "threshold": {
+                            "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                            "pnl_threshold": float(
+                                (pred_choice or {}).get("thr_pnl")
+                                or getattr(self.config, "type_c_pnl_threshold", self.config.pnl_threshold)
+                            ),
+                            "win_prob_threshold": float(
+                                (pred_choice or {}).get("thr_prob")
+                                or getattr(self.config, "type_c_win_prob_threshold", self.config.win_prob_threshold)
+                            ),
+                            "per_leg_notional_usdt": float(
+                                self.config.spot_per_leg_notional_usdt or self.config.per_leg_notional_usdt
+                            ),
+                        },
+                        "pred_choice": pred_choice,
+                        "orderbook_revalidation": {
+                            "pnl_hat": reval.get("pnl_hat"),
+                            "win_prob": reval.get("win_prob"),
+                            "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                            "win_prob_eval": reval.get("win_prob_eval"),
+                            "pred_source": reval.get("pred_source"),
+                            "pred_horizon_min": reval.get("pred_horizon_min"),
+                            "orderbook": reval.get("orderbook"),
+                        },
+                        "orderbook_confirm_open": confirm,
+                    }
+
+                    signal_id = self._insert_signal(
                         conn,
                         event=event,
-                        leg_long_exchange=long_ex,
-                        leg_short_exchange=short_ex,
-                        reason="signal_only",
-                        payload={
-                            "decision": "signal_only",
-                            "reason": "signal_only",
-                            "symbol": symbol,
-                            "event_id": event_id,
-                            "pred_choice": pred_choice,
-                            "orderbook_validation": event.get("orderbook_validation"),
-                        },
+                        leg_long_exchange=str(confirm.get("long_exchange") or long_ex),
+                        leg_short_exchange=str(confirm.get("short_exchange") or short_ex),
+                        pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+                        win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+                        pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                        win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                        horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                        pred_source=str((pred_choice or {}).get("source") or "v1_240"),
+                        payload=payload,
+                        status="opening",
+                        reason=None,
+                        client_order_id_base=client_base,
                     )
+                    if not signal_id:
+                        continue
+
+                    try:
+                        self._open_trade(
+                            conn,
+                            signal_id,
+                            symbol,
+                            str(confirm.get("long_exchange") or long_ex),
+                            str(confirm.get("short_exchange") or short_ex),
+                            client_base,
+                            pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
+                            signal_type=signal_type,
+                        )
+                        self._update_signal_status(conn, signal_id, "open")
+                    except TradeExecutionError as exc:
+                        self._record_error(
+                            conn,
+                            signal_id=signal_id,
+                            stage="open_trade",
+                            error_type="TradeExecutionError",
+                            message=str(exc),
+                            context={
+                                "event_id": int(event["id"]),
+                                "symbol": symbol,
+                                "long_ex": long_ex,
+                                "short_ex": short_ex,
+                            },
+                        )
+                        msg = str(exc)
+                        msg_l = msg.lower()
+                        status = (
+                            "skipped"
+                            if any(
+                                key in msg_l
+                                for key in (
+                                    "entry spread too small",
+                                    "non-tradable entry spread",
+                                    "orderbook unavailable",
+                                    "orderbook missing",
+                                )
+                            )
+                            else "failed"
+                        )
+                        self._update_signal_status(conn, signal_id, status, reason=msg)
+                    except Exception as exc:
+                        self._record_error(
+                            conn,
+                            signal_id=signal_id,
+                            stage="open_trade",
+                            error_type=type(exc).__name__,
+                            message=str(exc),
+                            context={
+                                "event_id": int(event["id"]),
+                                "symbol": symbol,
+                                "long_ex": long_ex,
+                                "short_ex": short_ex,
+                            },
+                        )
+                        self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
                     continue
 
                 chosen_reval = self._chosen_reval_from_event(event, pred_choice)
@@ -4150,6 +5091,7 @@ class LiveTradingManager:
                 high_ex,
                 client_base,
                 pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
+                signal_type=str(event.get("signal_type") or ""),
             )
             self._update_signal_status(conn, signal_id, "open")
         except TradeExecutionError as exc:
@@ -4194,7 +5136,15 @@ class LiveTradingManager:
         client_base: str,
         *,
         pnl_hat_ob: float,
+        signal_type: Optional[str] = None,
     ) -> None:
+        long_mkt, short_mkt = self._resolve_leg_market_types(signal_type or "")
+        perp_notional = float(self.config.per_leg_notional_usdt)
+        spot_notional = float(self.config.spot_per_leg_notional_usdt or perp_notional)
+        if str(signal_type or "").strip().upper() == "C":
+            perp_notional = spot_notional
+        long_notional = spot_notional if long_mkt == "spot" else perp_notional
+        short_notional = spot_notional if short_mkt == "spot" else perp_notional
         # Safety: avoid mixing with manual/external positions (especially Hyperliquid one-way positions).
         if str(long_ex).lower() == "hyperliquid":
             szi = float(self._get_hyperliquid_position_szi(symbol))
@@ -4205,8 +5155,10 @@ class LiveTradingManager:
             if abs(szi) > 1e-9:
                 raise TradeExecutionError(f"Hyperliquid {symbol} position not flat before open (szi={szi}); abort")
 
-        # Best-effort leverage=1
-        for ex in {long_ex, short_ex}:
+        # Best-effort leverage=1 (perp legs only).
+        for ex, mkt in ((long_ex, long_mkt), (short_ex, short_mkt)):
+            if str(mkt or "").lower() != "perp":
+                continue
             try:
                 self._maybe_set_leverage_1x(symbol, ex)
             except Exception as exc:
@@ -4221,10 +5173,10 @@ class LiveTradingManager:
 
         # Derive quantities based on orderbook sweep prices for the same notional used in validation.
         ob_long = fetch_orderbook_prices(
-            long_ex, symbol, self.config.orderbook_market_type, notional=float(self.config.per_leg_notional_usdt)
+            long_ex, symbol, long_mkt, notional=float(long_notional)
         ) or {}
         ob_short = fetch_orderbook_prices(
-            short_ex, symbol, self.config.orderbook_market_type, notional=float(self.config.per_leg_notional_usdt)
+            short_ex, symbol, short_mkt, notional=float(short_notional)
         ) or {}
         if ob_long.get("error") or ob_short.get("error"):
             raise TradeExecutionError(f"Orderbook unavailable for execution: long={ob_long.get('error')} short={ob_short.get('error')}")
@@ -4239,8 +5191,8 @@ class LiveTradingManager:
             )
 
         entry_spread_metric = float(math.log(float(short_px) / float(long_px)))
-        long_qty = float(self.config.per_leg_notional_usdt) / float(long_px)
-        short_qty = float(self.config.per_leg_notional_usdt) / float(short_px)
+        long_qty = float(long_notional) / float(long_px)
+        short_qty = float(short_notional) / float(short_px)
 
         take_profit_pnl = float(self.config.take_profit_ratio) * float(pnl_hat_ob)
         entry_spread_pct_actual = float(math.exp(float(entry_spread_metric)) - 1.0)
@@ -4306,30 +5258,36 @@ class LiveTradingManager:
 
         open_funding_long = None
         open_funding_short = None
-        try:
-            info = self._get_public_funding_mark(str(long_ex), symbol)
-            if info.get("funding_rate") is not None:
-                open_funding_long = float(info.get("funding_rate"))
-        except Exception:
-            open_funding_long = None
-        try:
-            info = self._get_public_funding_mark(str(short_ex), symbol)
-            if info.get("funding_rate") is not None:
-                open_funding_short = float(info.get("funding_rate"))
-        except Exception:
-            open_funding_short = None
+        if long_mkt == "perp":
+            try:
+                info = self._get_public_funding_mark(str(long_ex), symbol)
+                if info.get("funding_rate") is not None:
+                    open_funding_long = float(info.get("funding_rate"))
+            except Exception:
+                open_funding_long = None
+        if short_mkt == "perp":
+            try:
+                info = self._get_public_funding_mark(str(short_ex), symbol)
+                if info.get("funding_rate") is not None:
+                    open_funding_short = float(info.get("funding_rate"))
+            except Exception:
+                open_funding_short = None
 
         legs = [
             {
                 "exchange": long_ex,
                 "side": "long",
                 "quantity": long_qty,
+                "market_type": long_mkt,
+                "notional_usdt": float(long_notional),
                 "order_kwargs": {"client_order_id": f"{client_base}-L"},
             },
             {
                 "exchange": short_ex,
                 "side": "short",
                 "quantity": short_qty,
+                "market_type": short_mkt,
+                "notional_usdt": float(short_notional),
                 "order_kwargs": {"client_order_id": f"{client_base}-S"},
             },
         ]
@@ -4339,23 +5297,45 @@ class LiveTradingManager:
         try:
             for leg in legs:
                 leg_opened_at = _utcnow()
-                order = execute_perp_market_order(
-                    str(leg["exchange"]),
-                    symbol,
-                    float(leg["quantity"]),
-                    side=str(leg["side"]),
-                    order_kwargs=dict(leg.get("order_kwargs") or {}),
-                )
+                leg_mkt = str(leg.get("market_type") or "perp").lower()
+                if leg_mkt == "spot":
+                    if str(leg.get("side")) == "long":
+                        order = execute_spot_market_order(
+                            str(leg["exchange"]),
+                            symbol,
+                            side="buy",
+                            quantity=None,
+                            quote_quantity=float(leg.get("notional_usdt") or 0.0),
+                            order_kwargs=dict(leg.get("order_kwargs") or {}),
+                        )
+                    else:
+                        order = execute_spot_market_order(
+                            str(leg["exchange"]),
+                            symbol,
+                            side="sell",
+                            quantity=float(leg["quantity"]),
+                            quote_quantity=None,
+                            order_kwargs=dict(leg.get("order_kwargs") or {}),
+                        )
+                else:
+                    order = execute_perp_market_order(
+                        str(leg["exchange"]),
+                        symbol,
+                        float(leg["quantity"]),
+                        side=str(leg["side"]),
+                        order_kwargs=dict(leg.get("order_kwargs") or {}),
+                    )
                 result = {
                     "exchange": str(leg["exchange"]),
                     "side": str(leg["side"]),
                     "quantity": float(leg["quantity"]),
+                    "market_type": leg_mkt,
                     "order": order,
                 }
                 opened.append(result)
 
                 order_resp_param = _jsonb(order) if order is not None else None
-                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order)
+                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order, market_type=leg_mkt)
                 fill_by_side[str(leg["side"])] = dict(fill or {})
                 conn.execute(
                     """
@@ -4372,8 +5352,8 @@ class LiveTradingManager:
                         "long" if str(leg["side"]) == "long" else "short",
                         str(leg["exchange"]),
                         str(leg["side"]),
-                        "perp",
-                        float(self.config.per_leg_notional_usdt),
+                        leg_mkt,
+                        float(leg.get("notional_usdt") or 0.0) if leg.get("notional_usdt") is not None else None,
                         str(leg["quantity"]),
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                         float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
@@ -4394,7 +5374,11 @@ class LiveTradingManager:
                                updated_at=now()
                          WHERE id=%s;
                         """,
-                        (leg_opened_at, open_funding_long, int(signal_id)),
+                        (
+                            leg_opened_at,
+                            open_funding_long if leg_mkt == "perp" else None,
+                            int(signal_id),
+                        ),
                     )
                 else:
                     conn.execute(
@@ -4405,10 +5389,18 @@ class LiveTradingManager:
                                updated_at=now()
                          WHERE id=%s;
                         """,
-                        (leg_opened_at, open_funding_short, int(signal_id)),
+                        (
+                            leg_opened_at,
+                            open_funding_short if leg_mkt == "perp" else None,
+                            int(signal_id),
+                        ),
                     )
                 ex_l = str(leg["exchange"]).lower()
-                if ex_l == "hyperliquid":
+                if leg_mkt == "spot":
+                    self._verify_position_after_open(
+                        str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]), market_type="spot"
+                    )
+                elif ex_l == "hyperliquid":
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
                 elif ex_l == "okx":
                     client_id = str((leg.get("order_kwargs") or {}).get("client_order_id") or "")
@@ -4427,7 +5419,13 @@ class LiveTradingManager:
                         except Exception:
                             pass
                 else:
-                    self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
+                    self._verify_position_after_open(
+                        str(leg["exchange"]),
+                        symbol,
+                        str(leg["side"]),
+                        float(leg["quantity"]),
+                        market_type=leg_mkt,
+                    )
 
             # Persist:
             # - entry_spread_pct_actual: based on fills (percent), (short_entry_avg / long_entry_avg) - 1
@@ -4547,7 +5545,8 @@ class LiveTradingManager:
             # Post-failure safety: verify and flatten any residual exposure on both exchanges.
             for ex in {str(long_ex), str(short_ex)}:
                 if ex:
-                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex)
+                    leg_mkt = long_mkt if str(ex) == str(long_ex) else short_mkt
+                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex, market_type=leg_mkt)
             raise TradeExecutionError(str(exc)) from exc
 
     def monitor_open_trades_once(self) -> None:
@@ -4967,6 +5966,8 @@ class LiveTradingManager:
         short_ex = str(signal_row.get("leg_short_exchange") or "")
         if not (symbol and long_ex and short_ex):
             return
+        signal_type = str(signal_row.get("signal_type") or "").strip().upper()
+        long_mkt, short_mkt = self._resolve_leg_market_types(signal_type)
 
         status = str(signal_row.get("status") or "")
         if status not in {"open", "closing"}:
@@ -4977,18 +5978,20 @@ class LiveTradingManager:
         short_info: Dict[str, Any] = {}
         fr_long = None
         fr_short = None
-        try:
-            long_info = self._get_public_funding_mark(str(long_ex), symbol)
-            if long_info.get("funding_rate") is not None:
-                fr_long = float(long_info.get("funding_rate"))
-        except Exception:
-            fr_long = None
-        try:
-            short_info = self._get_public_funding_mark(str(short_ex), symbol)
-            if short_info.get("funding_rate") is not None:
-                fr_short = float(short_info.get("funding_rate"))
-        except Exception:
-            fr_short = None
+        if long_mkt == "perp":
+            try:
+                long_info = self._get_public_funding_mark(str(long_ex), symbol)
+                if long_info.get("funding_rate") is not None:
+                    fr_long = float(long_info.get("funding_rate"))
+            except Exception:
+                fr_long = None
+        if short_mkt == "perp":
+            try:
+                short_info = self._get_public_funding_mark(str(short_ex), symbol)
+                if short_info.get("funding_rate") is not None:
+                    fr_short = float(short_info.get("funding_rate"))
+            except Exception:
+                fr_short = None
         if fr_long is not None or fr_short is not None:
             conn.execute(
                 """
@@ -5014,8 +6017,8 @@ class LiveTradingManager:
         if status == "closing":
             try:
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol)
-                    fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol)
+                    fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol, long_mkt)
+                    fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol, short_mkt)
                     pos_l = fut_l.result()
                     pos_s = fut_s.result()
 
@@ -5065,6 +6068,7 @@ class LiveTradingManager:
                     short_ex=str(short_ex),
                     close_reason=str(signal_row.get("close_reason") or "retry_close"),
                     status_before="closing",
+                    signal_type=str(signal_row.get("signal_type") or ""),
                 )
             except Exception as exc:
                 self._record_error(
@@ -5156,8 +6160,8 @@ class LiveTradingManager:
         if status == "open" and (now - opened_at).total_seconds() >= grace_seconds:
             try:
                 with ThreadPoolExecutor(max_workers=2) as pool:
-                    fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol)
-                    fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol)
+                    fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol, long_mkt)
+                    fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol, short_mkt)
                     pos_l = fut_l.result()
                     pos_s = fut_s.result()
                 # Expect long leg >0, short leg <0
@@ -5187,6 +6191,7 @@ class LiveTradingManager:
                         short_ex=str(short_ex),
                         close_reason="unhedged",
                         status_before=status,
+                        signal_type=str(signal_row.get("signal_type") or ""),
                     )
                     # Mark failed (even if close succeeds) so it's visible as an execution anomaly.
                     conn.execute(
@@ -5253,7 +6258,15 @@ class LiveTradingManager:
             decision = "force_close"
             close_reason = "max_hold_days"
 
-        ob_long, ob_short = self._fetch_pair_orderbooks_for_close(symbol, long_ex, short_ex, qty_long, qty_short)
+        ob_long, ob_short = self._fetch_pair_orderbooks_for_close(
+            symbol,
+            long_ex,
+            short_ex,
+            qty_long,
+            qty_short,
+            long_market_type=long_mkt,
+            short_market_type=short_mkt,
+        )
         if ob_long.get("error") or ob_short.get("error"):
             self._record_error(
                 conn,
@@ -5417,6 +6430,8 @@ class LiveTradingManager:
                 take_profit_pnl=float(take_profit_pnl_f),
                 initial_ob_long=ob_long if isinstance(ob_long, dict) else None,
                 initial_ob_short=ob_short if isinstance(ob_short, dict) else None,
+                long_market_type=long_mkt,
+                short_market_type=short_mkt,
             )
             if confirm_take_profit.get("ok"):
                 decision = "take_profit"
@@ -5542,6 +6557,8 @@ class LiveTradingManager:
         take_profit_pnl: float,
         initial_ob_long: Optional[Dict[str, Any]] = None,
         initial_ob_short: Optional[Dict[str, Any]] = None,
+        long_market_type: str = "perp",
+        short_market_type: str = "perp",
     ) -> Dict[str, Any]:
         samples = max(1, int(self.config.orderbook_confirm_samples or 1))
         sleep_s = float(self.config.orderbook_confirm_sleep_seconds or 0.0)
@@ -5553,7 +6570,15 @@ class LiveTradingManager:
             if i == 0 and initial_ob_long is not None and initial_ob_short is not None:
                 ob_l, ob_s = dict(initial_ob_long), dict(initial_ob_short)
             else:
-                ob_l, ob_s = self._fetch_pair_orderbooks_for_close(symbol, long_ex, short_ex, qty_long, qty_short)
+                ob_l, ob_s = self._fetch_pair_orderbooks_for_close(
+                    symbol,
+                    long_ex,
+                    short_ex,
+                    qty_long,
+                    qty_short,
+                    long_market_type=long_market_type,
+                    short_market_type=short_market_type,
+                )
             long_sell = ob_l.get("sell")
             short_buy = ob_s.get("buy")
 
@@ -5601,21 +6626,29 @@ class LiveTradingManager:
         return {"ok": bool(ok_all), "series": series}
 
     def _fetch_pair_orderbooks_for_close(
-        self, symbol: str, long_ex: str, short_ex: str, qty_long: float, qty_short: float
+        self,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        qty_long: float,
+        qty_short: float,
+        *,
+        long_market_type: str = "perp",
+        short_market_type: str = "perp",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         with ThreadPoolExecutor(max_workers=2) as pool:
             fut_long = pool.submit(
                 fetch_orderbook_prices_for_quantity,
                 long_ex,
                 symbol,
-                self.config.orderbook_market_type,
+                str(long_market_type or "perp"),
                 quantity=float(qty_long),
             )
             fut_short = pool.submit(
                 fetch_orderbook_prices_for_quantity,
                 short_ex,
                 symbol,
-                self.config.orderbook_market_type,
+                str(short_market_type or "perp"),
                 quantity=float(qty_short),
             )
             ob_long = fut_long.result() or {"error": "no_data"}
@@ -5625,7 +6658,7 @@ class LiveTradingManager:
     def _load_open_quantities(self, conn, signal_id: int, symbol: str) -> Tuple[Optional[float], Optional[float]]:
         rows = conn.execute(
             """
-            SELECT leg, quantity, filled_qty, exchange
+            SELECT leg, quantity, filled_qty, exchange, market_type
               FROM watchlist.live_trade_order
              WHERE signal_id=%s
                AND action='open'
@@ -5659,6 +6692,7 @@ class LiveTradingManager:
                 continue
             leg = str(r.get("leg") or "")
             exchange = str(r.get("exchange") or "").lower()
+            mkt = str(r.get("market_type") or "perp").lower()
             qty_val: Optional[float] = None
             filled_qty = r.get("filled_qty")
             qty_raw = r.get("quantity")
@@ -5671,7 +6705,7 @@ class LiveTradingManager:
                     qty_val = filled_f
                     # Safety: OKX fills are in contracts; if a legacy row still stores contracts,
                     # convert to base when that matches the originally requested size better.
-                    if exchange == "okx" and symbol_u:
+                    if exchange == "okx" and mkt != "spot" and symbol_u:
                         try:
                             qty_req = float(qty_raw)
                         except Exception:
@@ -5699,7 +6733,7 @@ class LiveTradingManager:
     def _load_open_entry_prices(self, conn, signal_id: int, symbol: Optional[str] = None) -> Tuple[Optional[float], Optional[float]]:
         rows = conn.execute(
             """
-            SELECT leg, avg_price, filled_qty, quantity, exchange
+            SELECT leg, avg_price, filled_qty, quantity, exchange, market_type
               FROM watchlist.live_trade_order
              WHERE signal_id=%s
                AND action='open'
@@ -5736,6 +6770,7 @@ class LiveTradingManager:
                 continue
             leg = str(r.get("leg") or "")
             exchange = str(r.get("exchange") or "").lower()
+            mkt = str(r.get("market_type") or "perp").lower()
             try:
                 px = float(r.get("avg_price"))  # type: ignore[arg-type]
             except Exception:
@@ -5753,7 +6788,7 @@ class LiveTradingManager:
                     filled_f = 0.0
                 if filled_f > 0:
                     qty_val = filled_f
-                    if exchange == "okx" and sym_u:
+                    if exchange == "okx" and mkt != "spot" and sym_u:
                         try:
                             qty_req = float(qty_raw)
                         except Exception:
@@ -6392,6 +7427,9 @@ class LiveTradingManager:
         if status not in {"open", "closing"}:
             return
 
+        signal_type = str(signal_row.get("signal_type") or "").strip().upper()
+        long_mkt, short_mkt = self._resolve_leg_market_types(signal_type)
+
         close_requested_at = signal_row.get("close_requested_at")
         if isinstance(close_requested_at, datetime):
             close_requested_at = close_requested_at.astimezone(timezone.utc)
@@ -6420,8 +7458,8 @@ class LiveTradingManager:
         # Prefer live positions to avoid unit mismatches or partial-fill drift.
         try:
             with ThreadPoolExecutor(max_workers=2) as pool:
-                fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol)
-                fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol)
+                fut_l = pool.submit(self._get_exchange_position_size, str(long_ex), symbol, long_mkt)
+                fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol, short_mkt)
                 pos_long = fut_l.result()
                 pos_short = fut_s.result()
             if pos_long is not None and float(pos_long) > 0:
@@ -6440,6 +7478,7 @@ class LiveTradingManager:
                 "suffix": "L",
                 "side": "short",
                 "stage": "close_long",
+                "market_type": long_mkt,
             },
             {
                 "leg": "short",
@@ -6448,6 +7487,7 @@ class LiveTradingManager:
                 "suffix": "S",
                 "side": "long",
                 "stage": "close_short",
+                "market_type": short_mkt,
             },
         ]
 
@@ -6465,6 +7505,7 @@ class LiveTradingManager:
                         position_leg=str(spec["leg"]),
                         quantity=float(spec["qty"]),
                         client_order_id=f"{close_base}-{spec['suffix']}",
+                        market_type=str(spec.get("market_type") or "perp"),
                     )
                 ] = spec
             for fut, spec in futures.items():
@@ -6491,7 +7532,12 @@ class LiveTradingManager:
                 continue
             close_leg_at = _utcnow()
             order_param = _jsonb(order) if order is not None else None
-            fill = self._parse_fill_fields(str(spec["exchange"]), symbol, order)
+            fill = self._parse_fill_fields(
+                str(spec["exchange"]),
+                symbol,
+                order,
+                market_type=str(spec.get("market_type") or "perp"),
+            )
             conn.execute(
                 """
                 INSERT INTO watchlist.live_trade_order(
@@ -6507,7 +7553,7 @@ class LiveTradingManager:
                     str(spec["leg"]),
                     str(spec["exchange"]),
                     str(spec["side"]),
-                    "perp",
+                    str(spec.get("market_type") or "perp"),
                     None,
                     str(spec["qty"]),
                     float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
@@ -6552,6 +7598,7 @@ class LiveTradingManager:
                     short_ex=str(short_ex),
                     close_reason=str(close_reason),
                     status_before=status,
+                    signal_type=str(signal_row.get("signal_type") or ""),
                 )
                 if isinstance(retry, dict) and retry.get("closed"):
                     return
@@ -6585,10 +7632,11 @@ class LiveTradingManager:
         try:
             for ex in {str(long_ex), str(short_ex)}:
                 if ex:
-                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex)
+                    leg_mkt = long_mkt if str(ex) == str(long_ex) else short_mkt
+                    self._post_fail_safety_flatten(conn, int(signal_id), symbol, ex, market_type=leg_mkt)
 
-            pos_long = self._get_exchange_position_size(str(long_ex), symbol)
-            pos_short = self._get_exchange_position_size(str(short_ex), symbol)
+            pos_long = self._get_exchange_position_size(str(long_ex), symbol, long_mkt)
+            pos_short = self._get_exchange_position_size(str(short_ex), symbol, short_mkt)
             if (pos_long is not None and abs(float(pos_long)) > 1e-9) or (
                 pos_short is not None and abs(float(pos_short)) > 1e-9
             ):
@@ -6657,9 +7705,21 @@ class LiveTradingManager:
         position_leg: str,
         quantity: float,
         client_order_id: str,
+        market_type: str = "perp",
     ) -> Dict[str, Any]:
         ex = (exchange or "").lower()
         pos = (position_leg or "").lower()
+        mkt = (market_type or "perp").lower().strip()
+        if mkt == "spot":
+            if pos != "long":
+                raise TradeExecutionError("Spot close only supports long positions")
+            return execute_spot_market_order(
+                ex,
+                symbol,
+                side="sell",
+                quantity=float(quantity),
+                order_kwargs={"client_order_id": client_order_id},
+            )
         if ex == "binance":
             side = "SELL" if pos == "long" else "BUY"
             position_side = "LONG" if pos == "long" else "SHORT"

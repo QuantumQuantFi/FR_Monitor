@@ -1136,7 +1136,7 @@ def _watchlist_preload_worker() -> None:
 if str(os.getenv("WATCHLIST_PRELOAD_ON_STARTUP", "1")).strip().lower() not in {"0", "false", "no", "off"}:
     threading.Thread(target=_watchlist_preload_worker, name="watchlist-preload", daemon=True).start()
 
-# Live trading manager (Phase 1: Type B trading + Type C signal-only). Default disabled via LIVE_TRADING_CONFIG.
+# Live trading manager (Type B perp + optional Type C spot-perp). Default disabled via LIVE_TRADING_CONFIG.
 live_trading_manager = LiveTradingManager(
     LiveTradingConfig(
         enabled=bool(LIVE_TRADING_CONFIG.get('enabled')),
@@ -1151,6 +1151,17 @@ live_trading_manager = LiveTradingManager(
         win_prob_threshold=float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.93)),
         type_c_pnl_threshold=float(LIVE_TRADING_CONFIG.get('type_c_pnl_threshold', 0.012)),
         type_c_win_prob_threshold=float(LIVE_TRADING_CONFIG.get('type_c_win_prob_threshold', 0.93)),
+        spot_trading_enabled=bool(LIVE_TRADING_CONFIG.get('spot_trading_enabled', False)),
+        spot_allowed_exchanges=tuple(
+            x.strip().lower()
+            for x in str(LIVE_TRADING_CONFIG.get('spot_allowed_exchanges') or '').split(',')
+            if x.strip()
+        ) or ("binance", "okx", "bybit", "bitget"),
+        spot_per_leg_notional_usdt=(
+            float(LIVE_TRADING_CONFIG.get('spot_per_leg_notional_usdt'))
+            if float(LIVE_TRADING_CONFIG.get('spot_per_leg_notional_usdt') or 0.0) > 0
+            else None
+        ),
         v2_enabled=bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
         v2_pnl_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.012)),
         v2_win_prob_threshold_240=float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.92)),

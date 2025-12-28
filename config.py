@@ -320,7 +320,7 @@ WATCHLIST_V2_PRED_CONFIG = {
     'max_missing_ratio': float(_get_private('WATCHLIST_V2_MAX_MISSING', 'WATCHLIST_V2_MAX_MISSING', '0.2')),
 }
 
-# Live trading (Phase 1: Type B only, perp-perp)
+# Live trading (Type B perp-perp + Type C spot-perp)
 LIVE_TRADING_CONFIG = {
     # 默认开启自动实盘；如需关闭请设置 LIVE_TRADING_ENABLED=0
     'enabled': _is_truthy(_get_private('LIVE_TRADING_ENABLED', 'LIVE_TRADING_ENABLED', '1')),
@@ -331,6 +331,17 @@ LIVE_TRADING_CONFIG = {
     # Type C v1 阈值：仅用于 signal-only（默认与 Type B v1 保持一致）
     'type_c_pnl_threshold': float(_get_private('LIVE_TRADING_C_PNL_THRESHOLD', 'LIVE_TRADING_C_PNL_THRESHOLD', '0.0085')),
     'type_c_win_prob_threshold': float(_get_private('LIVE_TRADING_C_WIN_PROB_THRESHOLD', 'LIVE_TRADING_C_WIN_PROB_THRESHOLD', '0.85')),
+    # Spot trading for Type C: disabled by default.
+    'spot_trading_enabled': _is_truthy(_get_private('LIVE_TRADING_SPOT_ENABLED', 'LIVE_TRADING_SPOT_ENABLED', '0')),
+    'spot_allowed_exchanges': _get_private(
+        'LIVE_TRADING_SPOT_ALLOWED_EXCHANGES',
+        'LIVE_TRADING_SPOT_ALLOWED_EXCHANGES',
+        'binance,okx,bybit,bitget',
+    ),
+    # If <=0 or empty, fall back to per_leg_notional_usdt.
+    'spot_per_leg_notional_usdt': float(
+        _get_private('LIVE_TRADING_SPOT_PER_LEG_NOTIONAL', 'LIVE_TRADING_SPOT_PER_LEG_NOTIONAL', '0')
+    ),
     # v2 预测触发阈值（v2 的 win_prob 分布整体低于 v1；默认适度放宽以确保能触发）
     'v2_enabled': _is_truthy(_get_private('LIVE_TRADING_V2_ENABLED', 'LIVE_TRADING_V2_ENABLED', '1')),
     # v2 阈值：可按 horizon 独立配置；默认值以“每天触发量可控 + 不至于长期 0 v2 开仓”为目标。
