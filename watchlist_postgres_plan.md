@@ -163,6 +163,41 @@ FR_Monitor 的最小责任应是：
 - 将 `fee_threshold` 与交易所费率/预估滑点联动：为不同交易所/腿组合动态估算“净胜阈值”，并落库到 `live_trade_signal.threshold` 方便回放。
 - 对“分钟数据不完整”的现实做策略适配：仍保持 **全币种全交易所落库**，但在因子计算（尤其 Type B/C 跨所两腿）阶段允许用 `price_data` 的最近邻数据按分钟网格对齐（配置 `WATCHLIST_METRICS_CONFIG.legs_nearest_max_gap_seconds`），避免因 `price_data_1min` 的同分钟交集太少导致预测失败。
 
+### 0.3 现货交易能力调研与落地计划（2025-12-27）
+**现状发现（公开 REST 侧验证）**
+- `test_rest_apis.py` 实测：支持现货快照 API 的交易所仅 4/7 —— `binance/okx/bybit/bitget`；`grvt/lighter/hyperliquid` 无现货 REST。
+- 结论：Type C 的 spot 腿 **只能落地在上述 4 所**；其余交易所只能作为 perp 腿。
+
+**代码现状（功能缺口）**
+- `trading/trade_executor.py` 目前仅实现 perp 下单与持仓查询，`SUPPORTED_SPOT_EXCHANGES` 为空。
+- `live_trading_manager.py` 执行链路固定为双腿 perp（orderbook、下单、持仓检查、平仓逻辑均为 perp 口径）。
+- `orderbook_utils.py` 已支持 spot/perp 订单簿扫单口径，可直接用于 spot 复核与执行定价。
+
+**落地步骤（分批）**
+1) **交易所 spot 私有接口能力补齐**
+   - Binance/OKX/Bybit/Bitget：新增 spot 下单、余额/持仓（余额视为持仓）、订单查询接口与数量/最小下单规则。
+2) **live trading 支持 per‑leg market_type**
+   - Type C：固定 `long=spot`、`short=perp`，订单簿与执行均按腿 market_type 请求。
+   - 新增 `spot_trading_enabled` 配置；默认关闭，避免自动实盘。
+3) **风控与数据落库**
+   - live_trade_order 写入每条订单的 `market_type`；open/close 回补填充 spot leg 的成交量。
+   - spot leg 使用余额/持仓检查，避免 “现货卖出数量不足”。
+4) **私有 API & 实盘测试**
+   - 读取余额/持仓：4 所 spot + 现有 perp 账户。
+   - 以 `ETH` 执行一次 `50 USDT` 现货买入/卖出验算（记录成交 qty 与均价），并写入测试结果。
+
+**进度更新（已落地）**
+- `trading/trade_executor.py` 已补齐 Binance/OKX/Bybit/Bitget spot 下单、余额、订单查询与下单精度/最小名义校验。
+- `trading/live_trading_manager.py` 已支持 per‑leg `market_type`，Type C 可在 `spot_trading_enabled=1` 时执行 `spot long + perp short`；否则继续 signal-only。
+- 新增配置项：`spot_trading_enabled`、`spot_allowed_exchanges`、`spot_per_leg_notional_usdt`，并已接入 `simple_app.py` 配置解析。
+- 新增私有测试脚本：`test_spot_private_apis.py`（spot 余额读取 + 50U ETH 买卖）。
+
+**私有 API 测试结果（2025-12-27）**
+- OKX/Bybit/Bitget：spot 余额读取成功；Binance spot 余额接口可用（USDT 余额为 0）。
+- OKX：`50 USDT` 买入 ETH 成交成功。
+- 首次卖出按“满量”提交失败（手续费导致可用 ETH 低于成交量），改用 0.5% 缓冲后卖出成功。
+- 当前残留 `~0.000086 ETH`（手续费/缓冲造成的零头）；live trading 平仓路径使用余额检查，不会重复触发该问题。
+
 ---
 
 ## 1. 信号规则与过去 24h 频次校准（你提出的第 1 条）
@@ -220,7 +255,7 @@ FR_Monitor 的最小责任应是：
 - Type B（跨交易所永续）：从 `trigger_details.prices` 找到“高价交易所/低价交易所”：
   - `short` 高价 perp（价差收敛时盈利）
   - `long` 低价 perp
-- Type C（现货 vs 永续）：一期 **不自动交易**（当前交易模块未实现 spot 下单）。后续加入现货交易后，再实现 Type C 自动开仓与平仓。
+- Type C（现货 vs 永续）：当 `spot_trading_enabled=1` 时自动交易（`spot long + perp short`）；否则保持 signal-only。
 - Type A（同所现货 vs 永续、资金费逻辑）：同样受限于 spot 下单与策略口径，建议先不自动化，先做记录与展示。
 
 ### 3.2.2 Type C 当前实现现状（已落地）
@@ -234,7 +269,7 @@ FR_Monitor 的最小责任应是：
 - 该路径与 Type B 逻辑保持一致（Top‑K 交易所拉盘、内存枚举 pair），但 Type C 禁用 v2 预测与双向方向选择。
 
 **live trading 行为**
-- `trading/live_trading_manager.py` 已接入 Type C 事件筛选与阈值判断，但**仅记录 signal**：当达到阈值时写入 `watchlist.live_trade_signal`，状态为 `skipped`，`reason=signal_only`，不会触发实际开仓/平仓。
+- `trading/live_trading_manager.py` 已接入 Type C 事件筛选与阈值判断；当 `spot_trading_enabled=1` 时自动执行 `spot long + perp short`，否则仍为 `signal_only`（`status=skipped`）。
 - Type C 的跳过信号目前不会进入 “skipped 重试” 流程（仅 Type B 重试）。
 
 **阈值配置**
