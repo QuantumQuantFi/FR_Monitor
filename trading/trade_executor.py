@@ -208,6 +208,8 @@ class _BinanceSymbolFilters:
 
 _BINANCE_FILTER_CACHE: Dict[tuple[str, str], _BinanceSymbolFilters] = {}
 _BINANCE_FILTER_CACHE_TTL = 15 * 60  # seconds
+_BINANCE_SPOT_FILTER_CACHE: Dict[tuple[str, str], _BinanceSymbolFilters] = {}
+_BINANCE_SPOT_FILTER_CACHE_TTL = 15 * 60  # seconds
 
 # Binance price cache to reduce per-symbol polling (helps avoid IP bans).
 _BINANCE_PRICE_CACHE: Dict[str, tuple[float, float]] = {}
@@ -227,6 +229,8 @@ class _OKXInstrumentFilters:
 
 _OKX_INSTRUMENT_CACHE: Dict[tuple[str, str], _OKXInstrumentFilters] = {}
 _OKX_INSTRUMENT_CACHE_TTL = 15 * 60  # seconds
+_OKX_SPOT_INSTRUMENT_CACHE: Dict[tuple[str, str], _OKXInstrumentFilters] = {}
+_OKX_SPOT_INSTRUMENT_CACHE_TTL = 15 * 60  # seconds
 
 
 @dataclass
@@ -251,8 +255,18 @@ class _BitgetContractFilters:
     fetched_at: float
 
 
+@dataclass
+class _BitgetSpotSymbolFilters:
+    min_qty: Decimal
+    qty_step: Decimal
+    min_notional: Optional[Decimal]
+    fetched_at: float
+
+
 _BITGET_CONTRACT_CACHE: Dict[tuple[str, str, str], _BitgetContractFilters] = {}
 _BITGET_CONTRACT_CACHE_TTL = 15 * 60  # seconds
+_BITGET_SPOT_SYMBOL_CACHE: Dict[tuple[str, str], _BitgetSpotSymbolFilters] = {}
+_BITGET_SPOT_SYMBOL_CACHE_TTL = 15 * 60  # seconds
 
 
 @dataclass
@@ -275,7 +289,7 @@ _GRVT_CLIENT_CACHE: Dict[tuple[str, str], tuple[Any, float]] = {}
 
 
 SUPPORTED_PERPETUAL_EXCHANGES = ("binance", "okx", "bybit", "bitget", "hyperliquid", "lighter", "grvt")
-SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ()  # Spot helpers not yet implemented
+SUPPORTED_SPOT_EXCHANGES: tuple[str, ...] = ("binance", "okx", "bybit", "bitget")
 
 
 def _require_credentials(name: str) -> Any:
@@ -668,7 +682,12 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
     min_source = lot_filter
     if market_lot_filter is not None:
         if market_lot_filter.get("stepSize"):
-            step_source = market_lot_filter
+            try:
+                step_candidate = Decimal(str(market_lot_filter.get("stepSize")))
+            except Exception:
+                step_candidate = None
+            if step_candidate is not None and step_candidate > 0:
+                step_source = market_lot_filter
         if market_lot_filter.get("minQty"):
             min_source = market_lot_filter
 
@@ -707,6 +726,87 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
         min_notional,
         quantity_precision,
     )
+    return cached_filters
+
+
+def _get_binance_spot_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFilters:
+    """Fetch and cache Binance SPOT quantity filters for ``symbol``."""
+    key = (base_url, symbol)
+    now = time.time()
+    cached = _BINANCE_SPOT_FILTER_CACHE.get(key)
+    if cached and now - cached.fetched_at < _BINANCE_SPOT_FILTER_CACHE_TTL:
+        return cached
+
+    url = f"{base_url}/api/v3/exchangeInfo"
+    params: List[tuple[str, str]] = [("symbol", symbol)]
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Failed to fetch Binance spot exchange info ({response.status_code}): {data}")
+
+    symbols = data.get("symbols") or []
+    if not symbols:
+        raise TradeExecutionError(f"Binance spot exchange info missing symbol data: {data}")
+    target_symbol = symbol.upper()
+    if len(symbols) > 1:
+        symbol_info = next((item for item in symbols if item.get("symbol") == target_symbol), None)
+        if symbol_info is None:
+            raise TradeExecutionError(
+                f"Binance spot exchange info did not include requested symbol {target_symbol}: {data}"
+            )
+    else:
+        symbol_info = symbols[0]
+    filters = symbol_info.get("filters", [])
+    lot_filter = next((f for f in filters if f.get("filterType") == "LOT_SIZE"), None)
+    if lot_filter is None:
+        raise TradeExecutionError(f"Binance spot exchange info missing LOT_SIZE filter: {data}")
+
+    market_lot_filter = next((f for f in filters if f.get("filterType") == "MARKET_LOT_SIZE"), None)
+    step_source = lot_filter
+    min_source = lot_filter
+    if market_lot_filter is not None:
+        if market_lot_filter.get("stepSize"):
+            try:
+                step_candidate = Decimal(str(market_lot_filter.get("stepSize")))
+            except Exception:
+                step_candidate = None
+            if step_candidate is not None and step_candidate > 0:
+                step_source = market_lot_filter
+        if market_lot_filter.get("minQty"):
+            try:
+                min_candidate = Decimal(str(market_lot_filter.get("minQty")))
+            except Exception:
+                min_candidate = None
+            if min_candidate is not None and min_candidate > 0:
+                min_source = market_lot_filter
+
+    step_size = Decimal(step_source["stepSize"])
+    min_qty = Decimal(min_source["minQty"])
+
+    notional_filter = next(
+        (f for f in filters if f.get("filterType") in {"MIN_NOTIONAL", "NOTIONAL"}), None
+    )
+    min_notional: Optional[Decimal] = None
+    if notional_filter is not None:
+        raw_min_notional = notional_filter.get("notional") or notional_filter.get("minNotional")
+        if raw_min_notional is not None:
+            min_notional = Decimal(str(raw_min_notional))
+
+    quantity_precision_raw = symbol_info.get("quantityPrecision")
+    quantity_precision: Optional[int]
+    try:
+        quantity_precision = int(quantity_precision_raw) if quantity_precision_raw is not None else None
+    except (TypeError, ValueError):
+        quantity_precision = None
+
+    cached_filters = _BinanceSymbolFilters(
+        min_qty=min_qty,
+        step_size=step_size,
+        min_notional=min_notional,
+        quantity_precision=quantity_precision,
+        fetched_at=now,
+    )
+    _BINANCE_SPOT_FILTER_CACHE[key] = cached_filters
     return cached_filters
 
 
@@ -828,6 +928,60 @@ def _normalise_binance_quantity(
     )
 
     return quantity_str, normalised
+
+
+def _normalise_binance_spot_quantity(
+    symbol: str,
+    quantity: Union[str, float, Decimal, int],
+    base_url: str,
+) -> tuple[str, Decimal]:
+    """Snap ``quantity`` to Binance spot filter increments and enforce minimums."""
+    filters = _get_binance_spot_symbol_filters(symbol, base_url)
+    try:
+        dec_qty = Decimal(str(quantity))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise TradeExecutionError(f"`quantity` {quantity!r} is not a valid decimal amount") from exc
+    if dec_qty <= 0:
+        raise TradeExecutionError("`quantity` must be a positive number of units")
+    step = filters.step_size
+    minimum = filters.min_qty
+    precision = filters.quantity_precision
+
+    if precision is not None:
+        precision_step = Decimal(1).scaleb(-precision) if precision > 0 else Decimal(1)
+        if precision_step > step:
+            step = precision_step
+        if minimum < precision_step:
+            minimum = precision_step
+
+    units = (dec_qty / step).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * step
+
+    if normalised < minimum:
+        raise TradeExecutionError(
+            f"`quantity` {dec_qty} is below Binance spot minimum {minimum} for {symbol}; increase the order size"
+        )
+
+    quantity_str = _format_decimal_for_step(normalised, step)
+    return quantity_str, normalised
+
+
+def get_binance_spot_price(
+    symbol: str,
+    *,
+    base_url: str = "https://api.binance.com",
+) -> float:
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+    response = _send_request("GET", f"{base_url}/api/v3/ticker/price", params=[("symbol", pair)])
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance spot price error {response.status_code}: {data}")
+    try:
+        return float(data.get("price"))
+    except Exception as exc:
+        raise TradeExecutionError(f"Binance spot price invalid: {data}") from exc
 
 
 def _normalise_okx_size(symbol: str, size: Any, base_url: str, inst_type: str = "SWAP") -> tuple[str, Decimal]:
@@ -1425,6 +1579,194 @@ def get_binance_perp_order(
     return data if isinstance(data, dict) else {"data": data}
 
 
+def get_binance_spot_order(
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.binance.com",
+) -> Dict[str, Any]:
+    """Fetch a Binance SPOT order by orderId or origClientOrderId."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+    if not order_id and not client_order_id:
+        raise TradeExecutionError("Either order_id or client_order_id is required")
+
+    params: List[tuple[str, str]] = [
+        ("symbol", pair),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+    ]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("origClientOrderId", str(client_order_id)))
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {"X-MBX-APIKEY": creds.api_key, "User-Agent": USER_AGENT}
+    response = _send_request("GET", f"{base_url}/api/v3/order", params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance spot order query failed {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance spot order query reject: {data}")
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def get_binance_spot_account(
+    *,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.binance.com",
+) -> Dict[str, Any]:
+    """Fetch Binance SPOT account snapshot via GET /api/v3/account."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+    params: List[tuple[str, str]] = [
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+    ]
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+    headers = {"X-MBX-APIKEY": creds.api_key, "User-Agent": USER_AGENT}
+    response = _send_request("GET", f"{base_url}/api/v3/account", params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance spot account error {response.status_code}: {data}")
+    return data if isinstance(data, dict) else {"data": data}
+
+
+def get_binance_spot_balance(
+    *,
+    coin: Optional[str] = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.binance.com",
+) -> Dict[str, Any]:
+    """Return a normalized balance snapshot for Binance SPOT."""
+    account = get_binance_spot_account(api_key=api_key, secret_key=secret_key, base_url=base_url)
+    balances = account.get("balances") if isinstance(account, dict) else None
+    target = (coin or "").upper() if coin else None
+    item = None
+    if isinstance(balances, list) and target:
+        for b in balances:
+            if not isinstance(b, dict):
+                continue
+            if str(b.get("asset") or "").upper() == target:
+                item = b
+                break
+    if not isinstance(item, dict):
+        item = balances[0] if isinstance(balances, list) and balances else {}
+    free = item.get("free")
+    locked = item.get("locked")
+    total = None
+    try:
+        total = float(free or 0) + float(locked or 0)
+    except Exception:
+        total = None
+    return {
+        "currency": target,
+        "free": free,
+        "locked": locked,
+        "total": total,
+        "raw": item,
+    }
+
+
+def place_binance_spot_market_order(
+    symbol: str,
+    side: str,
+    *,
+    quantity: Optional[Union[str, float, Decimal, int]] = None,
+    quote_quantity: Optional[Union[str, float, Decimal, int]] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.binance.com",
+) -> Dict[str, Any]:
+    """Submit a Binance SPOT market order (quote quantity preferred for BUY)."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+
+    side_up = side.upper()
+    if side_up not in {"BUY", "SELL"}:
+        raise TradeExecutionError("Binance spot side must be BUY or SELL")
+
+    params: List[tuple[str, str]] = [
+        ("symbol", pair),
+        ("side", side_up),
+        ("type", "MARKET"),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+        ("newOrderRespType", "FULL"),
+    ]
+
+    if side_up == "BUY" and quote_quantity is not None:
+        try:
+            quote_val = Decimal(str(quote_quantity))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid quote_quantity {quote_quantity!r}") from exc
+        if quote_val <= 0:
+            raise TradeExecutionError("quote_quantity must be positive")
+        filters = _get_binance_spot_symbol_filters(pair, base_url)
+        min_notional = filters.min_notional
+        if min_notional is not None and quote_val < min_notional:
+            raise TradeExecutionError(
+                f"Binance spot notional {quote_val} is below minimum {min_notional} for {pair}; increase size"
+            )
+        params.append(("quoteOrderQty", format(quote_val.normalize(), "f")))
+    else:
+        if quantity is None:
+            raise TradeExecutionError("quantity is required for SELL or base-qty BUY")
+        qty_str, normalised_qty = _normalise_binance_spot_quantity(pair, quantity, base_url)
+        filters = _get_binance_spot_symbol_filters(pair, base_url)
+        min_notional = filters.min_notional
+        if min_notional is not None:
+            try:
+                price = get_binance_spot_price(pair, base_url=base_url)
+                notional_check = Decimal(str(price)) * Decimal(str(normalised_qty))
+                if notional_check < min_notional:
+                    raise TradeExecutionError(
+                        f"Binance spot notional {notional_check} is below minimum {min_notional} for {pair}; "
+                        "increase size"
+                    )
+            except TradeExecutionError:
+                raise
+            except Exception:
+                pass
+        params.append(("quantity", qty_str))
+
+    if client_order_id:
+        coid = _sanitize_binance_client_order_id(client_order_id)
+        if coid:
+            params.append(("newClientOrderId", coid))
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {"X-MBX-APIKEY": creds.api_key, "User-Agent": USER_AGENT}
+    response = _send_request("POST", f"{base_url}/api/v3/order", params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance spot error {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
+        raise TradeExecutionError(f"Binance spot reject: {data}")
+    return data if isinstance(data, dict) else {"data": data}
+
+
 def set_binance_perp_leverage(
     symbol: str,
     leverage: Union[int, float, str],
@@ -1751,6 +2093,72 @@ def _get_okx_instrument_filters(
     return filters
 
 
+def _get_okx_spot_instrument_filters(symbol: str, base_url: str) -> _OKXInstrumentFilters:
+    """Fetch OKX SPOT instrument metadata (lotSz/minSz/tickSz)."""
+    key_symbol = symbol.upper()
+    if not key_symbol.endswith("-USDT"):
+        key_symbol = f"{key_symbol}-USDT"
+
+    cache_key = (base_url, key_symbol)
+    now = time.time()
+    cached = _OKX_SPOT_INSTRUMENT_CACHE.get(cache_key)
+    if cached and now - cached.fetched_at < _OKX_SPOT_INSTRUMENT_CACHE_TTL:
+        return cached
+
+    request_path = "/api/v5/public/instruments"
+    params: List[tuple[str, str]] = [("instType", "SPOT"), ("instId", key_symbol)]
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX spot instrument metadata reject: {data}")
+
+    instruments = data.get("data") or []
+    if not instruments:
+        raise TradeExecutionError(f"OKX spot instruments payload empty for {key_symbol}: {data}")
+
+    instrument = instruments[0]
+    try:
+        lot_size = Decimal(str(instrument["lotSz"]))
+        min_size = Decimal(str(instrument["minSz"]))
+        tick_size = Decimal(str(instrument.get("tickSz", "0")))
+    except (KeyError, InvalidOperation) as exc:
+        raise TradeExecutionError(f"OKX spot instrument payload invalid: {instrument}") from exc
+
+    filters = _OKXInstrumentFilters(
+        lot_size=lot_size,
+        min_size=min_size,
+        contract_value=Decimal("1"),
+        tick_size=tick_size,
+        fetched_at=now,
+    )
+    _OKX_SPOT_INSTRUMENT_CACHE[cache_key] = filters
+    return filters
+
+
+def _normalise_okx_spot_size(symbol: str, size: Any, base_url: str) -> tuple[str, Decimal]:
+    filters = _get_okx_spot_instrument_filters(symbol, base_url)
+    try:
+        raw_base = Decimal(str(size))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"`size` {size!r} is not a valid decimal quantity") from exc
+    if raw_base <= 0:
+        raise TradeExecutionError("`size` must be a positive quantity")
+
+    lot = filters.lot_size
+    if lot <= 0:
+        raise TradeExecutionError("OKX spot lotSz invalid")
+
+    units = (raw_base / lot).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * lot
+    if normalised < filters.min_size:
+        raise TradeExecutionError(
+            f"`size` {raw_base} is below OKX spot minimum {filters.min_size} for {symbol}; increase order size"
+        )
+    size_str = format(normalised.normalize(), "f")
+    return size_str, normalised
+
+
 def get_okx_swap_contract_value(
     symbol: str,
     *,
@@ -1796,10 +2204,13 @@ def _get_bybit_symbol_filters(
     instrument = instruments[0]
     lot_filter = instrument.get("lotSizeFilter") or {}
 
+    qty_step_raw = lot_filter.get("qtyStep")
+    if qty_step_raw is None and category_key == "spot":
+        qty_step_raw = lot_filter.get("basePrecision") or lot_filter.get("minOrderQty")
     try:
-        qty_step = Decimal(str(lot_filter["qtyStep"]))
+        qty_step = Decimal(str(qty_step_raw))
         min_qty = Decimal(str(lot_filter["minOrderQty"]))
-    except (KeyError, InvalidOperation) as exc:
+    except (KeyError, InvalidOperation, TypeError) as exc:
         raise TradeExecutionError(f"Bybit lot size metadata invalid: {lot_filter}") from exc
 
     max_qty_raw = lot_filter.get("maxOrderQty")
@@ -2105,6 +2516,90 @@ def get_bybit_linear_order(
         first = order_list[0]
         return first if isinstance(first, dict) else {"data": first}
     return data
+
+
+def get_bybit_spot_order(
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Fetch a Bybit SPOT order status via `/v5/order/realtime`."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    if not order_id and not client_order_id:
+        raise TradeExecutionError("Either `order_id` or `client_order_id` is required")
+
+    request_path = "/v5/order/realtime"
+    params: List[tuple[str, str]] = [
+        ("category", "spot"),
+        ("symbol", symbol_id),
+    ]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("orderLinkId", str(client_order_id)))
+
+    params_sorted = sorted(params, key=lambda item: item[0])
+    query_str = urlencode(params_sorted)
+
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{query_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params_sorted, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit spot order query reject: {data}")
+    result = data.get("result") or {}
+    order_list = result.get("list") if isinstance(result, dict) else None
+    if isinstance(order_list, list) and order_list:
+        first = order_list[0]
+        return first if isinstance(first, dict) else {"data": first}
+    return data
+
+
+def get_bybit_spot_balance(
+    *,
+    coin: Optional[str] = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Return a normalized SPOT balance snapshot via Bybit unified wallet."""
+    data = get_bybit_wallet_balance(
+        account_type="UNIFIED",
+        coin=coin,
+        api_key=api_key,
+        secret_key=secret_key,
+        base_url=base_url,
+    )
+    cur = (coin or "").upper() if coin else None
+    return {
+        "currency": cur,
+        "wallet_balance": data.get("wallet_balance"),
+        "available_balance": data.get("available_balance"),
+        "equity": data.get("equity"),
+        "raw": data.get("raw") if isinstance(data, dict) else data,
+    }
 
 
 def get_bitget_usdt_perp_positions(
@@ -2438,6 +2933,84 @@ def _normalise_bitget_size(
     return size_str, normalised
 
 
+def _get_bitget_spot_symbol_filters(symbol: str, *, base_url: str) -> _BitgetSpotSymbolFilters:
+    key_symbol = symbol.upper()
+    if not key_symbol.endswith("USDT"):
+        key_symbol = f"{key_symbol}USDT"
+
+    cache_key = (base_url, key_symbol)
+    now = time.time()
+    cached = _BITGET_SPOT_SYMBOL_CACHE.get(cache_key)
+    if cached and now - cached.fetched_at < _BITGET_SPOT_SYMBOL_CACHE_TTL:
+        return cached
+
+    request_path = "/api/v2/spot/public/symbols"
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget spot symbols reject: {data}")
+
+    rows = data.get("data") or []
+    if not isinstance(rows, list):
+        raise TradeExecutionError(f"Bitget spot symbols payload invalid: {data}")
+    row = next((r for r in rows if str(r.get("symbol") or "").upper() == key_symbol), None)
+    if not isinstance(row, dict):
+        raise TradeExecutionError(f"Bitget spot symbol not found: {key_symbol}")
+
+    try:
+        min_qty = Decimal(str(row.get("minTradeNum") or "0"))
+    except Exception:
+        min_qty = Decimal("0")
+    qty_scale = 0
+    try:
+        if row.get("quantityPrecision") is not None:
+            qty_scale = int(row.get("quantityPrecision") or 0)
+        else:
+            qty_scale = int(row.get("quantityScale") or 0)
+    except Exception:
+        qty_scale = 0
+    qty_step = Decimal("1").scaleb(-qty_scale) if qty_scale >= 0 else Decimal("1")
+
+    min_notional: Optional[Decimal] = None
+    try:
+        raw_min_notional = row.get("minTradeUSDT") or row.get("minTradeAmount")
+        if raw_min_notional is not None:
+            min_notional = Decimal(str(raw_min_notional))
+    except Exception:
+        min_notional = None
+
+    filters = _BitgetSpotSymbolFilters(
+        min_qty=min_qty,
+        qty_step=qty_step,
+        min_notional=min_notional,
+        fetched_at=now,
+    )
+    _BITGET_SPOT_SYMBOL_CACHE[cache_key] = filters
+    return filters
+
+
+def _normalise_bitget_spot_quantity(symbol: str, quantity: Any, *, base_url: str) -> tuple[str, Decimal]:
+    filters = _get_bitget_spot_symbol_filters(symbol, base_url=base_url)
+    try:
+        raw_qty = Decimal(str(quantity))
+    except InvalidOperation as exc:
+        raise TradeExecutionError(f"`quantity` {quantity!r} is not a valid decimal quantity") from exc
+    if raw_qty <= 0:
+        raise TradeExecutionError("`quantity` must be positive")
+    step = filters.qty_step
+    if step <= 0:
+        step = Decimal("1")
+    units = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+    normalised = units * step
+    if normalised < filters.min_qty:
+        raise TradeExecutionError(
+            f"`quantity` {raw_qty} is below Bitget spot minimum {filters.min_qty} for {symbol}; increase size"
+        )
+    qty_str = format(normalised.normalize(), "f")
+    return qty_str, normalised
+
+
 def get_bitget_usdt_perp_price(
     symbol: str,
     *,
@@ -2609,6 +3182,77 @@ def place_okx_swap_market_order(
     return data
 
 
+def place_okx_spot_market_order(
+    symbol: str,
+    side: str,
+    *,
+    size: Optional[Union[str, float, Decimal]] = None,
+    quote_size: Optional[Union[str, float, Decimal]] = None,
+    td_mode: str = "cash",
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Submit a market order on OKX SPOT."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT"):
+        inst_id = f"{inst_id}-USDT"
+
+    payload: Dict[str, Any] = {
+        "instId": inst_id,
+        "tdMode": td_mode,
+        "side": side.lower(),
+        "ordType": "market",
+    }
+
+    if side.lower() == "buy" and quote_size is not None:
+        try:
+            qv = Decimal(str(quote_size))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid quote_size {quote_size!r}") from exc
+        if qv <= 0:
+            raise TradeExecutionError("quote_size must be positive")
+        payload["sz"] = format(qv.normalize(), "f")
+        payload["tgtCcy"] = "quote_ccy"
+    else:
+        if size is None:
+            raise TradeExecutionError("size is required for spot sell or base-qty buy")
+        size_str, _ = _normalise_okx_spot_size(inst_id, size, base_url)
+        payload["sz"] = size_str
+        payload["tgtCcy"] = "base_ccy"
+
+    if client_order_id:
+        sanitized = _sanitize_okx_client_order_id(client_order_id)
+        if sanitized:
+            payload["clOrdId"] = sanitized
+
+    request_path = "/api/v5/trade/order"
+    timestamp = _iso_timestamp()
+    body_str = _compact_json(payload)
+    message = f"{timestamp}POST{request_path}{body_str}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX spot reject: {data}")
+    return data
+
+
 def get_okx_swap_order(
     symbol: str,
     *,
@@ -2661,6 +3305,86 @@ def get_okx_swap_order(
     if isinstance(payload, list) and payload:
         return payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
     return data
+
+
+def get_okx_spot_order(
+    symbol: str,
+    *,
+    ord_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Fetch an OKX spot order by ordId or clOrdId."""
+    creds = _resolve_okx_credentials(api_key, secret_key, passphrase)
+
+    inst_id = symbol.upper()
+    if not inst_id.endswith("-USDT"):
+        inst_id = f"{inst_id}-USDT"
+
+    if not ord_id and not client_order_id:
+        raise TradeExecutionError("Either `ord_id` or `client_order_id` is required")
+
+    request_path = "/api/v5/trade/order"
+    params: List[tuple[str, str]] = [("instId", inst_id)]
+    if ord_id:
+        params.append(("ordId", str(ord_id)))
+    if client_order_id:
+        sanitized = _sanitize_okx_client_order_id(client_order_id)
+        if sanitized:
+            params.append(("clOrdId", sanitized))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "OK-ACCESS-KEY": creds.api_key,
+        "OK-ACCESS-SIGN": signature,
+        "OK-ACCESS-TIMESTAMP": timestamp,
+        "OK-ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "0":
+        raise TradeExecutionError(f"OKX spot order query reject: {data}")
+    payload = data.get("data") or []
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
+    return data
+
+
+def get_okx_spot_balance(
+    *,
+    ccy: Optional[str] = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://www.okx.com",
+) -> Dict[str, Any]:
+    """Return a normalized SPOT balance snapshot via OKX account balance."""
+    data = get_okx_account_balance(
+        ccy=ccy,
+        api_key=api_key,
+        secret_key=secret_key,
+        passphrase=passphrase,
+        base_url=base_url,
+    )
+    cur = (ccy or "").upper() if ccy else None
+    return {
+        "currency": cur,
+        "available_balance": data.get("avail_bal") or data.get("availBal") or data.get("availBal"),
+        "cash_bal": data.get("cash_bal"),
+        "equity": data.get("eq") or data.get("equity"),
+        "raw": data.get("raw") if isinstance(data, dict) else data,
+    }
 
 
 def cancel_okx_swap_order(
@@ -3150,6 +3874,81 @@ def place_bybit_linear_market_order(
     return data
 
 
+def place_bybit_spot_market_order(
+    symbol: str,
+    side: str,
+    *,
+    quantity: Optional[Union[str, float, Decimal]] = None,
+    quote_quantity: Optional[Union[str, float, Decimal]] = None,
+    client_order_id: Optional[str] = None,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> Dict[str, Any]:
+    """Submit a Bybit SPOT market order (quote qty for buy when provided)."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    side_norm = side.strip().lower()
+    if side_norm in {"buy", "b"}:
+        side_val = "Buy"
+    elif side_norm in {"sell", "s"}:
+        side_val = "Sell"
+    else:
+        raise TradeExecutionError("Bybit spot side must be BUY or SELL")
+
+    payload: Dict[str, Any] = {
+        "category": "spot",
+        "symbol": symbol_id,
+        "side": side_val,
+        "orderType": "Market",
+    }
+
+    if side_val == "Buy" and quote_quantity is not None:
+        try:
+            quote_val = Decimal(str(quote_quantity))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid quote_quantity {quote_quantity!r}") from exc
+        if quote_val <= 0:
+            raise TradeExecutionError("quote_quantity must be positive")
+        payload["qty"] = format(quote_val.normalize(), "f")
+        payload["marketUnit"] = "quoteCoin"
+    else:
+        if quantity is None:
+            raise TradeExecutionError("quantity is required for spot sell or base-qty buy")
+        qty_str, _ = _normalise_bybit_quantity(symbol_id, quantity, base_url, "spot")
+        payload["qty"] = qty_str
+        payload["marketUnit"] = "baseCoin"
+
+    if client_order_id:
+        payload["orderLinkId"] = client_order_id
+
+    body_str = _compact_json(payload)
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{body_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    response = _send_request("POST", f"{base_url}/v5/order/create", data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit spot reject: {data}")
+    return data
+
+
 def place_bitget_usdt_perp_market_order(
     symbol: str,
     side: str,
@@ -3268,6 +4067,88 @@ def place_bitget_usdt_perp_market_order(
     return data
 
 
+def place_bitget_spot_market_order(
+    symbol: str,
+    side: str,
+    *,
+    quantity: Optional[Union[str, float, Decimal]] = None,
+    quote_quantity: Optional[Union[str, float, Decimal]] = None,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Submit a Bitget SPOT market order (quote qty for buy when provided)."""
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+
+    inst = symbol.upper()
+    if not inst.endswith("USDT"):
+        inst = f"{inst}USDT"
+
+    side_norm = side.strip().lower()
+    if side_norm in {"buy", "b"}:
+        side_val = "buy"
+    elif side_norm in {"sell", "s"}:
+        side_val = "sell"
+    else:
+        raise TradeExecutionError("Bitget spot side must be BUY or SELL")
+
+    payload: Dict[str, Any] = {
+        "symbol": inst,
+        "side": side_val,
+        "orderType": "market",
+    }
+
+    if side_val == "buy" and quote_quantity is not None:
+        try:
+            quote_val = Decimal(str(quote_quantity))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid quote_quantity {quote_quantity!r}") from exc
+        if quote_val <= 0:
+            raise TradeExecutionError("quote_quantity must be positive")
+        filters = _get_bitget_spot_symbol_filters(inst, base_url=base_url)
+        min_notional = filters.min_notional
+        if min_notional is not None and quote_val < min_notional:
+            raise TradeExecutionError(
+                f"Bitget spot notional {quote_val} is below minimum {min_notional} for {inst}; increase size"
+            )
+        payload["size"] = format(quote_val.normalize(), "f")
+        payload["force"] = "gtc"
+        payload["target"] = "quote"
+    else:
+        if quantity is None:
+            raise TradeExecutionError("quantity is required for spot sell or base-qty buy")
+        qty_str, _ = _normalise_bitget_spot_quantity(inst, quantity, base_url=base_url)
+        payload["size"] = qty_str
+        payload["force"] = "gtc"
+
+    if client_order_id:
+        payload["clientOid"] = str(client_order_id)
+
+    request_path = "/api/v2/spot/trade/place-order"
+    timestamp = _iso_timestamp()
+    body_str = _compact_json(payload)
+    message = f"{timestamp}POST{request_path}{body_str}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("POST", url, data=body_str, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget spot reject: {data}")
+    return data
+
+
 def get_bitget_usdt_perp_order_detail(
     symbol: str,
     *,
@@ -3321,6 +4202,113 @@ def get_bitget_usdt_perp_order_detail(
     if isinstance(payload, dict):
         return payload
     return data
+
+
+def get_bitget_spot_order_detail(
+    symbol: str,
+    *,
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Fetch Bitget SPOT order detail (best-effort, V2 endpoint)."""
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+
+    inst = symbol.upper()
+    if not inst.endswith("USDT"):
+        inst = f"{inst}USDT"
+    if not order_id and not client_order_id:
+        raise TradeExecutionError("Either `order_id` or `client_order_id` is required")
+
+    request_path = "/api/v2/spot/trade/orderInfo"
+    params: List[tuple[str, str]] = [("symbol", inst)]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("clientOid", str(client_order_id)))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget spot order detail reject: {data}")
+    payload = data.get("data")
+    if isinstance(payload, dict):
+        return payload
+    if isinstance(payload, list) and payload:
+        return payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
+    return data
+
+
+def get_bitget_spot_balance(
+    *,
+    coin: Optional[str] = "USDT",
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    passphrase: Optional[str] = None,
+    base_url: str = "https://api.bitget.com",
+) -> Dict[str, Any]:
+    """Return a normalized SPOT balance snapshot for Bitget."""
+    creds = _resolve_bitget_credentials(api_key, secret_key, passphrase)
+    request_path = "/api/v2/spot/account/assets"
+    params: List[tuple[str, str]] = []
+    if coin:
+        params.append(("coin", str(coin).upper()))
+
+    query_str = urlencode(params)
+    timestamp = _iso_timestamp()
+    target = f"{request_path}?{query_str}" if query_str else request_path
+    message = f"{timestamp}GET{target}"
+    signature = _hmac_sha256_base64(creds.secret_key, message)
+
+    headers = {
+        "ACCESS-KEY": creds.api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": creds.passphrase,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("code") != "00000":
+        raise TradeExecutionError(f"Bitget spot balance reject: {data}")
+    payload = data.get("data")
+    cur = (coin or "").upper() if coin else None
+    if isinstance(payload, list) and payload:
+        item = payload[0] if isinstance(payload[0], dict) else {"data": payload[0]}
+        return {
+            "currency": cur,
+            "available_balance": item.get("available") or item.get("availableAmount"),
+            "locked": item.get("frozen") or item.get("lockedAmount"),
+            "raw": item,
+        }
+    if isinstance(payload, dict):
+        return {
+            "currency": cur,
+            "available_balance": payload.get("available") or payload.get("availableAmount"),
+            "locked": payload.get("frozen") or payload.get("lockedAmount"),
+            "raw": payload,
+        }
+    return {"currency": cur, "raw": payload}
 
 
 def get_hyperliquid_user_state(
@@ -4457,6 +5445,67 @@ def execute_dual_perp_market_order(
     exchange_key = (exchange or "").lower()
     if exchange_key not in SUPPORTED_PERPETUAL_EXCHANGES:
         raise TradeExecutionError(f"Exchange `{exchange}` is not supported for perpetual trading")
+
+
+def execute_spot_market_order(
+    exchange: str,
+    symbol: str,
+    *,
+    side: Union[str, None],
+    quantity: Optional[Union[str, float, Decimal, int]] = None,
+    quote_quantity: Optional[Union[str, float, Decimal, int]] = None,
+    order_kwargs: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Submit a spot market order on a supported exchange."""
+    exchange_key = (exchange or "").lower()
+    if exchange_key not in SUPPORTED_SPOT_EXCHANGES:
+        raise TradeExecutionError(f"Exchange `{exchange}` is not supported for spot trading")
+
+    side_key = (side or "").strip().lower()
+    if side_key in {"buy", "b", "long"}:
+        side_val = "buy"
+    elif side_key in {"sell", "s", "short"}:
+        side_val = "sell"
+    else:
+        raise TradeExecutionError("`side` must be BUY/LONG or SELL/SHORT")
+
+    kwargs = dict(order_kwargs or {})
+    client_order_id = kwargs.pop("client_order_id", None)
+
+    if exchange_key == "binance":
+        return place_binance_spot_market_order(
+            symbol,
+            side_val.upper(),
+            quantity=quantity,
+            quote_quantity=quote_quantity,
+            client_order_id=client_order_id,
+        )
+    if exchange_key == "okx":
+        return place_okx_spot_market_order(
+            symbol,
+            side_val,
+            size=quantity,
+            quote_size=quote_quantity,
+            client_order_id=client_order_id,
+        )
+    if exchange_key == "bybit":
+        return place_bybit_spot_market_order(
+            symbol,
+            side_val,
+            quantity=quantity,
+            quote_quantity=quote_quantity,
+            client_order_id=client_order_id,
+        )
+    if exchange_key == "bitget":
+        return place_bitget_spot_market_order(
+            symbol,
+            side_val,
+            quantity=quantity,
+            quote_quantity=quote_quantity,
+            client_order_id=client_order_id,
+        )
+
+    raise TradeExecutionError(f"Exchange `{exchange}` is not supported for spot trading")
 
     quantity_dec = _coerce_positive_quantity(quantity)
     base_kwargs = dict(order_kwargs or {})
