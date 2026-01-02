@@ -6,6 +6,7 @@ import logging
 import math
 import threading
 import time
+from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -37,6 +38,7 @@ from trading.trade_executor import (
     execute_perp_market_order,
     execute_spot_market_order,
     place_binance_perp_market_order,
+    _get_binance_spot_symbol_filters,
     get_binance_perp_usdt_balance,
     get_binance_perp_positions,
     get_binance_perp_order,
@@ -53,6 +55,7 @@ from trading.trade_executor import (
     get_bitget_usdt_perp_positions,
     get_bitget_usdt_balance,
     get_bitget_spot_balance,
+    _get_bitget_spot_symbol_filters,
     get_bitget_spot_order_detail,
     get_bitget_funding_fee_bills,
     get_hyperliquid_balance_summary,
@@ -75,6 +78,7 @@ from trading.trade_executor import (
     get_okx_spot_order,
     get_okx_spot_balance,
     place_okx_swap_market_order,
+    _get_okx_spot_instrument_filters,
     get_okx_funding_fee_bills,
     set_binance_perp_leverage,
     set_bybit_linear_leverage,
@@ -608,9 +612,11 @@ class LiveTradingManager:
 
         orders: List[Dict[str, Any]] = []
         close_base = f"wl{sid}C{int(time.time())}"
+        pos_a_eff = self._apply_spot_dust_filter(long_ex_l, symbol_u, long_mkt, pos_a)
+        pos_b_eff = self._apply_spot_dust_filter(short_ex_l, symbol_u, short_mkt, pos_b)
         for leg_name, ex, size, client_suffix in (
-            ("long", long_ex_l, pos_a, "L"),
-            ("short", short_ex_l, pos_b, "S"),
+            ("long", long_ex_l, pos_a_eff, "L"),
+            ("short", short_ex_l, pos_b_eff, "S"),
         ):
             if size is None:
                 self._record_error(
@@ -700,7 +706,14 @@ class LiveTradingManager:
                 a2 = fut_a2.result()
                 b2 = fut_b2.result()
             after = {"long_exchange": a2, "short_exchange": b2}
-            if a2 is not None and b2 is not None and abs(float(a2)) <= 1e-9 and abs(float(b2)) <= 1e-9:
+            a2_eff = self._apply_spot_dust_filter(long_ex_l, symbol_u, long_mkt, a2)
+            b2_eff = self._apply_spot_dust_filter(short_ex_l, symbol_u, short_mkt, b2)
+            if (
+                a2_eff is not None
+                and b2_eff is not None
+                and abs(float(a2_eff)) <= 1e-9
+                and abs(float(b2_eff)) <= 1e-9
+            ):
                 flat = True
                 break
             flat = False
@@ -1899,16 +1912,21 @@ class LiveTradingManager:
                 except Exception:
                     pass
             # Re-check: cancellation can race with a fill.
+            state = ""
             try:
                 detail = get_okx_swap_order(sym, ord_id=ord_id, client_order_id=resp_cl_id or client_order_id)
                 if isinstance(detail, dict):
                     fill_base = _filled_base(detail)
+                    state = str(detail.get("state") or "").lower()
             except Exception:
                 pass
-            raise TradeExecutionError(
-                f"OKX order not filled quickly; canceled to avoid late fill: symbol={sym} side={side_key} "
-                f"filled_qty={fill_base:.6g} requested_qty={requested_qty}"
-            )
+            if fill_base > 0 or state in {"filled", "partially_filled"}:
+                pass
+            else:
+                raise TradeExecutionError(
+                    f"OKX order not filled quickly; canceled to avoid late fill: symbol={sym} side={side_key} "
+                    f"filled_qty={fill_base:.6g} requested_qty={requested_qty}"
+                )
 
         # Update stored fill/status to avoid UI showing `live`/0.0 when it did fill quickly enough.
         out: Dict[str, Any] = {"exchange_order_id": ord_id}
@@ -2141,6 +2159,56 @@ class LiveTradingManager:
             return None
         return None
 
+
+    def _spot_qty_below_min(self, exchange: str, symbol: str, qty: float) -> bool:
+        ex = (exchange or "").lower().strip()
+        sym = (symbol or "").upper().strip()
+        if not ex or not sym:
+            return False
+        try:
+            raw_qty = Decimal(str(abs(float(qty))))
+        except Exception:
+            return False
+        if raw_qty <= 0:
+            return True
+        try:
+            if ex == "binance":
+                filters = _get_binance_spot_symbol_filters(sym, base_url="https://api.binance.com")
+                step = filters.step_size if filters.step_size > 0 else Decimal("1")
+                units = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+                normalised = units * step
+                return normalised < filters.min_qty
+            if ex == "okx":
+                filters = _get_okx_spot_instrument_filters(sym, base_url="https://www.okx.com")
+                step = filters.lot_size if filters.lot_size > 0 else Decimal("1")
+                units = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+                normalised = units * step
+                return normalised < filters.min_size
+            if ex == "bitget":
+                filters = _get_bitget_spot_symbol_filters(sym, base_url="https://api.bitget.com")
+                step = filters.qty_step if filters.qty_step > 0 else Decimal("1")
+                units = (raw_qty / step).to_integral_value(rounding=ROUND_DOWN)
+                normalised = units * step
+                return normalised < filters.min_qty
+        except Exception:
+            return False
+        return False
+
+    def _apply_spot_dust_filter(
+        self,
+        exchange: str,
+        symbol: str,
+        market_type: str,
+        size: Optional[float],
+    ) -> Optional[float]:
+        if size is None:
+            return None
+        mkt = (market_type or "perp").lower().strip()
+        size_f = float(size)
+        if mkt == "spot" and self._spot_qty_below_min(exchange, symbol, size_f):
+            return 0.0
+        return size_f
+
     def _post_fail_safety_flatten(
         self,
         conn,
@@ -2152,6 +2220,7 @@ class LiveTradingManager:
     ) -> None:
         """After an open failure, ensure the exchange-side symbol position is flat (best-effort)."""
         size = self._get_exchange_position_size(exchange, symbol, market_type)
+        size = self._apply_spot_dust_filter(exchange, symbol, market_type, size)
         if size is None:
             self._record_error(
                 conn,
@@ -6022,6 +6091,8 @@ class LiveTradingManager:
                     pos_l = fut_l.result()
                     pos_s = fut_s.result()
 
+                pos_l = self._apply_spot_dust_filter(str(long_ex), symbol, long_mkt, pos_l)
+                pos_s = self._apply_spot_dust_filter(str(short_ex), symbol, short_mkt, pos_s)
                 if pos_l is not None and pos_s is not None and abs(float(pos_l)) <= 1e-9 and abs(float(pos_s)) <= 1e-9:
                     self._update_signal_status(conn, signal_id, "closed")
                     # Funding PnL finalization: ensure history becomes stable for closed trades.
@@ -6164,9 +6235,26 @@ class LiveTradingManager:
                     fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol, short_mkt)
                     pos_l = fut_l.result()
                     pos_s = fut_s.result()
-                # Expect long leg >0, short leg <0
-                unhedged = False
-                if pos_l is not None and pos_s is not None:
+                pos_l = self._apply_spot_dust_filter(str(long_ex), symbol, long_mkt, pos_l)
+                pos_s = self._apply_spot_dust_filter(str(short_ex), symbol, short_mkt, pos_s)
+                if pos_l is None or pos_s is None:
+                    self._record_error(
+                        conn,
+                        signal_id=signal_id,
+                        stage="monitor_hedge_health",
+                        error_type="PositionUnavailable",
+                        message="position query returned None for one or more legs",
+                        context={
+                            "symbol": symbol,
+                            "long_ex": long_ex,
+                            "short_ex": short_ex,
+                            "pos_long": pos_l,
+                            "pos_short": pos_s,
+                        },
+                    )
+                else:
+                    # Expect long leg >0, short leg <0
+                    unhedged = False
                     if abs(float(pos_l)) > 1e-9 and abs(float(pos_s)) <= 1e-9:
                         unhedged = True
                     if abs(float(pos_s)) > 1e-9 and abs(float(pos_l)) <= 1e-9:
@@ -6174,37 +6262,37 @@ class LiveTradingManager:
                     if abs(float(pos_l)) > 1e-9 and abs(float(pos_s)) > 1e-9:
                         if float(pos_l) <= 0 or float(pos_s) >= 0:
                             unhedged = True
-                if unhedged:
-                    self._record_error(
-                        conn,
-                        signal_id=signal_id,
-                        stage="monitor_hedge_health",
-                        error_type="UnhedgedPosition",
-                        message="detected unhedged exposure; forcing close",
-                        context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex, "pos_long": pos_l, "pos_short": pos_s},
-                    )
-                    self._close_symbol_positions(
-                        conn,
-                        signal_id=signal_id,
-                        symbol=symbol,
-                        long_ex=str(long_ex),
-                        short_ex=str(short_ex),
-                        close_reason="unhedged",
-                        status_before=status,
-                        signal_type=str(signal_row.get("signal_type") or ""),
-                    )
-                    # Mark failed (even if close succeeds) so it's visible as an execution anomaly.
-                    conn.execute(
-                        """
-                        UPDATE watchlist.live_trade_signal
-                           SET status=CASE WHEN status='closed' THEN 'failed' ELSE status END,
-                               reason=COALESCE(reason, 'unhedged_position'),
-                               updated_at=now()
-                         WHERE id=%s;
-                        """,
-                        (signal_id,),
-                    )
-                    return
+                    if unhedged:
+                        self._record_error(
+                            conn,
+                            signal_id=signal_id,
+                            stage="monitor_hedge_health",
+                            error_type="UnhedgedPosition",
+                            message="detected unhedged exposure; forcing close",
+                            context={"symbol": symbol, "long_ex": long_ex, "short_ex": short_ex, "pos_long": pos_l, "pos_short": pos_s},
+                        )
+                        self._close_symbol_positions(
+                            conn,
+                            signal_id=signal_id,
+                            symbol=symbol,
+                            long_ex=str(long_ex),
+                            short_ex=str(short_ex),
+                            close_reason="unhedged",
+                            status_before=status,
+                            signal_type=str(signal_row.get("signal_type") or ""),
+                        )
+                        # Mark failed (even if close succeeds) so it's visible as an execution anomaly.
+                        conn.execute(
+                            """
+                            UPDATE watchlist.live_trade_signal
+                               SET status=CASE WHEN status='closed' THEN 'failed' ELSE status END,
+                                   reason=COALESCE(reason, 'unhedged_position'),
+                                   updated_at=now()
+                             WHERE id=%s;
+                            """,
+                            (signal_id,),
+                        )
+                        return
             except Exception as exc:
                 self._record_error(
                     conn,
@@ -7462,34 +7550,47 @@ class LiveTradingManager:
                 fut_s = pool.submit(self._get_exchange_position_size, str(short_ex), symbol, short_mkt)
                 pos_long = fut_l.result()
                 pos_short = fut_s.result()
-            if pos_long is not None and float(pos_long) > 0:
-                qty_long = abs(float(pos_long))
-            if pos_short is not None and float(pos_short) < 0:
-                qty_short = abs(float(pos_short))
+            pos_long = self._apply_spot_dust_filter(str(long_ex), symbol, long_mkt, pos_long)
+            pos_short = self._apply_spot_dust_filter(str(short_ex), symbol, short_mkt, pos_short)
+            if pos_long is not None:
+                if float(pos_long) > 0:
+                    qty_long = abs(float(pos_long))
+                else:
+                    qty_long = 0.0
+            if pos_short is not None:
+                if float(pos_short) < 0:
+                    qty_short = abs(float(pos_short))
+                else:
+                    qty_short = 0.0
         except Exception:
             pass
 
         close_base = f"wl{signal_id}C{int(time.time())}"
-        close_specs = [
-            {
-                "leg": "long",
-                "exchange": long_ex,
-                "qty": qty_long,
-                "suffix": "L",
-                "side": "short",
-                "stage": "close_long",
-                "market_type": long_mkt,
-            },
-            {
-                "leg": "short",
-                "exchange": short_ex,
-                "qty": qty_short,
-                "suffix": "S",
-                "side": "long",
-                "stage": "close_short",
-                "market_type": short_mkt,
-            },
-        ]
+        close_specs: List[Dict[str, Any]] = []
+        if qty_long > 0:
+            close_specs.append(
+                {
+                    "leg": "long",
+                    "exchange": long_ex,
+                    "qty": qty_long,
+                    "suffix": "L",
+                    "side": "short",
+                    "stage": "close_long",
+                    "market_type": long_mkt,
+                }
+            )
+        if qty_short > 0:
+            close_specs.append(
+                {
+                    "leg": "short",
+                    "exchange": short_ex,
+                    "qty": qty_short,
+                    "suffix": "S",
+                    "side": "long",
+                    "stage": "close_short",
+                    "market_type": short_mkt,
+                }
+            )
 
         orders: Dict[str, Optional[Dict[str, Any]]] = {}
         had_error = False
@@ -7637,6 +7738,8 @@ class LiveTradingManager:
 
             pos_long = self._get_exchange_position_size(str(long_ex), symbol, long_mkt)
             pos_short = self._get_exchange_position_size(str(short_ex), symbol, short_mkt)
+            pos_long = self._apply_spot_dust_filter(str(long_ex), symbol, long_mkt, pos_long)
+            pos_short = self._apply_spot_dust_filter(str(short_ex), symbol, short_mkt, pos_short)
             if (pos_long is not None and abs(float(pos_long)) > 1e-9) or (
                 pos_short is not None and abs(float(pos_short)) > 1e-9
             ):
