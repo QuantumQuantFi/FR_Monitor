@@ -366,6 +366,11 @@ LIVE_TRADING_CONFIG = {
     # 临时策略：仅保留 i0（单次）复核，降低 skipped（后续可再改回 3 次复核）。
     'orderbook_confirm_samples': int(float(_get_private('LIVE_TRADING_OB_CONFIRM_SAMPLES', 'LIVE_TRADING_OB_CONFIRM_SAMPLES', '1'))),
     'orderbook_confirm_sleep_seconds': float(_get_private('LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', 'LIVE_TRADING_OB_CONFIRM_SLEEP_SEC', '0.7')),
+    # skipped 开仓信号有效期（秒）：超过该窗口仍未成功开仓，则标记为 expired，避免几小时/几天后才成交。
+    # 后续如果同一个 event 再次触发（meta_last 时间更新），会重新进入 30min 窗口尝试。
+    'skipped_signal_ttl_seconds': float(
+        _get_private('LIVE_TRADING_SKIPPED_TTL_SEC', 'LIVE_TRADING_SKIPPED_TTL_SEC', '1800')
+    ),
     # 强制平仓：开仓后最大持仓天数（默认 7 天）
     'max_hold_days': int(float(_get_private('LIVE_TRADING_MAX_HOLD_DAYS', 'LIVE_TRADING_MAX_HOLD_DAYS', '7'))),
     # 止损：仓位盈亏 + 已收取资金费率亏损超过阈值（百分比，小数）

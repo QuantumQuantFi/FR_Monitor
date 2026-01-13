@@ -1169,6 +1169,7 @@ live_trading_manager = LiveTradingManager(
         v2_win_prob_threshold_1440=float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.93)),
         max_concurrent_trades=int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
         scan_interval_seconds=float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
+        skipped_signal_ttl_seconds=float(LIVE_TRADING_CONFIG.get('skipped_signal_ttl_seconds', 1800.0)),
         monitor_interval_seconds=float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
         take_profit_ratio=float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.8)),
         orderbook_confirm_samples=int(LIVE_TRADING_CONFIG.get('orderbook_confirm_samples', 3)),

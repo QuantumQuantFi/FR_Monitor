@@ -128,6 +128,9 @@ class LiveTradingConfig:
     # Retry schedule (seconds) for skipped signals (orderbook not ok / no direction / unstable).
     # After the last value, keep retrying with the last delay.
     skipped_retry_schedule_seconds: Tuple[float, ...] = (10.0, 30.0, 60.0, 120.0, 240.0)
+    # How long we keep retrying a skipped open signal since the last event update.
+    # Prevents stale events from being opened hours/days later.
+    skipped_signal_ttl_seconds: float = 1800.0
     # Per process_once: limit how many skipped signals we retry to avoid orderbook storms.
     max_skipped_retries_per_scan: int = 5
     event_lookback_minutes: int = 30
@@ -2421,6 +2424,26 @@ class LiveTradingManager:
                     updated_at
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
+                ON CONFLICT (event_id) DO UPDATE
+                    SET symbol=EXCLUDED.symbol,
+                        signal_type=EXCLUDED.signal_type,
+                        horizon_min=EXCLUDED.horizon_min,
+                        pnl_hat=EXCLUDED.pnl_hat,
+                        win_prob=EXCLUDED.win_prob,
+                        pnl_hat_ob=EXCLUDED.pnl_hat_ob,
+                        win_prob_ob=EXCLUDED.win_prob_ob,
+                        leg_long_exchange=EXCLUDED.leg_long_exchange,
+                        leg_short_exchange=EXCLUDED.leg_short_exchange,
+                        status=EXCLUDED.status,
+                        reason=EXCLUDED.reason,
+                        payload=EXCLUDED.payload,
+                        client_order_id_base=EXCLUDED.client_order_id_base,
+                        pred_source=EXCLUDED.pred_source,
+                        retry_attempts=0,
+                        next_retry_at=NULL,
+                        last_attempt_at=NULL,
+                        updated_at=now()
+                  WHERE watchlist.live_trade_signal.status='expired'
                 RETURNING id;
                 """,
                 (
@@ -3956,7 +3979,17 @@ class LiveTradingManager:
             return []
         # Keep the lookback at least a few minutes so the retry schedule (up to ~240s) has time to apply.
         lookback_min = max(5, int(getattr(self.config, "event_lookback_minutes", 30) or 30))
+        ttl_s = max(0.0, float(getattr(self.config, "skipped_signal_ttl_seconds", 1800.0) or 0.0))
         signal_types = "('B','C')" if bool(getattr(self.config, "spot_trading_enabled", False)) else "('B')"
+        event_last_ts_expr = """
+                COALESCE(
+                  (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                  (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                  (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                  e.end_ts,
+                  e.start_ts
+                )
+        """
         query = (
             """
             SELECT
@@ -3975,6 +4008,9 @@ class LiveTradingManager:
               e.leg_b_exchange,
               e.leg_a_price_last,
               e.leg_b_price_last,
+              """
+            + event_last_ts_expr
+            + """ AS event_last_ts,
               COALESCE(
                 (e.features_agg #>> '{meta_last,pnl_regression_ob,pred,240,pnl_hat}')::double precision,
                 (e.features_agg #>> '{meta_last,pnl_regression,pred,240,pnl_hat}')::double precision
@@ -4001,23 +4037,62 @@ class LiveTradingManager:
             + signal_types
             + """
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
-              AND (
-                e.status = 'open'
-                OR COALESCE(
+              AND ("""
+            + event_last_ts_expr
+            + """) >= now() - make_interval(secs := %s)
+              AND ("""
+            + event_last_ts_expr
+            + """) >= now() - make_interval(mins := %s)
+            ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
+            LIMIT %s;
+            """
+        )
+        return conn.execute(query, (float(ttl_s), int(lookback_min), int(limit_n))).fetchall()
+
+    def _expire_skipped_signals(self, conn) -> int:
+        ttl_s = max(0.0, float(getattr(self.config, "skipped_signal_ttl_seconds", 1800.0) or 0.0))
+        if ttl_s <= 0:
+            return 0
+        batch_n = 500
+        event_last_ts_expr = """
+                COALESCE(
                   (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
                   (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
                   (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
                   e.end_ts,
                   e.start_ts
-                ) >= now() - make_interval(mins := %s)
-              )
-            ORDER BY s.next_retry_at NULLS FIRST, s.updated_at ASC
-            LIMIT %s;
+                )
+        """
+        rows = conn.execute(
             """
-        )
-        return conn.execute(query, (int(lookback_min), int(limit_n))).fetchall()
+            WITH expired AS (
+              SELECT s.id
+              FROM watchlist.live_trade_signal s
+              JOIN watchlist.watch_signal_event e ON e.id = s.event_id
+              WHERE s.status='skipped'
+                AND ("""
+            + event_last_ts_expr
+            + """) < now() - make_interval(secs := %s)
+              LIMIT %s
+            )
+            UPDATE watchlist.live_trade_signal s
+               SET status='expired',
+                   reason='expired_ttl',
+                   next_retry_at=NULL,
+                   updated_at=now()
+              FROM expired x
+             WHERE s.id = x.id
+            RETURNING 1;
+            """,
+            (float(ttl_s), int(batch_n)),
+        ).fetchall()
+        return int(len(rows or []))
 
     def _retry_skipped_signals(self, conn) -> None:
+        try:
+            self._expire_skipped_signals(conn)
+        except Exception:
+            pass
         rows = self._fetch_retry_skipped_signals(conn)
         if not rows:
             return
