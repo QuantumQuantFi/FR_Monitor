@@ -1191,6 +1191,7 @@ live_trading_manager = LiveTradingManager(
         ),
         event_lookback_minutes=int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
         per_leg_notional_usdt=float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+        min_leg_notional_ratio=float(LIVE_TRADING_CONFIG.get('min_leg_notional_ratio', 0.8)),
         candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 50)),
         per_symbol_top_k=int(LIVE_TRADING_CONFIG.get('per_symbol_top_k', 3)),
         max_symbols_per_scan=int(LIVE_TRADING_CONFIG.get('max_symbols_per_scan', 8)),

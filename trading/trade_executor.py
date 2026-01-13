@@ -5423,6 +5423,86 @@ def execute_perp_market_order(
     return order
 
 
+def preview_normalised_base_quantity(
+    exchange: str,
+    symbol: str,
+    *,
+    market_type: str = "perp",
+    quantity: Union[str, float, Decimal, int],
+    order_kwargs: Optional[Dict[str, Any]] = None,
+) -> Decimal:
+    """
+    Preview the base-asset quantity that would be accepted by the exchange after normalisation.
+
+    This does NOT place any order; it only applies lot/step/min rules using the same metadata
+    lookups as the order placement helpers.
+
+    Returns the normalised quantity in base units (e.g. ETH). For OKX SWAP, this converts the
+    contract `sz` back to base units using ctVal.
+    """
+
+    exchange_key = (exchange or "").strip().lower()
+    mkt = (market_type or "perp").strip().lower()
+    kwargs = dict(order_kwargs or {})
+
+    if exchange_key in {"", "none"}:
+        raise TradeExecutionError("preview_normalised_base_quantity: missing exchange")
+    if not symbol:
+        raise TradeExecutionError("preview_normalised_base_quantity: missing symbol")
+
+    if mkt in {"perp", "perpetual", "swap"}:
+        if exchange_key == "binance":
+            base_url = str(kwargs.get("base_url") or "https://fapi.binance.com")
+            _, dec = _normalise_binance_quantity(symbol, quantity, base_url)
+            return dec
+        if exchange_key == "bybit":
+            base_url = str(kwargs.get("base_url") or "https://api.bybit.com")
+            category = str(kwargs.get("category") or "linear").lower()
+            _, dec = _normalise_bybit_quantity(symbol, quantity, base_url, category)
+            return dec
+        if exchange_key == "bitget":
+            base_url = str(kwargs.get("base_url") or "https://api.bitget.com")
+            product_type = str(kwargs.get("product_type") or kwargs.get("productType") or "USDT-FUTURES")
+            _, dec = _normalise_bitget_size(symbol, quantity, base_url=base_url, product_type=product_type)
+            return dec
+        if exchange_key == "okx":
+            base_url = str(kwargs.get("base_url") or "https://www.okx.com")
+            inst_type = str(kwargs.get("inst_type") or kwargs.get("instType") or "SWAP")
+            _, contracts = _normalise_okx_size(symbol, quantity, base_url, inst_type=inst_type)
+            filters = _get_okx_instrument_filters(symbol, base_url, inst_type=inst_type)
+            base_qty = contracts * filters.contract_value
+            return base_qty
+        # DEX/new venues: best-effort (no public lot metadata here).
+        try:
+            dec = Decimal(str(quantity))
+        except Exception as exc:
+            raise TradeExecutionError(f"preview_normalised_base_quantity invalid quantity: {quantity!r}") from exc
+        if dec <= 0:
+            raise TradeExecutionError("preview_normalised_base_quantity: quantity must be positive")
+        return dec
+
+    if mkt in {"spot"}:
+        if exchange_key == "binance":
+            base_url = str(kwargs.get("base_url") or "https://api.binance.com")
+            _, dec = _normalise_binance_spot_quantity(symbol, quantity, base_url)
+            return dec
+        if exchange_key == "bybit":
+            base_url = str(kwargs.get("base_url") or "https://api.bybit.com")
+            _, dec = _normalise_bybit_quantity(symbol, quantity, base_url, "spot")
+            return dec
+        if exchange_key == "bitget":
+            base_url = str(kwargs.get("base_url") or "https://api.bitget.com")
+            _, dec = _normalise_bitget_spot_quantity(symbol, quantity, base_url=base_url)
+            return dec
+        if exchange_key == "okx":
+            base_url = str(kwargs.get("base_url") or "https://www.okx.com")
+            _, dec = _normalise_okx_spot_size(symbol, quantity, base_url)
+            return dec
+        raise TradeExecutionError(f"preview_normalised_base_quantity: unsupported spot exchange {exchange_key}")
+
+    raise TradeExecutionError(f"preview_normalised_base_quantity: unsupported market_type {mkt}")
+
+
 def execute_perp_market_batch(
     symbol: str,
     legs: List[Dict[str, Any]],

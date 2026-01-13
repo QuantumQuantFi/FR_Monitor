@@ -413,6 +413,10 @@ LIVE_TRADING_CONFIG = {
     'event_lookback_minutes': int(float(_get_private('LIVE_TRADING_LOOKBACK_MIN', 'LIVE_TRADING_LOOKBACK_MIN', '3'))),
     # 注意：不同交易所/合约对存在最小下单名义金额/最小下单数量；默认提升到 50U 以降低拒单概率。
     'per_leg_notional_usdt': float(_get_private('LIVE_TRADING_PER_LEG_USDT', 'LIVE_TRADING_PER_LEG_USDT', '50')),
+    # 下单数量归一化：若某一腿因为交易所 step/min 取整导致名义金额低于该比例，则跳过信号（避免严重不对称）。
+    'min_leg_notional_ratio': float(
+        _get_private('LIVE_TRADING_MIN_LEG_NOTIONAL_RATIO', 'LIVE_TRADING_MIN_LEG_NOTIONAL_RATIO', '0.8')
+    ),
     # 限制自动实盘允许使用的交易所（逗号分隔）；避免因为某个交易所接口变更/余额不足导致全局失败。
     'allowed_exchanges': _get_private(
         'LIVE_TRADING_ALLOWED_EXCHANGES',

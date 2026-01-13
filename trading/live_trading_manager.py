@@ -37,6 +37,7 @@ from trading.trade_executor import (
     TradeExecutionError,
     execute_perp_market_order,
     execute_spot_market_order,
+    preview_normalised_base_quantity,
     place_binance_perp_market_order,
     _get_binance_spot_symbol_filters,
     get_binance_perp_usdt_balance,
@@ -167,6 +168,9 @@ class LiveTradingConfig:
     # Safety cap: max total notional per leg for a single symbol across all entries.
     # Default allows max_entries * per_leg_notional_usdt.
     scale_in_max_total_notional_usdt: Optional[float] = None
+    # Sizing guard: if exchange quantity normalisation makes either leg's notional too small,
+    # skip the signal (prevents severe imbalance when one venue has coarse qty steps).
+    min_leg_notional_ratio: float = 0.8
 
 
 class LiveTradingManager:
@@ -4532,6 +4536,7 @@ class LiveTradingManager:
                 if any(
                     key in msg_l
                     for key in (
+                        "common_target_qty_too_small",
                         "entry spread too small",
                         "non-tradable entry spread",
                         "orderbook unavailable",
@@ -5273,7 +5278,23 @@ class LiveTradingManager:
                 message=str(exc),
                 context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
             )
-            self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
+            msg = str(exc)
+            msg_l = msg.lower()
+            status = (
+                "skipped"
+                if any(
+                    key in msg_l
+                    for key in (
+                        "common_target_qty_too_small",
+                        "entry spread too small",
+                        "non-tradable entry spread",
+                        "orderbook unavailable",
+                        "orderbook missing",
+                    )
+                )
+                else "failed"
+            )
+            self._update_signal_status(conn, signal_id, status, reason=msg)
         except Exception as exc:
             self._record_error(
                 conn,
@@ -5295,6 +5316,119 @@ class LiveTradingManager:
             set_bybit_linear_leverage(symbol=f"{symbol}USDT", leverage=1, category="linear", allow_no_change=True)
         elif ex == "bitget":
             set_bitget_usdt_perp_leverage(symbol=f"{symbol}USDT", leverage=1, margin_coin="USDT")
+
+    def _derive_common_leg_quantity(
+        self,
+        *,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        long_mkt: str,
+        short_mkt: str,
+        long_px: float,
+        short_px: float,
+        long_notional_usdt: float,
+        short_notional_usdt: float,
+        order_kwargs_long: Optional[Dict[str, Any]] = None,
+        order_kwargs_short: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compute a single base-asset quantity that BOTH legs can trade after exchange normalisation.
+
+        Returns a dict containing:
+        - target_qty (base units)
+        - raw/norm quantities per leg
+        - target notional per leg and ratio vs requested notional
+        """
+        if not symbol:
+            raise TradeExecutionError("common_qty: missing_symbol")
+        if float(long_px) <= 0 or float(short_px) <= 0:
+            raise TradeExecutionError("common_qty: invalid_sweep_prices")
+        if float(long_notional_usdt) <= 0 or float(short_notional_usdt) <= 0:
+            raise TradeExecutionError("common_qty: invalid_notionals")
+
+        raw_long_qty = float(long_notional_usdt) / float(long_px)
+        raw_short_qty = float(short_notional_usdt) / float(short_px)
+
+        ql = float(
+            preview_normalised_base_quantity(
+                long_ex,
+                symbol,
+                market_type=long_mkt,
+                quantity=raw_long_qty,
+                order_kwargs=order_kwargs_long,
+            )
+        )
+        qs = float(
+            preview_normalised_base_quantity(
+                short_ex,
+                symbol,
+                market_type=short_mkt,
+                quantity=raw_short_qty,
+                order_kwargs=order_kwargs_short,
+            )
+        )
+        if ql <= 0 or qs <= 0:
+            raise TradeExecutionError(f"common_qty: non_positive_normalised long={ql} short={qs}")
+
+        target = min(ql, qs)
+        # Fixed-point under rounding (ensure target itself is accepted by BOTH legs).
+        for _ in range(3):
+            ql2 = float(
+                preview_normalised_base_quantity(
+                    long_ex,
+                    symbol,
+                    market_type=long_mkt,
+                    quantity=target,
+                    order_kwargs=order_kwargs_long,
+                )
+            )
+            qs2 = float(
+                preview_normalised_base_quantity(
+                    short_ex,
+                    symbol,
+                    market_type=short_mkt,
+                    quantity=target,
+                    order_kwargs=order_kwargs_short,
+                )
+            )
+            target2 = min(ql2, qs2)
+            if abs(target2 - target) <= 1e-12:
+                target = target2
+                break
+            target = target2
+
+        if target <= 0:
+            raise TradeExecutionError("common_qty: target_qty_non_positive")
+
+        target_long_notional = float(target) * float(long_px)
+        target_short_notional = float(target) * float(short_px)
+        ratio_long = target_long_notional / float(long_notional_usdt)
+        ratio_short = target_short_notional / float(short_notional_usdt)
+
+        min_ratio = max(0.0, float(getattr(self.config, "min_leg_notional_ratio", 0.8) or 0.0))
+        if min_ratio > 0 and (ratio_long < min_ratio or ratio_short < min_ratio):
+            raise TradeExecutionError(
+                "common_target_qty_too_small "
+                f"target_qty={target:.12g} "
+                f"long({long_ex},{long_mkt}) raw={raw_long_qty:.12g} norm={ql:.12g} "
+                f"short({short_ex},{short_mkt}) raw={raw_short_qty:.12g} norm={qs:.12g} "
+                f"target_notional_long={target_long_notional:.6g} ratio_long={ratio_long:.3f} "
+                f"target_notional_short={target_short_notional:.6g} ratio_short={ratio_short:.3f} "
+                f"min_ratio={min_ratio:.3f}"
+            )
+
+        return {
+            "target_qty": float(target),
+            "raw_long_qty": float(raw_long_qty),
+            "raw_short_qty": float(raw_short_qty),
+            "norm_long_qty": float(ql),
+            "norm_short_qty": float(qs),
+            "target_long_notional_usdt": float(target_long_notional),
+            "target_short_notional_usdt": float(target_short_notional),
+            "ratio_long": float(ratio_long),
+            "ratio_short": float(ratio_short),
+        }
 
     def _open_trade(
         self,
@@ -5363,6 +5497,22 @@ class LiveTradingManager:
         entry_spread_metric = float(math.log(float(short_px) / float(long_px)))
         long_qty = float(long_notional) / float(long_px)
         short_qty = float(short_notional) / float(short_px)
+        sizing = self._derive_common_leg_quantity(
+            symbol=symbol,
+            long_ex=str(long_ex),
+            short_ex=str(short_ex),
+            long_mkt=str(long_mkt),
+            short_mkt=str(short_mkt),
+            long_px=float(long_px),
+            short_px=float(short_px),
+            long_notional_usdt=float(long_notional),
+            short_notional_usdt=float(short_notional),
+            order_kwargs_long={"client_order_id": f"{client_base}-L"},
+            order_kwargs_short={"client_order_id": f"{client_base}-S"},
+        )
+        target_qty = float(sizing.get("target_qty") or 0.0)
+        if target_qty <= 0:
+            raise TradeExecutionError("common_qty: target_qty <= 0")
 
         take_profit_pnl = float(self.config.take_profit_ratio) * float(pnl_hat_ob)
         entry_spread_pct_actual = float(math.exp(float(entry_spread_metric)) - 1.0)
@@ -5386,14 +5536,15 @@ class LiveTradingManager:
                            'short_sell_px', %s::double precision,
                            'entry_spread_metric', %s::double precision,
                            'entry_spread_pct', %s::double precision,
-                           'take_profit_pnl', %s::double precision,
-                           'take_profit_exit_spread_pct', %s::double precision,
-                           'long_qty', %s::double precision,
-                           'short_qty', %s::double precision,
-                           'orderbook_long', %s::jsonb,
-                           'orderbook_short', %s::jsonb
-                       )
-                   )
+	                           'take_profit_pnl', %s::double precision,
+	                           'take_profit_exit_spread_pct', %s::double precision,
+	                           'long_qty', %s::double precision,
+	                           'short_qty', %s::double precision,
+	                           'common_qty', %s::jsonb,
+	                           'orderbook_long', %s::jsonb,
+	                           'orderbook_short', %s::jsonb
+	                       )
+	                   )
              WHERE id=%s::bigint;
             """,
             (
@@ -5407,15 +5558,16 @@ class LiveTradingManager:
                 float(short_px),
                 float(entry_spread_metric),
                 float(entry_spread_pct_actual),
-                float(take_profit_pnl),
-                float(take_profit_exit_spread_pct),
-                float(long_qty),
-                float(short_qty),
-                _jsonb(ob_long),
-                _jsonb(ob_short),
-                int(signal_id),
-            ),
-        )
+	                float(take_profit_pnl),
+	                float(take_profit_exit_spread_pct),
+	                float(long_qty),
+	                float(short_qty),
+	                _jsonb(sizing),
+	                _jsonb(ob_long),
+	                _jsonb(ob_short),
+	                int(signal_id),
+	            ),
+	        )
         # Final guard: if entry spread is smaller than TP target, this trade is unlikely to
         # ever hit TP (pnl_spread <= entry_spread_metric when spread_now >= 0). Abort to
         # avoid "成交时刻无价差" openings.
@@ -5447,17 +5599,17 @@ class LiveTradingManager:
             {
                 "exchange": long_ex,
                 "side": "long",
-                "quantity": long_qty,
+                "quantity": float(target_qty),
                 "market_type": long_mkt,
-                "notional_usdt": float(long_notional),
+                "notional_usdt": float(sizing.get("target_long_notional_usdt") or 0.0),
                 "order_kwargs": {"client_order_id": f"{client_base}-L"},
             },
             {
                 "exchange": short_ex,
                 "side": "short",
-                "quantity": short_qty,
+                "quantity": float(target_qty),
                 "market_type": short_mkt,
-                "notional_usdt": float(short_notional),
+                "notional_usdt": float(sizing.get("target_short_notional_usdt") or 0.0),
                 "order_kwargs": {"client_order_id": f"{client_base}-S"},
             },
         ]
@@ -5474,8 +5626,8 @@ class LiveTradingManager:
                             str(leg["exchange"]),
                             symbol,
                             side="buy",
-                            quantity=None,
-                            quote_quantity=float(leg.get("notional_usdt") or 0.0),
+                            quantity=float(leg["quantity"]),
+                            quote_quantity=None,
                             order_kwargs=dict(leg.get("order_kwargs") or {}),
                         )
                     else:
@@ -7438,8 +7590,20 @@ class LiveTradingManager:
         if not signal_id:
             raise TradeExecutionError("missing_signal_id_for_scale_in")
 
-        # Best-effort leverage=1
-        for ex in {long_ex, short_ex}:
+        signal_type = str(signal_row.get("signal_type") or "")
+        long_mkt, short_mkt = self._resolve_leg_market_types(signal_type)
+
+        perp_notional = float(self.config.per_leg_notional_usdt)
+        spot_notional = float(self.config.spot_per_leg_notional_usdt or perp_notional)
+        if str(signal_type or "").strip().upper() == "C":
+            perp_notional = spot_notional
+        long_notional = spot_notional if long_mkt == "spot" else perp_notional
+        short_notional = spot_notional if short_mkt == "spot" else perp_notional
+
+        # Best-effort leverage=1 (perp legs only).
+        for ex, mkt in ((long_ex, long_mkt), (short_ex, short_mkt)):
+            if str(mkt or "").lower() != "perp":
+                continue
             try:
                 self._maybe_set_leverage_1x(symbol, ex)
             except Exception as exc:
@@ -7452,9 +7616,8 @@ class LiveTradingManager:
                     context={"symbol": symbol, "exchange": ex, "leverage": 1},
                 )
 
-        per_leg = float(self.config.per_leg_notional_usdt)
-        ob_long = fetch_orderbook_prices(long_ex, symbol, self.config.orderbook_market_type, notional=float(per_leg)) or {}
-        ob_short = fetch_orderbook_prices(short_ex, symbol, self.config.orderbook_market_type, notional=float(per_leg)) or {}
+        ob_long = fetch_orderbook_prices(long_ex, symbol, long_mkt, notional=float(long_notional)) or {}
+        ob_short = fetch_orderbook_prices(short_ex, symbol, short_mkt, notional=float(short_notional)) or {}
         if ob_long.get("error") or ob_short.get("error"):
             raise TradeExecutionError(f"Orderbook unavailable for scale-in: long={ob_long.get('error')} short={ob_short.get('error')}")
         long_px = ob_long.get("buy")
@@ -7469,8 +7632,24 @@ class LiveTradingManager:
 
         entry_spread_metric = float(math.log(float(short_px) / float(long_px)))
         entry_spread_pct = float(math.exp(float(entry_spread_metric)) - 1.0)
-        long_qty = float(per_leg) / float(long_px)
-        short_qty = float(per_leg) / float(short_px)
+        long_qty = float(long_notional) / float(long_px)
+        short_qty = float(short_notional) / float(short_px)
+        sizing = self._derive_common_leg_quantity(
+            symbol=symbol,
+            long_ex=str(long_ex),
+            short_ex=str(short_ex),
+            long_mkt=str(long_mkt),
+            short_mkt=str(short_mkt),
+            long_px=float(long_px),
+            short_px=float(short_px),
+            long_notional_usdt=float(long_notional),
+            short_notional_usdt=float(short_notional),
+            order_kwargs_long={"client_order_id": f"{client_base}-L"},
+            order_kwargs_short={"client_order_id": f"{client_base}-S"},
+        )
+        target_qty = float(sizing.get("target_qty") or 0.0)
+        if target_qty <= 0:
+            raise TradeExecutionError("common_qty: target_qty <= 0 (scale_in)")
 
         # Same guardrail as initial open: entry spread must not be smaller than TP target.
         if float(entry_spread_metric) < float(take_profit_pnl):
@@ -7480,8 +7659,22 @@ class LiveTradingManager:
             )
 
         legs = [
-            {"exchange": long_ex, "side": "long", "quantity": long_qty, "order_kwargs": {"client_order_id": f"{client_base}-L"}},
-            {"exchange": short_ex, "side": "short", "quantity": short_qty, "order_kwargs": {"client_order_id": f"{client_base}-S"}},
+            {
+                "exchange": long_ex,
+                "side": "long",
+                "quantity": float(target_qty),
+                "market_type": long_mkt,
+                "notional_usdt": float(sizing.get("target_long_notional_usdt") or 0.0),
+                "order_kwargs": {"client_order_id": f"{client_base}-L"},
+            },
+            {
+                "exchange": short_ex,
+                "side": "short",
+                "quantity": float(target_qty),
+                "market_type": short_mkt,
+                "notional_usdt": float(sizing.get("target_short_notional_usdt") or 0.0),
+                "order_kwargs": {"client_order_id": f"{client_base}-S"},
+            },
         ]
 
         opened: List[Dict[str, Any]] = []
@@ -7489,18 +7682,45 @@ class LiveTradingManager:
         try:
             for leg in legs:
                 leg_opened_at = _utcnow()
-                order = execute_perp_market_order(
-                    str(leg["exchange"]),
-                    symbol,
-                    float(leg["quantity"]),
-                    side=str(leg["side"]),
-                    order_kwargs=dict(leg.get("order_kwargs") or {}),
-                )
+                leg_mkt = str(leg.get("market_type") or "perp").lower()
+                if leg_mkt == "spot":
+                    if str(leg.get("side")) == "long":
+                        order = execute_spot_market_order(
+                            str(leg["exchange"]),
+                            symbol,
+                            side="buy",
+                            quantity=float(leg["quantity"]),
+                            quote_quantity=None,
+                            order_kwargs=dict(leg.get("order_kwargs") or {}),
+                        )
+                    else:
+                        order = execute_spot_market_order(
+                            str(leg["exchange"]),
+                            symbol,
+                            side="sell",
+                            quantity=float(leg["quantity"]),
+                            quote_quantity=None,
+                            order_kwargs=dict(leg.get("order_kwargs") or {}),
+                        )
+                else:
+                    order = execute_perp_market_order(
+                        str(leg["exchange"]),
+                        symbol,
+                        float(leg["quantity"]),
+                        side=str(leg["side"]),
+                        order_kwargs=dict(leg.get("order_kwargs") or {}),
+                    )
                 opened.append(
-                    {"exchange": str(leg["exchange"]), "side": str(leg["side"]), "quantity": float(leg["quantity"]), "order": order}
+                    {
+                        "exchange": str(leg["exchange"]),
+                        "side": str(leg["side"]),
+                        "quantity": float(leg["quantity"]),
+                        "market_type": leg_mkt,
+                        "order": order,
+                    }
                 )
 
-                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order)
+                fill = self._parse_fill_fields(str(leg["exchange"]), symbol, order, market_type=leg_mkt)
                 fill_by_side[str(leg["side"])] = dict(fill or {})
 
                 conn.execute(
@@ -7518,8 +7738,8 @@ class LiveTradingManager:
                         "long" if str(leg["side"]) == "long" else "short",
                         str(leg["exchange"]),
                         str(leg["side"]),
-                        "perp",
-                        float(per_leg),
+                        leg_mkt,
+                        float(leg.get("notional_usdt") or 0.0) if leg.get("notional_usdt") is not None else None,
                         str(leg["quantity"]),
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                         float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
@@ -7535,9 +7755,9 @@ class LiveTradingManager:
                 )
 
                 ex_l = str(leg["exchange"]).lower()
-                if ex_l == "hyperliquid":
+                if ex_l == "hyperliquid" and leg_mkt == "perp":
                     self._verify_hyperliquid_position_after_open(symbol, str(leg["side"]), float(leg["quantity"]))
-                elif ex_l == "okx":
+                elif ex_l == "okx" and leg_mkt == "perp":
                     client_id = str((leg.get("order_kwargs") or {}).get("client_order_id") or "")
                     updated = self._verify_okx_order_after_open(
                         conn,
@@ -7554,7 +7774,13 @@ class LiveTradingManager:
                         except Exception:
                             pass
                 else:
-                    self._verify_position_after_open(str(leg["exchange"]), symbol, str(leg["side"]), float(leg["quantity"]))
+                    self._verify_position_after_open(
+                        str(leg["exchange"]),
+                        symbol,
+                        str(leg["side"]),
+                        float(leg["quantity"]),
+                        market_type=leg_mkt,
+                    )
         except Exception as exc:
             # Best-effort rollback: close any legs that were opened before a failure.
             rollback_base = f"wl{signal_id}SR{int(time.time())}"
@@ -7598,6 +7824,7 @@ class LiveTradingManager:
                 "take_profit_pnl": float(take_profit_pnl),
                 "long_qty": float(long_qty),
                 "short_qty": float(short_qty),
+                "common_qty": sizing,
                 "orderbook_long": ob_long,
                 "orderbook_short": ob_short,
             },
