@@ -122,6 +122,8 @@ class TradeExecutionError(Exception):
 
 _PROXY_ENV_LOCK = threading.RLock()
 _LIGHTER_SOCKS_PATCHED = False
+_LIGHTER_AUTH_LOCK = threading.RLock()
+_LIGHTER_AUTH_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0.0}
 
 
 def _exchange_proxy_url(exchange: str) -> Optional[str]:
@@ -225,6 +227,323 @@ def _ensure_lighter_aiohttp_socks_patch() -> None:
 
     lighter_rest.RESTClientObject = SocksRESTClientObject  # type: ignore[assignment]
     _LIGHTER_SOCKS_PATCHED = True
+
+
+def _resolve_lighter_account_index(account_index: Optional[Union[int, str]] = None) -> int:
+    raw = account_index
+    if raw in (None, ""):
+        raw = (getattr(CONFIG_PRIVATE, "LIGHTER_ACCOUNT_INDEX", None) if CONFIG_PRIVATE else None) or os.getenv(
+            "LIGHTER_ACCOUNT_INDEX"
+        )
+    if raw in (None, ""):
+        raise TradeExecutionError("Missing LIGHTER_ACCOUNT_INDEX (or account_index=...)")
+    try:
+        return int(str(raw))
+    except Exception as exc:
+        raise TradeExecutionError(f"Invalid LIGHTER_ACCOUNT_INDEX: {raw!r}") from exc
+
+
+def _lighter_build_auth_token(*, expiry_seconds: int = 600) -> str:
+    """Create a short-lived auth token via Lighter SignerClient (required for main accounts private endpoints)."""
+    if LighterSignerClient is None:
+        raise TradeExecutionError("lighter SDK is required for Lighter auth token")
+
+    deadline = int(time.time() + max(60, int(expiry_seconds)))
+
+    async def _create() -> str:
+        signer = LighterSignerClient(
+            "https://mainnet.zklighter.elliot.ai",
+            str(getattr(CONFIG_PRIVATE, "LIGHTER_PRIVATE_KEY", "") or "").strip(),
+            int(str(getattr(CONFIG_PRIVATE, "LIGHTER_KEY_INDEX", "") or "").strip()),
+            _resolve_lighter_account_index(),
+        )
+        try:
+            token, err = signer.create_auth_token_with_expiry(deadline)
+            if err or not token:
+                raise TradeExecutionError(f"Lighter auth token generation failed: {err or 'empty_token'}")
+            return str(token)
+        finally:
+            try:
+                await signer.close()
+            except Exception:
+                pass
+
+    return str(_run_async(_create()))
+
+
+def get_lighter_auth_token(*, expiry_seconds: int = 600) -> str:
+    """Get cached Lighter auth token (auto-renew)."""
+    with _LIGHTER_AUTH_LOCK:
+        now = time.time()
+        token = _LIGHTER_AUTH_CACHE.get("token")
+        exp = float(_LIGHTER_AUTH_CACHE.get("expires_at") or 0.0)
+        if isinstance(token, str) and token and now < (exp - 15.0):
+            return token
+
+        proxy_url = _exchange_proxy_url("lighter")
+        with _temporary_socks_proxy(proxy_url):
+            token_new = _lighter_build_auth_token(expiry_seconds=int(expiry_seconds))
+        _LIGHTER_AUTH_CACHE["token"] = token_new
+        _LIGHTER_AUTH_CACHE["expires_at"] = now + float(max(60, int(expiry_seconds)))
+        return token_new
+
+
+def _lighter_api_get(
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    timeout: float = 15.0,
+    require_auth: bool = False,
+) -> Dict[str, Any]:
+    base = "https://mainnet.zklighter.elliot.ai/api/v1"
+    url = f"{base}/{path.lstrip('/')}"
+    qp = dict(params or {})
+    if require_auth:
+        qp.setdefault("auth", get_lighter_auth_token())
+    resp = _send_request("GET", url, params=[(str(k), str(v)) for k, v in qp.items()], timeout=int(timeout))
+    data = _json_or_error(resp)
+    if resp.status_code != 200 or not isinstance(data, dict):
+        raise TradeExecutionError(f"Lighter GET {path} failed {resp.status_code}: {data}")
+    if data.get("code") not in (200, 0, None):
+        raise TradeExecutionError(f"Lighter GET {path} rejected: {data}")
+    return data
+
+
+def get_lighter_trades(
+    *,
+    account_index: Optional[Union[int, str]] = None,
+    market_id: Optional[int] = None,
+    order_index: Optional[int] = None,
+    tx_hash: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 100,
+    timeout: float = 15.0,
+    max_pages: int = 10,
+) -> List[Dict[str, Any]]:
+    """Fetch Lighter trades for an account (private endpoint, requires auth token).
+
+    Normalizes:
+      - time (ms)
+      - market_id
+      - price
+      - size
+      - usd_amount
+      - fee_usdc
+      - tx_hash
+      - order_index (ask_id/bid_id)
+      - is_buyer (bool)
+    """
+    acct = _resolve_lighter_account_index(account_index)
+    tx_filter = str(tx_hash or "").strip().lower() or None
+    proxy_url = _exchange_proxy_url("lighter")
+    with _temporary_socks_proxy(proxy_url):
+        cursor = None
+        out: List[Dict[str, Any]] = []
+        pages = 0
+        while pages < max(1, int(max_pages)):
+            pages += 1
+            params: Dict[str, Any] = {
+                "account_index": acct,
+                "sort_by": "timestamp",
+                # Server currently rejects sort_dir=asc; use desc and paginate via next_cursor.
+                "sort_dir": "desc",
+                "limit": int(min(100, max(1, int(limit)))),
+            }
+            if market_id is not None:
+                params["market_id"] = int(market_id)
+            if order_index is not None:
+                params["order_index"] = int(order_index)
+            if cursor:
+                params["cursor"] = str(cursor)
+
+            data = _lighter_api_get("trades", params=params, timeout=float(timeout), require_auth=True)
+            rows = data.get("trades") or []
+            if not isinstance(rows, list) or not rows:
+                break
+
+            for t in rows:
+                if not isinstance(t, dict):
+                    continue
+                if tx_filter:
+                    if str(t.get("tx_hash") or "").strip().lower() != tx_filter:
+                        continue
+                ts = t.get("timestamp")
+                try:
+                    ts_ms = int(ts)
+                except Exception:
+                    ts_ms = None
+                if ts_ms is not None:
+                    if start_time_ms is not None and ts_ms < int(start_time_ms):
+                        continue
+                    if end_time_ms is not None and ts_ms > int(end_time_ms):
+                        continue
+
+                try:
+                    ask_id = int(t.get("ask_id"))
+                except Exception:
+                    ask_id = None
+                try:
+                    bid_id = int(t.get("bid_id"))
+                except Exception:
+                    bid_id = None
+                try:
+                    ask_acct = int(t.get("ask_account_id"))
+                except Exception:
+                    ask_acct = None
+                try:
+                    bid_acct = int(t.get("bid_account_id"))
+                except Exception:
+                    bid_acct = None
+                is_maker_ask = bool(t.get("is_maker_ask"))
+
+                fee_int = None
+                is_buyer = None
+                if ask_acct == acct:
+                    is_buyer = False
+                    fee_int = t.get("maker_fee") if is_maker_ask else t.get("taker_fee")
+                elif bid_acct == acct:
+                    is_buyer = True
+                    fee_int = t.get("maker_fee") if not is_maker_ask else t.get("taker_fee")
+
+                fee_usdc = None
+                if fee_int in (None, "") and is_buyer is not None:
+                    fee_usdc = 0.0
+                elif fee_int not in (None, ""):
+                    try:
+                        fee_usdc = float(int(fee_int)) / 1_000_000.0
+                    except Exception:
+                        fee_usdc = None
+
+                out.append(
+                    {
+                        "time": ts_ms,
+                        "market_id": int(t.get("market_id")) if t.get("market_id") is not None else None,
+                        "price": float(t.get("price")) if t.get("price") not in (None, "") else None,
+                        "size": float(t.get("size")) if t.get("size") not in (None, "") else None,
+                        "usd_amount": float(t.get("usd_amount")) if t.get("usd_amount") not in (None, "") else None,
+                        "fee_usdc": fee_usdc,
+                        "tx_hash": str(t.get("tx_hash") or "") or None,
+                        "ask_id": ask_id,
+                        "bid_id": bid_id,
+                        "is_buyer": is_buyer,
+                        "raw": t,
+                    }
+                )
+
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+
+            # When paginating in desc order, stop once we pass the requested start_time_ms.
+            if start_time_ms is not None:
+                try:
+                    oldest = min(int(x.get("time")) for x in out if x.get("time") is not None)
+                except Exception:
+                    oldest = None
+                if oldest is not None and int(oldest) < int(start_time_ms):
+                    break
+            if tx_filter and out:
+                break
+
+        return out
+
+
+def get_lighter_position_funding_history(
+    *,
+    account_index: Optional[Union[int, str]] = None,
+    market_id: Optional[int] = None,
+    side: Optional[str] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 100,
+    timeout: float = 15.0,
+    max_pages: int = 20,
+) -> List[Dict[str, Any]]:
+    """Fetch account-level position funding changes (private endpoint).
+
+    Normalizes:
+      - time (ms)
+      - market_id
+      - change_usdc (positive=received, negative=paid; best-effort)
+      - rate
+      - position_size
+      - position_side
+    """
+    acct = _resolve_lighter_account_index(account_index)
+    proxy_url = _exchange_proxy_url("lighter")
+    with _temporary_socks_proxy(proxy_url):
+        cursor = None
+        out: List[Dict[str, Any]] = []
+        pages = 0
+        while pages < max(1, int(max_pages)):
+            pages += 1
+            params: Dict[str, Any] = {"account_index": acct, "limit": int(min(100, max(1, int(limit))))}
+            if market_id is not None:
+                params["market_id"] = int(market_id)
+            if side:
+                params["side"] = str(side)
+            if cursor:
+                params["cursor"] = str(cursor)
+
+            data = _lighter_api_get("positionFunding", params=params, timeout=float(timeout), require_auth=True)
+            rows = data.get("position_fundings") or []
+            if not isinstance(rows, list) or not rows:
+                break
+
+            ts_list: List[int] = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                try:
+                    ts_ms = int(r.get("timestamp"))
+                except Exception:
+                    ts_ms = None
+                if ts_ms is not None:
+                    ts_list.append(int(ts_ms))
+                if ts_ms is not None:
+                    if start_time_ms is not None and ts_ms < int(start_time_ms):
+                        continue
+                    if end_time_ms is not None and ts_ms > int(end_time_ms):
+                        continue
+
+                change_usdc = None
+                try:
+                    raw = str(r.get("change") or "0").strip()
+                    if raw:
+                        # Lighter typically returns integer micro-USDC (like maker_fee/taker_fee).
+                        # If it's a plain integer, treat it as micro-unit; otherwise parse as decimal USDC.
+                        if raw.lstrip("-").isdigit():
+                            change_usdc = float(int(raw)) / 1_000_000.0
+                        else:
+                            change_usdc = float(raw)
+                except Exception:
+                    change_usdc = None
+
+                out.append(
+                    {
+                        "time": ts_ms,
+                        "market_id": int(r.get("market_id")) if r.get("market_id") is not None else None,
+                        "funding_id": int(r.get("funding_id")) if r.get("funding_id") is not None else None,
+                        "change_usdc": change_usdc,
+                        "rate": str(r.get("rate") or "") or None,
+                        "position_size": str(r.get("position_size") or "") or None,
+                        "position_side": str(r.get("position_side") or "") or None,
+                        "raw": r,
+                    }
+                )
+
+            cursor = data.get("next_cursor")
+            if not cursor:
+                break
+            # If results are in descending timestamp order, stop once we paged past start_time_ms.
+            if start_time_ms is not None and ts_list and ts_list[0] > ts_list[-1]:
+                try:
+                    if min(ts_list) < int(start_time_ms):
+                        break
+                except Exception:
+                    pass
+        return out
 
 
 @contextmanager

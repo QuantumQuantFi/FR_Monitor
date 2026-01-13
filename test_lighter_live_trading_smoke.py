@@ -21,7 +21,13 @@ import time
 from orderbook_utils import fetch_orderbook_prices
 from config import WATCHLIST_PG_CONFIG
 from trading.live_trading_manager import LiveTradingConfig, LiveTradingManager
-from trading.trade_executor import TradeExecutionError, execute_perp_market_order
+from trading.trade_executor import (
+    TradeExecutionError,
+    execute_perp_market_order,
+    get_lighter_market_meta,
+    get_lighter_position_funding_history,
+    get_lighter_trades,
+)
 
 
 def main() -> None:
@@ -66,12 +72,35 @@ def main() -> None:
         order_kwargs={"client_order_id": client_base + "1"},
     )
     print("open resp:", open_order)
+    resp = open_order.get("response") if isinstance(open_order.get("response"), dict) else {}
+    open_tx_hash = None
+    if isinstance(resp, dict):
+        open_tx_hash = resp.get("tx_hash")
+    open_tx_hash = str(open_tx_hash or "").strip() or None
+    open_order_index = open_order.get("client_order_index")
+    if open_order_index is None:
+        raise SystemExit("OPEN did not return client_order_index")
+    if not open_tx_hash:
+        raise SystemExit("OPEN did not return tx_hash (required for trade ledger lookup)")
 
     time.sleep(2.0)
     after = manager._get_exchange_position_size("lighter", symbol) or 0.0
     print("position after open:", after)
     if float(after) <= 0:
         raise SystemExit(f"OPEN failed: position not detected after open ({after})")
+
+    # Verify fee/fill ledger is queryable and includes this order.
+    print("querying lighter trades for open tx_hash:", open_tx_hash)
+    trades_open = []
+    for _ in range(8):
+        trades_open = get_lighter_trades(tx_hash=open_tx_hash, limit=50, max_pages=5)
+        if trades_open:
+            break
+        time.sleep(0.5)
+    if not trades_open:
+        raise SystemExit("OPEN trade ledger empty (expected at least 1 trade)")
+    total_fee_open = sum(float(t.get("fee_usdc") or 0.0) for t in trades_open)
+    print("open trades n=", len(trades_open), "fee_usdc=", total_fee_open)
 
     print(f"placing CLOSE long->sell lighter {symbol} qty={abs(after)} client={client_base}-C")
     close_order = manager._place_close_order(
@@ -82,12 +111,24 @@ def main() -> None:
         client_order_id=client_base + "2",
     )
     print("close resp:", close_order)
+    close_order_index = None
+    if isinstance(close_order, dict):
+        close_order_index = close_order.get("client_order_index") or close_order.get("client_order_id") or close_order.get("client_order_index")
 
     time.sleep(2.0)
     final = manager._get_exchange_position_size("lighter", symbol) or 0.0
     print("position after close:", final)
     if abs(float(final)) > 1e-9:
         raise SystemExit(f"CLOSE failed: residual position remains: {final}")
+
+    # Verify funding ledger endpoint is accessible (may return empty for short holds).
+    try:
+        meta = get_lighter_market_meta(symbol)
+        market_id = int(meta.get("market_id"))
+        pf = get_lighter_position_funding_history(market_id=market_id, limit=5, max_pages=1)
+        print("positionFunding ok n=", len(pf))
+    except Exception as exc:
+        raise SystemExit(f"positionFunding query failed: {type(exc).__name__}: {exc}") from exc
 
     print("OK: lighter live trading smoke passed.")
 

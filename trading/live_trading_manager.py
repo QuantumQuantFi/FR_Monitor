@@ -67,6 +67,8 @@ from trading.trade_executor import (
     get_hyperliquid_user_fills_by_time,
     get_lighter_balance_summary,
     get_lighter_market_meta,
+    get_lighter_position_funding_history,
+    get_lighter_trades,
     place_lighter_perp_market_order,
     get_grvt_balance_summary,
     get_grvt_perp_positions,
@@ -1219,6 +1221,40 @@ class LiveTradingManager:
                         out["last_fee_time"] = ts_dt
                         out["last_fee_usdt"] = fee
 
+            elif ex == "lighter":
+                meta = get_lighter_market_meta(sym)
+                try:
+                    market_id = int(meta.get("market_id"))
+                except Exception:
+                    market_id = None
+                if market_id is None:
+                    out["funding_pnl_usdt"] = None
+                    out["source"] = None
+                    out["error"] = "lighter_missing_market_id"
+                    return out
+
+                side = "long" if int(pos_sign or 0) >= 0 else "short"
+                rows = get_lighter_position_funding_history(
+                    market_id=market_id,
+                    side=side,
+                    start_time_ms=start_ms,
+                    end_time_ms=end_ms,
+                    limit=100,
+                    timeout=15.0,
+                    max_pages=10,
+                )
+                for r in rows or []:
+                    fee = _as_float(r.get("change_usdc"))
+                    ts_ms = r.get("time")
+                    if fee is None:
+                        continue
+                    out["funding_pnl_usdt"] += fee  # treat USDC≈USDT for display
+                    out["currency"] = "USDC"
+                    ts_dt = _as_dt_from_ms(ts_ms)
+                    if ts_dt and (out["last_fee_time"] is None or ts_dt > out["last_fee_time"]):
+                        out["last_fee_time"] = ts_dt
+                        out["last_fee_usdt"] = fee
+
             else:
                 out["funding_pnl_usdt"] = None
                 out["source"] = None
@@ -1781,32 +1817,120 @@ class LiveTradingManager:
             tx_hash = resp.get("tx_hash") if isinstance(resp, dict) else None
             info["exchange_order_id"] = str(tx_hash or "") or None
             info["status"] = str(order.get("status") or "submitted")
-            info["filled_qty"] = _float_or_none(order.get("size"))
-            # Best-effort: use latest account position avg_entry_price as the fill price proxy.
+
+            # Prefer trade ledger for actual fill + fee (requires short-lived auth token).
             try:
-                bal = get_lighter_balance_summary()
-                raw = bal.get("raw_account") if isinstance(bal, dict) else None
-                positions = raw.get("positions") if isinstance(raw, dict) else None
-                if isinstance(positions, list):
-                    sym_u = str(symbol or "").upper()
-                    for p in positions:
-                        if not isinstance(p, dict):
-                            continue
-                        if str(p.get("symbol") or "").upper() != sym_u:
-                            continue
-                        avg_entry = _float_or_none(p.get("avg_entry_price"))
-                        if avg_entry and avg_entry > 0:
-                            info["avg_price"] = avg_entry
-                            break
+                market_id = int(order.get("market_id")) if order.get("market_id") is not None else None
             except Exception:
-                pass
-            if info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                market_id = None
+            try:
+                order_index = int(order.get("client_order_index")) if order.get("client_order_index") is not None else None
+            except Exception:
+                order_index = None
+
+            trades: List[Dict[str, Any]] = []
+
+            # Best-effort: match by tx_hash (stable), since `order_index` on /api/v1/trades
+            # corresponds to ask_id/bid_id (matching engine order index), not client_order_index.
+            if tx_hash:
+                now_ms = int(time.time() * 1000)
+                for _ in range(6):
+                    try:
+                        trades = get_lighter_trades(
+                            market_id=market_id,
+                            tx_hash=str(tx_hash),
+                            start_time_ms=now_ms - 900_000,
+                            end_time_ms=now_ms + 60_000,
+                            limit=100,
+                            timeout=15.0,
+                            max_pages=3,
+                        )
+                    except Exception:
+                        trades = []
+                    if trades:
+                        break
+                    time.sleep(0.5)
+
+            # Fallback: try `order_index` filter (may not be client_order_index).
+            if not trades and order_index is not None:
+                now_ms = int(time.time() * 1000)
+                for _ in range(6):
+                    try:
+                        trades = get_lighter_trades(
+                            market_id=market_id,
+                            order_index=order_index,
+                            start_time_ms=now_ms - 900_000,
+                            end_time_ms=now_ms + 60_000,
+                            limit=100,
+                            timeout=15.0,
+                            max_pages=3,
+                        )
+                    except Exception:
+                        trades = []
+                    if trades:
+                        break
+                    time.sleep(0.5)
+
+            if trades:
+                total_qty = 0.0
+                total_quote = 0.0
+                total_fee = 0.0
+                seen_fee = False
+                for t in trades:
+                    q = _float_or_none(t.get("size"))
+                    p = _float_or_none(t.get("price"))
+                    usd = _float_or_none(t.get("usd_amount"))
+                    if q is None or q <= 0:
+                        continue
+                    total_qty += float(q)
+                    if usd is not None and usd > 0:
+                        total_quote += float(usd)
+                    elif p is not None and p > 0:
+                        total_quote += float(p) * float(q)
+                    fee = _float_or_none(t.get("fee_usdc"))
+                    if fee is not None:
+                        total_fee += abs(float(fee))
+                        seen_fee = True
+
+                if total_qty > 0 and total_quote > 0:
+                    info["filled_qty"] = total_qty
+                    info["avg_price"] = total_quote / total_qty
+                    info["cum_quote"] = total_quote
+                    info["status"] = str(info.get("status") or "filled")
+
+                if seen_fee:
+                    info["fee_currency"] = "USDC"
+                    info["fee_usdt"] = float(total_fee)  # treat USDC≈USDT
+
+            # Fallback: use account position avg_entry_price as fill proxy, and taker_fee from metadata.
+            if info.get("avg_price") is None:
+                try:
+                    bal = get_lighter_balance_summary()
+                    raw = bal.get("raw_account") if isinstance(bal, dict) else None
+                    positions = raw.get("positions") if isinstance(raw, dict) else None
+                    if isinstance(positions, list):
+                        sym_u = str(symbol or "").upper()
+                        for p in positions:
+                            if not isinstance(p, dict):
+                                continue
+                            if str(p.get("symbol") or "").upper() != sym_u:
+                                continue
+                            avg_entry = _float_or_none(p.get("avg_entry_price"))
+                            if avg_entry and avg_entry > 0:
+                                info["avg_price"] = avg_entry
+                                break
+                except Exception:
+                    pass
+
+            if info.get("filled_qty") is None:
+                info["filled_qty"] = _float_or_none(order.get("size"))
+
+            if info.get("avg_price") is not None and info.get("filled_qty") is not None and info.get("cum_quote") is None:
                 try:
                     info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
                 except Exception:
                     pass
-            # Best-effort: Lighter exposes maker/taker fee rates in market metadata (public).
-            # Active markets currently report 0 fees, but we still compute for forward compatibility.
+
             try:
                 if info.get("fee_usdt") is None and info.get("cum_quote") is not None:
                     meta = get_lighter_market_meta(str(symbol or ""))
@@ -1819,6 +1943,7 @@ class LiveTradingManager:
                         info["fee_usdt"] = abs(float(info["cum_quote"]) * float(taker_fee))
             except Exception:
                 pass
+
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "grvt":
