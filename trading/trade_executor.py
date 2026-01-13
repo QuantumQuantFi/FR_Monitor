@@ -11,6 +11,7 @@ import base64
 import hashlib
 import hmac
 import json
+import math
 import os
 import re
 import socket
@@ -5052,6 +5053,91 @@ def get_hyperliquid_user_funding_history(
     )
     if not isinstance(payload, list):
         raise TradeExecutionError(f"Hyperliquid user_funding_history payload malformed: {payload!r}")
+    return payload
+
+
+_HYPERLIQUID_USER_FEE_RATES: Dict[str, Dict[str, Any]] = {}
+_HYPERLIQUID_USER_FEE_RATES_LOCK = threading.Lock()
+_HYPERLIQUID_USER_FEE_RATES_TTL_SECONDS = 60.0
+
+
+def get_hyperliquid_user_fee_rates(
+    *,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> Dict[str, Any]:
+    """Return Hyperliquid per-user fee rates (maker/taker) via Info.user_fees().
+
+    Notes
+    - Rates are returned as fractions (e.g. 0.00045 for 0.045%) per Hyperliquid docs.
+    - Maker rebates may be represented as negative rates; callers can decide how to treat them.
+    """
+    if HyperliquidInfo is None:
+        raise TradeExecutionError("hyperliquid-python-sdk is required for Hyperliquid fee rates")
+
+    creds = _resolve_hyperliquid_credentials(private_key, address, base_url=base_url)
+    key = f"{creds.base_url}|{creds.address}".lower()
+
+    now = time.time()
+    with _HYPERLIQUID_USER_FEE_RATES_LOCK:
+        cached = _HYPERLIQUID_USER_FEE_RATES.get(key)
+        if cached and (now - float(cached.get("fetched_at") or 0.0)) < _HYPERLIQUID_USER_FEE_RATES_TTL_SECONDS:
+            return dict(cached)
+
+    info = HyperliquidInfo(base_url=creds.base_url, skip_ws=True, timeout=timeout)
+    payload = info.user_fees(creds.address)
+    if not isinstance(payload, dict):
+        raise TradeExecutionError(f"Hyperliquid user_fees payload malformed: {payload!r}")
+
+    def _as_float(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            f = float(v)
+        except Exception:
+            return None
+        if not math.isfinite(f):
+            return None
+        return f
+
+    out = {
+        "user_add_rate": _as_float(payload.get("userAddRate")),
+        "user_cross_rate": _as_float(payload.get("userCrossRate")),
+        "active_referral_discount": _as_float(payload.get("activeReferralDiscount")),
+        "fee_schedule": payload.get("feeSchedule") if isinstance(payload.get("feeSchedule"), dict) else None,
+        "currency": "USDC",
+        "fetched_at": float(now),
+    }
+    with _HYPERLIQUID_USER_FEE_RATES_LOCK:
+        _HYPERLIQUID_USER_FEE_RATES[key] = dict(out)
+    return out
+
+
+def get_hyperliquid_user_fills_by_time(
+    *,
+    start_time_ms: int,
+    end_time_ms: Optional[int] = None,
+    aggregate_by_time: bool = True,
+    address: Optional[str] = None,
+    private_key: Optional[str] = None,
+    base_url: Optional[str] = None,
+    timeout: float = 10.0,
+) -> List[Dict[str, Any]]:
+    """Return Hyperliquid fills in a time range via Info.user_fills_by_time()."""
+    if HyperliquidInfo is None:
+        raise TradeExecutionError("hyperliquid-python-sdk is required for Hyperliquid fill history")
+    creds = _resolve_hyperliquid_credentials(private_key, address, base_url=base_url)
+    info = HyperliquidInfo(base_url=creds.base_url, skip_ws=True, timeout=timeout)
+    payload = info.user_fills_by_time(
+        creds.address,
+        int(start_time_ms),
+        int(end_time_ms) if end_time_ms is not None else None,
+        aggregate_by_time=bool(aggregate_by_time),
+    )
+    if not isinstance(payload, list):
+        raise TradeExecutionError(f"Hyperliquid user_fills_by_time payload malformed: {payload!r}")
     return payload
 
 

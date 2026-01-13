@@ -63,7 +63,10 @@ from trading.trade_executor import (
     get_hyperliquid_balance_summary,
     get_hyperliquid_perp_positions,
     get_hyperliquid_user_funding_history,
+    get_hyperliquid_user_fee_rates,
+    get_hyperliquid_user_fills_by_time,
     get_lighter_balance_summary,
+    get_lighter_market_meta,
     place_lighter_perp_market_order,
     get_grvt_balance_summary,
     get_grvt_perp_positions,
@@ -1699,6 +1702,72 @@ class LiveTradingManager:
                 info["filled_qty"] = _float_or_none(filled.get("totalSz") or filled.get("sz"))
                 if info.get("exchange_order_id") is None:
                     info["exchange_order_id"] = str(filled.get("oid") or "") or None
+            # Best-effort: compute fees by matching the order's fills and applying per-user fee rates.
+            # Hyperliquid settles fees in USDC; we treat it as USDT for display/storage.
+            try:
+                oid = info.get("exchange_order_id")
+                if oid and info.get("fee_usdt") is None:
+                    now_ms = int(time.time() * 1000)
+                    fills = get_hyperliquid_user_fills_by_time(
+                        start_time_ms=now_ms - 120_000,
+                        end_time_ms=now_ms + 30_000,
+                        aggregate_by_time=True,
+                    )
+                    matched: List[Dict[str, Any]] = []
+                    sym_u = str(symbol or "").upper()
+                    for f in fills or []:
+                        if not isinstance(f, dict):
+                            continue
+                        if str(f.get("oid") or "") != str(oid):
+                            continue
+                        if str(f.get("coin") or "").upper() != sym_u:
+                            continue
+                        matched.append(f)
+
+                    if matched:
+                        rates = get_hyperliquid_user_fee_rates()
+                        cross_rate = rates.get("user_cross_rate")
+                        add_rate = rates.get("user_add_rate")
+
+                        total_qty = 0.0
+                        total_quote = 0.0
+                        total_fee = 0.0
+                        seen_rate = False
+
+                        for f in matched:
+                            px = _float_or_none(f.get("px"))
+                            sz = _float_or_none(f.get("sz"))
+                            if px is None or sz is None or px <= 0 or sz <= 0:
+                                continue
+                            notional = float(px) * float(sz)
+                            total_qty += float(sz)
+                            total_quote += float(notional)
+
+                            crossed = bool(f.get("crossed"))
+                            rate = cross_rate if crossed else add_rate
+                            if rate is None:
+                                continue
+                            try:
+                                rate_f = float(rate)
+                            except Exception:
+                                continue
+                            if not math.isfinite(rate_f):
+                                continue
+                            total_fee += abs(float(notional) * rate_f)
+                            seen_rate = True
+
+                        if info.get("filled_qty") is None and total_qty > 0:
+                            info["filled_qty"] = total_qty
+                        if info.get("avg_price") is None and total_qty > 0 and total_quote > 0:
+                            info["avg_price"] = total_quote / total_qty
+                        if info.get("cum_quote") is None and total_quote > 0:
+                            info["cum_quote"] = total_quote
+
+                        if seen_rate:
+                            info["fee_currency"] = "USDC"
+                            info["fee_usdt"] = float(total_fee)
+            except Exception:
+                pass
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "lighter":
@@ -1730,6 +1799,20 @@ class LiveTradingManager:
                     info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
                 except Exception:
                     pass
+            # Best-effort: Lighter exposes maker/taker fee rates in market metadata (public).
+            # Active markets currently report 0 fees, but we still compute for forward compatibility.
+            try:
+                if info.get("fee_usdt") is None and info.get("cum_quote") is not None:
+                    meta = get_lighter_market_meta(str(symbol or ""))
+                    try:
+                        taker_fee = float(meta.get("taker_fee") or 0.0)
+                    except Exception:
+                        taker_fee = 0.0
+                    if math.isfinite(taker_fee) and taker_fee >= 0:
+                        info["fee_currency"] = "USDC"
+                        info["fee_usdt"] = abs(float(info["cum_quote"]) * float(taker_fee))
+            except Exception:
+                pass
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "grvt":
@@ -1780,6 +1863,8 @@ class LiveTradingManager:
                 if matched:
                     total_qty = 0.0
                     total_quote = 0.0
+                    total_fee = 0.0
+                    seen_fee = False
                     for f in matched:
                         try:
                             q = float(f.get("size") or 0.0)
@@ -1790,12 +1875,19 @@ class LiveTradingManager:
                             continue
                         total_qty += q
                         total_quote += q * p
+                        fee = _float_or_none(f.get("fee"))
+                        if fee is not None:
+                            total_fee += abs(float(fee))
+                            seen_fee = True
                         if info.get("exchange_order_id") is None and f.get("order_id"):
                             info["exchange_order_id"] = str(f.get("order_id"))
                     if total_qty > 0 and total_quote > 0:
                         info["filled_qty"] = total_qty
                         info["avg_price"] = total_quote / total_qty
                         info["status"] = str(info.get("status") or "filled")
+                    if seen_fee:
+                        info["fee_currency"] = "USDT"
+                        info["fee_usdt"] = float(total_fee)
 
             if info.get("avg_price") is not None and info.get("filled_qty") is not None:
                 try:
@@ -6322,8 +6414,14 @@ class LiveTradingManager:
             conn.execute(
                 """
                 UPDATE watchlist.live_trade_signal
-                   SET last_long_funding_rate=CASE WHEN %s IS NULL THEN last_long_funding_rate ELSE %s END,
-                       last_short_funding_rate=CASE WHEN %s IS NULL THEN last_short_funding_rate ELSE %s END,
+                   SET last_long_funding_rate=CASE
+                           WHEN %s::double precision IS NULL THEN last_long_funding_rate
+                           ELSE %s::double precision
+                       END,
+                       last_short_funding_rate=CASE
+                           WHEN %s::double precision IS NULL THEN last_short_funding_rate
+                           ELSE %s::double precision
+                       END,
                        last_funding_rate_at=now(),
                        updated_at=now()
                  WHERE id=%s;
