@@ -275,6 +275,72 @@ FR_Monitor 的最小责任应是：
 **阈值配置**
 - 新增 `LIVE_TRADING_CONFIG` 的 `type_c_pnl_threshold` / `type_c_win_prob_threshold`，默认与 B‑v1 阈值一致（可独立调参）。
 
+#### 资金费阈值（单腿上限 vs 净资金费成本）—当前线上默认值（2026-01-13）
+
+本项目里与 Type B（perp‑perp）开仓相关的资金费门槛分为两层，分别解决两类风险：
+
+1) **净资金费成本（net_cost，watchlist 侧预筛）**：避免“交易结构本身在持续付钱”，价差不回归时被资金费慢性拖死。  
+2) **单腿资金费上限（max_abs_funding，live trading 开仓前二次门控）**：避免“单腿资金费极端/跳变风险”，即使两腿净值接近 0，也可能在持仓中突然恶化触发资金费止损。
+
+两层门槛当前默认值（可用环境变量覆盖）：
+
+- Watchlist Type B funding filter（`watchlist_manager.py:_type_b_funding_ok()`）
+  - `WATCHLIST_TYPEB_FUNDING_FILTER_MODE=net_cost`（默认）
+  - `WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H=4`（默认，贴合 240min 持仓）
+  - `WATCHLIST_TYPEB_FUNDING_NET_COST_MAX=0.0008`（默认，表示在 horizon 内允许的“净资金费亏损比例”上限）
+  - 计算口径（注意：先按各自 funding 周期归一到“每小时”）：
+    - 方向：`short` = 高价交易所，`long` = 低价交易所（与 Type B 开仓方向一致）
+    - `net_per_hour = (funding_short / interval_short_h) - (funding_long / interval_long_h)`
+    - `net_over_horizon = net_per_hour * horizon_h`
+    - `net_loss = max(0, -net_over_horizon)`（只关心亏损，不限制净盈利）
+    - 通过条件：`net_loss <= WATCHLIST_TYPEB_FUNDING_NET_COST_MAX`
+
+- Live trading Type B funding guard（`trading/live_trading_manager.py:_check_funding_guard()`）
+  - `LIVE_TRADING_MAX_ABS_FUNDING=0.003`（默认开启）
+  - 计算口径：对两腿 “当前 funding_rate / interval_h” 做 per-hour 归一后，再做绝对值上限：
+    - `fr_long_per_hour = fr_long / interval_long_h`
+    - `fr_short_per_hour = fr_short / interval_short_h`
+    - 通过条件：`max(abs(fr_long_per_hour), abs(fr_short_per_hour)) <= LIVE_TRADING_MAX_ABS_FUNDING`
+
+- Live trading Type B 1h 净资金费开仓门槛（同上函数内的第二道门槛）
+  - `LIVE_TRADING_MAX_NEG_NET_FUNDING_PER_HOUR_1H=0.0015`（默认开启）
+  - 仅当两腿都属于 `interval_h=1` 的交易所时启用（避免对 4h/8h 周期产生口径混淆）
+  - 计算口径（与监控止损一致）：
+    - `net_funding_per_hour = (-fr_long_per_hour) + (fr_short_per_hour)`
+    - 通过条件：`net_funding_per_hour >= -LIVE_TRADING_MAX_NEG_NET_FUNDING_PER_HOUR_1H`
+
+另外，持仓中还有一条更硬的资金费风控（与开仓门槛不同，是平仓触发）：
+- Live trading funding stop-loss：`funding_rate_per_hour <= -stop_loss_funding_per_hour_pct`（`LIVE_TRADING_STOP_LOSS_FUNDING_PER_HOUR_PCT`，默认 `0.003`）
+  - 该条在监控环节会把两腿 funding 按各自 interval 折算到 per-hour 再相加，属于“净资金费/小时”的硬止损（见 `trading/live_trading_manager.py` monitor loop）。
+
+##### 两腿示例（帮助理解“单腿阈值”与“净成本阈值”区别）
+
+示例 A：两腿 funding 都不极端，但净成本为正（可视为资金费更偏收益/无亏损）→ 应允许进入后续订单簿复核/开仓尝试
+- 假设（两家都 8h 结算）：
+  - 低价所（将做多）：`long_fr = -0.0006`（-0.06%/8h），`interval_long=8`
+  - 高价所（将做空）：`short_fr = -0.0001`（-0.01%/8h），`interval_short=8`
+- Watchlist net_cost：
+  - `net_per_hour = (-0.0001/8) - (-0.0006/8) = +0.0000625`
+  - `net_over_horizon (4h) = 0.0000625 * 4 = +0.00025`
+  - `net_loss = max(0, -0.00025) = 0`，满足 `<= 0.0008` → **通过**
+- Live trading 单腿上限：
+  - `max(abs(-0.0006), abs(-0.0001)) = 0.0006 <= 0.003` → **通过**
+
+示例 B：两腿净资金费已经偏负、接近资金费止损线 → 应在开仓阶段直接跳过（尤其是 1h 资金费产品）
+- 假设（两家都 1h 结算）：
+  - 低价所（将做多）：`long_fr = -0.0039`（-0.39%/1h），`interval_long=1`
+  - 高价所（将做空）：`short_fr = -0.0062`（-0.62%/1h），`interval_short=1`
+- per-hour：
+  - `fr_long_per_hour = -0.0039`
+  - `fr_short_per_hour = -0.0062`
+  - `net_funding_per_hour = (-(-0.0039)) + (-0.0062) = -0.0023`
+- Live trading 单腿上限（`LIVE_TRADING_MAX_ABS_FUNDING=0.003`）：
+  - `max(abs(-0.0039), abs(-0.0062)) = 0.0062 > 0.003` → **拦截（不开仓）**
+- 即使你放宽单腿上限，仍会被 1h 净资金费门槛拦截（`LIVE_TRADING_MAX_NEG_NET_FUNDING_PER_HOUR_1H=0.0015`）：
+  - `net_funding_per_hour = -0.0023 < -0.0015` → **拦截（不开仓）**
+
+结论：`net_cost` 解决“结构性慢性亏损”，`max_abs_funding` 解决“单腿极端与跳变风险”；二者并行能减少类似“开仓时净值不差，但持仓中资金费骤变触发止损”的事故。
+
 **未完成项（下一步）**
 - spot 下单/平仓接口与 per‑leg `market_type` 处理尚未实现；当前 `_open_trade()` 仍是 “双腿永续” 路径。
 - 需把 Type C 从 `signal_only` 分支切换为真实下单，并增加风控（现货不可做空、仓位复核、成交失败回滚等）。

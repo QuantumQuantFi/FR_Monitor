@@ -154,9 +154,15 @@ class LiveTradingConfig:
     max_hold_days: int = 7
     stop_loss_total_pnl_pct: float = 0.01
     stop_loss_funding_per_hour_pct: float = 0.003
-    # Type B funding guard: require both legs' current funding to satisfy abs(funding_rate) <= max_abs_funding.
+    # Type B funding guard: require both legs' current funding (per-hour normalised) to satisfy
+    # abs(funding_rate_per_hour) <= max_abs_funding.
     # Set to 0 to disable.
     max_abs_funding: float = 0.0
+    # Extra Type B entry guard for 1h-funding venues: require net funding per hour to not be too negative.
+    # net_funding_per_hour = (-long_fr/long_iv_h) + (short_fr/short_iv_h)
+    # Only applies when both legs report funding_interval_hours == 1.
+    # Set to 0 to disable.
+    max_neg_net_funding_per_hour_1h: float = 0.0
     close_retry_cooldown_seconds: float = 120.0
     # Hyperliquid reduce-only close uses an IOC limit under the hood; for illiquid symbols,
     # small slippage may fail to cross the spread ("could not immediately match...").
@@ -3205,8 +3211,11 @@ class LiveTradingManager:
         Returns (ok, payload_fragment, reason).
         """
         threshold = float(getattr(self.config, "max_abs_funding", 0.0) or 0.0)
+        net_1h_threshold = float(getattr(self.config, "max_neg_net_funding_per_hour_1h", 0.0) or 0.0)
         if threshold <= 0:
-            return True, {"enabled": False}, None
+            # Net guard is optional; keep current behavior when both are disabled.
+            if net_1h_threshold <= 0:
+                return True, {"enabled": False}, None
 
         if str((event or {}).get("signal_type") or "").upper() != "B":
             return True, {"enabled": False}, None
@@ -3221,19 +3230,62 @@ class LiveTradingManager:
             except Exception:
                 return None
 
+        def _iv(info: Dict[str, Any]) -> Optional[float]:
+            try:
+                v = info.get("funding_interval_hours")
+                if v is None:
+                    return None
+                vf = float(v)
+                return vf if vf > 0 else None
+            except Exception:
+                return None
+
+        def _per_hour(fr: Optional[float], iv: Optional[float]) -> Optional[float]:
+            try:
+                if fr is None or iv is None or float(iv) <= 0:
+                    return None
+                return float(fr) / float(iv)
+            except Exception:
+                return None
+
         fr_long = _fr(long_info or {})
         fr_short = _fr(short_info or {})
+        iv_long = _iv(long_info or {})
+        iv_short = _iv(short_info or {})
+        fr_long_per_hour = _per_hour(fr_long, iv_long)
+        fr_short_per_hour = _per_hour(fr_short, iv_short)
+
+        net_funding_per_hour = None
+        # For long leg: positive funding means paying; for short leg: positive funding means receiving.
+        # Use the same convention as monitor loop (`funding_rate_per_hour`).
+        if fr_long_per_hour is not None and fr_short_per_hour is not None:
+            net_funding_per_hour = (-float(fr_long_per_hour)) + float(fr_short_per_hour)
+
         payload = {
-            "enabled": True,
+            "enabled": bool(threshold > 0 or net_1h_threshold > 0),
             "threshold": threshold,
+            "net_1h_threshold": net_1h_threshold,
             "long": {"exchange": str(long_ex), **(long_info or {})},
             "short": {"exchange": str(short_ex), **(short_info or {})},
+            "long_per_hour": fr_long_per_hour,
+            "short_per_hour": fr_short_per_hour,
+            "net_funding_per_hour": net_funding_per_hour,
         }
 
-        if fr_long is None or fr_short is None:
+        if fr_long is None or fr_short is None or iv_long is None or iv_short is None:
             return False, payload, "funding_unavailable"
-        if max(abs(float(fr_long)), abs(float(fr_short))) > threshold:
-            return False, payload, "funding_too_high"
+        # 1) Per-leg absolute funding guard (per-hour normalised).
+        if threshold > 0:
+            if fr_long_per_hour is None or fr_short_per_hour is None:
+                return False, payload, "funding_unavailable"
+            if max(abs(float(fr_long_per_hour)), abs(float(fr_short_per_hour))) > threshold:
+                return False, payload, "funding_too_high"
+
+        # 2) Extra net funding guard for 1h venues (avoid opening too close to funding stop-loss line).
+        if net_1h_threshold > 0:
+            if iv_long == 1.0 and iv_short == 1.0 and net_funding_per_hour is not None:
+                if float(net_funding_per_hour) < -float(net_1h_threshold):
+                    return False, payload, "funding_net_too_negative_1h"
         return True, payload, None
 
     def _pick_high_low(

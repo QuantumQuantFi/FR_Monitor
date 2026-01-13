@@ -226,8 +226,8 @@ WATCHLIST_CONFIG = {
     # - "net_cost": 允许 funding_rate 绝对值很大，但要求按「高价做空/低价做多」方向计算的净资金费“亏损”不超过阈值
     #   亏损定义：net_funding_over_horizon < 0 时，abs(net_funding_over_horizon) <= max_loss
     'type_b_funding_filter_mode': str(_get_private('WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'net_cost')).strip().lower(),
-    'type_b_funding_net_cost_max': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', 'WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', '0.001')),  # 0.1%
-    'type_b_funding_net_cost_horizon_hours': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', 'WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', '8')),
+    'type_b_funding_net_cost_max': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', 'WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', '0.0008')),  # 0.08% / horizon
+    'type_b_funding_net_cost_horizon_hours': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', 'WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', '4')),
     # Type C：现货低于永续
     'type_c_spread_threshold': float(_get_private('WATCHLIST_TYPEC_SPREAD', 'WATCHLIST_TYPEC_SPREAD', '0.01')),  # 1%
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),
@@ -359,10 +359,20 @@ LIVE_TRADING_CONFIG = {
     'kick_driven': _is_truthy(_get_private('LIVE_TRADING_KICK_DRIVEN', 'LIVE_TRADING_KICK_DRIVEN', '1')),
     'monitor_interval_seconds': float(_get_private('LIVE_TRADING_MONITOR_SEC', 'LIVE_TRADING_MONITOR_SEC', '60')),
     'take_profit_ratio': float(_get_private('LIVE_TRADING_TP_RATIO', 'LIVE_TRADING_TP_RATIO', '0.7')),
-    # Optional guard for Type B: require both legs' current funding rates to satisfy
-    # abs(funding_rate) <= max_abs_funding before opening a trade.
-    # Default disabled (0) because watchlist already filters funding and we want maximum entry speed.
-    'max_abs_funding': float(_get_private('LIVE_TRADING_MAX_ABS_FUNDING', 'LIVE_TRADING_MAX_ABS_FUNDING', '0')),
+    # Optional guard for Type B: require both legs' current funding rates (per-hour normalised) to satisfy
+    # abs(funding_rate_per_hour) <= max_abs_funding before opening a trade.
+    # Note: this is an extra safety gate on top of watchlist filters (which operate on a horizon net_cost view).
+    'max_abs_funding': float(_get_private('LIVE_TRADING_MAX_ABS_FUNDING', 'LIVE_TRADING_MAX_ABS_FUNDING', '0.003')),
+    # Extra Type B entry guard for 1h-funding venues: require net funding per hour to not be too negative.
+    # net_funding_per_hour = (-long_fr/long_iv_h) + (short_fr/short_iv_h)
+    # Only applies when both legs are interval_h == 1.
+    'max_neg_net_funding_per_hour_1h': float(
+        _get_private(
+            'LIVE_TRADING_MAX_NEG_NET_FUNDING_PER_HOUR_1H',
+            'LIVE_TRADING_MAX_NEG_NET_FUNDING_PER_HOUR_1H',
+            '0.0015',
+        )
+    ),
     # 订单簿快速复核：在“决定开仓/止盈平仓”前做多次短间隔验算，避免瞬时价差假信号。
     # 注意：每次验算会同时请求两家交易所的订单簿（REST），请结合限频调整。
     # 临时策略：仅保留 i0（单次）复核，降低 skipped（后续可再改回 3 次复核）。
