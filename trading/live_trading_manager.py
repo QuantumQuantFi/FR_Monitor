@@ -2424,26 +2424,6 @@ class LiveTradingManager:
                     updated_at
                 )
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,now())
-                ON CONFLICT (event_id) DO UPDATE
-                    SET symbol=EXCLUDED.symbol,
-                        signal_type=EXCLUDED.signal_type,
-                        horizon_min=EXCLUDED.horizon_min,
-                        pnl_hat=EXCLUDED.pnl_hat,
-                        win_prob=EXCLUDED.win_prob,
-                        pnl_hat_ob=EXCLUDED.pnl_hat_ob,
-                        win_prob_ob=EXCLUDED.win_prob_ob,
-                        leg_long_exchange=EXCLUDED.leg_long_exchange,
-                        leg_short_exchange=EXCLUDED.leg_short_exchange,
-                        status=EXCLUDED.status,
-                        reason=EXCLUDED.reason,
-                        payload=EXCLUDED.payload,
-                        client_order_id_base=EXCLUDED.client_order_id_base,
-                        pred_source=EXCLUDED.pred_source,
-                        retry_attempts=0,
-                        next_retry_at=NULL,
-                        last_attempt_at=NULL,
-                        updated_at=now()
-                  WHERE watchlist.live_trade_signal.status='expired'
                 RETURNING id;
                 """,
                 (
@@ -4037,9 +4017,7 @@ class LiveTradingManager:
             + signal_types
             + """
               AND (s.next_retry_at IS NULL OR s.next_retry_at <= now())
-              AND ("""
-            + event_last_ts_expr
-            + """) >= now() - make_interval(secs := %s)
+              AND s.created_at >= now() - make_interval(secs := %s)
               AND ("""
             + event_last_ts_expr
             + """) >= now() - make_interval(mins := %s)
@@ -4054,25 +4032,13 @@ class LiveTradingManager:
         if ttl_s <= 0:
             return 0
         batch_n = 500
-        event_last_ts_expr = """
-                COALESCE(
-                  (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                  (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                  (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                  e.end_ts,
-                  e.start_ts
-                )
-        """
         rows = conn.execute(
             """
             WITH expired AS (
               SELECT s.id
               FROM watchlist.live_trade_signal s
-              JOIN watchlist.watch_signal_event e ON e.id = s.event_id
               WHERE s.status='skipped'
-                AND ("""
-            + event_last_ts_expr
-            + """) < now() - make_interval(secs := %s)
+                AND s.created_at < now() - make_interval(secs := %s)
               LIMIT %s
             )
             UPDATE watchlist.live_trade_signal s

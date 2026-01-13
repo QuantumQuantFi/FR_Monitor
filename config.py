@@ -270,6 +270,8 @@ WATCHLIST_PG_CONFIG = {
     # 连续触发分钟数：1 可以显著降低 event 生成延迟（利于捕捉秒级价差），但会增加 event 数量与后续订单簿验算压力。
     'consecutive_required': int(float(_get_private('WATCHLIST_PG_CONSEC', 'WATCHLIST_PG_CONSEC', '1'))),
     'cooldown_minutes': int(float(_get_private('WATCHLIST_PG_COOLDOWN_MIN', 'WATCHLIST_PG_COOLDOWN_MIN', '3'))),
+    # 单个 event 的最大持续时间（秒）：超过后强制 close，下一次触发会创建新的 event_id。
+    'event_ttl_seconds': float(_get_private('WATCHLIST_EVENT_TTL_SEC', 'WATCHLIST_EVENT_TTL_SEC', '1800')),
     # 默认开启事件合并；如需关闭可设置 WATCHLIST_PG_EVENT_MERGE=0
     'enable_event_merge': _is_truthy(_get_private('WATCHLIST_PG_EVENT_MERGE', 'WATCHLIST_PG_EVENT_MERGE', '1')),
     # 写入 event 时是否同步做订单簿验算：会显著增加写入延迟（网络 I/O），默认开启（但内部有阈值预筛选），live trading 仍会下单前二次复核。

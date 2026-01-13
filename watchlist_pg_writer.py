@@ -37,6 +37,8 @@ class PgWriterConfig:
     flush_seconds: float = 5.0
     consecutive_required: int = 2  # N 连续分钟归并事件
     cooldown_minutes: int = 3  # M 分钟冷静期
+    # Max duration for a single watch_signal_event (seconds). When exceeded, close and start a new event_id.
+    event_ttl_seconds: float = 1800.0
     enable_event_merge: bool = False
     orderbook_validation_on_write: bool = True
 
@@ -601,6 +603,34 @@ class PgWriter:
                         "close": True,
                     }
                 )
+                state.update(
+                    {
+                        "open": False,
+                        "event_id": None,
+                        "pending_count": 0,
+                        "agg": None,
+                        "start_ts": None,
+                        "last_ts": ts,
+                        "last_trigger_ts": None,
+                        "triggered_count": 0,
+                    }
+                )
+
+            # If open and max event duration exceeded -> close (even if still triggering).
+            ttl_s = max(0.0, float(getattr(self.config, "event_ttl_seconds", 1800.0) or 0.0))
+            if state["open"] and state.get("start_ts") and ttl_s > 0 and (ts - state["start_ts"]).total_seconds() > ttl_s:
+                if state.get("event_id"):
+                    ops["update"].append(
+                        {
+                            "event_id": state["event_id"],
+                            "end_ts": state.get("last_trigger_ts") or ts,
+                            "duration_sec": int(((state.get("last_trigger_ts") or ts) - state["start_ts"]).total_seconds())
+                            if state.get("start_ts")
+                            else None,
+                            "features_agg": self._agg_finalize(state["agg"], legs=self._last_legs.get(key)),
+                            "close": True,
+                        }
+                    )
                 state.update(
                     {
                         "open": False,

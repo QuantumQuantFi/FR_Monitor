@@ -115,6 +115,7 @@ class WatchlistManager:
                     flush_seconds=float(pg_cfg_dict.get('flush_seconds', 5.0)),
                     consecutive_required=int(pg_cfg_dict.get('consecutive_required', 2)),
                     cooldown_minutes=int(pg_cfg_dict.get('cooldown_minutes', 3)),
+                    event_ttl_seconds=float(pg_cfg_dict.get('event_ttl_seconds', 1800.0)),
                     enable_event_merge=bool(pg_cfg_dict.get('enable_event_merge', False)),
                     orderbook_validation_on_write=bool(pg_cfg_dict.get('orderbook_validation_on_write', False)),
                 )
