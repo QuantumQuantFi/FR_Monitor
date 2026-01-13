@@ -1579,6 +1579,55 @@ def get_binance_perp_order(
     return data if isinstance(data, dict) else {"data": data}
 
 
+def get_binance_perp_user_trades(
+    symbol: str,
+    *,
+    order_id: Optional[Union[int, str]] = None,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    limit: int = 1000,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://fapi.binance.com",
+) -> List[Dict[str, Any]]:
+    """Return Binance USDT perpetual user trades via GET /fapi/v1/userTrades (best-effort)."""
+    creds = _resolve_binance_credentials(api_key, secret_key)
+
+    pair = symbol.upper()
+    if not pair.endswith("USDT"):
+        pair = f"{pair}USDT"
+
+    params: List[tuple[str, str]] = [
+        ("symbol", pair),
+        ("timestamp", _utc_millis_str()),
+        ("recvWindow", str(recv_window)),
+        ("limit", str(min(max(int(limit or 1000), 1), 1000))),
+    ]
+    if order_id is not None:
+        params.append(("orderId", str(order_id)))
+    if start_time_ms is not None:
+        params.append(("startTime", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("endTime", str(int(end_time_ms))))
+
+    query = urlencode(params)
+    signature = _hmac_sha256_hexdigest(creds.secret_key, query)
+    params.append(("signature", signature))
+
+    headers = {"X-MBX-APIKEY": creds.api_key, "User-Agent": USER_AGENT}
+    url = f"{base_url}/fapi/v1/userTrades"
+    response = _send_request("GET", url, params=params, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200:
+        raise TradeExecutionError(f"Binance userTrades query failed {response.status_code}: {data}")
+    if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+        raise TradeExecutionError(f"Binance userTrades reject: {data}")
+    if not isinstance(data, list):
+        raise TradeExecutionError(f"Binance userTrades payload malformed: {data!r}")
+    return data
+
+
 def get_binance_spot_order(
     symbol: str,
     *,

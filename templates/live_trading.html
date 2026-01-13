@@ -165,8 +165,14 @@
               <th style="width: 130px;">
                 <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
               </th>
+              <th style="width: 120px;">
+                <span class="hint" title="手续费(USDT)：两条腿开/平仓订单回执或订单查询返回的 fee_usdt 汇总（best-effort；仅当手续费币种可直接换算为 USDT/USDC/BUSD 时才稳定）。">FeePnL</span>
+              </th>
               <th style="width: 140px;">
                 <span class="hint" title="FundingPnL(USDT)：从 opened_at 起，按交易所账户“已收/已付”资金费明细累加（两条腿叠加，best-effort；不同交易所回执字段不同，可能为空/延迟）。每小时整点后的首次刷新会更新一次（其余时间使用缓存）。">FundingPnL</span>
+              </th>
+              <th style="width: 130px;">
+                <span class="hint" title="净PnL(USDT)：realized_pnl + funding_pnl - fee_pnl（best-effort；资金费或手续费为空时不展示）。">NetPnL</span>
               </th>
               <th style="width: 120px;">
                 <span class="hint" title="开仓时 Long 腿资金费率（小数；例如 0.0001=0.01%）。来自公开 funding rate 快照。">开仓费率L</span>
@@ -213,7 +219,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="36" class="muted">loading...</td></tr>
+            <tr><td colspan="38" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -471,7 +477,7 @@
       const body = document.getElementById('signalsBody');
       const signals = signalsResp.signals || [];
       if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="35" class="muted">暂无数据</td></tr>';
+        body.innerHTML = '<tr><td colspan="38" class="muted">暂无数据</td></tr>';
         return;
       }
 
@@ -500,12 +506,23 @@
         const entrySpreadPct = fmtPct(s.entry_spread_pct_actual, 4);
         const tpExitSpreadPct = fmtPct(s.take_profit_exit_spread_pct, 4);
         const realized = fmt(s.realized_pnl_usdt, 6);
+        const feePnl = fmt(s.fee_pnl_usdt, 6);
         const closeExitSpreadPct = calcCloseExitSpreadPct(s);
         const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
         const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
         const src = s.funding_source || {};
-        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate');
+        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate') || (src.long === 'sqlite_estimate') || (src.short === 'sqlite_estimate');
         const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
+        let netPnlNum = null;
+        try {
+          const rp = Number(s.realized_pnl_usdt);
+          const fp = Number(s.funding_pnl_usdt);
+          const fe = Number(s.fee_pnl_usdt);
+          if (Number.isFinite(rp) && Number.isFinite(fp) && Number.isFinite(fe)) netPnlNum = rp + fp - fe;
+        } catch (e) {
+          netPnlNum = null;
+        }
+        const netPnl = (hasEst && netPnlNum !== null ? '~' : '') + fmt(netPnlNum ?? s.net_pnl_usdt, 6);
         const openFundLong = fmtPct(s.open_long_funding_rate, 6);
         const openFundShort = fmtPct(s.open_short_funding_rate, 6);
         const liveFundLong = fmtPct(s.last_long_funding_rate, 6);
@@ -564,7 +581,9 @@
             <td class="muted">${entrySpreadPct}</td>
             <td class="muted">${tpExitSpreadPct}</td>
             <td class="muted">${realized}</td>
+            <td class="muted">${feePnl}</td>
             <td class="muted"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
+            <td class="muted">${netPnl}</td>
             <td class="muted">${openFundLong}</td>
             <td class="muted">${openFundShort}</td>
             <td class="muted">${liveFundLong}</td>

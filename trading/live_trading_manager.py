@@ -42,6 +42,7 @@ from trading.trade_executor import (
     get_binance_perp_usdt_balance,
     get_binance_perp_positions,
     get_binance_perp_order,
+    get_binance_perp_user_trades,
     get_binance_spot_balance,
     get_binance_spot_order,
     get_binance_funding_fee_income,
@@ -651,10 +652,10 @@ class LiveTradingManager:
                     """
                     INSERT INTO watchlist.live_trade_order(
                         signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                        filled_qty, avg_price, cum_quote, exchange_order_id,
+                        filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                         client_order_id, submitted_at, order_resp, status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                     """,
                     (
                         sid,
@@ -668,6 +669,8 @@ class LiveTradingManager:
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                         float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                         float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                        float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                        str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                         str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                         client_id,
                         _utcnow(),
@@ -849,6 +852,8 @@ class LiveTradingManager:
           filled_qty double precision,
           avg_price double precision,
           cum_quote double precision,
+          fee_usdt double precision,
+          fee_currency text,
           exchange_order_id text,
           client_order_id text,
           submitted_at timestamptz,
@@ -1011,6 +1016,10 @@ class LiveTradingManager:
           ADD COLUMN IF NOT EXISTS avg_price double precision;
         ALTER TABLE watchlist.live_trade_order
           ADD COLUMN IF NOT EXISTS cum_quote double precision;
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS fee_usdt double precision;
+        ALTER TABLE watchlist.live_trade_order
+          ADD COLUMN IF NOT EXISTS fee_currency text;
         ALTER TABLE watchlist.live_trade_order
           ADD COLUMN IF NOT EXISTS exchange_order_id text;
         """
@@ -1309,6 +1318,8 @@ class LiveTradingManager:
         - filled_qty (base qty when available)
         - avg_price
         - cum_quote (USDT notional when available)
+        - fee_usdt (best-effort, only when fee currency is USDT/USDC/BUSD)
+        - fee_currency
         - exchange_order_id
         - status (exchange-reported)
         """
@@ -1338,6 +1349,26 @@ class LiveTradingManager:
 
         info: Dict[str, Any] = {}
 
+        def _set_fee(fee_val: Any, currency: Optional[str]) -> None:
+            if info.get("fee_usdt") is not None or info.get("fee_currency") is not None:
+                return
+            if fee_val is None:
+                return
+            try:
+                fee = float(fee_val)
+            except Exception:
+                return
+            if not math.isfinite(fee):
+                return
+            fee = abs(fee)
+            if currency:
+                cur = str(currency)
+                info["fee_currency"] = cur
+                if cur.upper() in {"USDT", "USDC", "BUSD"}:
+                    info["fee_usdt"] = fee
+            else:
+                info["fee_usdt"] = fee
+
         if mkt == "spot":
             if ex == "binance":
                 info["exchange_order_id"] = str(order.get("orderId") or "") or None
@@ -1351,19 +1382,27 @@ class LiveTradingManager:
                 if isinstance(fills, list) and fills:
                     sum_qty = 0.0
                     sum_quote = 0.0
+                    fee_by_ccy: Dict[str, float] = {}
                     for f in fills:
                         if not isinstance(f, dict):
                             continue
                         px = _float_or_none(f.get("price"))
                         qty = _float_or_none(f.get("qty"))
+                        fee = _float_or_none(f.get("commission"))
+                        fee_ccy = f.get("commissionAsset")
                         if px is None or qty is None:
                             continue
                         sum_qty += qty
                         sum_quote += px * qty
+                        if fee is not None and fee_ccy:
+                            fee_by_ccy[str(fee_ccy)] = fee_by_ccy.get(str(fee_ccy), 0.0) + float(fee)
                     if sum_qty > 0 and sum_quote > 0:
                         info["avg_price"] = sum_quote / sum_qty
                         info["filled_qty"] = info.get("filled_qty") if info.get("filled_qty") is not None else sum_qty
                         info["cum_quote"] = info.get("cum_quote") if info.get("cum_quote") is not None else sum_quote
+                    if len(fee_by_ccy) == 1:
+                        ccy, fee_val = next(iter(fee_by_ccy.items()))
+                        _set_fee(fee_val, ccy)
                 if info.get("exchange_order_id") and (
                     info.get("filled_qty") is None or float(info.get("filled_qty") or 0.0) <= 0.0
                 ):
@@ -1510,6 +1549,25 @@ class LiveTradingManager:
                     st = detail.get("status")
                     if st is not None:
                         info["status"] = str(st)
+            # Binance futures fee is best-effort: query userTrades by orderId to get commission.
+            try:
+                oid = info.get("exchange_order_id")
+                if oid:
+                    trades = get_binance_perp_user_trades(symbol, order_id=oid)
+                    total_fee = 0.0
+                    seen_fee = False
+                    for t in trades or []:
+                        if not isinstance(t, dict):
+                            continue
+                        fee = _float_or_none(t.get("commission"))
+                        if fee is None:
+                            continue
+                        total_fee += abs(float(fee))
+                        seen_fee = True
+                    if seen_fee:
+                        _set_fee(total_fee, "USDT")
+            except Exception:
+                pass
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "okx":
@@ -2252,10 +2310,10 @@ class LiveTradingManager:
                 """
                 INSERT INTO watchlist.live_trade_order(
                     signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                    filled_qty, avg_price, cum_quote, exchange_order_id,
+                    filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                     client_order_id, submitted_at, order_resp, status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                 """,
                 (
                     int(signal_id),
@@ -2269,6 +2327,8 @@ class LiveTradingManager:
                     float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                     float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                     float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                    float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                    str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                     str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                     client_id,
                     _utcnow(),
@@ -5410,10 +5470,10 @@ class LiveTradingManager:
                     """
                     INSERT INTO watchlist.live_trade_order(
                         signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                        filled_qty, avg_price, cum_quote, exchange_order_id,
+                        filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                         client_order_id, submitted_at, order_resp, status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                     """,
                     (
                         int(signal_id),
@@ -5427,6 +5487,8 @@ class LiveTradingManager:
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                         float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                         float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                        float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                        str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                         str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                         str((leg.get("order_kwargs") or {}).get("client_order_id") or ""),
                         leg_opened_at,
@@ -5574,10 +5636,10 @@ class LiveTradingManager:
                         """
                         INSERT INTO watchlist.live_trade_order(
                             signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                            filled_qty, avg_price, cum_quote, exchange_order_id,
+                            filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                             client_order_id, submitted_at, order_resp, status
                         )
-                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                         """,
                         (
                             int(signal_id),
@@ -5591,6 +5653,8 @@ class LiveTradingManager:
                             float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                             float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                             float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                            float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                            str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                             str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                             close_client_id,
                             _utcnow(),
@@ -7402,10 +7466,10 @@ class LiveTradingManager:
                     """
                     INSERT INTO watchlist.live_trade_order(
                         signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                        filled_qty, avg_price, cum_quote, exchange_order_id,
+                        filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                         client_order_id, submitted_at, order_resp, status
                     )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                     """,
                     (
                         int(signal_id),
@@ -7419,6 +7483,8 @@ class LiveTradingManager:
                         float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                         float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                         float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                        float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                        str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                         str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                         str((leg.get("order_kwargs") or {}).get("client_order_id") or ""),
                         leg_opened_at,
@@ -7643,10 +7709,10 @@ class LiveTradingManager:
                 """
                 INSERT INTO watchlist.live_trade_order(
                     signal_id, action, leg, exchange, side, market_type, notional_usdt, quantity,
-                    filled_qty, avg_price, cum_quote, exchange_order_id,
+                    filled_qty, avg_price, cum_quote, fee_usdt, fee_currency, exchange_order_id,
                     client_order_id, submitted_at, order_resp, status
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
                 """,
                 (
                     int(signal_id),
@@ -7660,6 +7726,8 @@ class LiveTradingManager:
                     float(fill.get("filled_qty")) if fill.get("filled_qty") is not None else None,
                     float(fill.get("avg_price")) if fill.get("avg_price") is not None else None,
                     float(fill.get("cum_quote")) if fill.get("cum_quote") is not None else None,
+                    float(fill.get("fee_usdt")) if fill.get("fee_usdt") is not None else None,
+                    str(fill.get("fee_currency")) if fill.get("fee_currency") is not None else None,
                     str(fill.get("exchange_order_id")) if fill.get("exchange_order_id") is not None else None,
                     f"{close_base}-{spec['suffix']}",
                     close_leg_at,

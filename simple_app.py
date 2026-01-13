@@ -4378,6 +4378,7 @@ def live_trading_signals():
             ).fetchall()
 
             price_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
+            fee_map: Dict[int, float] = {}
             if include_prices and rows:
                 signal_ids: List[int] = []
                 for r in rows:
@@ -4412,6 +4413,31 @@ def live_trading_signals():
                                 'status': orow.get('status'),
                                 'created_at': orow.get('created_at'),
                             }
+                    # Fee is best-effort and depends on connector/order detail support.
+                    # If the DB schema doesn't have fee_usdt yet, keep UI graceful.
+                    try:
+                        fee_rows = conn.execute(
+                            """
+                            SELECT signal_id, SUM(ABS(fee_usdt)) AS fee_usdt
+                              FROM watchlist.live_trade_order
+                             WHERE signal_id = ANY(%s)
+                               AND fee_usdt IS NOT NULL
+                             GROUP BY signal_id;
+                            """,
+                            (signal_ids,),
+                        ).fetchall()
+                        for frow in fee_rows or []:
+                            if isinstance(frow, dict):
+                                try:
+                                    sid = int(frow.get('signal_id'))
+                                except Exception:
+                                    continue
+                                try:
+                                    fee_map[sid] = float(frow.get('fee_usdt') or 0.0)
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
@@ -4491,6 +4517,18 @@ def live_trading_signals():
                     except Exception:
                         realized_pnl = None
                     item['realized_pnl_usdt'] = realized_pnl
+                    if sid is not None and sid in fee_map:
+                        item['fee_pnl_usdt'] = fee_map.get(sid)
+                    net_pnl = item.get('net_pnl_usdt')
+                    fee_pnl = item.get('fee_pnl_usdt')
+                    if net_pnl is None and realized_pnl is not None and fee_pnl is not None:
+                        try:
+                            funding_val = item.get('funding_pnl_usdt')
+                            if funding_val is not None:
+                                net_pnl = float(realized_pnl) + float(funding_val) - float(fee_pnl)
+                        except Exception:
+                            net_pnl = item.get('net_pnl_usdt')
+                    item['net_pnl_usdt'] = net_pnl
 
             if include_funding:
                 # Funding fields are persisted by LiveTradingManager:
