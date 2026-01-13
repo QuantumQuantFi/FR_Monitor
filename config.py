@@ -88,6 +88,23 @@ LIGHTER_MARKET_REFRESH_SECONDS = int(
     float(_get_private('LIGHTER_MARKET_REFRESH_SECONDS', 'LIGHTER_MARKET_REFRESH_SECONDS', '900'))
 )
 
+# SOCKS5 proxy support (optional; used for private trading APIs when exchanges block the server IP).
+# - If *_PROXY_URL is not set, it falls back to BINANCE_PROXY_URL for convenience.
+# - Set *_PROXY_ENABLED=0 or *_PROXY_URL="" to disable quickly after migrating servers.
+LIGHTER_PROXY_URL = _get_private(
+    'LIGHTER_PROXY_URL',
+    'LIGHTER_PROXY_URL',
+    _get_private('BINANCE_PROXY_URL', 'BINANCE_PROXY_URL', ''),
+)
+LIGHTER_PROXY_ENABLED = _is_truthy(_get_private('LIGHTER_PROXY_ENABLED', 'LIGHTER_PROXY_ENABLED', '1'))
+
+GRVT_PROXY_URL = _get_private(
+    'GRVT_PROXY_URL',
+    'GRVT_PROXY_URL',
+    _get_private('BINANCE_PROXY_URL', 'BINANCE_PROXY_URL', ''),
+)
+GRVT_PROXY_ENABLED = _is_truthy(_get_private('GRVT_PROXY_ENABLED', 'GRVT_PROXY_ENABLED', '1'))
+
 # Hyperliquid configuration
 # 说明：Hyperliquid 公共行情通过 REST `/info` 与 WebSocket `allMids` 提供，
 # 下面的配置用来描述 REST 与 WS 端点，方便在不同环境（主网/测试网）之间切换。

@@ -19,6 +19,7 @@ import threading
 import time
 import logging
 import zlib
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
@@ -117,6 +118,176 @@ _configure_ipv4_only()
 
 class TradeExecutionError(Exception):
     """Raised when an exchange rejects a trading request."""
+
+
+_PROXY_ENV_LOCK = threading.RLock()
+_LIGHTER_SOCKS_PATCHED = False
+
+
+def _exchange_proxy_url(exchange: str) -> Optional[str]:
+    ex = (exchange or "").lower().strip()
+    if ex == "lighter":
+        if not bool(getattr(config, "LIGHTER_PROXY_ENABLED", False)):
+            return None
+        url = str(getattr(config, "LIGHTER_PROXY_URL", "") or "").strip()
+        return url or None
+    if ex == "grvt":
+        if not bool(getattr(config, "GRVT_PROXY_ENABLED", False)):
+            return None
+        url = str(getattr(config, "GRVT_PROXY_URL", "") or "").strip()
+        return url or None
+    return None
+
+
+def _ensure_lighter_aiohttp_socks_patch() -> None:
+    """Patch `lighter.rest.RESTClientObject` to support SOCKS5 proxies via aiohttp-socks.
+
+    Why: Lighter SDK uses aiohttp (openapi client) for tx submission, but aiohttp does not
+    support SOCKS proxies via standard HTTP proxy params/env; it requires a SOCKS connector.
+    """
+    global _LIGHTER_SOCKS_PATCHED
+    if _LIGHTER_SOCKS_PATCHED:
+        return
+
+    try:
+        import lighter.rest as lighter_rest  # type: ignore[import-not-found]
+    except Exception:
+        return
+
+    try:
+        from aiohttp_socks import ProxyConnector  # type: ignore[import-not-found]
+    except Exception:
+        ProxyConnector = None  # type: ignore[assignment]
+
+    if ProxyConnector is None:
+        # Only required when a SOCKS proxy is actually configured; callers will surface this.
+        _LIGHTER_SOCKS_PATCHED = True
+        return
+
+    try:
+        import aiohttp  # type: ignore
+        import aiohttp_retry  # type: ignore
+        import ssl
+    except Exception:
+        _LIGHTER_SOCKS_PATCHED = True
+        return
+
+    original = getattr(lighter_rest, "RESTClientObject", None)
+    if original is None:
+        _LIGHTER_SOCKS_PATCHED = True
+        return
+    if getattr(original, "_fr_monitor_socks_patched", False):
+        _LIGHTER_SOCKS_PATCHED = True
+        return
+
+    class SocksRESTClientObject(original):  # type: ignore[misc, valid-type]
+        _fr_monitor_socks_patched = True
+
+        def __init__(self, configuration) -> None:  # type: ignore[override]
+            proxy_url = str(os.getenv("LIGHTER_SOCKS_PROXY_URL", "") or "").strip()
+            if not proxy_url:
+                super().__init__(configuration)
+                return
+            proxy_lower = proxy_url.lower()
+            if not proxy_lower.startswith(("socks5://", "socks5h://")):
+                super().__init__(configuration)
+                return
+            if proxy_lower.startswith("socks5h://"):
+                proxy_url = "socks5://" + proxy_url[len("socks5h://") :]
+
+            maxsize = getattr(configuration, "connection_pool_maxsize", 100)
+            ssl_context = ssl.create_default_context(cafile=getattr(configuration, "ssl_ca_cert", None))
+            cert_file = getattr(configuration, "cert_file", None)
+            if cert_file:
+                ssl_context.load_cert_chain(cert_file, keyfile=getattr(configuration, "key_file", None))
+            if not bool(getattr(configuration, "verify_ssl", True)):
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+
+            connector = ProxyConnector.from_url(proxy_url, limit=int(maxsize), ssl=ssl_context)
+            self.proxy = None
+            self.proxy_headers = None
+            self.pool_manager = aiohttp.ClientSession(connector=connector, trust_env=False)
+
+            retries = getattr(configuration, "retries", None)
+            if retries is not None:
+                self.retry_client = aiohttp_retry.RetryClient(
+                    client_session=self.pool_manager,
+                    retry_options=aiohttp_retry.ExponentialRetry(
+                        attempts=retries,
+                        factor=0.0,
+                        start_timeout=0.0,
+                        max_timeout=120.0,
+                    ),
+                )
+            else:
+                self.retry_client = None
+
+    lighter_rest.RESTClientObject = SocksRESTClientObject  # type: ignore[assignment]
+    _LIGHTER_SOCKS_PATCHED = True
+
+
+@contextmanager
+def _temporary_socks_proxy(proxy_url: Optional[str]):
+    """Temporarily set env proxy vars so 3rd-party SDKs can route via SOCKS5.
+
+    We keep localhost/127.0.0.1 in NO_PROXY to avoid breaking local Postgres/Flask calls.
+    Guarded by a global lock to avoid concurrent env mutations across threads.
+    """
+    url = (proxy_url or "").strip()
+    if not url:
+        yield
+        return
+
+    with _PROXY_ENV_LOCK:
+        keys = (
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "NO_PROXY",
+            "no_proxy",
+            "LIGHTER_SOCKS_PROXY_URL",
+        )
+        saved = {k: os.environ.get(k) for k in keys}
+
+        # Lighter SDK: requests-based nonce_manager uses env proxies, while tx submission uses aiohttp.
+        # We patch aiohttp client to use socks connector and disable trust_env; env proxies are kept
+        # for the requests-based paths.
+        lighter_proxy = str(saved.get("LIGHTER_SOCKS_PROXY_URL") or "").strip()
+        if not lighter_proxy and url.lower().startswith(("socks5://", "socks5h://")):
+            # aiohttp-socks does not accept socks5h://; normalize for the aiohttp connector.
+            lighter_url = url
+            if url.lower().startswith("socks5h://"):
+                lighter_url = "socks5://" + url[len("socks5h://") :]
+            os.environ["LIGHTER_SOCKS_PROXY_URL"] = lighter_url
+            _ensure_lighter_aiohttp_socks_patch()
+        os.environ["ALL_PROXY"] = url
+        os.environ["all_proxy"] = url
+        os.environ["HTTP_PROXY"] = url
+        os.environ["http_proxy"] = url
+        os.environ["HTTPS_PROXY"] = url
+        os.environ["https_proxy"] = url
+
+        no_proxy_old = str(saved.get("NO_PROXY") or saved.get("no_proxy") or "").strip()
+        parts = [p.strip() for p in no_proxy_old.split(",") if p.strip()] if no_proxy_old else []
+        for item in ("localhost", "127.0.0.1"):
+            if item not in parts:
+                parts.append(item)
+        no_proxy_new = ",".join(parts)
+        os.environ["NO_PROXY"] = no_proxy_new
+        os.environ["no_proxy"] = no_proxy_new
+
+        try:
+            yield
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
 
 def _json_or_error(response: requests.Response) -> Dict[str, Any]:
@@ -4426,25 +4597,27 @@ def get_grvt_balance_summary(
     environment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Return a normalized account balance summary for GRVT (USDT-margined)."""
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
-    client = _get_grvt_client(creds=creds)
-    summary = client.get_account_summary()  # ccxt-style wrapper around /account_summary
-    if not isinstance(summary, dict):
-        raise TradeExecutionError(f"GRVT get_account_summary payload malformed: {summary!r}")
-    settle = str(summary.get("settle_currency") or "USDT").upper()
-    return {
-        "currency": settle,
-        "available_balance": summary.get("available_balance"),
-        "wallet_balance": summary.get("total_equity"),
-        "equity": summary.get("total_equity"),
-        "unrealized_pnl": summary.get("unrealized_pnl"),
-        "raw_summary": summary,
-    }
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
+        client = _get_grvt_client(creds=creds)
+        summary = client.get_account_summary()  # ccxt-style wrapper around /account_summary
+        if not isinstance(summary, dict):
+            raise TradeExecutionError(f"GRVT get_account_summary payload malformed: {summary!r}")
+        settle = str(summary.get("settle_currency") or "USDT").upper()
+        return {
+            "currency": settle,
+            "available_balance": summary.get("available_balance"),
+            "wallet_balance": summary.get("total_equity"),
+            "equity": summary.get("total_equity"),
+            "unrealized_pnl": summary.get("unrealized_pnl"),
+            "raw_summary": summary,
+        }
 
 
 def get_grvt_perp_positions(
@@ -4456,21 +4629,23 @@ def get_grvt_perp_positions(
     environment: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Return GRVT perp positions (private API)."""
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
-    client = _get_grvt_client(creds=creds)
-    instruments: List[str] = []
-    if symbol:
-        filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
-        instruments = [filters.instrument]
-    rows = client.fetch_positions(symbols=instruments)
-    if not isinstance(rows, list):
-        raise TradeExecutionError(f"GRVT fetch_positions payload malformed: {rows!r}")
-    return rows
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
+        client = _get_grvt_client(creds=creds)
+        instruments: List[str] = []
+        if symbol:
+            filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
+            instruments = [filters.instrument]
+        rows = client.fetch_positions(symbols=instruments)
+        if not isinstance(rows, list):
+            raise TradeExecutionError(f"GRVT fetch_positions payload malformed: {rows!r}")
+        return rows
 
 
 def get_grvt_order(
@@ -4482,19 +4657,21 @@ def get_grvt_order(
     environment: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Fetch an order by exchange order_id (private API)."""
-    if not order_id:
-        raise TradeExecutionError("GRVT order_id is required")
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
-    client = _get_grvt_client(creds=creds)
-    data = client.fetch_order(id=str(order_id))
-    if not isinstance(data, dict):
-        raise TradeExecutionError(f"GRVT fetch_order payload malformed: {data!r}")
-    return data
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        if not order_id:
+            raise TradeExecutionError("GRVT order_id is required")
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
+        client = _get_grvt_client(creds=creds)
+        data = client.fetch_order(id=str(order_id))
+        if not isinstance(data, dict):
+            raise TradeExecutionError(f"GRVT fetch_order payload malformed: {data!r}")
+        return data
 
 
 def place_grvt_perp_market_order(
@@ -4515,29 +4692,31 @@ def place_grvt_perp_market_order(
     - GRVT expects amount to respect min_size increments; we round down to min_size.
     - reduce_only is forwarded via params["reduce_only"].
     """
-    sym = (symbol or "").upper().strip()
-    if not sym:
-        raise TradeExecutionError("GRVT symbol is required")
-    side_key = (side or "").lower().strip()
-    if side_key not in {"buy", "sell"}:
-        raise TradeExecutionError("GRVT side must be buy/sell")
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        sym = (symbol or "").upper().strip()
+        if not sym:
+            raise TradeExecutionError("GRVT symbol is required")
+        side_key = (side or "").lower().strip()
+        if side_key not in {"buy", "sell"}:
+            raise TradeExecutionError("GRVT side must be buy/sell")
 
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
-    filters = _get_grvt_instrument_filters(sym, environment=creds.environment)
-    qty_dec = _coerce_positive_quantity(quantity)
-    qty_dec = _grvt_round_qty(sym, qty_dec)
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
+        filters = _get_grvt_instrument_filters(sym, environment=creds.environment)
+        qty_dec = _coerce_positive_quantity(quantity)
+        qty_dec = _grvt_round_qty(sym, qty_dec)
 
-    client = _get_grvt_client(creds=creds)
-    params = {"reduce_only": bool(reduce_only), "client_order_id": _grvt_client_order_id(client_order_id)}
-    resp = client.create_order(filters.instrument, "market", side_key, str(qty_dec), None, params=params)
-    if not isinstance(resp, dict) or not resp:
-        raise TradeExecutionError(f"GRVT create_order returned empty payload: {resp!r}")
-    return resp
+        client = _get_grvt_client(creds=creds)
+        params = {"reduce_only": bool(reduce_only), "client_order_id": _grvt_client_order_id(client_order_id)}
+        resp = client.create_order(filters.instrument, "market", side_key, str(qty_dec), None, params=params)
+        if not isinstance(resp, dict) or not resp:
+            raise TradeExecutionError(f"GRVT create_order returned empty payload: {resp!r}")
+        return resp
 
 
 def get_grvt_funding_payment_history(
@@ -4556,43 +4735,45 @@ def get_grvt_funding_payment_history(
     GRVT docs: amount is positive if paid, negative if received.
     We normalize to `income` semantics: positive -> received, negative -> paid.
     """
-    if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
-        raise TradeExecutionError("grvt-pysdk is required for GRVT funding payment history")
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
+            raise TradeExecutionError("grvt-pysdk is required for GRVT funding payment history")
 
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
 
-    start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
-    end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
-    inst = None
-    if symbol:
-        filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
-        inst = filters.instrument
+        start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
+        end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
+        inst = None
+        if symbol:
+            filters = _get_grvt_instrument_filters(symbol, environment=creds.environment)
+            inst = filters.instrument
 
-    cfg = GrvtApiConfig(
-        env=_grvt_raw_env_enum(creds.environment),
-        trading_account_id=creds.trading_account_id,
-        private_key=creds.private_key,
-        api_key=creds.api_key,
-        logger=LOGGER,
-    )
-    client = GrvtRawSync(cfg)
-    req = grvt_raw_types.ApiFundingPaymentHistoryRequest(
-        sub_account_id=str(creds.trading_account_id),
-        instrument=str(inst) if inst else None,
-        start_time=start_ns,
-        end_time=end_ns,
-        limit=int(limit) if int(limit) > 0 else 500,
-        cursor=None,
-    )
-    resp = client.funding_payment_history_v1(req)
-    # resp can be GrvtError or ApiFundingPaymentHistoryResponse
-    if hasattr(resp, "code") and hasattr(resp, "message"):
-        raise TradeExecutionError(f"GRVT funding_payment_history reject: {resp}")
+        cfg = GrvtApiConfig(
+            env=_grvt_raw_env_enum(creds.environment),
+            trading_account_id=creds.trading_account_id,
+            private_key=creds.private_key,
+            api_key=creds.api_key,
+            logger=LOGGER,
+        )
+        client = GrvtRawSync(cfg)
+        req = grvt_raw_types.ApiFundingPaymentHistoryRequest(
+            sub_account_id=str(creds.trading_account_id),
+            instrument=str(inst) if inst else None,
+            start_time=start_ns,
+            end_time=end_ns,
+            limit=int(limit) if int(limit) > 0 else 500,
+            cursor=None,
+        )
+        resp = client.funding_payment_history_v1(req)
+        # resp can be GrvtError or ApiFundingPaymentHistoryResponse
+        if hasattr(resp, "code") and hasattr(resp, "message"):
+            raise TradeExecutionError(f"GRVT funding_payment_history reject: {resp}")
     rows = getattr(resp, "result", None)
     if not isinstance(rows, list):
         return []
@@ -4652,41 +4833,43 @@ def get_grvt_fill_history(
       - order_id
       - is_buyer
     """
-    if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
-        raise TradeExecutionError("grvt-pysdk is required for GRVT fill history")
+    proxy_url = _exchange_proxy_url("grvt")
+    with _temporary_socks_proxy(proxy_url):
+        if GrvtRawSync is None or GrvtApiConfig is None or grvt_raw_types is None:
+            raise TradeExecutionError("grvt-pysdk is required for GRVT fill history")
 
-    creds = _resolve_grvt_credentials(
-        api_key=api_key,
-        private_key=private_key,
-        trading_account_id=trading_account_id,
-        environment=environment,
-    )
+        creds = _resolve_grvt_credentials(
+            api_key=api_key,
+            private_key=private_key,
+            trading_account_id=trading_account_id,
+            environment=environment,
+        )
 
-    start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
-    end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
-    base = (symbol or "").upper().strip() if symbol else None
+        start_ns = str(int(start_time_ms) * 1_000_000) if start_time_ms else None
+        end_ns = str(int(end_time_ms) * 1_000_000) if end_time_ms else None
+        base = (symbol or "").upper().strip() if symbol else None
 
-    cfg = GrvtApiConfig(
-        env=_grvt_raw_env_enum(creds.environment),
-        trading_account_id=creds.trading_account_id,
-        private_key=creds.private_key,
-        api_key=creds.api_key,
-        logger=LOGGER,
-    )
-    client = GrvtRawSync(cfg)
-    req = grvt_raw_types.ApiFillHistoryRequest(
-        sub_account_id=str(creds.trading_account_id),
-        kind=None,
-        base=[base] if base else None,
-        quote=["USDT"] if base else None,
-        start_time=start_ns,
-        end_time=end_ns,
-        limit=int(limit) if int(limit) > 0 else 200,
-        cursor=None,
-    )
-    resp = client.fill_history_v1(req)
-    if hasattr(resp, "code") and hasattr(resp, "message"):
-        raise TradeExecutionError(f"GRVT fill_history reject: {resp}")
+        cfg = GrvtApiConfig(
+            env=_grvt_raw_env_enum(creds.environment),
+            trading_account_id=creds.trading_account_id,
+            private_key=creds.private_key,
+            api_key=creds.api_key,
+            logger=LOGGER,
+        )
+        client = GrvtRawSync(cfg)
+        req = grvt_raw_types.ApiFillHistoryRequest(
+            sub_account_id=str(creds.trading_account_id),
+            kind=None,
+            base=[base] if base else None,
+            quote=["USDT"] if base else None,
+            start_time=start_ns,
+            end_time=end_ns,
+            limit=int(limit) if int(limit) > 0 else 200,
+            cursor=None,
+        )
+        resp = client.fill_history_v1(req)
+        if hasattr(resp, "code") and hasattr(resp, "message"):
+            raise TradeExecutionError(f"GRVT fill_history reject: {resp}")
     rows = getattr(resp, "result", None)
     if not isinstance(rows, list):
         return []
@@ -4742,48 +4925,49 @@ def get_lighter_balance_summary(
     - This uses the public `GET /account?by=index&value=...` endpoint (no auth).
     - Collateral on Lighter is USDC; we normalize currency to USDC.
     """
+    proxy_url = _exchange_proxy_url("lighter")
+    with _temporary_socks_proxy(proxy_url):
+        resolved_account_index = account_index
+        if resolved_account_index in (None, ""):
+            resolved_account_index = (
+                getattr(CONFIG_PRIVATE, "LIGHTER_ACCOUNT_INDEX", None) if CONFIG_PRIVATE else None
+            ) or os.getenv("LIGHTER_ACCOUNT_INDEX")
+        if resolved_account_index in (None, ""):
+            raise TradeExecutionError("Lighter balance requires LIGHTER_ACCOUNT_INDEX (or account_index=...)")
 
-    resolved_account_index = account_index
-    if resolved_account_index in (None, ""):
-        resolved_account_index = (
-            getattr(CONFIG_PRIVATE, "LIGHTER_ACCOUNT_INDEX", None) if CONFIG_PRIVATE else None
-        ) or os.getenv("LIGHTER_ACCOUNT_INDEX")
-    if resolved_account_index in (None, ""):
-        raise TradeExecutionError("Lighter balance requires LIGHTER_ACCOUNT_INDEX (or account_index=...)")
+        try:
+            resolved_account_index_int = int(str(resolved_account_index))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid LIGHTER_ACCOUNT_INDEX: {resolved_account_index!r}") from exc
 
-    try:
-        resolved_account_index_int = int(str(resolved_account_index))
-    except Exception as exc:
-        raise TradeExecutionError(f"Invalid LIGHTER_ACCOUNT_INDEX: {resolved_account_index!r}") from exc
+        base = (base_url or getattr(config, "LIGHTER_REST_BASE_URL", "") or "").rstrip("/")
+        if not base:
+            base = "https://mainnet.zklighter.elliot.ai/api/v1"
 
-    base = (base_url or getattr(config, "LIGHTER_REST_BASE_URL", "") or "").rstrip("/")
-    if not base:
-        base = "https://mainnet.zklighter.elliot.ai/api/v1"
+        url = f"{base}/account"
+        response = _send_request(
+            "GET",
+            url,
+            params=[("by", "index"), ("value", str(resolved_account_index_int))],
+            timeout=float(timeout) if timeout is not None else REQUEST_TIMEOUT,
+        )
+        data = _json_or_error(response)
+        if response.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
+            raise TradeExecutionError(f"Lighter account query failed {response.status_code}: {data}")
 
-    url = f"{base}/account"
-    response = _send_request(
-        "GET",
-        url,
-        params=[("by", "index"), ("value", str(resolved_account_index_int))],
-        timeout=float(timeout) if timeout is not None else REQUEST_TIMEOUT,
-    )
-    data = _json_or_error(response)
-    if response.status_code != 200 or not isinstance(data, dict) or data.get("code") != 200:
-        raise TradeExecutionError(f"Lighter account query failed {response.status_code}: {data}")
+        accounts = data.get("accounts") or []
+        account = accounts[0] if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict) else {}
 
-    accounts = data.get("accounts") or []
-    account = accounts[0] if isinstance(accounts, list) and accounts and isinstance(accounts[0], dict) else {}
-
-    return {
-        "currency": "USDC",
-        "available_balance": account.get("available_balance"),
-        "wallet_balance": account.get("collateral"),
-        "account_value": account.get("total_asset_value"),
-        "account_index": account.get("account_index"),
-        "l1_address": account.get("l1_address"),
-        "status": account.get("status"),
-        "raw_account": account,
-    }
+        return {
+            "currency": "USDC",
+            "available_balance": account.get("available_balance"),
+            "wallet_balance": account.get("collateral"),
+            "account_value": account.get("total_asset_value"),
+            "account_index": account.get("account_index"),
+            "l1_address": account.get("l1_address"),
+            "status": account.get("status"),
+            "raw_account": account,
+        }
 
 
 def get_lighter_market_meta(
@@ -4886,150 +5070,149 @@ def place_lighter_perp_market_order(
     timeout: float = 15.0,
 ) -> Dict[str, Any]:
     """Submit a market order on Lighter perp via SignerClient (async under the hood)."""
-    if LighterSignerClient is None:
-        raise TradeExecutionError("lighter SDK is required for Lighter trading (pip install lighter)")
+    proxy_url = _exchange_proxy_url("lighter")
+    with _temporary_socks_proxy(proxy_url):
+        if LighterSignerClient is None:
+            raise TradeExecutionError("lighter SDK is required for Lighter trading (pip install lighter)")
 
-    creds = _resolve_lighter_credentials(private_key, account_index, api_key_index, base_url=base_url)
-    market = get_lighter_market_meta(symbol, base_url=creds.base_url, timeout=timeout)
-    try:
-        market_id = int(market.get("market_id"))
-    except Exception as exc:
-        raise TradeExecutionError(f"Lighter market_id invalid for {symbol}: {market.get('market_id')!r}") from exc
-
-    try:
-        size_dec = Decimal(str(size))
-    except Exception as exc:
-        raise TradeExecutionError(f"Invalid Lighter size: {size!r}") from exc
-    if size_dec <= 0:
-        raise TradeExecutionError("Lighter size must be positive")
-
-    try:
-        size_decimals = int(market.get("supported_size_decimals") or 0)
-        price_decimals = int(market.get("supported_price_decimals") or 0)
-    except Exception:
-        size_decimals = 0
-        price_decimals = 0
-    base_multiplier = Decimal("10") ** Decimal(str(max(0, size_decimals)))
-    price_multiplier = Decimal("10") ** Decimal(str(max(0, price_decimals)))
-
-    book = get_lighter_orderbook_orders(market_id, limit=50, base_url=creds.base_url, timeout=timeout)
-    bids = book.get("bids") or []
-    asks = book.get("asks") or []
-    try:
-        best_bid = float((bids[0] or {}).get("price")) if isinstance(bids, list) and bids else None
-        best_ask = float((asks[0] or {}).get("price")) if isinstance(asks, list) and asks else None
-    except Exception:
-        best_bid, best_ask = None, None
-    if not best_bid or not best_ask:
-        raise TradeExecutionError(f"Lighter orderbook missing best levels for market_id={market_id}")
-    mid = (float(best_bid) + float(best_ask)) / 2.0
-    slippage = float(max_slippage_bps) / 10000.0
-
-    side_key = (side or "").strip().lower()
-    if side_key in {"long", "buy", "b"}:
-        is_ask = False
-        px = mid * (1.0 + slippage)
-    elif side_key in {"short", "sell", "s"}:
-        is_ask = True
-        px = mid * (1.0 - slippage)
-    else:
-        raise TradeExecutionError("Lighter side must be BUY/LONG or SELL/SHORT")
-
-    step = Decimal("1").scaleb(-max(0, size_decimals))
-    size_dec = size_dec.quantize(step, rounding=ROUND_DOWN)
-    if size_dec <= 0:
-        raise TradeExecutionError(f"Lighter size too small after rounding ({size_decimals} dp): {size!r}")
-
-    base_amount_int = int((size_dec * base_multiplier).to_integral_value(rounding=ROUND_DOWN))
-    if base_amount_int <= 0:
-        raise TradeExecutionError("Lighter base_amount becomes 0 after scaling")
-
-    px_int = int((Decimal(str(px)) * price_multiplier).to_integral_value(rounding=ROUND_DOWN))
-    if px_int <= 0:
-        raise TradeExecutionError("Lighter price becomes 0 after scaling")
-
-    try:
-        min_base = Decimal(str(market.get("min_base_amount"))) if market.get("min_base_amount") is not None else None
-        if min_base is not None and size_dec < min_base:
-            raise TradeExecutionError(f"Lighter size below min_base_amount={min_base} for {symbol}")
-    except Exception:
-        pass
-    try:
-        min_quote = Decimal(str(market.get("min_quote_amount"))) if market.get("min_quote_amount") is not None else None
-        if min_quote is not None and (size_dec * Decimal(str(mid))) < min_quote:
-            raise TradeExecutionError(f"Lighter notional below min_quote_amount={min_quote} for {symbol}")
-    except Exception:
-        pass
-
-    if client_order_id is None:
-        client_order_index = int(time.time() * 1000) % 2_000_000_000
-    else:
+        creds = _resolve_lighter_credentials(private_key, account_index, api_key_index, base_url=base_url)
+        market = get_lighter_market_meta(symbol, base_url=creds.base_url, timeout=timeout)
         try:
-            client_order_index = int(str(client_order_id))
+            market_id = int(market.get("market_id"))
+        except Exception as exc:
+            raise TradeExecutionError(f"Lighter market_id invalid for {symbol}: {market.get('market_id')!r}") from exc
+
+        try:
+            size_dec = Decimal(str(size))
+        except Exception as exc:
+            raise TradeExecutionError(f"Invalid Lighter size: {size!r}") from exc
+        if size_dec <= 0:
+            raise TradeExecutionError("Lighter size must be positive")
+
+        try:
+            size_decimals = int(market.get("supported_size_decimals") or 0)
+            price_decimals = int(market.get("supported_price_decimals") or 0)
         except Exception:
-            digest = hashlib.sha256(str(client_order_id).encode("utf-8")).hexdigest()
-            client_order_index = int(digest[:12], 16) % 2_000_000_000
+            size_decimals = 0
+            price_decimals = 0
+        base_multiplier = Decimal("10") ** Decimal(str(max(0, size_decimals)))
+        price_multiplier = Decimal("10") ** Decimal(str(max(0, price_decimals)))
 
-    async def _submit():
-        signer = LighterSignerClient(
-            creds.base_url,
-            creds.private_key,
-            int(creds.api_key_index),
-            int(creds.account_index),
-        )
+        book = get_lighter_orderbook_orders(market_id, limit=50, base_url=creds.base_url, timeout=timeout)
+        bids = book.get("bids") or []
+        asks = book.get("asks") or []
         try:
-            tx_info, tx_hash, error = await signer.create_market_order(
-            market_id,
-            int(client_order_index),
-            int(base_amount_int),
-            int(px_int),
-            bool(is_ask),
-            reduce_only=bool(reduce_only),
+            best_bid = float((bids[0] or {}).get("price")) if isinstance(bids, list) and bids else None
+            best_ask = float((asks[0] or {}).get("price")) if isinstance(asks, list) and asks else None
+        except Exception:
+            best_bid, best_ask = None, None
+        if not best_bid or not best_ask:
+            raise TradeExecutionError(f"Lighter orderbook missing best levels for market_id={market_id}")
+        mid = (float(best_bid) + float(best_ask)) / 2.0
+        slippage = float(max_slippage_bps) / 10000.0
+
+        side_key = (side or "").strip().lower()
+        if side_key in {"long", "buy", "b"}:
+            is_ask = False
+            px = mid * (1.0 + slippage)
+        elif side_key in {"short", "sell", "s"}:
+            is_ask = True
+            px = mid * (1.0 - slippage)
+        else:
+            raise TradeExecutionError("Lighter side must be BUY/LONG or SELL/SHORT")
+
+        step = Decimal("1").scaleb(-max(0, size_decimals))
+        size_dec = size_dec.quantize(step, rounding=ROUND_DOWN)
+        if size_dec <= 0:
+            raise TradeExecutionError(f"Lighter size too small after rounding ({size_decimals} dp): {size!r}")
+
+        base_amount_int = int((size_dec * base_multiplier).to_integral_value(rounding=ROUND_DOWN))
+        if base_amount_int <= 0:
+            raise TradeExecutionError("Lighter base_amount becomes 0 after scaling")
+
+        px_int = int((Decimal(str(px)) * price_multiplier).to_integral_value(rounding=ROUND_DOWN))
+        if px_int <= 0:
+            raise TradeExecutionError("Lighter price becomes 0 after scaling")
+
+        try:
+            min_base = Decimal(str(market.get("min_base_amount"))) if market.get("min_base_amount") is not None else None
+            if min_base is not None and size_dec < min_base:
+                raise TradeExecutionError(f"Lighter size below min_base_amount={min_base} for {symbol}")
+        except Exception:
+            pass
+        try:
+            min_quote = Decimal(str(market.get("min_quote_amount"))) if market.get("min_quote_amount") is not None else None
+            if min_quote is not None and (size_dec * Decimal(str(mid))) < min_quote:
+                raise TradeExecutionError(f"Lighter notional below min_quote_amount={min_quote} for {symbol}")
+        except Exception:
+            pass
+
+        if client_order_id is None:
+            client_order_index = int(time.time() * 1000) % 2_000_000_000
+        else:
+            try:
+                client_order_index = int(str(client_order_id))
+            except Exception:
+                digest = hashlib.sha256(str(client_order_id).encode("utf-8")).hexdigest()
+                client_order_index = int(digest[:12], 16) % 2_000_000_000
+
+        async def _submit():
+            signer = LighterSignerClient(
+                creds.base_url,
+                creds.private_key,
+                int(creds.api_key_index),
+                int(creds.account_index),
             )
-            if error is not None:
-                raise TradeExecutionError(f"Lighter create_market_order error: {error}")
-            tx_hash_value = None
             try:
-                tx_hash_value = getattr(tx_hash, "tx_hash", None)
-            except Exception:
+                tx_info, tx_hash, error = await signer.create_market_order(
+                    market_id,
+                    int(client_order_index),
+                    int(base_amount_int),
+                    int(px_int),
+                    bool(is_ask),
+                    reduce_only=bool(reduce_only),
+                )
+                if error is not None:
+                    raise TradeExecutionError(f"Lighter create_market_order error: {error}")
                 tx_hash_value = None
-            if not tx_hash_value:
-                tx_hash_value = str(tx_hash)
-
-            if hasattr(tx_info, "to_dict"):
                 try:
-                    tx_info_value = tx_info.to_dict()  # type: ignore[attr-defined]
+                    tx_hash_value = getattr(tx_hash, "tx_hash", None)
                 except Exception:
+                    tx_hash_value = None
+                if not tx_hash_value:
+                    tx_hash_value = str(tx_hash)
+
+                if hasattr(tx_info, "to_dict"):
+                    try:
+                        tx_info_value = tx_info.to_dict()  # type: ignore[attr-defined]
+                    except Exception:
+                        tx_info_value = getattr(tx_info, "__dict__", str(tx_info))
+                else:
                     tx_info_value = getattr(tx_info, "__dict__", str(tx_info))
-            else:
-                tx_info_value = getattr(tx_info, "__dict__", str(tx_info))
 
-            return {"tx_info": tx_info_value, "tx_hash": tx_hash_value}
-        finally:
-            try:
-                close = getattr(signer, "close", None)
-                if callable(close):
-                    await close()
-            except Exception:
-                pass
+                return {"tx_info": tx_info_value, "tx_hash": tx_hash_value}
+            finally:
+                try:
+                    close = getattr(signer, "close", None)
+                    if callable(close):
+                        await close()
+                except Exception:
+                    pass
 
-    try:
         resp = _run_async(_submit())
-    finally:
-        pass
 
-    return {
-        "symbol": symbol.upper(),
-        "market_id": market_id,
-        "side": side_key,
-        "reduce_only": bool(reduce_only),
-        "size": str(size_dec),
-        "client_order_index": int(client_order_index),
-        "price_limit": float(px),
-        "best_bid": best_bid,
-        "best_ask": best_ask,
-        "response": resp,
-    }
+        return {
+            "symbol": symbol.upper(),
+            "market_id": market_id,
+            "side": side_key,
+            "reduce_only": bool(reduce_only),
+            "size": str(size_dec),
+            "client_order_index": int(client_order_index),
+            "price_limit": float(px),
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "response": resp,
+        }
 
 
 def get_hyperliquid_user_funding_history(
