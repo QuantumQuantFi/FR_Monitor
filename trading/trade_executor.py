@@ -5472,6 +5472,85 @@ def preview_normalised_base_quantity(
             filters = _get_okx_instrument_filters(symbol, base_url, inst_type=inst_type)
             base_qty = contracts * filters.contract_value
             return base_qty
+        if exchange_key == "hyperliquid":
+            base_url = str(
+                kwargs.get("base_url")
+                or getattr(config, "HYPERLIQUID_API_BASE_URL", None)
+                or "https://api.hyperliquid.xyz"
+            ).rstrip("/")
+            try:
+                size_dec = Decimal(str(quantity))
+            except Exception as exc:
+                raise TradeExecutionError(
+                    f"preview_normalised_base_quantity: invalid hyperliquid quantity: {quantity!r}"
+                ) from exc
+            if size_dec <= 0:
+                raise TradeExecutionError("preview_normalised_base_quantity: quantity must be positive")
+            sz_decimals = _get_hyperliquid_sz_decimals(
+                symbol, base_url=base_url, timeout=float(kwargs.get("timeout") or REQUEST_TIMEOUT)
+            )
+            step = Decimal("1").scaleb(-int(sz_decimals))
+            out = size_dec.quantize(step, rounding=ROUND_DOWN)
+            if out <= 0:
+                raise TradeExecutionError(
+                    f"preview_normalised_base_quantity: hyperliquid size too small after rounding ({sz_decimals} dp): {quantity!r}"
+                )
+            return out
+        if exchange_key == "lighter":
+            base_url = str(
+                kwargs.get("base_url")
+                or getattr(config, "LIGHTER_REST_BASE_URL", None)
+                or "https://mainnet.zklighter.elliot.ai"
+            ).rstrip("/")
+            if base_url.endswith("/api/v1"):
+                base_url = base_url[: -len("/api/v1")]
+            market = get_lighter_market_meta(
+                symbol, base_url=base_url, timeout=float(kwargs.get("timeout") or REQUEST_TIMEOUT)
+            )
+            try:
+                size_dec = Decimal(str(quantity))
+            except Exception as exc:
+                raise TradeExecutionError(
+                    f"preview_normalised_base_quantity: invalid lighter quantity: {quantity!r}"
+                ) from exc
+            if size_dec <= 0:
+                raise TradeExecutionError("preview_normalised_base_quantity: quantity must be positive")
+            try:
+                size_decimals = int(market.get("supported_size_decimals") or 0)
+            except Exception:
+                size_decimals = 0
+            step = Decimal("1").scaleb(-max(0, size_decimals))
+            out = size_dec.quantize(step, rounding=ROUND_DOWN)
+            if out <= 0:
+                raise TradeExecutionError(
+                    f"preview_normalised_base_quantity: lighter size too small after rounding ({size_decimals} dp): {quantity!r}"
+                )
+            try:
+                min_base = (
+                    Decimal(str(market.get("min_base_amount")))
+                    if market.get("min_base_amount") is not None
+                    else None
+                )
+                if min_base is not None and min_base > 0 and out < min_base:
+                    raise TradeExecutionError(
+                        f"preview_normalised_base_quantity: lighter size below min_base_amount={min_base} for {symbol}"
+                    )
+            except TradeExecutionError:
+                raise
+            except Exception:
+                pass
+            return out
+        if exchange_key == "grvt":
+            try:
+                size_dec = Decimal(str(quantity))
+            except Exception as exc:
+                raise TradeExecutionError(f"preview_normalised_base_quantity: invalid grvt quantity: {quantity!r}") from exc
+            if size_dec <= 0:
+                raise TradeExecutionError("preview_normalised_base_quantity: quantity must be positive")
+            out = _grvt_round_qty(symbol, size_dec)
+            if out <= 0:
+                raise TradeExecutionError("preview_normalised_base_quantity: grvt size too small after rounding")
+            return out
         # DEX/new venues: best-effort (no public lot metadata here).
         try:
             dec = Decimal(str(quantity))
