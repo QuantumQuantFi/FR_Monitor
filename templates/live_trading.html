@@ -10,13 +10,14 @@
     body { font-family: Arial, sans-serif; padding: 0; background: #0d1421; color: #e6edf3; }
     .page-container { padding: 16px; }
     a { color: #58a6ff; text-decoration: none; }
-    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
-    .card { background: #111a2a; border: 1px solid #263040; border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
-    .muted { color: #8b949e; }
-    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #263040; }
-    .pill.ok { background: rgba(35,134,54,0.2); border-color: rgba(35,134,54,0.6); }
-    .pill.warn { background: rgba(227,179,65,0.18); border-color: rgba(227,179,65,0.6); }
-    .pill.bad { background: rgba(248,81,73,0.18); border-color: rgba(248,81,73,0.6); }
+	    .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+	    .card { background: #111a2a; border: 1px solid #263040; border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
+	    .muted { color: #8b949e; }
+	    .est { color: rgba(227,179,65,0.95); }
+	    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #263040; }
+	    .pill.ok { background: rgba(35,134,54,0.2); border-color: rgba(35,134,54,0.6); }
+	    .pill.warn { background: rgba(227,179,65,0.18); border-color: rgba(227,179,65,0.6); }
+	    .pill.bad { background: rgba(248,81,73,0.18); border-color: rgba(248,81,73,0.6); }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 8px 10px; border-bottom: 1px solid #263040; vertical-align: top; }
     th { text-align: left; position: sticky; top: 0; background: #111a2a; z-index: 1; }
@@ -509,20 +510,20 @@
         const feePnl = fmt(s.fee_pnl_usdt, 6);
         const closeExitSpreadPct = calcCloseExitSpreadPct(s);
         const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
-        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
-        const src = s.funding_source || {};
-        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate') || (src.long === 'sqlite_estimate') || (src.short === 'sqlite_estimate');
-        const fundingPnl = (hasEst ? '~' : '') + fmt(s.funding_pnl_usdt, 6);
-        let netPnlNum = null;
-        try {
-          const rp = Number(s.realized_pnl_usdt);
-          const fp = Number(s.funding_pnl_usdt);
-          const fe = Number(s.fee_pnl_usdt);
-          if (Number.isFinite(rp) && Number.isFinite(fp) && Number.isFinite(fe)) netPnlNum = rp + fp - fe;
-        } catch (e) {
-          netPnlNum = null;
-        }
-        const netPnl = (hasEst && netPnlNum !== null ? '~' : '') + fmt(netPnlNum ?? s.net_pnl_usdt, 6);
+	        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
+	        const src = s.funding_source || {};
+	        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate') || (src.long === 'sqlite_estimate') || (src.short === 'sqlite_estimate');
+	        const fundingPnl = fmt(s.funding_pnl_usdt, 6);
+	        let netPnlNum = null;
+	        try {
+	          const rp = Number(s.realized_pnl_usdt);
+	          const fp = Number(s.funding_pnl_usdt);
+	          const fe = Number(s.fee_pnl_usdt);
+	          if (Number.isFinite(rp) && Number.isFinite(fp) && Number.isFinite(fe)) netPnlNum = rp + fp - fe;
+	        } catch (e) {
+	          netPnlNum = null;
+	        }
+	        const netPnl = fmt(netPnlNum ?? s.net_pnl_usdt, 6);
         const openFundLong = fmtPct(s.open_long_funding_rate, 6);
         const openFundShort = fmtPct(s.open_short_funding_rate, 6);
         const liveFundLong = fmtPct(s.last_long_funding_rate, 6);
@@ -579,16 +580,16 @@
             <td class="muted">${bOpen}</td>
             <td class="muted">${bClose}</td>
             <td class="muted">${entrySpreadPct}</td>
-            <td class="muted">${tpExitSpreadPct}</td>
-            <td class="muted">${realized}</td>
-            <td class="muted">${feePnl}</td>
-            <td class="muted"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
-            <td class="muted">${netPnl}</td>
-            <td class="muted">${openFundLong}</td>
-            <td class="muted">${openFundShort}</td>
-            <td class="muted">${liveFundLong}</td>
-            <td class="muted">${liveFundShort}</td>
-            <td class="muted" title="UTC: ${escapeHtml(fundRateAtUtc)}">${fundRateAt}</td>
+	            <td class="muted">${tpExitSpreadPct}</td>
+	            <td class="muted">${realized}</td>
+	            <td class="muted">${feePnl}</td>
+	            <td class="muted ${hasEst ? 'est' : ''}"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
+	            <td class="muted ${hasEst ? 'est' : ''}">${netPnl}</td>
+	            <td class="muted">${openFundLong}</td>
+	            <td class="muted">${openFundShort}</td>
+	            <td class="muted">${liveFundLong}</td>
+	            <td class="muted">${liveFundShort}</td>
+	            <td class="muted" title="UTC: ${escapeHtml(fundRateAtUtc)}">${fundRateAt}</td>
             <td><span class="pill ${stCls}">${stText}</span></td>
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
@@ -652,11 +653,12 @@
         const mark = fmt(p.mark_price, 8);
         const fr = fmtPct(p.funding_rate, 4);
         const interval = fmt(p.funding_interval_hours, 2);
-        const next = fmtCountdown(p.next_funding_time);
-        const nextTitle = p.next_funding_time ? `next_funding_time=${p.next_funding_time}` : '';
-        const feeSrc = p.funding_source || null;
-        const feePnl = (feeSrc === 'rate_estimate' ? '~' : '') + fmt(p.funding_pnl_usdt, 6);
-        const lastFee = fmt(p.funding_last_fee_usdt, 6);
+	        const next = fmtCountdown(p.next_funding_time);
+	        const nextTitle = p.next_funding_time ? `next_funding_time=${p.next_funding_time}` : '';
+	        const feeSrc = p.funding_source || null;
+	        const isEst = (feeSrc === 'rate_estimate');
+	        const feePnl = fmt(p.funding_pnl_usdt, 6);
+	        const lastFee = fmt(p.funding_last_fee_usdt, 6);
         const feeTitle = [
           `opened_at=${p.funding_opened_at || '-'}`,
           `funding_pnl_usdt=${p.funding_pnl_usdt ?? '-'}`,
@@ -679,15 +681,15 @@
             <td class="muted">${value}</td>
             <td class="muted">${entry}</td>
             <td class="muted">${mark}</td>
-            <td class="muted">${fr}</td>
-            <td class="muted">${interval}</td>
-            <td class="muted" title="${nextTitle}">${next}</td>
-            <td class="muted"><span class="hint" title="${escapeHtml(feeTitle)}">${feePnl}</span></td>
-            <td class="muted"><span class="hint" title="${escapeHtml(feeTitle)}">${lastFee}</span></td>
-            <td class="muted">${upnl}</td>
-            <td>
-              <button class="secondary" onclick="flattenPosition('${p.exchange}','${p.symbol}')">一键平仓</button>
-            </td>
+	            <td class="muted">${fr}</td>
+	            <td class="muted">${interval}</td>
+	            <td class="muted" title="${nextTitle}">${next}</td>
+	            <td class="muted ${isEst ? 'est' : ''}"><span class="hint" title="${escapeHtml(feeTitle)}">${feePnl}</span></td>
+	            <td class="muted"><span class="hint" title="${escapeHtml(feeTitle)}">${lastFee}</span></td>
+	            <td class="muted">${upnl}</td>
+	            <td>
+	              <button class="secondary" onclick="flattenPosition('${p.exchange}','${p.symbol}')">一键平仓</button>
+	            </td>
           </tr>
         `;
       }).join('');
