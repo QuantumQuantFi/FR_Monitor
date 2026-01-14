@@ -1620,6 +1620,23 @@ class LiveTradingManager:
                         _set_fee(total_fee, "USDT")
             except Exception:
                 pass
+            if info.get("cum_quote") is None and info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                try:
+                    info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
+                except Exception:
+                    pass
+            # If we cannot reliably match fills (e.g. time-window misses), fall back to a conservative taker-fee estimate.
+            if info.get("fee_usdt") is None and info.get("cum_quote") is not None:
+                try:
+                    rates = get_hyperliquid_user_fee_rates()
+                    cross_rate = rates.get("user_cross_rate")
+                    if cross_rate is not None:
+                        rate_f = float(cross_rate)
+                        if math.isfinite(rate_f):
+                            info["fee_currency"] = "USDC"
+                            info["fee_usdt"] = abs(float(info["cum_quote"]) * rate_f)
+                except Exception:
+                    pass
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "okx":
@@ -1656,8 +1673,17 @@ class LiveTradingManager:
                 else:
                     info["filled_qty"] = filled_contracts
                 info["cum_quote"] = _float_or_none(detail.get("accFillNotional") or detail.get("fillNotional"))
+                _set_fee(
+                    _float_or_none(detail.get("fee") or detail.get("fillFee")),
+                    str(detail.get("feeCcy") or detail.get("fillFeeCcy") or "USDT"),
+                )
                 status = detail.get("state") or detail.get("status")
                 info["status"] = str(status) if status is not None else None
+            if info.get("cum_quote") is None and info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                try:
+                    info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
+                except Exception:
+                    pass
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "bitget":
@@ -1725,6 +1751,10 @@ class LiveTradingManager:
                     info["cum_quote"] = _float_or_none(detail.get("quoteVolume") or detail.get("quoteVol"))
                     status = detail.get("state") or detail.get("status")
                     info["status"] = str(status) if status is not None else None
+                _set_fee(
+                    _float_or_none(detail.get("fee")),
+                    str(detail.get("feeCoin") or detail.get("marginCoin") or "USDT"),
+                )
             return {k: v for k, v in info.items() if v is not None}
 
         if ex == "hyperliquid":
@@ -2053,9 +2083,18 @@ class LiveTradingManager:
                 info["avg_price"] = _float_or_none(detail.get("avgPrice"))
                 info["filled_qty"] = _float_or_none(detail.get("cumExecQty"))
                 info["cum_quote"] = _float_or_none(detail.get("cumExecValue"))
+                _set_fee(
+                    _float_or_none(detail.get("cumExecFee")),
+                    str(detail.get("feeCurrency") or "USDT"),
+                )
                 status = detail.get("orderStatus") or detail.get("orderStatus")
                 if status is not None:
                     info["status"] = str(status)
+            if info.get("cum_quote") is None and info.get("avg_price") is not None and info.get("filled_qty") is not None:
+                try:
+                    info["cum_quote"] = float(info["avg_price"]) * float(info["filled_qty"])
+                except Exception:
+                    pass
             return {k: v for k, v in info.items() if v is not None}
 
         return {}
@@ -6359,7 +6398,16 @@ class LiveTradingManager:
 
         rows = conn.execute(
             """
-            SELECT id, symbol, leg_long_exchange, leg_short_exchange, opened_at, created_at, funding_finalized
+            SELECT
+              id,
+              symbol,
+              leg_long_exchange,
+              leg_short_exchange,
+              opened_at,
+              created_at,
+              open_long_at,
+              open_short_at,
+              funding_finalized
               FROM watchlist.live_trade_signal
              WHERE status IN ('open','closing')
                AND COALESCE(funding_finalized, false)=false
@@ -6379,6 +6427,8 @@ class LiveTradingManager:
             opened_at = r.get("opened_at") or r.get("created_at")
             if not (sid and sym and long_ex and short_ex and opened_at):
                 continue
+            long_opened_at = r.get("open_long_at") or opened_at
+            short_opened_at = r.get("open_short_at") or opened_at
             # Prefer actual per-leg notional from open order records.
             per_leg = float(self.config.per_leg_notional_usdt)
             try:
@@ -6412,10 +6462,10 @@ class LiveTradingManager:
 
             end_ms = int(now.timestamp() * 1000)
             long_sum = self._funding_fee_summary_since_open(
-                long_ex, sym, opened_at, end_ms=end_ms, notional_usdt=long_notional, pos_sign=1
+                long_ex, sym, long_opened_at, end_ms=end_ms, notional_usdt=long_notional, pos_sign=1
             )
             short_sum = self._funding_fee_summary_since_open(
-                short_ex, sym, opened_at, end_ms=end_ms, notional_usdt=short_notional, pos_sign=-1
+                short_ex, sym, short_opened_at, end_ms=end_ms, notional_usdt=short_notional, pos_sign=-1
             )
             total = None
             try:
@@ -6452,7 +6502,18 @@ class LiveTradingManager:
 
         rows = conn.execute(
             """
-            SELECT id, symbol, leg_long_exchange, leg_short_exchange, opened_at, created_at, closed_at
+            SELECT
+              id,
+              symbol,
+              leg_long_exchange,
+              leg_short_exchange,
+              opened_at,
+              created_at,
+              open_long_at,
+              open_short_at,
+              close_long_at,
+              close_short_at,
+              closed_at
               FROM watchlist.live_trade_signal
              WHERE status='closed'
                AND COALESCE(funding_finalized, false)=false
@@ -6472,7 +6533,19 @@ class LiveTradingManager:
             closed_at = r.get("closed_at")
             if not (sid and sym and long_ex and short_ex and opened_at and isinstance(closed_at, datetime)):
                 continue
-            self._finalize_signal_funding(conn, sid, sym, long_ex, short_ex, opened_at, closed_at)
+            self._finalize_signal_funding(
+                conn,
+                sid,
+                sym,
+                long_ex,
+                short_ex,
+                opened_at,
+                closed_at,
+                open_long_at=r.get("open_long_at"),
+                open_short_at=r.get("open_short_at"),
+                close_long_at=r.get("close_long_at"),
+                close_short_at=r.get("close_short_at"),
+            )
 
     def _finalize_signal_funding(
         self,
@@ -6483,6 +6556,11 @@ class LiveTradingManager:
         short_ex: str,
         opened_at: Any,
         closed_at: datetime,
+        *,
+        open_long_at: Any = None,
+        open_short_at: Any = None,
+        close_long_at: Any = None,
+        close_short_at: Any = None,
     ) -> None:
         per_leg = float(self.config.per_leg_notional_usdt)
         try:
@@ -6518,12 +6596,18 @@ class LiveTradingManager:
         if short_notional <= 0:
             short_notional = per_leg
 
-        end_ms = int(closed_at.astimezone(timezone.utc).timestamp() * 1000)
+        long_opened_at = open_long_at or opened_at
+        short_opened_at = open_short_at or opened_at
+        long_closed_at = close_long_at if isinstance(close_long_at, datetime) else closed_at
+        short_closed_at = close_short_at if isinstance(close_short_at, datetime) else closed_at
+
+        end_long_ms = int(long_closed_at.astimezone(timezone.utc).timestamp() * 1000)
+        end_short_ms = int(short_closed_at.astimezone(timezone.utc).timestamp() * 1000)
         long_sum = self._funding_fee_summary_since_open(
-            long_ex, symbol, opened_at, end_ms=end_ms, notional_usdt=long_notional, pos_sign=1
+            long_ex, symbol, long_opened_at, end_ms=end_long_ms, notional_usdt=long_notional, pos_sign=1
         )
         short_sum = self._funding_fee_summary_since_open(
-            short_ex, symbol, opened_at, end_ms=end_ms, notional_usdt=short_notional, pos_sign=-1
+            short_ex, symbol, short_opened_at, end_ms=end_short_ms, notional_usdt=short_notional, pos_sign=-1
         )
         total = None
         try:

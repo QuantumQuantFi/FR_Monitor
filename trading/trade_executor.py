@@ -2998,6 +2998,68 @@ def get_bybit_funding_fee_transactions(
     return rows if isinstance(rows, list) else []
 
 
+def get_bybit_execution_list(
+    *,
+    symbol: str,
+    start_time_ms: Optional[int] = None,
+    end_time_ms: Optional[int] = None,
+    category: str = "linear",
+    order_id: Optional[str] = None,
+    client_order_id: Optional[str] = None,
+    limit: int = 100,
+    recv_window: int = 5000,
+    api_key: Optional[str] = None,
+    secret_key: Optional[str] = None,
+    base_url: str = "https://api.bybit.com",
+) -> List[Dict[str, Any]]:
+    """Return Bybit execution rows via GET /v5/execution/list (best-effort)."""
+    creds = _resolve_bybit_credentials(api_key, secret_key)
+
+    symbol_id = symbol.upper()
+    if not symbol_id.endswith("USDT"):
+        symbol_id = f"{symbol_id}USDT"
+
+    request_path = "/v5/execution/list"
+    params: List[tuple[str, str]] = [
+        ("category", str(category).lower()),
+        ("symbol", symbol_id),
+        ("limit", str(min(max(int(limit or 100), 1), 1000))),
+    ]
+    if order_id:
+        params.append(("orderId", str(order_id)))
+    if client_order_id:
+        params.append(("orderLinkId", str(client_order_id)))
+    if start_time_ms is not None:
+        params.append(("startTime", str(int(start_time_ms))))
+    if end_time_ms is not None:
+        params.append(("endTime", str(int(end_time_ms))))
+
+    params_sorted = sorted(params, key=lambda item: item[0])
+    query_str = urlencode(params_sorted)
+
+    timestamp = _utc_millis_str()
+    recv_str = str(recv_window)
+    sign_payload = f"{timestamp}{creds.api_key}{recv_str}{query_str}"
+    signature = _hmac_sha256_hexdigest(creds.secret_key, sign_payload)
+
+    headers = {
+        "X-BAPI-API-KEY": creds.api_key,
+        "X-BAPI-SIGN": signature,
+        "X-BAPI-TIMESTAMP": timestamp,
+        "X-BAPI-RECV-WINDOW": recv_str,
+        "User-Agent": USER_AGENT,
+    }
+
+    url = f"{base_url}{request_path}"
+    response = _send_request("GET", url, params=params_sorted, headers=headers)
+    data = _json_or_error(response)
+    if response.status_code != 200 or data.get("retCode") != 0:
+        raise TradeExecutionError(f"Bybit execution list reject: {data}")
+    result = data.get("result") or {}
+    rows = result.get("list") if isinstance(result, dict) else None
+    return rows if isinstance(rows, list) else []
+
+
 def get_bybit_linear_order(
     symbol: str,
     *,
