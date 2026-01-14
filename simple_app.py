@@ -4101,7 +4101,7 @@ def live_trading_overview():
         {
             'timestamp': now_utc_iso(),
             'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
-	            'live_trading_config': {
+		            'live_trading_config': {
 	                'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
 	                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
 	                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
@@ -4123,6 +4123,341 @@ def live_trading_overview():
 	            },
             'signals': signals_out,
             'errors': errors_out,
+        }
+    )
+
+
+def _parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            # Accept YYYY-MM-DD
+            dt = datetime.fromisoformat(raw + "T00:00:00+00:00")
+        except Exception:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _bucket_dt(dt: datetime, granularity: str) -> datetime:
+    g = (granularity or "hour").strip().lower()
+    if g == "day":
+        return dt.replace(hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+    return dt.replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
+
+
+@app.route('/api/live_trading/stats/balance')
+def live_trading_stats_balance():
+    """Return balance/equity curve from watchlist.live_trade_balance_snapshot (hourly/manual persisted)."""
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    granularity = str(request.args.get("granularity") or "hour").strip().lower()
+    if granularity not in ("hour", "day"):
+        granularity = "hour"
+
+    days = request.args.get("days")
+    start = _parse_iso_utc(request.args.get("start"))
+    end = _parse_iso_utc(request.args.get("end"))
+    try:
+        days_i = int(days) if days is not None else 14
+    except Exception:
+        days_i = 14
+    days_i = max(1, min(days_i, 180))
+
+    now = datetime.now(timezone.utc)
+    if end is None:
+        end = now
+    if start is None:
+        start = end - timedelta(days=days_i)
+
+    stable = request.args.get("stable") or "USDT,USDC,USD,BUSD,FDUSD"
+    stable_currencies = [c.strip().upper() for c in str(stable).split(",") if c.strip()]
+    if not stable_currencies:
+        stable_currencies = ["USDT", "USDC", "USD"]
+
+    limit = 20000 if granularity == "hour" else 5000
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            rows = conn.execute(
+                """
+                SELECT ts, source, totals
+                  FROM watchlist.live_trade_balance_snapshot
+                 WHERE ts >= %s AND ts <= %s
+                 ORDER BY ts ASC
+                 LIMIT %s;
+                """,
+                (start, end, int(limit)),
+            ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    by_bucket: Dict[str, Dict[str, Any]] = {}
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        ts = r.get("ts")
+        if not isinstance(ts, datetime):
+            continue
+        ts_utc = ts.astimezone(timezone.utc)
+        bucket = _bucket_dt(ts_utc, granularity)
+        key = bucket.isoformat()
+        prev = by_bucket.get(key)
+        if prev is None or (isinstance(prev.get("ts"), datetime) and ts_utc > prev["ts"]):
+            by_bucket[key] = {"ts": ts_utc, "bucket": bucket, "source": r.get("source"), "totals": r.get("totals")}
+
+    points = sorted(by_bucket.values(), key=lambda x: x["bucket"])
+    out_points: List[Dict[str, Any]] = []
+    for p in points:
+        totals = p.get("totals") if isinstance(p.get("totals"), dict) else {}
+        wallets: Dict[str, Optional[float]] = {}
+        avails: Dict[str, Optional[float]] = {}
+        stable_wallet = 0.0
+        stable_avail = 0.0
+        stable_any = False
+        for cur in stable_currencies:
+            w = None
+            a = None
+            try:
+                row = totals.get(cur) if isinstance(totals, dict) else None
+                if isinstance(row, dict):
+                    w = float(row.get("wallet")) if row.get("wallet") is not None else None
+                    a = float(row.get("available")) if row.get("available") is not None else None
+            except Exception:
+                w = None
+                a = None
+            wallets[cur] = w
+            avails[cur] = a
+            if w is not None:
+                stable_wallet += float(w)
+                stable_any = True
+            if a is not None:
+                stable_avail += float(a)
+                stable_any = True
+        out_points.append(
+            {
+                "ts": p["ts"].isoformat(),
+                "bucket": p["bucket"].isoformat(),
+                "source": p.get("source"),
+                "stable_wallet": float(stable_wallet) if stable_any else None,
+                "stable_available": float(stable_avail) if stable_any else None,
+                "wallet_by_currency": wallets,
+                "available_by_currency": avails,
+            }
+        )
+
+    return jsonify(
+        {
+            "timestamp": now_utc_iso(),
+            "granularity": granularity,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "stable_currencies": stable_currencies,
+            "points": out_points,
+        }
+    )
+
+
+@app.route('/api/live_trading/stats/pnl')
+def live_trading_stats_pnl():
+    """
+    Return realized PnL curve aggregated from closed signals.
+    NetPnL definition: realized_pnl_usdt + funding_pnl_usdt - fee_pnl_usdt (best-effort).
+    """
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    granularity = str(request.args.get("granularity") or "day").strip().lower()
+    if granularity not in ("hour", "day"):
+        granularity = "day"
+
+    days = request.args.get("days")
+    start = _parse_iso_utc(request.args.get("start"))
+    end = _parse_iso_utc(request.args.get("end"))
+    try:
+        days_i = int(days) if days is not None else 14
+    except Exception:
+        days_i = 14
+    days_i = max(1, min(days_i, 365))
+
+    now = datetime.now(timezone.utc)
+    if end is None:
+        end = now
+    if start is None:
+        start = end - timedelta(days=days_i)
+
+    signal_type = str(request.args.get("signal_type") or "all").strip().upper()
+    if signal_type not in ("ALL", "B", "C"):
+        signal_type = "ALL"
+    pred_group = str(request.args.get("pred_group") or "all").strip().lower()
+    if pred_group not in ("all", "v1", "v2"):
+        pred_group = "all"
+
+    where = ["s.status='closed'", "s.closed_at IS NOT NULL", "s.closed_at >= %s", "s.closed_at <= %s"]
+    params: List[Any] = [start, end]
+    if signal_type in ("B", "C"):
+        where.append("s.signal_type=%s")
+        params.append(signal_type)
+    if pred_group == "v1":
+        where.append("COALESCE(s.pred_source,'') ILIKE 'v1_%'")
+    elif pred_group == "v2":
+        where.append("COALESCE(s.pred_source,'') ILIKE 'v2_%'")
+
+    where_sql = " AND ".join(where)
+    limit = 20000
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            rows = conn.execute(
+                f"""
+                WITH ord AS (
+                  SELECT
+                    signal_id,
+                    MAX(filled_qty) FILTER (WHERE action='open' AND leg='long') AS open_long_filled_qty,
+                    MAX(avg_price)  FILTER (WHERE action='open' AND leg='long') AS open_long_avg_price,
+                    MAX(filled_qty) FILTER (WHERE action='close' AND leg='long') AS close_long_filled_qty,
+                    MAX(avg_price)  FILTER (WHERE action='close' AND leg='long') AS close_long_avg_price,
+                    MAX(filled_qty) FILTER (WHERE action='open' AND leg='short') AS open_short_filled_qty,
+                    MAX(avg_price)  FILTER (WHERE action='open' AND leg='short') AS open_short_avg_price,
+                    MAX(filled_qty) FILTER (WHERE action='close' AND leg='short') AS close_short_filled_qty,
+                    MAX(avg_price)  FILTER (WHERE action='close' AND leg='short') AS close_short_avg_price,
+                    SUM(COALESCE(fee_usdt, 0)) AS fee_pnl_usdt
+                  FROM watchlist.live_trade_order
+                  GROUP BY signal_id
+                )
+                SELECT
+                  s.id,
+                  s.closed_at,
+                  s.signal_type,
+                  s.pred_source,
+                  s.funding_pnl_usdt,
+                  ord.open_long_filled_qty,
+                  ord.open_long_avg_price,
+                  ord.close_long_filled_qty,
+                  ord.close_long_avg_price,
+                  ord.open_short_filled_qty,
+                  ord.open_short_avg_price,
+                  ord.close_short_filled_qty,
+                  ord.close_short_avg_price,
+                  ord.fee_pnl_usdt
+                FROM watchlist.live_trade_signal s
+                LEFT JOIN ord ON ord.signal_id=s.id
+                WHERE {where_sql}
+                ORDER BY s.closed_at ASC
+                LIMIT %s;
+                """,
+                (*params, int(limit)),
+            ).fetchall()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    by_bucket: Dict[str, Dict[str, Any]] = {}
+    trades = 0
+    trades_included = 0
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        trades += 1
+        closed_at = r.get("closed_at")
+        if not isinstance(closed_at, datetime):
+            continue
+        bucket = _bucket_dt(closed_at.astimezone(timezone.utc), granularity)
+        key = bucket.isoformat()
+
+        realized = None
+        fee = None
+        funding = None
+        try:
+            fee = float(r.get("fee_pnl_usdt")) if r.get("fee_pnl_usdt") is not None else 0.0
+        except Exception:
+            fee = None
+        try:
+            funding = float(r.get("funding_pnl_usdt")) if r.get("funding_pnl_usdt") is not None else None
+        except Exception:
+            funding = None
+
+        try:
+            olp = r.get("open_long_avg_price")
+            clp = r.get("close_long_avg_price")
+            osp = r.get("open_short_avg_price")
+            csp = r.get("close_short_avg_price")
+            ql = min(float(r.get("open_long_filled_qty") or 0), float(r.get("close_long_filled_qty") or 0))
+            qs = min(float(r.get("open_short_filled_qty") or 0), float(r.get("close_short_filled_qty") or 0))
+            ok_l = ql > 0 and olp is not None and clp is not None
+            ok_s = qs > 0 and osp is not None and csp is not None
+            if ok_l and ok_s:
+                realized = (float(clp) - float(olp)) * ql + (float(osp) - float(csp)) * qs
+        except Exception:
+            realized = None
+
+        net = None
+        if realized is not None and fee is not None and funding is not None:
+            try:
+                net = float(realized) + float(funding) - float(fee)
+            except Exception:
+                net = None
+
+        if net is None:
+            continue
+        trades_included += 1
+        b = by_bucket.setdefault(
+            key,
+            {
+                "bucket": bucket,
+                "count": 0,
+                "realized_pnl_usdt": 0.0,
+                "funding_pnl_usdt": 0.0,
+                "fee_pnl_usdt": 0.0,
+                "net_pnl_usdt": 0.0,
+            },
+        )
+        b["count"] += 1
+        b["realized_pnl_usdt"] += float(realized or 0.0)
+        b["funding_pnl_usdt"] += float(funding or 0.0)
+        b["fee_pnl_usdt"] += float(fee or 0.0)
+        b["net_pnl_usdt"] += float(net or 0.0)
+
+    buckets = sorted(by_bucket.values(), key=lambda x: x["bucket"])
+    out_buckets: List[Dict[str, Any]] = []
+    cum = 0.0
+    for b in buckets:
+        cum += float(b.get("net_pnl_usdt") or 0.0)
+        out_buckets.append(
+            {
+                "bucket": b["bucket"].isoformat(),
+                "count": int(b["count"]),
+                "realized_pnl_usdt": float(b["realized_pnl_usdt"]),
+                "funding_pnl_usdt": float(b["funding_pnl_usdt"]),
+                "fee_pnl_usdt": float(b["fee_pnl_usdt"]),
+                "net_pnl_usdt": float(b["net_pnl_usdt"]),
+                "cum_net_pnl_usdt": float(cum),
+            }
+        )
+
+    return jsonify(
+        {
+            "timestamp": now_utc_iso(),
+            "granularity": granularity,
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "filters": {"signal_type": signal_type, "pred_group": pred_group},
+            "trades_total": trades,
+            "trades_included": trades_included,
+            "buckets": out_buckets,
         }
     )
 

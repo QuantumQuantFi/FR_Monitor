@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>实盘交易（Type B）</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
     * { box-sizing: border-box; }
     body { font-family: Arial, sans-serif; padding: 0; background: #0d1421; color: #e6edf3; }
@@ -30,6 +31,8 @@
     pre { margin: 0; white-space: pre-wrap; word-break: break-word; background: #0b1220; border: 1px solid #263040; border-radius: 10px; padding: 10px; max-height: 35vh; overflow: auto; }
     .grid { display: grid; grid-template-columns: 2fr 1fr; gap: 12px; }
     @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+    .chart-wrap { height: 240px; }
+    .chart-wrap canvas { width: 100% !important; height: 240px !important; }
     .hint { border-bottom: 1px dotted #8b949e; cursor: help; }
     .sort-btn { display: inline-block; padding: 0 4px; margin-left: 4px; border: 1px solid #263040; border-radius: 6px; color: #8b949e; cursor: pointer; user-select: none; font-size: 11px; line-height: 16px; }
     .sort-btn:hover { color: #e6edf3; border-color: #3b4a60; }
@@ -108,6 +111,7 @@
       <select id="filterType" title="signal_type(可选)" style="width: 120px;">
         <option value="">type(全部)</option>
         <option value="B">B</option>
+        <option value="C">C</option>
       </select>
       <input id="filterExchange" placeholder="exchange(可选)" style="width: 120px;" />
       <button id="refreshBtn" class="secondary">立即刷新</button>
@@ -124,6 +128,53 @@
       <span class="muted" style="margin-left: 12px;">RealizedPnL(USDT)：</span>
       <input id="filterRealMin" type="number" step="0.0001" placeholder="min" style="width: 100px;" />
       <input id="filterRealMax" type="number" step="0.0001" placeholder="max" style="width: 100px;" />
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom: 12px;">
+    <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+      <div style="font-weight: 700;">统计</div>
+      <div class="muted">资金曲线：来自 balance_snapshot；收益曲线：已平仓净PnL（realized+funding-fee）</div>
+    </div>
+    <div class="row" style="margin-bottom: 10px;">
+      <span class="muted">时间范围(天)：</span>
+      <input id="statsDays" type="number" min="1" max="180" value="14" style="width: 90px;" />
+      <span class="muted" style="margin-left: 12px;">资金曲线：</span>
+      <select id="statsGranBalance" style="width: 120px;">
+        <option value="hour">按小时</option>
+        <option value="day">按天</option>
+      </select>
+      <span class="muted" style="margin-left: 12px;">收益曲线：</span>
+      <select id="statsGranPnl" style="width: 120px;">
+        <option value="day">按天</option>
+        <option value="hour">按小时</option>
+      </select>
+      <span class="muted" style="margin-left: 12px;">筛选：</span>
+      <select id="statsSignalType" style="width: 140px;" title="交易类型筛选">
+        <option value="all">Type(全部)</option>
+        <option value="B">Type B</option>
+        <option value="C">Type C</option>
+      </select>
+      <select id="statsPredGroup" style="width: 140px;" title="信号版本筛选">
+        <option value="all">v1/v2(全部)</option>
+        <option value="v1">仅 v1</option>
+        <option value="v2">仅 v2</option>
+      </select>
+      <button id="statsRefreshBtn" class="secondary">刷新统计</button>
+      <button id="statsUnrealBtn" class="secondary" title="会调用私有持仓接口，可能较慢">刷新未实现</button>
+      <span class="muted" style="margin-left: 12px;">钱包/权益(稳定币)：</span><span id="statsWallet" style="font-weight: 700;">-</span>
+      <span class="muted" style="margin-left: 12px;">已实现累计(筛选后)：</span><span id="statsRealCum" style="font-weight: 700;">-</span>
+      <span class="muted" style="margin-left: 12px;">当前未实现(USDT)：</span><span id="statsUpnl" style="font-weight: 700;">-</span>
+    </div>
+    <div class="grid" style="grid-template-columns: 1fr 1fr;">
+      <div class="card" style="padding: 10px;">
+        <div class="muted" style="margin-bottom: 6px;">整体资金曲线（稳定币 Wallet/Equity）</div>
+        <div class="chart-wrap"><canvas id="balanceChart"></canvas></div>
+      </div>
+      <div class="card" style="padding: 10px;">
+        <div class="muted" style="margin-bottom: 6px;">已实现净PnL曲线（realized + funding - fee）</div>
+        <div class="chart-wrap"><canvas id="pnlChart"></canvas></div>
+      </div>
     </div>
   </div>
 
@@ -475,12 +526,13 @@
       const errors = (overview.errors || []).slice(0, 30);
       document.getElementById('errorsPre').textContent = JSON.stringify(errors, null, 2);
 
-      const body = document.getElementById('signalsBody');
-      const signals = signalsResp.signals || [];
-      if (!signals.length) {
-        body.innerHTML = '<tr><td colspan="38" class="muted">暂无数据</td></tr>';
-        return;
-      }
+	      const body = document.getElementById('signalsBody');
+	      const signals = signalsResp.signals || [];
+	      if (!signals.length) {
+	        body.innerHTML = '<tr><td colspan="38" class="muted">暂无数据</td></tr>';
+	        await refreshStats(false);
+	        return;
+	      }
 
       const closeReasonLabel = (reason) => {
         const key = (reason || '').toLowerCase();
@@ -497,7 +549,7 @@
         return map[key] || '';
       };
 
-      body.innerHTML = signals.map(s => {
+	      body.innerHTML = signals.map(s => {
         const [stText, stCls] = pillForStatus(s.status);
         const ex = `${s.leg_long_exchange || '-'}(long) / ${s.leg_short_exchange || '-'}(short)`;
         const aOpen = fmt(s.open_long_avg_price, 8);
@@ -612,12 +664,152 @@
             </td>
           </tr>
         `;
-      }).join('');
-    }
+	      }).join('');
+	      await refreshStats(false);
+	    }
 
-    function setPositionsSort(key, dir) {
-      positionsSort = {key, dir};
-      const btns = ['sortExAsc', 'sortExDesc', 'sortSymAsc', 'sortSymDesc'];
+	    let balanceChart = null;
+	    let pnlChart = null;
+	    let lastStatsAtMs = 0;
+
+	    function _formatNumber(x, digits=2) {
+	      const v = Number(x);
+	      if (!Number.isFinite(v)) return '-';
+	      return v.toFixed(digits);
+	    }
+
+	    function _formatSigned(x, digits=2) {
+	      const v = Number(x);
+	      if (!Number.isFinite(v)) return '-';
+	      const s = v >= 0 ? '+' : '';
+	      return s + v.toFixed(digits);
+	    }
+
+	    function _destroyChart(ch) {
+	      try { if (ch) ch.destroy(); } catch (e) {}
+	    }
+
+	    function _toLabels(points) {
+	      return (points || []).map(p => {
+	        const ts = p.bucket || p.ts || '';
+	        return (ts || '').replace('T', ' ').replace('Z', '').slice(0, 16);
+	      });
+	    }
+
+	    function _lineCfg(labels, datasets) {
+	      return {
+	        type: 'line',
+	        data: { labels, datasets },
+	        options: {
+	          responsive: true,
+	          maintainAspectRatio: false,
+	          interaction: { mode: 'index', intersect: false },
+	          plugins: { legend: { labels: { color: '#e6edf3' } } },
+	          scales: {
+	            x: { ticks: { color: '#8b949e' }, grid: { color: 'rgba(38,48,64,0.6)' } },
+	            y: { ticks: { color: '#8b949e' }, grid: { color: 'rgba(38,48,64,0.6)' } },
+	          },
+	        },
+	      };
+	    }
+
+	    function _barLineCfg(labels, barDataset, lineDataset) {
+	      return {
+	        data: { labels, datasets: [barDataset, lineDataset] },
+	        options: {
+	          responsive: true,
+	          maintainAspectRatio: false,
+	          interaction: { mode: 'index', intersect: false },
+	          plugins: { legend: { labels: { color: '#e6edf3' } } },
+	          scales: {
+	            x: { ticks: { color: '#8b949e' }, grid: { color: 'rgba(38,48,64,0.6)' } },
+	            y: { ticks: { color: '#8b949e' }, grid: { color: 'rgba(38,48,64,0.6)' } },
+	          },
+	        },
+	      };
+	    }
+
+	    async function refreshStats(force) {
+	      const now = Date.now();
+	      if (!force && (now - lastStatsAtMs) < 60_000) return;
+	      lastStatsAtMs = now;
+
+	      const days = Math.max(1, Math.min(180, Number(document.getElementById('statsDays')?.value || 14)));
+	      const granBal = (document.getElementById('statsGranBalance')?.value || 'hour');
+	      const granPnl = (document.getElementById('statsGranPnl')?.value || 'day');
+	      const sigType = (document.getElementById('statsSignalType')?.value || 'all');
+	      const predGroup = (document.getElementById('statsPredGroup')?.value || 'all');
+
+	      const [bal, pnl] = await Promise.all([
+	        fetchJson(`/api/live_trading/stats/balance?days=${encodeURIComponent(days)}&granularity=${encodeURIComponent(granBal)}`),
+	        fetchJson(`/api/live_trading/stats/pnl?days=${encodeURIComponent(days)}&granularity=${encodeURIComponent(granPnl)}&signal_type=${encodeURIComponent(sigType)}&pred_group=${encodeURIComponent(predGroup)}`),
+	      ]);
+
+	      const pts = bal.points || [];
+	      const labelsBal = _toLabels(pts);
+	      const stable = pts.map(p => (p.stable_wallet ?? null));
+	      const usdt = pts.map(p => (p.wallet_by_currency ? p.wallet_by_currency.USDT : null));
+	      const usdc = pts.map(p => (p.wallet_by_currency ? p.wallet_by_currency.USDC : null));
+	      const last = pts.length ? pts[pts.length - 1] : null;
+	      const walletEl = document.getElementById('statsWallet');
+	      if (walletEl) walletEl.textContent = last && last.stable_wallet != null ? _formatNumber(last.stable_wallet, 2) : '-';
+
+	      _destroyChart(balanceChart);
+	      const balCanvas = document.getElementById('balanceChart');
+	      if (balCanvas && balCanvas.getContext) {
+	        const ctxBal = balCanvas.getContext('2d');
+	        balanceChart = new Chart(ctxBal, _lineCfg(labelsBal, [
+	          { label: 'Stable Wallet', data: stable, borderColor: '#58a6ff', backgroundColor: 'rgba(88,166,255,0.15)', pointRadius: 0, tension: 0.2 },
+	          { label: 'USDT', data: usdt, borderColor: 'rgba(35,134,54,0.9)', backgroundColor: 'rgba(35,134,54,0.12)', pointRadius: 0, tension: 0.2 },
+	          { label: 'USDC', data: usdc, borderColor: 'rgba(227,179,65,0.95)', backgroundColor: 'rgba(227,179,65,0.10)', pointRadius: 0, tension: 0.2 },
+	        ]));
+	      }
+
+	      const buckets = pnl.buckets || [];
+	      const labelsP = buckets.map(b => (b.bucket || '').replace('T',' ').replace('Z','').slice(0, 16));
+	      const net = buckets.map(b => b.net_pnl_usdt);
+	      const cum = buckets.map(b => b.cum_net_pnl_usdt);
+	      const lastCum = cum.length ? cum[cum.length - 1] : null;
+	      const cumEl = document.getElementById('statsRealCum');
+	      if (cumEl) cumEl.textContent = lastCum != null ? _formatSigned(lastCum, 2) : '-';
+
+	      _destroyChart(pnlChart);
+	      const pnlCanvas = document.getElementById('pnlChart');
+	      if (pnlCanvas && pnlCanvas.getContext) {
+	        const ctxPnl = pnlCanvas.getContext('2d');
+	        pnlChart = new Chart(ctxPnl, _barLineCfg(labelsP,
+	          { type: 'bar', label: 'NetPnL', data: net, backgroundColor: 'rgba(88,166,255,0.25)', borderColor: 'rgba(88,166,255,0.9)', borderWidth: 1 },
+	          { type: 'line', label: 'CumNetPnL', data: cum, borderColor: 'rgba(227,179,65,0.95)', backgroundColor: 'rgba(227,179,65,0.12)', pointRadius: 0, tension: 0.15 }
+	        ));
+	      }
+	    }
+
+	    async function refreshUnrealized() {
+	      const upnlEl = document.getElementById('statsUpnl');
+	      try {
+	        const pos = await fetchJson(`/api/live_trading/positions?all=0&nonzero=1&persist_balances=1`);
+	        const results = pos.results || [];
+	        let total = 0.0;
+	        let any = false;
+	        for (const ex of results) {
+	          const positions = ex.positions || [];
+	          for (const p of positions) {
+	            const v = Number(p.upnl_usdt);
+	            if (Number.isFinite(v)) {
+	              total += v;
+	              any = true;
+	            }
+	          }
+	        }
+	        if (upnlEl) upnlEl.textContent = any ? _formatSigned(total, 2) : '-';
+	      } catch (e) {
+	        if (upnlEl) upnlEl.textContent = '-';
+	      }
+	    }
+
+	    function setPositionsSort(key, dir) {
+	      positionsSort = {key, dir};
+	      const btns = ['sortExAsc', 'sortExDesc', 'sortSymAsc', 'sortSymDesc'];
       for (const id of btns) document.getElementById(id)?.classList.remove('active');
       if (key === 'exchange' && dir === 'asc') document.getElementById('sortExAsc')?.classList.add('active');
       if (key === 'exchange' && dir === 'desc') document.getElementById('sortExDesc')?.classList.add('active');
@@ -1035,11 +1227,13 @@
       document.getElementById('filterRealMax').value = '';
       refresh().catch(err => console.error(err));
     });
-    document.getElementById('posBtn').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
-    document.getElementById('posBtn2').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
-    document.getElementById('posNonzeroOnly').addEventListener('change', () => refreshPositions().catch(err => console.error(err)));
-    document.getElementById('refreshSec').addEventListener('change', () => schedule());
-    document.getElementById('signalsLimit').addEventListener('change', () => refresh().catch(err => console.error(err)));
+	    document.getElementById('posBtn').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
+	    document.getElementById('posBtn2').addEventListener('click', () => refreshPositions().catch(err => console.error(err)));
+	    document.getElementById('posNonzeroOnly').addEventListener('change', () => refreshPositions().catch(err => console.error(err)));
+	    document.getElementById('statsRefreshBtn')?.addEventListener('click', () => refreshStats(true).catch(err => console.error(err)));
+	    document.getElementById('statsUnrealBtn')?.addEventListener('click', () => refreshUnrealized().catch(err => console.error(err)));
+	    document.getElementById('refreshSec').addEventListener('change', () => schedule());
+	    document.getElementById('signalsLimit').addEventListener('change', () => refresh().catch(err => console.error(err)));
     document.getElementById('filterSymbol').addEventListener('change', () => refresh().catch(err => console.error(err)));
     document.getElementById('filterType').addEventListener('change', () => refresh().catch(err => console.error(err)));
     document.getElementById('filterExchange').addEventListener('change', () => refresh().catch(err => console.error(err)));
@@ -1098,11 +1292,12 @@
       if (!wrap || !menu) return;
       if (menu.style.display !== 'none' && !wrap.contains(e.target)) toggleStatusMenu(false);
     });
-    updateStatusLabel();
+	    updateStatusLabel();
 
-    refresh().catch(err => console.error(err));
-    schedule();
-  </script>
+	    refresh().catch(err => console.error(err));
+	    refreshStats(true).catch(err => console.error(err));
+	    schedule();
+	  </script>
   </div>
 </body>
 </html>
