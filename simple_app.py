@@ -4358,7 +4358,11 @@ def live_trading_stats_pnl():
                   GROUP BY signal_id
                 ),
                 fee AS (
-                  SELECT signal_id, SUM(COALESCE(fee_usdt, 0)) AS fee_pnl_usdt
+                  SELECT
+                    signal_id,
+                    SUM(COALESCE(fee_usdt, 0)) AS fee_pnl_usdt,
+                    COUNT(*) FILTER (WHERE COALESCE(filled_qty, 0) > 0) AS fee_orders,
+                    COUNT(*) FILTER (WHERE COALESCE(filled_qty, 0) > 0 AND fee_usdt IS NOT NULL) AS fee_orders_with_fee
                     FROM watchlist.live_trade_order
                    GROUP BY signal_id
                 )
@@ -4376,7 +4380,9 @@ def live_trading_stats_pnl():
                   ord.open_short_avg_price,
                   ord.close_short_filled_qty,
                   ord.close_short_avg_price,
-                  fee.fee_pnl_usdt
+                  fee.fee_pnl_usdt,
+                  fee.fee_orders,
+                  fee.fee_orders_with_fee
                 FROM watchlist.live_trade_signal s
                 LEFT JOIN ord ON ord.signal_id=s.id
                 LEFT JOIN fee ON fee.signal_id=s.id
@@ -4406,9 +4412,22 @@ def live_trading_stats_pnl():
         fee = None
         funding = None
         try:
-            fee = float(r.get("fee_pnl_usdt")) if r.get("fee_pnl_usdt") is not None else 0.0
+            fee_orders = int(r.get("fee_orders") or 0)
         except Exception:
+            fee_orders = 0
+        try:
+            fee_orders_with_fee = int(r.get("fee_orders_with_fee") or 0)
+        except Exception:
+            fee_orders_with_fee = 0
+        try:
+            fee_val = float(r.get("fee_pnl_usdt")) if r.get("fee_pnl_usdt") is not None else 0.0
+        except Exception:
+            fee_val = None
+        # Avoid silently under-counting: require full fee coverage for filled orders.
+        if fee_orders > 0 and fee_orders_with_fee < fee_orders:
             fee = None
+        else:
+            fee = fee_val
         try:
             funding = float(r.get("funding_pnl_usdt")) if r.get("funding_pnl_usdt") is not None else None
         except Exception:
@@ -4742,7 +4761,7 @@ def live_trading_signals():
             ).fetchall()
 
             price_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
-            fee_map: Dict[int, float] = {}
+            fee_map: Dict[int, Dict[str, Any]] = {}
             agg_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
             if include_prices and rows:
                 signal_ids: List[int] = []
@@ -4836,14 +4855,17 @@ def live_trading_signals():
                     except Exception:
                         agg_map = {}
 
-                    # Fee is best-effort and depends on connector/order detail support.
+                    # Fee is best-effort; we track coverage to avoid silently under-counting.
                     try:
                         fee_rows = conn.execute(
                             """
-                            SELECT signal_id, SUM(ABS(fee_usdt)) AS fee_usdt
+                            SELECT
+                              signal_id,
+                              SUM(COALESCE(ABS(fee_usdt), 0)) AS fee_usdt,
+                              COUNT(*) FILTER (WHERE COALESCE(filled_qty, 0) > 0) AS fee_orders,
+                              COUNT(*) FILTER (WHERE COALESCE(filled_qty, 0) > 0 AND fee_usdt IS NOT NULL) AS fee_orders_with_fee
                               FROM watchlist.live_trade_order
                              WHERE signal_id = ANY(%s)
-                               AND fee_usdt IS NOT NULL
                              GROUP BY signal_id;
                             """,
                             (signal_ids,),
@@ -4855,7 +4877,11 @@ def live_trading_signals():
                                 except Exception:
                                     continue
                                 try:
-                                    fee_map[sid] = float(frow.get('fee_usdt') or 0.0)
+                                    fee_map[sid] = {
+                                        "fee_usdt": float(frow.get("fee_usdt") or 0.0),
+                                        "fee_orders": int(frow.get("fee_orders") or 0),
+                                        "fee_orders_with_fee": int(frow.get("fee_orders_with_fee") or 0),
+                                    }
                                 except Exception:
                                     continue
                     except Exception:
@@ -4957,8 +4983,23 @@ def live_trading_signals():
                         realized_pnl = None
                     item['realized_pnl_usdt'] = realized_pnl
 
-                    if sid in fee_map:
-                        item['fee_pnl_usdt'] = fee_map.get(sid)
+                    if sid in fee_map and isinstance(fee_map.get(sid), dict):
+                        f = fee_map.get(sid) or {}
+                        try:
+                            fee_orders = int(f.get("fee_orders") or 0)
+                        except Exception:
+                            fee_orders = 0
+                        try:
+                            fee_orders_with_fee = int(f.get("fee_orders_with_fee") or 0)
+                        except Exception:
+                            fee_orders_with_fee = 0
+                        item["fee_orders"] = fee_orders
+                        item["fee_orders_with_fee"] = fee_orders_with_fee
+                        item["fee_complete"] = (fee_orders == 0) or (fee_orders_with_fee >= fee_orders)
+                        if item["fee_complete"]:
+                            item["fee_pnl_usdt"] = float(f.get("fee_usdt") or 0.0)
+                        else:
+                            item["fee_pnl_usdt"] = None
                     net_pnl = item.get('net_pnl_usdt')
                     fee_pnl = item.get('fee_pnl_usdt')
                     if net_pnl is None and realized_pnl is not None and fee_pnl is not None:
