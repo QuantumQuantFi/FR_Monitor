@@ -1239,3 +1239,67 @@ venv/bin/python backtest/v2_ridge_logistic.py \
   - `config.py`：新增 `WATCHLIST_ORDERBOOK_REFRESH_SECONDS`（默认 10s），订单簿缓存刷新与 watchlist 刷新解耦。
   - `simple_app.py`：Type C 仍使用本地 REST 扫单订单簿（spot+perp）；Type B 使用 8010 perp L1 BBO，避免 Type C 因 8010 不提供 spot 而永远显示 `-`。
   - `simple_app.py`：若 8010 `/snapshot` 失败，则保留上一份 `monitor8010_bbo`（不让前端 BBO 列“清空”），并在 `/api/watchlist` 暴露 `monitor8010_error`。
+
+## 0.3 Live Trading PnL/记账审计（问题清单，待讨论与修复）（2026-01-14）
+
+### 0.3.1 当前页面/接口的 PnL 口径（现状）
+- realized_pnl（价差收益“已实现”）：`/api/live_trading/signals?include_prices=1` 在接口层现算（不落库）。当前实现只取 `watchlist.live_trade_order` 中 `(signal_id, action, leg)` 的 **最新一条**（`DISTINCT ON ... ORDER BY created_at DESC`），再按：
+  - Long 腿：`(close_avg - open_avg) * min(open_filled, close_filled)`
+  - Short 腿：`(open_avg - close_avg) * min(open_filled, close_filled)`
+- fee_pnl（手续费）：汇总 `watchlist.live_trade_order.fee_usdt`（`SUM(ABS(fee_usdt))`）。注意 fee_usdt 是 best-effort：不同交易所对“订单回执/订单查询/成交回查”的字段差异很大。
+- funding_pnl（资金费）：由 LiveTradingManager 定时查询交易所资金费账单并写回 `watchlist.live_trade_signal.funding_*` 字段；closed 时会按 `opened_at → closed_at` 做一次 finalize（best-effort）。
+
+### 0.3.2 风险点（潜在不准确/会误导策略评估）
+1) **realized_pnl 只取“每腿每动作最新一条订单”**（高风险）
+   - 当出现“重试下单/回滚平仓/多次 close 重试/部分成交记录”时，最新一条不一定代表该腿在该动作上的真实成交汇总；会导致 avg_price/filled_qty 被误取，从而 realized_pnl 偏离。
+   - 数据里已观察到同一 `(signal_id=236, action=close, leg=short)` 存在多条 close 记录（部分为失败/无成交，最后一条才有 filled）。当前实现依赖“最后一条刚好是有效成交”，属于偶然正确。
+
+2) **两腿数量不一致时，realized_pnl 的口径需要明确**
+   - 示例（`signal_id=2044, symbol=RIVER`）：Long filled=2.0，Short filled=2.6；这意味着该笔交易在某些时段存在方向性净敞口，最终的收益/亏损应当包含这部分敞口的 PnL。
+   - 因此 realized_pnl 的目标应是“按实际成交（两腿各自的 open/close）计算出来的真实已实现收益”，而不是强行用两腿的最小共同数量把敞口抹掉。
+
+3) **手续费 fee_usdt 的可得性不一致**
+   - Binance perp / GRVT 相对可回查；Lighter/Hyperliquid 可能需要用成交回查或费率估算；OKX/Bybit/Bitget 在某些路径下可能拿不到 fee 字段，导致净PnL缺失或被当成 0（高估净收益）。
+   - 当前实现对 fee 统一取 `ABS()`，会抹掉“返佣/负手续费”的方向性（如存在的话）。
+
+4) **资金费 funding_pnl 的窗口边界风险**
+   - funding 的查询窗口以 `opened_at` 为起点，但 `opened_at` 是“状态置 open 的 now()”，不一定等于第一笔真实成交时间；若在资金费结算点附近成交，存在漏记第一笔资金费的风险。
+   - 交易所账单落库存在延迟时，也可能出现最后一笔资金费到账晚于 `closed_at` 而被截断的情况。
+
+### 0.3.3 聚焦问题 #1：realized_pnl 如何用更少复杂度做“稳定且更准确”
+
+#### A) 约束与目标（我们应当先统一）
+- 目标：尽量使用我们已经落库的 `live_trade_order` 数据，做到：
+  - 对重试/多单/回滚等情况不敏感（不会因为“取了最后一条”而算错）
+  - 能正确反映“两腿数量不一致”带来的真实净敞口 PnL（不强行对齐数量）
+  - 尽量不引入“去交易所逐笔成交回查”的复杂性（避免页面刷新依赖私有接口）
+
+#### B) 推荐方案（低复杂度、可解释、可在 DB 侧聚合）
+把 `realized_pnl` 从“取最新一条订单”改为“**按 signal_id + action + leg 聚合**（sum qty + VWAP）”：
+1) 对每个 `signal_id`，从 `watchlist.live_trade_order` 取出该 signal 的所有订单行（至少 action∈{open,close}）。
+2) 对每个 `(action, leg)` 计算：
+   - `filled_sum = SUM(COALESCE(filled_qty,0))`
+   - `quote_sum = SUM(COALESCE(cum_quote, avg_price*filled_qty, 0))`
+   - `vwap = quote_sum / filled_sum`（filled_sum>0 时）
+3) 单腿 realized 采用“平均成本法（avg-cost）”：
+   - Long 腿：`qty_closed = min(open_filled_sum, close_filled_sum)`，`pnl_long = (close_vwap - open_vwap) * qty_closed`
+   - Short 腿：`qty_closed = min(open_filled_sum, close_filled_sum)`，`pnl_short = (open_vwap - close_vwap) * qty_closed`
+4) 总 realized：`realized_pnl = pnl_long + pnl_short`
+5) 附加（可选但很建议）：同时输出若干“健康度字段”用于 UI 标记与审计：
+   - `open_long_filled_sum / close_long_filled_sum / open_short_filled_sum / close_short_filled_sum`
+   - `qty_mismatch_open = open_long_filled_sum - open_short_filled_sum`
+   - `qty_mismatch_close = close_long_filled_sum - close_short_filled_sum`
+   - 若任一 mismatch 绝对值超过阈值，则 UI 标黄/标红，提醒这笔单子的 PnL 可能包含净敞口风险
+
+#### C) 用现有数据举例（确认“数量不一致也能算出真实 realized”）
+- `signal_id=2044 (RIVER)`：
+  - Long：open_vwap=18.749, close_vwap=18.351, qty_closed=2.0 → pnl_long≈-0.796
+  - Short：open_vwap=19.019, close_vwap=18.508, qty_closed=2.6 → pnl_short≈+1.3286
+  - realized≈+0.5326（该值包含了“short 比 long 多 0.6”的净敞口部分）
+- `signal_id=2075 (PIEVERSE)`：
+  - Long qty=75, Short qty=74（两腿不一致），realized 仍可按上述方法稳定计算，并可用 mismatch 字段提示“存在 1 单位的净敞口差异”。
+
+#### D) 为什么这比“取最后一条订单”更稳
+- 不怕重试/多次 close：只要最终所有订单行都落库，聚合得到的 filled_sum/vwap 都能覆盖真实成交。
+- 不要求两腿等量：每腿各算各的 realized，反映真实敞口收益/亏损；并用 mismatch 做风险提示，而不是把敞口隐藏掉。
+- 复杂度低：可以在一个 SQL 聚合里完成（或在 Python 里做一次 groupby），不需要引入逐笔成交（fills）表也能显著提升准确性。

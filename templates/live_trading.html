@@ -15,6 +15,8 @@
 	    .card { background: #111a2a; border: 1px solid #263040; border-radius: 10px; padding: 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.25); }
 	    .muted { color: #8b949e; }
 	    .est { color: rgba(227,179,65,0.95); }
+	    .mismatch-warn { color: rgba(227,179,65,0.95); }
+	    .mismatch-bad { color: rgba(248,81,73,0.95); }
 	    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid #263040; }
 	    .pill.ok { background: rgba(35,134,54,0.2); border-color: rgba(35,134,54,0.6); }
 	    .pill.warn { background: rgba(227,179,65,0.18); border-color: rgba(227,179,65,0.6); }
@@ -214,14 +216,20 @@
               <th style="width: 150px;">
                 <span class="hint" title="预计达到止盈条件时的“平仓临界价差”（百分比）：与实际止盈判断口径一致（使用开仓时订单簿扫盘得到的 entry_spread_metric）。计算：take_profit_exit_spread_pct = exp(entry_spread_metric - tp_pnl) - 1。含义：当后续平仓方向订单簿可成交价差 short_buy/long_sell 收敛到该水平附近，则 last_pnl≈tp_pnl，进入止盈判定。">止盈临界价差%</span>
               </th>
-              <th style="width: 130px;">
-                <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
-              </th>
-              <th style="width: 120px;">
-                <span class="hint" title="手续费(USDT)：两条腿开/平仓订单回执或订单查询返回的 fee_usdt 汇总（best-effort；仅当手续费币种可直接换算为 USDT/USDC/BUSD 时才稳定）。">FeePnL</span>
-              </th>
-              <th style="width: 140px;">
-                <span class="hint" title="FundingPnL(USDT)：从 opened_at 起，按交易所账户“已收/已付”资金费明细累加（两条腿叠加，best-effort；不同交易所回执字段不同，可能为空/延迟）。每小时整点后的首次刷新会更新一次（其余时间使用缓存）。">FundingPnL</span>
+	              <th style="width: 130px;">
+	                <span class="hint" title="实际盈亏（USDT，未计资金费/手续费）：按两条腿的开/平仓成交均价和成交数量估算。Long腿：(close-open)*qty；Short腿：(open-close)*qty；qty 取开/平两侧 filled_qty 的最小值。">realized_pnl</span>
+	              </th>
+	              <th style="width: 110px;">
+	                <span class="hint" title="开仓两腿成交数量差（Long - Short）。用于提示“净敞口风险”；该差值不会被隐藏。">开仓QtyΔ</span>
+	              </th>
+	              <th style="width: 110px;">
+	                <span class="hint" title="平仓两腿成交数量差（Long - Short）。用于提示是否存在残余敞口或平仓异常。">平仓QtyΔ</span>
+	              </th>
+	              <th style="width: 120px;">
+	                <span class="hint" title="手续费(USDT)：两条腿开/平仓订单回执或订单查询返回的 fee_usdt 汇总（best-effort；仅当手续费币种可直接换算为 USDT/USDC/BUSD 时才稳定）。">FeePnL</span>
+	              </th>
+	              <th style="width: 140px;">
+	                <span class="hint" title="FundingPnL(USDT)：从 opened_at 起，按交易所账户“已收/已付”资金费明细累加（两条腿叠加，best-effort；不同交易所回执字段不同，可能为空/延迟）。每小时整点后的首次刷新会更新一次（其余时间使用缓存）。">FundingPnL</span>
               </th>
               <th style="width: 130px;">
                 <span class="hint" title="净PnL(USDT)：realized_pnl + funding_pnl - fee_pnl（best-effort；资金费或手续费为空时不展示）。">NetPnL</span>
@@ -384,12 +392,20 @@
     let positionsCache = [];
     let positionsSort = {key: null, dir: null};
 
-    function fmt(v, nd=6) {
-      if (v === null || v === undefined) return '-';
-      const n = Number(v);
-      if (!Number.isFinite(n)) return String(v);
-      return n.toFixed(nd);
-    }
+	    function fmt(v, nd=6) {
+	      if (v === null || v === undefined) return '-';
+	      const n = Number(v);
+	      if (!Number.isFinite(n)) return String(v);
+	      return n.toFixed(nd);
+	    }
+	
+	    function fmtSigned(v, nd=6) {
+	      if (v === null || v === undefined) return '-';
+	      const n = Number(v);
+	      if (!Number.isFinite(n)) return String(v);
+	      const s = n > 0 ? '+' : '';
+	      return s + n.toFixed(nd);
+	    }
 
     function fmtPct(v, nd=4) {
       if (v === null || v === undefined) return '-';
@@ -558,11 +574,31 @@
         const bClose = fmt(s.close_short_avg_price, 8);
         const entrySpreadPct = fmtPct(s.entry_spread_pct_actual, 4);
         const tpExitSpreadPct = fmtPct(s.take_profit_exit_spread_pct, 4);
-        const realized = fmt(s.realized_pnl_usdt, 6);
-        const feePnl = fmt(s.fee_pnl_usdt, 6);
-        const closeExitSpreadPct = calcCloseExitSpreadPct(s);
-        const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
-	        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
+	        const realized = fmt(s.realized_pnl_usdt, 6);
+	        const qtyOpenDelta = s.qty_mismatch_open;
+	        const qtyCloseDelta = s.qty_mismatch_close;
+	        const openL = Number(s.open_long_filled_qty ?? 0);
+	        const openS = Number(s.open_short_filled_qty ?? 0);
+	        const closeL = Number(s.close_long_filled_qty ?? 0);
+	        const closeS = Number(s.close_short_filled_qty ?? 0);
+	
+	        function mismatchCls(delta, a, b) {
+	          const d = Number(delta);
+	          if (!Number.isFinite(d) || Math.abs(d) <= 1e-9) return '';
+	          const denom = Math.max(1e-12, Math.max(Math.abs(Number(a) || 0), Math.abs(Number(b) || 0)));
+	          const rel = Math.abs(d) / denom;
+	          if (rel >= 0.05) return 'mismatch-bad';
+	          if (rel >= 0.01) return 'mismatch-warn';
+	          return '';
+	        }
+	        const openDeltaCls = mismatchCls(qtyOpenDelta, openL, openS);
+	        const closeDeltaCls = mismatchCls(qtyCloseDelta, closeL, closeS);
+	        const openDeltaTitle = `open_long_filled=${openL} open_short_filled=${openS} delta=${qtyOpenDelta ?? '-'}`;
+	        const closeDeltaTitle = `close_long_filled=${closeL} close_short_filled=${closeS} delta=${qtyCloseDelta ?? '-'}`;
+	        const feePnl = fmt(s.fee_pnl_usdt, 6);
+	        const closeExitSpreadPct = calcCloseExitSpreadPct(s);
+	        const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
+		        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
 	        const src = s.funding_source || {};
 	        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate') || (src.long === 'sqlite_estimate') || (src.short === 'sqlite_estimate');
 	        const fundingPnl = fmt(s.funding_pnl_usdt, 6);
@@ -631,13 +667,15 @@
             <td class="muted">${aClose}</td>
             <td class="muted">${bOpen}</td>
             <td class="muted">${bClose}</td>
-            <td class="muted">${entrySpreadPct}</td>
-	            <td class="muted">${tpExitSpreadPct}</td>
-	            <td class="muted">${realized}</td>
-	            <td class="muted">${feePnl}</td>
-	            <td class="muted ${hasEst ? 'est' : ''}"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
-	            <td class="muted ${hasEst ? 'est' : ''}">${netPnl}</td>
-	            <td class="muted">${openFundLong}</td>
+		            <td class="muted">${entrySpreadPct}</td>
+			            <td class="muted">${tpExitSpreadPct}</td>
+			            <td class="muted">${realized}</td>
+			            <td class="muted ${openDeltaCls}" title="${escapeHtml(openDeltaTitle)}">${fmtSigned(qtyOpenDelta, 6)}</td>
+			            <td class="muted ${closeDeltaCls}" title="${escapeHtml(closeDeltaTitle)}">${fmtSigned(qtyCloseDelta, 6)}</td>
+			            <td class="muted">${feePnl}</td>
+			            <td class="muted ${hasEst ? 'est' : ''}"><span class="hint" title="${escapeHtml(fundingTitle)}">${fundingPnl}</span></td>
+			            <td class="muted ${hasEst ? 'est' : ''}">${netPnl}</td>
+			            <td class="muted">${openFundLong}</td>
 	            <td class="muted">${openFundShort}</td>
 	            <td class="muted">${liveFundLong}</td>
 	            <td class="muted">${liveFundShort}</td>

@@ -4101,10 +4101,10 @@ def live_trading_overview():
         {
             'timestamp': now_utc_iso(),
             'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
-		            'live_trading_config': {
-	                'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
-	                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
-	                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+	            'live_trading_config': {
+                'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
+                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
                 'v2_enabled': bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
                 'v2_pnl_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.0065)),
                 'v2_win_prob_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.72)),
@@ -4115,12 +4115,12 @@ def live_trading_overview():
                 'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
                 'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
                 'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
-	                'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
-	                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
-	                'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
-	                'max_abs_funding': float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.0)),
-	                'max_neg_net_funding_per_hour_1h': float(LIVE_TRADING_CONFIG.get('max_neg_net_funding_per_hour_1h', 0.0)),
-	            },
+                'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
+                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
+                'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
+                'max_abs_funding': float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.0)),
+                'max_neg_net_funding_per_hour_1h': float(LIVE_TRADING_CONFIG.get('max_neg_net_funding_per_hour_1h', 0.0)),
+            },
             'signals': signals_out,
             'errors': errors_out,
         }
@@ -4324,20 +4324,43 @@ def live_trading_stats_pnl():
         with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
             rows = conn.execute(
                 f"""
-                WITH ord AS (
+                WITH ord_leg AS (
                   SELECT
                     signal_id,
-                    MAX(filled_qty) FILTER (WHERE action='open' AND leg='long') AS open_long_filled_qty,
-                    MAX(avg_price)  FILTER (WHERE action='open' AND leg='long') AS open_long_avg_price,
-                    MAX(filled_qty) FILTER (WHERE action='close' AND leg='long') AS close_long_filled_qty,
-                    MAX(avg_price)  FILTER (WHERE action='close' AND leg='long') AS close_long_avg_price,
-                    MAX(filled_qty) FILTER (WHERE action='open' AND leg='short') AS open_short_filled_qty,
-                    MAX(avg_price)  FILTER (WHERE action='open' AND leg='short') AS open_short_avg_price,
-                    MAX(filled_qty) FILTER (WHERE action='close' AND leg='short') AS close_short_filled_qty,
-                    MAX(avg_price)  FILTER (WHERE action='close' AND leg='short') AS close_short_avg_price,
-                    SUM(COALESCE(fee_usdt, 0)) AS fee_pnl_usdt
+                    action,
+                    leg,
+                    SUM(COALESCE(filled_qty, 0)) AS filled_sum,
+                    SUM(
+                      COALESCE(
+                        cum_quote,
+                        CASE
+                          WHEN avg_price IS NOT NULL AND filled_qty IS NOT NULL THEN (avg_price * filled_qty)
+                          ELSE 0
+                        END,
+                        0
+                      )
+                    ) AS quote_sum
                   FROM watchlist.live_trade_order
+                  GROUP BY signal_id, action, leg
+                ),
+                ord AS (
+                  SELECT
+                    signal_id,
+                    SUM(filled_sum) FILTER (WHERE action='open' AND leg='long')  AS open_long_filled_qty,
+                    (SUM(quote_sum) FILTER (WHERE action='open' AND leg='long') / NULLIF(SUM(filled_sum) FILTER (WHERE action='open' AND leg='long'), 0)) AS open_long_avg_price,
+                    SUM(filled_sum) FILTER (WHERE action='close' AND leg='long') AS close_long_filled_qty,
+                    (SUM(quote_sum) FILTER (WHERE action='close' AND leg='long') / NULLIF(SUM(filled_sum) FILTER (WHERE action='close' AND leg='long'), 0)) AS close_long_avg_price,
+                    SUM(filled_sum) FILTER (WHERE action='open' AND leg='short') AS open_short_filled_qty,
+                    (SUM(quote_sum) FILTER (WHERE action='open' AND leg='short') / NULLIF(SUM(filled_sum) FILTER (WHERE action='open' AND leg='short'), 0)) AS open_short_avg_price,
+                    SUM(filled_sum) FILTER (WHERE action='close' AND leg='short') AS close_short_filled_qty,
+                    (SUM(quote_sum) FILTER (WHERE action='close' AND leg='short') / NULLIF(SUM(filled_sum) FILTER (WHERE action='close' AND leg='short'), 0)) AS close_short_avg_price
+                  FROM ord_leg
                   GROUP BY signal_id
+                ),
+                fee AS (
+                  SELECT signal_id, SUM(COALESCE(fee_usdt, 0)) AS fee_pnl_usdt
+                    FROM watchlist.live_trade_order
+                   GROUP BY signal_id
                 )
                 SELECT
                   s.id,
@@ -4353,9 +4376,10 @@ def live_trading_stats_pnl():
                   ord.open_short_avg_price,
                   ord.close_short_filled_qty,
                   ord.close_short_avg_price,
-                  ord.fee_pnl_usdt
+                  fee.fee_pnl_usdt
                 FROM watchlist.live_trade_signal s
                 LEFT JOIN ord ON ord.signal_id=s.id
+                LEFT JOIN fee ON fee.signal_id=s.id
                 WHERE {where_sql}
                 ORDER BY s.closed_at ASC
                 LIMIT %s;
@@ -4719,6 +4743,7 @@ def live_trading_signals():
 
             price_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
             fee_map: Dict[int, float] = {}
+            agg_map: Dict[Tuple[int, str, str], Dict[str, Any]] = {}
             if include_prices and rows:
                 signal_ids: List[int] = []
                 for r in rows:
@@ -4728,6 +4753,7 @@ def live_trading_signals():
                         except Exception:
                             continue
                 if signal_ids:
+                    # Keep a lightweight "latest row" map only for metadata display (exchange/status).
                     order_rows = conn.execute(
                         """
                         SELECT DISTINCT ON (signal_id, action, leg)
@@ -4748,13 +4774,69 @@ def live_trading_signals():
                             price_map[key] = {
                                 'avg_price': orow.get('avg_price'),
                                 'filled_qty': orow.get('filled_qty'),
-                                'notional_usdt': orow.get('notional_usdt'),
                                 'exchange': orow.get('exchange'),
                                 'status': orow.get('status'),
                                 'created_at': orow.get('created_at'),
                             }
+
+                    # Aggregate VWAP + filled_sum per (signal_id, action, leg) for robust realized PnL.
+                    try:
+                        agg_rows = conn.execute(
+                            """
+                            SELECT
+                              signal_id,
+                              action,
+                              leg,
+                              SUM(COALESCE(filled_qty, 0)) AS filled_sum,
+                              SUM(
+                                COALESCE(
+                                  cum_quote,
+                                  CASE
+                                    WHEN avg_price IS NOT NULL AND filled_qty IS NOT NULL THEN (avg_price * filled_qty)
+                                    ELSE 0
+                                  END,
+                                  0
+                                )
+                              ) AS quote_sum,
+                              SUM(COALESCE(notional_usdt, 0)) AS notional_sum
+                            FROM watchlist.live_trade_order
+                            WHERE signal_id = ANY(%s)
+                            GROUP BY signal_id, action, leg;
+                            """,
+                            (signal_ids,),
+                        ).fetchall()
+                        for arow in agg_rows or []:
+                            if not isinstance(arow, dict):
+                                continue
+                            try:
+                                sid = int(arow.get("signal_id"))
+                            except Exception:
+                                continue
+                            action = str(arow.get("action") or "")
+                            leg = str(arow.get("leg") or "")
+                            try:
+                                filled_sum = float(arow.get("filled_sum") or 0.0)
+                            except Exception:
+                                filled_sum = 0.0
+                            try:
+                                quote_sum = float(arow.get("quote_sum") or 0.0)
+                            except Exception:
+                                quote_sum = 0.0
+                            try:
+                                notional_sum = float(arow.get("notional_sum") or 0.0)
+                            except Exception:
+                                notional_sum = 0.0
+                            vwap = (quote_sum / filled_sum) if filled_sum > 0 else None
+                            agg_map[(sid, action, leg)] = {
+                                "filled_sum": filled_sum,
+                                "quote_sum": quote_sum,
+                                "vwap": vwap,
+                                "notional_sum": notional_sum if notional_sum > 0 else None,
+                            }
+                    except Exception:
+                        agg_map = {}
+
                     # Fee is best-effort and depends on connector/order detail support.
-                    # If the DB schema doesn't have fee_usdt yet, keep UI graceful.
                     try:
                         fee_rows = conn.execute(
                             """
@@ -4813,16 +4895,16 @@ def live_trading_signals():
                     sid = None
                 if sid is not None:
                     def _get_px(action: str, leg: str) -> Any:
-                        got = price_map.get((sid, action, leg)) or {}
-                        return _jsonable(got.get('avg_price'))
+                        got = agg_map.get((sid, action, leg)) or {}
+                        return _jsonable(got.get('vwap'))
 
                     def _get_filled(action: str, leg: str) -> Any:
-                        got = price_map.get((sid, action, leg)) or {}
-                        return got.get('filled_qty')
+                        got = agg_map.get((sid, action, leg)) or {}
+                        return got.get('filled_sum')
 
                     def _get_notional(action: str, leg: str) -> Any:
-                        got = price_map.get((sid, action, leg)) or {}
-                        return got.get('notional_usdt')
+                        got = agg_map.get((sid, action, leg)) or {}
+                        return got.get('notional_sum')
 
                     item['open_long_avg_price'] = _get_px('open', 'long')
                     item['close_long_avg_price'] = _get_px('close', 'long')
@@ -4836,14 +4918,31 @@ def live_trading_signals():
                     item['open_long_notional_usdt'] = _get_notional('open', 'long')
                     item['open_short_notional_usdt'] = _get_notional('open', 'short')
 
+                    try:
+                        ol = float(item.get("open_long_filled_qty") or 0.0)
+                        os = float(item.get("open_short_filled_qty") or 0.0)
+                        cl = float(item.get("close_long_filled_qty") or 0.0)
+                        cs = float(item.get("close_short_filled_qty") or 0.0)
+                        item["qty_mismatch_open"] = ol - os
+                        item["qty_mismatch_close"] = cl - cs
+                    except Exception:
+                        item["qty_mismatch_open"] = None
+                        item["qty_mismatch_close"] = None
+
                     realized_pnl = None
                     try:
                         olp = item.get('open_long_avg_price')
                         clp = item.get('close_long_avg_price')
                         osp = item.get('open_short_avg_price')
                         csp = item.get('close_short_avg_price')
-                        ql = min(float(item.get('open_long_filled_qty') or 0), float(item.get('close_long_filled_qty') or 0))
-                        qs = min(float(item.get('open_short_filled_qty') or 0), float(item.get('close_short_filled_qty') or 0))
+                        ql = min(
+                            float(item.get('open_long_filled_qty') or 0),
+                            float(item.get('close_long_filled_qty') or 0),
+                        )
+                        qs = min(
+                            float(item.get('open_short_filled_qty') or 0),
+                            float(item.get('close_short_filled_qty') or 0),
+                        )
                         pnl_l = 0.0
                         pnl_s = 0.0
                         ok_l = ql > 0 and olp is not None and clp is not None
@@ -4857,7 +4956,8 @@ def live_trading_signals():
                     except Exception:
                         realized_pnl = None
                     item['realized_pnl_usdt'] = realized_pnl
-                    if sid is not None and sid in fee_map:
+
+                    if sid in fee_map:
                         item['fee_pnl_usdt'] = fee_map.get(sid)
                     net_pnl = item.get('net_pnl_usdt')
                     fee_pnl = item.get('fee_pnl_usdt')
