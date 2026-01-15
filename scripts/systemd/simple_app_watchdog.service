@@ -1,0 +1,17 @@
+[Unit]
+Description=FR_Monitor simple_app watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/jerry/wlfi/FR_Monitor
+ExecStart=/root/jerry/wlfi/FR_Monitor/venv/bin/python /root/jerry/wlfi/FR_Monitor/scripts/simple_app_watchdog.py
+Restart=always
+RestartSec=2
+StandardOutput=append:/root/jerry/wlfi/FR_Monitor/logs/simple_app_watchdog.stdout
+StandardError=append:/root/jerry/wlfi/FR_Monitor/logs/simple_app_watchdog.stdout
+
+[Install]
+WantedBy=multi-user.target
+
