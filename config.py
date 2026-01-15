@@ -245,6 +245,17 @@ WATCHLIST_CONFIG = {
     'type_b_funding_filter_mode': str(_get_private('WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'WATCHLIST_TYPEB_FUNDING_FILTER_MODE', 'net_cost')).strip().lower(),
     'type_b_funding_net_cost_max': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', 'WATCHLIST_TYPEB_FUNDING_NET_COST_MAX', '0.0008')),  # 0.08% / horizon
     'type_b_funding_net_cost_horizon_hours': float(_get_private('WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', 'WATCHLIST_TYPEB_FUNDING_NET_COST_HORIZON_H', '4')),
+    # Type B 准入额外限制：避免两腿出现“非 Hyperliquid 的 1H 资金费结算”场景（资金费易反转，且与价差收敛假设耦合更强）。
+    # - 默认开启（1）
+    # - Hyperliquid 例外：允许 hyperliquid<->(4H/8H 等) 的套利
+    # - 但如果另一腿也是 1H 且非 hyperliquid（例如 lighter），仍会被过滤
+    'type_b_disallow_1h_non_hyperliquid': _is_truthy(
+        _get_private(
+            'WATCHLIST_TYPEB_DISALLOW_1H_NON_HL',
+            'WATCHLIST_TYPEB_DISALLOW_1H_NON_HL',
+            '1',
+        )
+    ),
     # Type C：现货低于永续
     'type_c_spread_threshold': float(_get_private('WATCHLIST_TYPEC_SPREAD', 'WATCHLIST_TYPEC_SPREAD', '0.01')),  # 1%
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),

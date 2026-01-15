@@ -10,6 +10,7 @@ from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 import sqlite3
 
 from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
+from funding_utils import derive_funding_interval_hours
 from precision_utils import funding_rate_to_float
 from watchlist_pg_writer import PgWriter, PgWriterConfig
 from watchlist_metrics import compute_metrics_for_symbols, compute_metrics_for_legs
@@ -92,6 +93,7 @@ class WatchlistManager:
         self.type_b_funding_filter_mode = str(cfg.get('type_b_funding_filter_mode', 'range')).strip().lower()
         self.type_b_funding_net_cost_max = float(cfg.get('type_b_funding_net_cost_max', 0.001))
         self.type_b_funding_net_cost_horizon_hours = float(cfg.get('type_b_funding_net_cost_horizon_hours', 8))
+        self.type_b_disallow_1h_non_hyperliquid = bool(cfg.get('type_b_disallow_1h_non_hyperliquid', True))
         self.type_c_spread_threshold = float(cfg.get('type_c_spread_threshold', 0.01))
         self.type_c_funding_min = float(cfg.get('type_c_funding_min', -0.001))
 
@@ -163,6 +165,46 @@ class WatchlistManager:
         - range：要求两腿 funding_rate 同时落在 [min, max]
         - net_cost：按「高价做空/低价做多」方向计算净资金费（按小时归一并映射到 horizon），仅限制“亏损”不超过阈值
         """
+        def _interval_hours(ex: str) -> Optional[float]:
+            snap = exch_data.get(ex) or {}
+            hint = snap.get("funding_interval_hours")
+            try:
+                hint_val = float(hint) if hint not in (None, "") else None
+            except Exception:
+                hint_val = None
+            try:
+                return derive_funding_interval_hours(str(ex), hint_val, fallback=True)
+            except Exception:
+                return hint_val
+
+        def _is_one_hour(iv: Optional[float]) -> bool:
+            if iv is None:
+                return False
+            try:
+                v = float(iv)
+            except Exception:
+                return False
+            return 0.95 <= v <= 1.05
+
+        if self.type_b_disallow_1h_non_hyperliquid:
+            a_iv = _interval_hours(a_ex)
+            b_iv = _interval_hours(b_ex)
+            a_is_bad = str(a_ex).lower() != "hyperliquid" and _is_one_hour(a_iv)
+            b_is_bad = str(b_ex).lower() != "hyperliquid" and _is_one_hour(b_iv)
+            if a_is_bad or b_is_bad:
+                return (
+                    False,
+                    {
+                        "mode": "interval_guard",
+                        "ok": False,
+                        "reason": "disallow_1h_non_hyperliquid",
+                        "a_ex": str(a_ex),
+                        "b_ex": str(b_ex),
+                        "a_interval_hours": a_iv,
+                        "b_interval_hours": b_iv,
+                    },
+                )
+
         mode = (self.type_b_funding_filter_mode or "range").lower()
         if mode == "range":
             ok = (self.type_b_funding_min <= a_fr <= self.type_b_funding_max) and (self.type_b_funding_min <= b_fr <= self.type_b_funding_max)

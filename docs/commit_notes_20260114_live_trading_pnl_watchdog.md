@@ -55,3 +55,15 @@ tail -f logs/simple_app_watchdog.log
 systemctl status --no-pager simple_app_watchdog.service
 ```
 
+---
+
+# 2026-01-15 提交说明（Type B 准入：过滤非 Hyperliquid 的 1H 资金费腿）
+
+背景：
+- 当资金费率为 1 小时结算时，资金费率更容易在短周期内反转，导致 Type B 的“价差收敛 + carry”假设更不稳定。
+- Hyperliquid 例外：该交易所所有币种均为 1H 资金费结算，允许 `hyperliquid <-> (4H/8H 等)` 的跨所套利。
+
+内容：
+- `config.py`：新增 `WATCHLIST_CONFIG['type_b_disallow_1h_non_hyperliquid']`（默认开启），可用 `WATCHLIST_TYPEB_DISALLOW_1H_NON_HL=0` 关闭。
+- `watchlist_manager.py`：Type B pair 评估新增 interval guard：任一腿为“非 hyperliquid 且 funding_interval_hours≈1H”则直接过滤。
+- `trading/live_trading_manager.py`：开仓前 funding guard 增加同样的 interval guard（兜底），避免异常数据导致实盘误入场。

@@ -3436,6 +3436,19 @@ class LiveTradingManager:
             "net_funding_per_hour": net_funding_per_hour,
         }
 
+        def _is_one_hour(v: Optional[float]) -> bool:
+            if v is None:
+                return False
+            try:
+                fv = float(v)
+            except Exception:
+                return False
+            return 0.95 <= fv <= 1.05
+
+        # Guardrail: avoid 1h-funding legs unless the exchange is Hyperliquid (all symbols settle hourly there).
+        if (str(long_ex).lower() != "hyperliquid" and _is_one_hour(iv_long)) or (str(short_ex).lower() != "hyperliquid" and _is_one_hour(iv_short)):
+            return False, payload, "disallow_1h_non_hyperliquid"
+
         if fr_long is None or fr_short is None or iv_long is None or iv_short is None:
             return False, payload, "funding_unavailable"
         # 1) Per-leg absolute funding guard (per-hour normalised).
