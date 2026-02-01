@@ -61,12 +61,15 @@ def normalize_funding_rate(raw_value: Any, assume_percent: bool = False) -> Opti
     return normalized
 
 
-def funding_rate_to_float(raw_value: Any) -> float:
-    """Utility to convert normalized funding rate representations back to float."""
+def funding_rate_to_float(raw_value: Any) -> Optional[float]:
+    """Utility to convert normalized funding rate representations back to float.
+
+    Returns None when the value is missing or unparsable, preserving 0.0 as a valid rate.
+    """
     normalized = normalize_funding_rate(raw_value)
     if normalized is None:
-        return 0.0
+        return None
     try:
         return float(normalized)
     except (TypeError, ValueError):
-        return 0.0
+        return None

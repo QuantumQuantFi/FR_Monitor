@@ -430,6 +430,8 @@ class WatchlistManager:
             if funding_raw is None:
                 continue
             funding_value = funding_rate_to_float(funding_raw)
+            if funding_value is None:
+                continue
             ts = _parse_timestamp(futures.get('timestamp')) or now
             interval = futures.get('funding_interval_hours')
             try:
@@ -1043,7 +1045,7 @@ class WatchlistManager:
                 'symbol': entry.symbol,
                 'kind': 'perp',
                 'price': perp_price or metrics.get('last_futures_price'),
-                'funding_rate': funding or entry.last_funding_rate,
+                'funding_rate': funding if funding is not None else entry.last_funding_rate,
                 'next_funding_time': _parse_timestamp(entry.next_funding_time),
                 'funding_interval_hours': entry.funding_interval_hours,
             }

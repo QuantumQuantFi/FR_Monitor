@@ -340,7 +340,7 @@ class PriceDatabase:
                         MAX(futures_price) as futures_price_high,
                         MIN(CASE WHEN futures_price > 0 THEN futures_price ELSE NULL END) as futures_price_low,
                         LAST_VALUE(futures_price) OVER (PARTITION BY symbol, exchange, datetime(strftime('%Y-%m-%d %H:%M:00', timestamp)) ORDER BY timestamp ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) as futures_price_close,
-                        AVG(CASE WHEN funding_rate != 0 THEN funding_rate ELSE NULL END) as funding_rate_avg,
+                        AVG(CASE WHEN funding_rate IS NOT NULL THEN funding_rate ELSE NULL END) as funding_rate_avg,
                         AVG(CASE WHEN funding_interval_hours > 0 THEN funding_interval_hours ELSE NULL END) as funding_interval_hours,
                         MAX(next_funding_time) as next_funding_time,
                         AVG(premium_percent) as premium_percent_avg,
