@@ -256,6 +256,104 @@ WATCHLIST_CONFIG = {
             '1',
         )
     ),
+    # Type B 资金费历史稳定性过滤（48h，小时级别抽样/去重）
+    'type_b_funding_history_enabled': _is_truthy(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_ENABLED',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_ENABLED',
+            '1',
+        )
+    ),
+    'type_b_funding_history_window_hours': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_HOURS',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_HOURS',
+            '48',
+        )
+    ),
+    'type_b_funding_history_min_hours': int(
+        float(
+            _get_private(
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_MIN_HOURS',
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_MIN_HOURS',
+                '12',
+            )
+        )
+    ),
+    'type_b_funding_history_dead_band_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_DEAD_BAND_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_DEAD_BAND_BP',
+            '1',
+        )
+    ),
+    'type_b_funding_history_allow_insufficient': _is_truthy(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_ALLOW_INSUFF',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_ALLOW_INSUFF',
+            '1',
+        )
+    ),
+    'type_b_funding_history_range_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_RANGE_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_RANGE_BP',
+            '120',
+        )
+    ),
+    'type_b_funding_history_std_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_STD_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_STD_BP',
+            '22',
+        )
+    ),
+    'type_b_funding_history_mean_abs_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_MEAN_ABS_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_MEAN_ABS_BP',
+            '35',
+        )
+    ),
+    'type_b_funding_history_sign_changes': int(
+        float(
+            _get_private(
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_SIGN_CHANGES',
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_SIGN_CHANGES',
+                '5',
+            )
+        )
+    ),
+    'type_b_funding_history_net_mean_loss_4h_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_MEAN_LOSS_4H_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_MEAN_LOSS_4H_BP',
+            '20',
+        )
+    ),
+    'type_b_funding_history_net_range_bp': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_RANGE_BP',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_RANGE_BP',
+            '60',
+        )
+    ),
+    'type_b_funding_history_net_sign_changes': int(
+        float(
+            _get_private(
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_SIGN_CHANGES',
+                'WATCHLIST_TYPEB_FUNDING_HISTORY_NET_SIGN_CHANGES',
+                '10',
+            )
+        )
+    ),
+    'type_b_funding_history_cache_ttl_seconds': float(
+        _get_private(
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_CACHE_TTL',
+            'WATCHLIST_TYPEB_FUNDING_HISTORY_CACHE_TTL',
+            '300',
+        )
+    ),
     # Type C：现货低于永续
     'type_c_spread_threshold': float(_get_private('WATCHLIST_TYPEC_SPREAD', 'WATCHLIST_TYPEC_SPREAD', '0.01')),  # 1%
     'type_c_funding_min': float(_get_private('WATCHLIST_TYPEC_FUNDING_MIN', 'WATCHLIST_TYPEC_FUNDING_MIN', '-0.001')),

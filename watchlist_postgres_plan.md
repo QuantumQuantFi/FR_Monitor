@@ -341,6 +341,43 @@ FR_Monitor 的最小责任应是：
 
 结论：`net_cost` 解决“结构性慢性亏损”，`max_abs_funding` 解决“单腿极端与跳变风险”；二者并行能减少类似“开仓时净值不差，但持仓中资金费骤变触发止损”的事故。
 
+##### Type B 资金费历史稳定性过滤（A档低敏，48h 小时级抽样）
+**目的**：在现有 `net_cost`/`max_abs_funding` 之外，过滤“资金费波动过大/频繁反转”的币种。  
+**采样口径**：使用 `price_data_1min.funding_rate_avg`，按小时聚合后计算指标；`sign_changes` 采用 **1bp dead‑band** 去抖。  
+**数据缺失处理**：若 48h 内有效小时数不足（`min_hours=12`），**不拦截但记录 `insufficient_data`**（避免误杀）。  
+
+**默认阈值（A档低敏）**
+- 单腿（小时级）  
+  - `range_bp ≤ 120`  
+  - `std_bp ≤ 22`  
+  - `mean_abs_bp ≤ 35`  
+  - `sign_changes ≤ 5`
+- 净资金费（按小时归一，再按 4h 观察）  
+  - `net_mean_loss_4h_bp ≤ 20`  
+  - `net_range_bp ≤ 60`  
+  - `net_sign_changes ≤ 10`
+
+**落地点**
+- Watchlist 侧：`watchlist_manager.py:_type_b_funding_ok()`  
+  - 通过 `funding_history_filter.evaluate_type_b_funding_history()` 执行  
+  - 结果写入 `trigger_details.funding_filter.history_filter`
+- Live trading 侧：`trading/live_trading_manager.py:_check_funding_guard()`  
+  - 失败则 `reason=funding_history`，payload 记录详细指标
+
+**配置项（`WATCHLIST_CONFIG`）**
+- `type_b_funding_history_enabled`（默认 1）
+- `type_b_funding_history_window_hours`（默认 48）
+- `type_b_funding_history_min_hours`（默认 12）
+- `type_b_funding_history_dead_band_bp`（默认 1）
+- `type_b_funding_history_allow_insufficient`（默认 1）
+- `type_b_funding_history_range_bp`（默认 120）
+- `type_b_funding_history_std_bp`（默认 22）
+- `type_b_funding_history_mean_abs_bp`（默认 35）
+- `type_b_funding_history_sign_changes`（默认 5）
+- `type_b_funding_history_net_mean_loss_4h_bp`（默认 20）
+- `type_b_funding_history_net_range_bp`（默认 60）
+- `type_b_funding_history_net_sign_changes`（默认 10）
+
 **未完成项（下一步）**
 - spot 下单/平仓接口与 per‑leg `market_type` 处理尚未实现；当前 `_open_trade()` 仍是 “双腿永续” 路径。
 - 需把 Type C 从 `signal_only` 分支切换为真实下单，并增加风控（现货不可做空、仓位复核、成交失败回滚等）。

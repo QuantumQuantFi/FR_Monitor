@@ -32,6 +32,7 @@ from funding_utils import (
     normalize_next_funding_time,
     normalize_and_advance_next_funding_time,
 )
+from funding_history_filter import evaluate_type_b_funding_history
 from watchlist_pnl_regression_model import predict_bc
 from trading.trade_executor import (
     TradeExecutionError,
@@ -182,6 +183,21 @@ class LiveTradingConfig:
     # Sizing guard: if exchange quantity normalisation makes either leg's notional too small,
     # skip the signal (prevents severe imbalance when one venue has coarse qty steps).
     min_leg_notional_ratio: float = 0.8
+    # Type B funding history guard (hourly sample, 48h window).
+    type_b_funding_history_enabled: bool = True
+    type_b_funding_history_window_hours: float = 48.0
+    type_b_funding_history_min_hours: int = 12
+    type_b_funding_history_dead_band_bp: float = 1.0
+    type_b_funding_history_allow_insufficient: bool = True
+    type_b_funding_history_range_bp: float = 120.0
+    type_b_funding_history_std_bp: float = 22.0
+    type_b_funding_history_mean_abs_bp: float = 35.0
+    type_b_funding_history_sign_changes: int = 5
+    type_b_funding_history_net_mean_loss_4h_bp: float = 20.0
+    type_b_funding_history_net_range_bp: float = 60.0
+    type_b_funding_history_net_sign_changes: int = 10
+    type_b_funding_history_cache_ttl_seconds: float = 300.0
+    db_path: str = "market_data.db"
 
 
 class LiveTradingManager:
@@ -217,6 +233,8 @@ class LiveTradingManager:
         self._funding_cache_lock = threading.Lock()
         self._funding_refresh_hour: Optional[int] = None
         self._funding_backfill_hour: Optional[int] = None
+        self._type_b_funding_history_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._type_b_funding_history_cache_lock = threading.Lock()
         self._balance_snapshot_hour: Optional[int] = None
         # Avoid hammering orderbook REST on the same event when revalidation fails.
         # event_id -> {attempts:int, next_retry_ts:float, last_reason:str}
@@ -3463,6 +3481,38 @@ class LiveTradingManager:
             if iv_long == 1.0 and iv_short == 1.0 and net_funding_per_hour is not None:
                 if float(net_funding_per_hour) < -float(net_1h_threshold):
                     return False, payload, "funding_net_too_negative_1h"
+
+        history_enabled = bool(getattr(self.config, "type_b_funding_history_enabled", False))
+        if history_enabled:
+            thresholds = {
+                "range_bp": float(getattr(self.config, "type_b_funding_history_range_bp", 120.0)),
+                "std_bp": float(getattr(self.config, "type_b_funding_history_std_bp", 22.0)),
+                "mean_abs_bp": float(getattr(self.config, "type_b_funding_history_mean_abs_bp", 35.0)),
+                "sign_changes": int(getattr(self.config, "type_b_funding_history_sign_changes", 5)),
+                "net_mean_loss_4h_bp": float(getattr(self.config, "type_b_funding_history_net_mean_loss_4h_bp", 20.0)),
+                "net_range_bp": float(getattr(self.config, "type_b_funding_history_net_range_bp", 60.0)),
+                "net_sign_changes": int(getattr(self.config, "type_b_funding_history_net_sign_changes", 10)),
+            }
+            try:
+                hist_ok, hist_info = evaluate_type_b_funding_history(
+                    db_path=str(getattr(self.config, "db_path", "market_data.db") or "market_data.db"),
+                    symbol=str(symbol),
+                    long_ex=str(long_ex),
+                    short_ex=str(short_ex),
+                    window_hours=float(getattr(self.config, "type_b_funding_history_window_hours", 48.0)),
+                    min_hours=int(getattr(self.config, "type_b_funding_history_min_hours", 12)),
+                    dead_band_bp=float(getattr(self.config, "type_b_funding_history_dead_band_bp", 1.0)),
+                    thresholds=thresholds,
+                    allow_insufficient=bool(getattr(self.config, "type_b_funding_history_allow_insufficient", True)),
+                    cache=self._type_b_funding_history_cache,
+                    cache_ttl_seconds=float(getattr(self.config, "type_b_funding_history_cache_ttl_seconds", 300.0)),
+                )
+            except Exception as exc:
+                hist_ok = True
+                hist_info = {"ok": True, "skipped": True, "error": f"{type(exc).__name__}: {exc}"}
+            payload["history_filter"] = hist_info
+            if not hist_ok:
+                return False, payload, "funding_history"
         return True, payload, None
 
     def _pick_high_low(

@@ -11,6 +11,7 @@ import sqlite3
 
 from config import WATCHLIST_CONFIG, WATCHLIST_PG_CONFIG
 from funding_utils import derive_funding_interval_hours
+from funding_history_filter import evaluate_type_b_funding_history
 from precision_utils import funding_rate_to_float
 from watchlist_pg_writer import PgWriter, PgWriterConfig
 from watchlist_metrics import compute_metrics_for_symbols, compute_metrics_for_legs
@@ -94,6 +95,19 @@ class WatchlistManager:
         self.type_b_funding_net_cost_max = float(cfg.get('type_b_funding_net_cost_max', 0.001))
         self.type_b_funding_net_cost_horizon_hours = float(cfg.get('type_b_funding_net_cost_horizon_hours', 8))
         self.type_b_disallow_1h_non_hyperliquid = bool(cfg.get('type_b_disallow_1h_non_hyperliquid', True))
+        self.type_b_funding_history_enabled = bool(cfg.get('type_b_funding_history_enabled', True))
+        self.type_b_funding_history_window_hours = float(cfg.get('type_b_funding_history_window_hours', 48.0))
+        self.type_b_funding_history_min_hours = int(cfg.get('type_b_funding_history_min_hours', 12))
+        self.type_b_funding_history_dead_band_bp = float(cfg.get('type_b_funding_history_dead_band_bp', 1.0))
+        self.type_b_funding_history_allow_insufficient = bool(cfg.get('type_b_funding_history_allow_insufficient', True))
+        self.type_b_funding_history_range_bp = float(cfg.get('type_b_funding_history_range_bp', 120.0))
+        self.type_b_funding_history_std_bp = float(cfg.get('type_b_funding_history_std_bp', 22.0))
+        self.type_b_funding_history_mean_abs_bp = float(cfg.get('type_b_funding_history_mean_abs_bp', 35.0))
+        self.type_b_funding_history_sign_changes = int(cfg.get('type_b_funding_history_sign_changes', 5))
+        self.type_b_funding_history_net_mean_loss_4h_bp = float(cfg.get('type_b_funding_history_net_mean_loss_4h_bp', 20.0))
+        self.type_b_funding_history_net_range_bp = float(cfg.get('type_b_funding_history_net_range_bp', 60.0))
+        self.type_b_funding_history_net_sign_changes = int(cfg.get('type_b_funding_history_net_sign_changes', 10))
+        self.type_b_funding_history_cache_ttl_seconds = float(cfg.get('type_b_funding_history_cache_ttl_seconds', 300.0))
         self.type_c_spread_threshold = float(cfg.get('type_c_spread_threshold', 0.01))
         self.type_c_funding_min = float(cfg.get('type_c_funding_min', -0.001))
 
@@ -105,6 +119,7 @@ class WatchlistManager:
         self.logger = logging.getLogger('watchlist')
         self.logger.setLevel(logging.INFO)
         self._preloaded = False
+        self._type_b_funding_history_cache: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         # PG writer (optional)
         pg_cfg_dict = pg_config or WATCHLIST_PG_CONFIG
         self.pg_writer: Optional[PgWriter] = None
@@ -151,6 +166,7 @@ class WatchlistManager:
     def _type_b_funding_ok(
         self,
         *,
+        symbol: str,
         exch_data: Dict[str, Dict[str, Any]],
         a_ex: str,
         a_price: float,
@@ -208,48 +224,49 @@ class WatchlistManager:
         mode = (self.type_b_funding_filter_mode or "range").lower()
         if mode == "range":
             ok = (self.type_b_funding_min <= a_fr <= self.type_b_funding_max) and (self.type_b_funding_min <= b_fr <= self.type_b_funding_max)
-            return ok, {"mode": "range", "ok": ok}
-
-        if mode != "net_cost":
+            info = {"mode": "range", "ok": ok}
+            if not ok:
+                return ok, info
+        elif mode != "net_cost":
             ok = (self.type_b_funding_min <= a_fr <= self.type_b_funding_max) and (self.type_b_funding_min <= b_fr <= self.type_b_funding_max)
-            return ok, {"mode": mode, "ok": ok, "fallback": "range"}
+            info = {"mode": mode, "ok": ok, "fallback": "range"}
+            if not ok:
+                return ok, info
+        else:
+            if a_price == b_price:
+                return False, {"mode": "net_cost", "ok": False, "reason": "equal_price"}
 
-        if a_price == b_price:
-            return False, {"mode": "net_cost", "ok": False, "reason": "equal_price"}
+            short_ex = a_ex if a_price > b_price else b_ex
+            long_ex = b_ex if short_ex == a_ex else a_ex
+            short_fr = a_fr if short_ex == a_ex else b_fr
+            long_fr = b_fr if long_ex == b_ex else a_fr
+            short_iv = (exch_data.get(short_ex) or {}).get("funding_interval_hours")
+            long_iv = (exch_data.get(long_ex) or {}).get("funding_interval_hours")
+            try:
+                short_iv_h = float(short_iv) if short_iv else None
+                long_iv_h = float(long_iv) if long_iv else None
+            except Exception:
+                short_iv_h = None
+                long_iv_h = None
+            if not short_iv_h or not long_iv_h or short_iv_h <= 0 or long_iv_h <= 0:
+                return (
+                    False,
+                    {
+                        "mode": "net_cost",
+                        "ok": False,
+                        "reason": "missing_funding_interval",
+                        "short_ex": short_ex,
+                        "long_ex": long_ex,
+                    },
+                )
 
-        short_ex = a_ex if a_price > b_price else b_ex
-        long_ex = b_ex if short_ex == a_ex else a_ex
-        short_fr = a_fr if short_ex == a_ex else b_fr
-        long_fr = b_fr if long_ex == b_ex else a_fr
-        short_iv = (exch_data.get(short_ex) or {}).get("funding_interval_hours")
-        long_iv = (exch_data.get(long_ex) or {}).get("funding_interval_hours")
-        try:
-            short_iv_h = float(short_iv) if short_iv else None
-            long_iv_h = float(long_iv) if long_iv else None
-        except Exception:
-            short_iv_h = None
-            long_iv_h = None
-        if not short_iv_h or not long_iv_h or short_iv_h <= 0 or long_iv_h <= 0:
-            return (
-                False,
-                {
-                    "mode": "net_cost",
-                    "ok": False,
-                    "reason": "missing_funding_interval",
-                    "short_ex": short_ex,
-                    "long_ex": long_ex,
-                },
-            )
-
-        horizon_h = float(self.type_b_funding_net_cost_horizon_hours or 8.0)
-        # funding_rate 通常是“每 interval”的比例；先按小时归一。
-        net_per_hour = (float(short_fr) / short_iv_h) - (float(long_fr) / long_iv_h)
-        net_over_horizon = net_per_hour * horizon_h
-        net_loss = max(0.0, -net_over_horizon)
-        ok = net_loss <= float(self.type_b_funding_net_cost_max or 0.0)
-        return (
-            ok,
-            {
+            horizon_h = float(self.type_b_funding_net_cost_horizon_hours or 8.0)
+            # funding_rate 通常是“每 interval”的比例；先按小时归一。
+            net_per_hour = (float(short_fr) / short_iv_h) - (float(long_fr) / long_iv_h)
+            net_over_horizon = net_per_hour * horizon_h
+            net_loss = max(0.0, -net_over_horizon)
+            ok = net_loss <= float(self.type_b_funding_net_cost_max or 0.0)
+            info = {
                 "mode": "net_cost",
                 "ok": ok,
                 "horizon_hours": horizon_h,
@@ -261,8 +278,46 @@ class WatchlistManager:
                 "long_fr": long_fr,
                 "short_interval_hours": short_iv_h,
                 "long_interval_hours": long_iv_h,
-            },
-        )
+            }
+            if not ok:
+                return ok, info
+
+        short_ex = a_ex if a_price > b_price else b_ex
+        long_ex = b_ex if short_ex == a_ex else a_ex
+
+        if self.type_b_funding_history_enabled:
+            thresholds = {
+                "range_bp": self.type_b_funding_history_range_bp,
+                "std_bp": self.type_b_funding_history_std_bp,
+                "mean_abs_bp": self.type_b_funding_history_mean_abs_bp,
+                "sign_changes": self.type_b_funding_history_sign_changes,
+                "net_mean_loss_4h_bp": self.type_b_funding_history_net_mean_loss_4h_bp,
+                "net_range_bp": self.type_b_funding_history_net_range_bp,
+                "net_sign_changes": self.type_b_funding_history_net_sign_changes,
+            }
+            try:
+                hist_ok, hist_info = evaluate_type_b_funding_history(
+                    db_path=self.db_path,
+                    symbol=str(symbol),
+                    long_ex=str(long_ex),
+                    short_ex=str(short_ex),
+                    window_hours=self.type_b_funding_history_window_hours,
+                    min_hours=self.type_b_funding_history_min_hours,
+                    dead_band_bp=self.type_b_funding_history_dead_band_bp,
+                    thresholds=thresholds,
+                    allow_insufficient=self.type_b_funding_history_allow_insufficient,
+                    cache=self._type_b_funding_history_cache,
+                    cache_ttl_seconds=self.type_b_funding_history_cache_ttl_seconds,
+                )
+            except Exception as exc:
+                hist_ok = True
+                hist_info = {"ok": True, "skipped": True, "error": f"{type(exc).__name__}: {exc}"}
+            info["history_filter"] = hist_info
+            if not hist_ok:
+                info["ok"] = False
+                return False, info
+
+        return True, info
 
     def _prune_history(self, symbol: str, now: datetime) -> None:
         interval_hours = self._funding_interval.get(symbol)
@@ -512,6 +567,7 @@ class WatchlistManager:
                     if a_fr is None or b_fr is None:
                         continue
                     funding_ok, funding_info = self._type_b_funding_ok(
+                        symbol=symbol,
                         exch_data=exch_data,
                         a_ex=a_ex,
                         a_price=a_price,
