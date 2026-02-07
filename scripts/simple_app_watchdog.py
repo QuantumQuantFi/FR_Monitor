@@ -122,6 +122,50 @@ def _dmesg_oom_tail(n: int = 120) -> str:
         return ""
 
 
+def _ps_snapshot(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        out = subprocess.run(
+            ["bash", "-lc", f"ps -p {int(pid)} -o pid,ppid,stat,etime,pcpu,pmem,cmd= | sed -n '1,2p'"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return (out.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _proc_status(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    path = Path(f"/proc/{int(pid)}/status")
+    if not path.exists():
+        return ""
+    wanted = {
+        "Name",
+        "State",
+        "Threads",
+        "VmSize",
+        "VmRSS",
+        "VmPeak",
+        "VmHWM",
+        "FDSize",
+        "voluntary_ctxt_switches",
+        "nonvoluntary_ctxt_switches",
+    }
+    lines = []
+    try:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            key = line.split(":", 1)[0].strip()
+            if key in wanted:
+                lines.append(line.strip())
+    except Exception:
+        return ""
+    return " | ".join(lines)
+
+
 def sh_quote(s: str) -> str:
     return "'" + s.replace("'", "'\"'\"'") + "'"
 
@@ -140,7 +184,7 @@ def _describe_rc(rc: int) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Keep simple_app.py running; restart on exit and log reasons.")
-    parser.add_argument("--cmd", type=str, default="./venv/bin/python -u simple_app.py")
+    parser.add_argument("--cmd", type=str, default="./venv/bin/python -X faulthandler -u simple_app.py")
     parser.add_argument("--port", type=int, default=4002)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--interval", type=float, default=2.0)
@@ -206,6 +250,15 @@ def main() -> int:
             log_event(f"detected_app_stopped pid={last_seen_pid}")
         else:
             log_event(f"port_down host={args.host} port={args.port} pid={last_seen_pid or 'unknown'}")
+
+        if last_seen_pid and _pid_exists(last_seen_pid):
+            ps_snap = _ps_snapshot(last_seen_pid)
+            if ps_snap:
+                for line in ps_snap.splitlines():
+                    log_event(f"proc_ps {line}")
+            proc_status = _proc_status(last_seen_pid)
+            if proc_status:
+                log_event(f"proc_status {proc_status}")
 
         oom = _dmesg_oom_tail()
         if oom:
