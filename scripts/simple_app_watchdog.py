@@ -144,7 +144,7 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=4002)
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--interval", type=float, default=2.0)
-    parser.add_argument("--startup-grace", type=float, default=25.0)
+    parser.add_argument("--startup-grace", type=float, default=300.0)
     parser.add_argument("--pid-file", type=str, default=str(REPO_ROOT / ".simple_app.pid"))
     parser.add_argument("--watchdog-pid-file", type=str, default=str(REPO_ROOT / ".simple_app_watchdog.pid"))
     parser.add_argument("--app-log", type=str, default=str(REPO_ROOT / "nohup_simple_app.out"))
@@ -272,4 +272,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
