@@ -497,6 +497,19 @@ class WatchlistManager:
                 self._entries[symbol] = entry
 
         # Type B/C：跨交易所价差与资金费过滤
+        # 当前可交易符号索引（复用 exchange_symbols，不维护额外清单）
+        tradable_symbols: Dict[str, Dict[str, set]] = {}
+        for ex_name, ex_payload in (exchange_symbols or {}).items():
+            ex_key = str(ex_name or "").strip().lower()
+            if not ex_key or not isinstance(ex_payload, dict):
+                continue
+            spot_list = ex_payload.get("spot") or []
+            futures_list = ex_payload.get("futures") or []
+            tradable_symbols[ex_key] = {
+                "spot": {str(s).strip().upper() for s in spot_list if str(s).strip()},
+                "futures": {str(s).strip().upper() for s in futures_list if str(s).strip()},
+            }
+
         market_snapshots: Dict[str, Dict[str, Dict[str, Any]]] = {}
         def _to_price(val: Any) -> Optional[float]:
             try:
@@ -554,9 +567,12 @@ class WatchlistManager:
             futures_list = []
             spot_list = []
             for exch, vals in exch_data.items():
-                if vals.get('futures_price'):
+                ex_key = str(exch or "").strip().lower()
+                sym_u = str(symbol or "").strip().upper()
+                ex_tradable = tradable_symbols.get(ex_key, {})
+                if vals.get('futures_price') and sym_u in (ex_tradable.get("futures") or set()):
                     futures_list.append((exch, vals['futures_price'], vals.get('funding_rate')))
-                if vals.get('spot_price'):
+                if vals.get('spot_price') and sym_u in (ex_tradable.get("spot") or set()):
                     spot_list.append((exch, vals['spot_price']))
 
             # Type B：两家永续价差 > 阈值，且资金费在区间内

@@ -1157,6 +1157,14 @@ live_trading_manager = LiveTradingManager(
             for x in str(LIVE_TRADING_CONFIG.get('spot_allowed_exchanges') or '').split(',')
             if x.strip()
         ) or ("binance", "okx", "bybit", "bitget"),
+        blocked_symbols=tuple(
+            x.strip().upper()
+            for x in str(LIVE_TRADING_CONFIG.get('blocked_symbols') or '').split(',')
+            if x.strip()
+        ),
+        max_cross_exchange_price_ratio=float(
+            LIVE_TRADING_CONFIG.get('max_cross_exchange_price_ratio', 3.0)
+        ),
         spot_per_leg_notional_usdt=(
             float(LIVE_TRADING_CONFIG.get('spot_per_leg_notional_usdt'))
             if float(LIVE_TRADING_CONFIG.get('spot_per_leg_notional_usdt') or 0.0) > 0
@@ -1212,6 +1220,10 @@ live_trading_manager = LiveTradingManager(
         max_symbols_per_scan=int(LIVE_TRADING_CONFIG.get('max_symbols_per_scan', 8)),
         kick_driven=bool(LIVE_TRADING_CONFIG.get('kick_driven', True)),
     )
+)
+# 复用监控层 exchange_symbols 作为 live trading 的可交易性数据源（不维护额外清单）。
+live_trading_manager.set_exchange_symbols_provider(
+    lambda: getattr(data_collector, "exchange_symbols", {}) or {}
 )
 
 

@@ -4,12 +4,13 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import math
+import os
 import threading
 import time
 from decimal import Decimal, ROUND_DOWN
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
     import requests  # type: ignore
@@ -121,6 +122,10 @@ class LiveTradingConfig:
     type_c_win_prob_threshold: float = 0.85
     spot_trading_enabled: bool = False
     spot_allowed_exchanges: Tuple[str, ...] = ("binance", "okx", "bybit", "bitget")
+    blocked_symbols: Tuple[str, ...] = ()
+    # Cross-venue sanity guard: if executable long/short entry prices differ too much
+    # between two legs, skip opening to avoid symbol/contract mismatch.
+    max_cross_exchange_price_ratio: float = 3.0
     spot_per_leg_notional_usdt: Optional[float] = None
     v2_enabled: bool = True
     v2_pnl_threshold_240: float = 0.0065
@@ -241,6 +246,13 @@ class LiveTradingManager:
         self._event_backoff: Dict[int, Dict[str, Any]] = {}
         self._event_backoff_lock = threading.Lock()
         self._event_backoff_schedule_seconds = (10, 30, 60, 120, 240)
+        # symbol@exchange cooldown for repeated invalid-symbol style open errors.
+        self._symbol_exchange_backoff: Dict[str, float] = {}
+        self._symbol_exchange_backoff_lock = threading.Lock()
+        self._symbol_exchange_backoff_seconds = float(os.getenv("LIVE_TRADING_SYMBOL_BACKOFF_SECONDS", "21600"))
+        # Optional provider from runtime monitor (e.g. ExchangeDataCollector.exchange_symbols):
+        # returns {exchange: {"spot":[...], "futures":[...]}}.
+        self._exchange_symbols_provider: Optional[Callable[[], Dict[str, Dict[str, List[str]]]]] = None
 
     def kick(self, *, reason: str = "external") -> None:
         """Wake the live trading loop to scan immediately (non-blocking)."""
@@ -276,6 +288,32 @@ class LiveTradingManager:
             delay = schedule[min(max(0, attempts - 1), max(0, len(schedule) - 1))] if schedule else 60
             next_ts = now + float(delay)
             self._event_backoff[eid] = {"attempts": attempts, "next_retry_ts": float(next_ts), "last_reason": str(reason or "")}
+
+    @staticmethod
+    def _symbol_exchange_backoff_key(symbol: str, exchange: str) -> str:
+        return f"{str(symbol or '').upper()}@{str(exchange or '').lower()}"
+
+    def _is_symbol_exchange_in_backoff(self, symbol: str, exchange: str) -> bool:
+        key = self._symbol_exchange_backoff_key(symbol, exchange)
+        if key == "@":
+            return False
+        now = time.time()
+        with self._symbol_exchange_backoff_lock:
+            until_ts = float(self._symbol_exchange_backoff.get(key) or 0.0)
+            if until_ts <= 0 or now >= until_ts:
+                self._symbol_exchange_backoff.pop(key, None)
+                return False
+            return True
+
+    def _bump_symbol_exchange_backoff(self, symbol: str, exchange: str, *, seconds: Optional[float] = None) -> None:
+        key = self._symbol_exchange_backoff_key(symbol, exchange)
+        if key == "@":
+            return
+        delay = float(seconds if seconds is not None else self._symbol_exchange_backoff_seconds)
+        if delay <= 0:
+            return
+        with self._symbol_exchange_backoff_lock:
+            self._symbol_exchange_backoff[key] = time.time() + delay
 
     def _next_skipped_retry_delay_seconds(self, attempts: int) -> float:
         schedule = tuple(getattr(self.config, "skipped_retry_schedule_seconds", ()) or ())
@@ -655,6 +693,7 @@ class LiveTradingManager:
             ("long", long_ex_l, pos_a_eff, "L"),
             ("short", short_ex_l, pos_b_eff, "S"),
         ):
+            leg_mkt = long_mkt if leg_name == "long" else short_mkt
             if size is None:
                 self._record_error(
                     conn,
@@ -672,7 +711,6 @@ class LiveTradingManager:
             qty = abs(float(size))
             client_id = f"{close_base}-{client_suffix}"
             try:
-                leg_mkt = long_mkt if leg_name == "long" else short_mkt
                 resp = self._place_close_order(
                     exchange=ex,
                     symbol=symbol_u,
@@ -726,6 +764,16 @@ class LiveTradingManager:
                     }
                 )
             except Exception as exc:
+                if leg_mkt == "spot" and self._is_spot_min_qty_error(str(exc)):
+                    self.logger.info(
+                        "close_spot_dust_ignored signal_id=%s symbol=%s exchange=%s qty=%s reason=%s",
+                        sid,
+                        symbol_u,
+                        ex,
+                        qty,
+                        exc,
+                    )
+                    continue
                 self._record_error(
                     conn,
                     signal_id=sid,
@@ -2536,8 +2584,54 @@ class LiveTradingManager:
                 normalised = units * step
                 return normalised < filters.min_qty
         except Exception:
-            return False
+            # Fail-safe for close-path dust handling: when metadata fetch fails, treat tiny spot balances as dust
+            # so we don't loop forever retrying an unfillable close.
+            fallback_min_qty = {
+                "binance": Decimal("0.01"),
+                "okx": Decimal("0.00000001"),
+                "bitget": Decimal("0.00000001"),
+            }.get(ex, Decimal("0"))
+            return fallback_min_qty > 0 and raw_qty < fallback_min_qty
         return False
+
+    @staticmethod
+    def _is_spot_min_qty_error(message: str) -> bool:
+        msg = str(message or "").lower()
+        return (
+            "below binance spot minimum" in msg
+            or "minimum order quantity" in msg
+            or ("below" in msg and "spot minimum" in msg)
+        )
+
+    @staticmethod
+    def _is_open_trade_skip_error(message: str) -> bool:
+        msg = str(message or "").lower()
+        return any(
+            key in msg
+            for key in (
+                "common_target_qty_too_small",
+                "entry spread too small",
+                "non-tradable entry spread",
+                "orderbook unavailable",
+                "orderbook missing",
+                "invalid symbol",
+                "did not include requested symbol",
+                "exchange info payload missing symbol data",
+                "exchange info missing symbol data",
+                "exchange_symbol_unavailable",
+            )
+        )
+
+    @staticmethod
+    def _is_invalid_symbol_error(message: str) -> bool:
+        msg = str(message or "").lower()
+        return (
+            "invalid symbol" in msg
+            or "did not include requested symbol" in msg
+            or "exchange info payload missing symbol data" in msg
+            or "exchange info missing symbol data" in msg
+            or "exchange_symbol_unavailable" in msg
+        )
 
     def _apply_spot_dust_filter(
         self,
@@ -3088,11 +3182,151 @@ class LiveTradingManager:
             allowed = {"binance", "okx", "bybit", "bitget"}
         return (exchange or "").lower() in allowed
 
+    def _is_blocked_symbol(self, symbol: str) -> bool:
+        blocked = {str(x).upper() for x in (self.config.blocked_symbols or ()) if str(x).strip()}
+        return str(symbol or "").upper() in blocked
+
+    def _check_cross_exchange_price_ratio_guard(
+        self,
+        *,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        reval: Optional[Dict[str, Any]],
+    ) -> Tuple[bool, Dict[str, Any], Optional[str]]:
+        max_ratio = float(getattr(self.config, "max_cross_exchange_price_ratio", 0.0) or 0.0)
+        payload: Dict[str, Any] = {
+            "symbol": str(symbol or "").upper(),
+            "long_exchange": str(long_ex or ""),
+            "short_exchange": str(short_ex or ""),
+            "max_ratio": max_ratio,
+        }
+        if max_ratio <= 0:
+            payload["enabled"] = False
+            return True, payload, None
+
+        long_buy: Optional[float] = None
+        short_sell: Optional[float] = None
+        orderbook = (reval or {}).get("orderbook") if isinstance(reval, dict) else None
+        if isinstance(orderbook, dict):
+            # Type C shape: {"spot": ..., "perp": ...}
+            if isinstance(orderbook.get("spot"), dict) and isinstance(orderbook.get("perp"), dict):
+                try:
+                    long_buy = float((orderbook.get("spot") or {}).get("buy"))
+                except Exception:
+                    long_buy = None
+                try:
+                    short_sell = float((orderbook.get("perp") or {}).get("sell"))
+                except Exception:
+                    short_sell = None
+            # Type B shape: {"a": ..., "b": ...} with meta.exchange
+            for side_key in ("a", "b"):
+                leg = orderbook.get(side_key)
+                if not isinstance(leg, dict):
+                    continue
+                meta = leg.get("meta")
+                leg_ex = str((meta or {}).get("exchange") if isinstance(meta, dict) else "").lower()
+                if leg_ex == str(long_ex or "").lower():
+                    try:
+                        long_buy = float(leg.get("buy"))
+                    except Exception:
+                        long_buy = None
+                if leg_ex == str(short_ex or "").lower():
+                    try:
+                        short_sell = float(leg.get("sell"))
+                    except Exception:
+                        short_sell = None
+
+        payload["long_buy"] = long_buy
+        payload["short_sell"] = short_sell
+        if not (long_buy and short_sell and long_buy > 0 and short_sell > 0):
+            payload["enabled"] = True
+            payload["checked"] = False
+            return True, payload, None
+
+        ratio = max(float(long_buy), float(short_sell)) / min(float(long_buy), float(short_sell))
+        payload["enabled"] = True
+        payload["checked"] = True
+        payload["observed_ratio"] = float(ratio)
+        if ratio > max_ratio:
+            return False, payload, (
+                f"cross_exchange_price_ratio_too_high symbol={str(symbol).upper()} "
+                f"long({long_ex})={long_buy:g} short({short_ex})={short_sell:g} "
+                f"ratio={ratio:.4f} max={max_ratio:.4f}"
+            )
+        return True, payload, None
+
     def _resolve_leg_market_types(self, signal_type: str) -> Tuple[str, str]:
         st = (signal_type or "").strip().upper()
         if st == "C":
             return ("spot", "perp")
         return ("perp", "perp")
+
+    def set_exchange_symbols_provider(
+        self,
+        provider: Optional[Callable[[], Dict[str, Dict[str, List[str]]]]],
+    ) -> None:
+        """Inject runtime exchange_symbols provider so open checks can reuse monitor symbol lists."""
+        self._exchange_symbols_provider = provider
+
+    def _is_symbol_tradeable_on_exchange(self, exchange: str, symbol: str, market_type: str) -> bool:
+        provider = self._exchange_symbols_provider
+        if not callable(provider):
+            return True
+        try:
+            snapshot = provider() or {}
+        except Exception:
+            return True
+        if not isinstance(snapshot, dict):
+            return True
+
+        ex_key = str(exchange or "").strip().lower()
+        sym = str(symbol or "").strip().upper()
+        if not ex_key or not sym:
+            return True
+
+        ex_payload = snapshot.get(ex_key)
+        if not isinstance(ex_payload, dict):
+            # If provider has no explicit entry for this exchange, don't hard-block.
+            return True
+
+        mkt_key = "spot" if str(market_type or "").strip().lower() == "spot" else "futures"
+        listed = ex_payload.get(mkt_key)
+        if not isinstance(listed, list):
+            return True
+        listed_set = {str(x).strip().upper() for x in listed if str(x).strip()}
+        return sym in listed_set
+
+    def _validate_symbol_legs_tradeable(
+        self,
+        *,
+        symbol: str,
+        long_ex: str,
+        long_mkt: str,
+        short_ex: str,
+        short_mkt: str,
+    ) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        sym = str(symbol or "").strip().upper()
+        payload = {
+            "symbol": sym,
+            "long_exchange": str(long_ex or ""),
+            "long_market_type": str(long_mkt or ""),
+            "short_exchange": str(short_ex or ""),
+            "short_market_type": str(short_mkt or ""),
+        }
+        long_ok = self._is_symbol_tradeable_on_exchange(str(long_ex), sym, str(long_mkt))
+        short_ok = self._is_symbol_tradeable_on_exchange(str(short_ex), sym, str(short_mkt))
+        payload["long_tradeable"] = bool(long_ok)
+        payload["short_tradeable"] = bool(short_ok)
+        if long_ok and short_ok:
+            return True, None, payload
+        missing: List[str] = []
+        if not long_ok:
+            missing.append(f"{str(long_ex)}:{str(long_mkt)}")
+        if not short_ok:
+            missing.append(f"{str(short_ex)}:{str(short_mkt)}")
+        reason = f"exchange_symbol_unavailable symbol={sym} legs={','.join(missing)}"
+        return False, reason, payload
 
     def _resolve_type_c_exchanges(self, event: Dict[str, Any]) -> Tuple[Optional[str], Optional[str], str]:
         """Resolve (spot_exchange, perp_exchange) for Type C from event payload."""
@@ -4284,6 +4518,8 @@ class LiveTradingManager:
                 sym = str(row.get("symbol") or "").upper()
                 if not sym:
                     continue
+                if self._is_blocked_symbol(sym):
+                    continue
                 by_symbol.setdefault(sym, []).append(row)
 
             # 控制每轮扫描的订单簿压力：每评估 1 个 symbol 至少会触发 2 次订单簿 REST（两家交易所各一次）。
@@ -4467,6 +4703,19 @@ class LiveTradingManager:
         symbol = str(row.get("symbol") or "").upper()
         if not signal_id or not symbol:
             return
+        if self._is_blocked_symbol(symbol):
+            conn.execute(
+                """
+                UPDATE watchlist.live_trade_signal
+                   SET status='expired',
+                       reason='blocked_symbol',
+                       next_retry_at=NULL,
+                       updated_at=now()
+                 WHERE id=%s;
+                """,
+                (int(signal_id),),
+            )
+            return
 
         # If there's already an active trade for symbol, do not interfere.
         exists = conn.execute(
@@ -4570,6 +4819,29 @@ class LiveTradingManager:
                 )
                 return
 
+            ok_legs, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+                symbol=symbol,
+                long_ex=str(spot_ex),
+                long_mkt="spot",
+                short_ex=str(perp_ex),
+                short_mkt="perp",
+            )
+            if not ok_legs:
+                self._bump_symbol_exchange_backoff(symbol, str(spot_ex))
+                self._bump_symbol_exchange_backoff(symbol, str(perp_ex))
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason=str(legs_reason or "exchange_symbol_unavailable"),
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": str(legs_reason or "exchange_symbol_unavailable"),
+                        "exchange_source": ex_source,
+                        "symbol_tradeable_guard": legs_payload,
+                    },
+                )
+                return
+
             reval = self._revalidate_with_orderbook_type_c(
                 symbol=symbol,
                 spot_exchange=str(spot_ex),
@@ -4612,6 +4884,31 @@ class LiveTradingManager:
                         "reason": str(confirm.get("reason") or "orderbook_unstable"),
                         "orderbook_revalidation": reval,
                         "orderbook_confirm_open": confirm,
+                    },
+                )
+                return
+
+            chosen_long_ex = str(confirm.get("long_exchange") or spot_ex)
+            chosen_short_ex = str(confirm.get("short_exchange") or perp_ex)
+            ratio_ok, ratio_payload, ratio_reason = self._check_cross_exchange_price_ratio_guard(
+                symbol=symbol,
+                long_ex=chosen_long_ex,
+                short_ex=chosen_short_ex,
+                reval=reval if isinstance(reval, dict) else None,
+            )
+            if not ratio_ok:
+                self._bump_symbol_exchange_backoff(symbol, chosen_long_ex)
+                self._bump_symbol_exchange_backoff(symbol, chosen_short_ex)
+                self._bump_signal_retry(
+                    conn,
+                    signal_id=signal_id,
+                    reason=str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                    payload={
+                        "decision": "retry_skipped",
+                        "reason": str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                        "orderbook_revalidation": reval,
+                        "orderbook_confirm_open": confirm,
+                        "price_ratio_guard": ratio_payload,
                     },
                 )
                 return
@@ -4664,8 +4961,8 @@ class LiveTradingManager:
                 reason=None,
                 payload=payload,
                 client_order_id_base=client_base,
-                leg_long_exchange=str(confirm.get("long_exchange") or spot_ex),
-                leg_short_exchange=str(confirm.get("short_exchange") or perp_ex),
+                leg_long_exchange=chosen_long_ex,
+                leg_short_exchange=chosen_short_ex,
                 pnl_hat=float(pred_choice.get("pnl_hat") or 0.0),
                 win_prob=float(pred_choice.get("win_prob") or 0.0),
                 pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
@@ -4679,8 +4976,8 @@ class LiveTradingManager:
                     conn,
                     signal_id,
                     symbol,
-                    str(confirm.get("long_exchange") or spot_ex),
-                    str(confirm.get("short_exchange") or perp_ex),
+                    chosen_long_ex,
+                    chosen_short_ex,
                     client_base,
                     pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
                     signal_type=signal_type,
@@ -4696,20 +4993,12 @@ class LiveTradingManager:
                     context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": spot_ex, "short_ex": perp_ex},
                 )
                 msg = str(exc)
-                msg_l = msg.lower()
-                status = (
-                    "skipped"
-                    if any(
-                        key in msg_l
-                        for key in (
-                            "entry spread too small",
-                            "non-tradable entry spread",
-                            "orderbook unavailable",
-                            "orderbook missing",
-                        )
-                    )
-                    else "failed"
-                )
+                status = "skipped" if self._is_open_trade_skip_error(msg) else "failed"
+                if status == "skipped":
+                    self._bump_event_backoff(int(event["id"]), msg)
+                    if self._is_invalid_symbol_error(msg):
+                        self._bump_symbol_exchange_backoff(symbol, str(spot_ex))
+                        self._bump_symbol_exchange_backoff(symbol, str(perp_ex))
                 self._update_signal_status(conn, signal_id, status, reason=msg)
             except Exception as exc:
                 self._record_error(
@@ -4783,6 +5072,28 @@ class LiveTradingManager:
                 )
                 return
 
+        ok_legs, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+            symbol=symbol,
+            long_ex=str(low_ex),
+            long_mkt="perp",
+            short_ex=str(high_ex),
+            short_mkt="perp",
+        )
+        if not ok_legs:
+            self._bump_symbol_exchange_backoff(symbol, str(low_ex))
+            self._bump_symbol_exchange_backoff(symbol, str(high_ex))
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason=str(legs_reason or "exchange_symbol_unavailable"),
+                payload={
+                    "decision": "retry_skipped",
+                    "reason": str(legs_reason or "exchange_symbol_unavailable"),
+                    "symbol_tradeable_guard": legs_payload,
+                },
+            )
+            return
+
         confirm = self._confirm_open_signal_with_orderbook(
             symbol=symbol,
             ex_a=str(high_ex),
@@ -4808,6 +5119,29 @@ class LiveTradingManager:
         # Confirm passed; lock in direction to avoid flapping.
         high_ex = str(confirm.get("short_exchange") or high_ex)
         low_ex = str(confirm.get("long_exchange") or low_ex)
+
+        ratio_ok, ratio_payload, ratio_reason = self._check_cross_exchange_price_ratio_guard(
+            symbol=symbol,
+            long_ex=low_ex,
+            short_ex=high_ex,
+            reval=reval if isinstance(reval, dict) else None,
+        )
+        if not ratio_ok:
+            self._bump_symbol_exchange_backoff(symbol, low_ex)
+            self._bump_symbol_exchange_backoff(symbol, high_ex)
+            self._bump_signal_retry(
+                conn,
+                signal_id=signal_id,
+                reason=str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                payload={
+                    "decision": "retry_skipped",
+                    "reason": str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                    "orderbook_revalidation": reval,
+                    "orderbook_confirm_open": confirm,
+                    "price_ratio_guard": ratio_payload,
+                },
+            )
+            return
 
         f_ok, f_payload, f_reason = self._check_funding_guard(symbol=symbol, long_ex=low_ex, short_ex=high_ex, event=event)
         if not f_ok:
@@ -4899,23 +5233,12 @@ class LiveTradingManager:
                 context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
             )
             msg = str(exc)
-            msg_l = msg.lower()
-            # Treat "did not send orders" class errors as skipped (not failed) to reduce noise and
-            # keep failed reserved for partial fills / position mismatches / other execution issues.
-            status = (
-                "skipped"
-                if any(
-                    key in msg_l
-                    for key in (
-                        "common_target_qty_too_small",
-                        "entry spread too small",
-                        "non-tradable entry spread",
-                        "orderbook unavailable",
-                        "orderbook missing",
-                    )
-                )
-                else "failed"
-            )
+            status = "skipped" if self._is_open_trade_skip_error(msg) else "failed"
+            if status == "skipped":
+                self._bump_event_backoff(int(event["id"]), msg)
+                if self._is_invalid_symbol_error(msg):
+                    self._bump_symbol_exchange_backoff(symbol, str(low_ex))
+                    self._bump_symbol_exchange_backoff(symbol, str(high_ex))
             self._update_signal_status(conn, signal_id, status, reason=msg)
         except Exception as exc:
             self._record_error(
@@ -4929,6 +5252,8 @@ class LiveTradingManager:
             self._update_signal_status(conn, signal_id, "failed", reason=str(exc))
 
     def _process_symbol_candidates(self, conn, symbol: str, rows: List[Dict[str, Any]]) -> None:
+        if self._is_blocked_symbol(symbol):
+            return
         # Fast check: already active trade for symbol?
         exists = conn.execute(
             "SELECT 1 FROM watchlist.live_trade_signal WHERE symbol=%s AND status IN ('opening','open','closing') LIMIT 1;",
@@ -5033,6 +5358,32 @@ class LiveTradingManager:
                                 "perp_allowed_exchanges": sorted(
                                     {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
                                 ),
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
+                    ok_legs, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+                        symbol=symbol,
+                        long_ex=str(long_ex),
+                        long_mkt="spot",
+                        short_ex=str(short_ex),
+                        short_mkt="perp",
+                    )
+                    if not ok_legs:
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=long_ex,
+                            leg_short_exchange=short_ex,
+                            reason=str(legs_reason or "exchange_symbol_unavailable"),
+                            payload={
+                                "decision": "skipped",
+                                "reason": str(legs_reason or "exchange_symbol_unavailable"),
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "exchange_source": ex_source,
+                                "symbol_tradeable_guard": legs_payload,
                             },
                             pred_choice=pred_choice,
                         )
@@ -5170,6 +5521,37 @@ class LiveTradingManager:
                             )
                         continue
 
+                    chosen_long_ex = str(confirm.get("long_exchange") or long_ex)
+                    chosen_short_ex = str(confirm.get("short_exchange") or short_ex)
+                    ratio_ok, ratio_payload, ratio_reason = self._check_cross_exchange_price_ratio_guard(
+                        symbol=symbol,
+                        long_ex=chosen_long_ex,
+                        short_ex=chosen_short_ex,
+                        reval=reval if isinstance(reval, dict) else None,
+                    )
+                    if not ratio_ok:
+                        self._bump_symbol_exchange_backoff(symbol, chosen_long_ex)
+                        self._bump_symbol_exchange_backoff(symbol, chosen_short_ex)
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=chosen_long_ex,
+                            leg_short_exchange=chosen_short_ex,
+                            reason=str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                            payload={
+                                "decision": "skipped",
+                                "reason": str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "exchange_source": ex_source,
+                                "orderbook_revalidation": reval,
+                                "orderbook_confirm_open": confirm,
+                                "price_ratio_guard": ratio_payload,
+                            },
+                            pred_choice=pred_choice,
+                        )
+                        continue
+
                     client_base = f"wl{int(event['id'])}O{int(time.time())}"
                     payload = {
                         "event": {
@@ -5209,8 +5591,8 @@ class LiveTradingManager:
                     signal_id = self._insert_signal(
                         conn,
                         event=event,
-                        leg_long_exchange=str(confirm.get("long_exchange") or long_ex),
-                        leg_short_exchange=str(confirm.get("short_exchange") or short_ex),
+                        leg_long_exchange=chosen_long_ex,
+                        leg_short_exchange=chosen_short_ex,
                         pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
                         win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
                         pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
@@ -5230,8 +5612,8 @@ class LiveTradingManager:
                             conn,
                             signal_id,
                             symbol,
-                            str(confirm.get("long_exchange") or long_ex),
-                            str(confirm.get("short_exchange") or short_ex),
+                            chosen_long_ex,
+                            chosen_short_ex,
                             client_base,
                             pnl_hat_ob=float(reval.get("pnl_hat_eval") or reval.get("pnl_hat") or 0.0),
                             signal_type=signal_type,
@@ -5252,20 +5634,12 @@ class LiveTradingManager:
                             },
                         )
                         msg = str(exc)
-                        msg_l = msg.lower()
-                        status = (
-                            "skipped"
-                            if any(
-                                key in msg_l
-                                for key in (
-                                    "entry spread too small",
-                                    "non-tradable entry spread",
-                                    "orderbook unavailable",
-                                    "orderbook missing",
-                                )
-                            )
-                            else "failed"
-                        )
+                        status = "skipped" if self._is_open_trade_skip_error(msg) else "failed"
+                        if status == "skipped":
+                            self._bump_event_backoff(int(event["id"]), msg)
+                            if self._is_invalid_symbol_error(msg):
+                                self._bump_symbol_exchange_backoff(symbol, str(long_ex))
+                                self._bump_symbol_exchange_backoff(symbol, str(short_ex))
                         self._update_signal_status(conn, signal_id, status, reason=msg)
                     except Exception as exc:
                         self._record_error(
@@ -5286,6 +5660,31 @@ class LiveTradingManager:
 
                 chosen_reval = self._chosen_reval_from_event(event, pred_choice)
                 if chosen_reval and chosen_reval.get("ok"):
+                    c_long_ex = str(chosen_reval.get("long_exchange") or "")
+                    c_short_ex = str(chosen_reval.get("short_exchange") or "")
+                    ok_legs, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+                        symbol=symbol,
+                        long_ex=c_long_ex,
+                        long_mkt="perp",
+                        short_ex=c_short_ex,
+                        short_mkt="perp",
+                    )
+                    if not ok_legs:
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=c_long_ex,
+                            leg_short_exchange=c_short_ex,
+                            reason=str(legs_reason or "exchange_symbol_unavailable"),
+                            payload={
+                                "decision": "skipped",
+                                "reason": str(legs_reason or "exchange_symbol_unavailable"),
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "symbol_tradeable_guard": legs_payload,
+                            },
+                        )
+                        continue
                     base_factors = event.get("factors") or {}
                     if not isinstance(base_factors, dict):
                         self._insert_skipped_event(
@@ -5364,6 +5763,31 @@ class LiveTradingManager:
                             "allowed_exchanges": sorted(
                                 {str(x).lower() for x in (self.config.allowed_exchanges or ()) if str(x).strip()}
                             ),
+                        },
+                    )
+                    continue
+
+                ok_legs, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+                    symbol=symbol,
+                    long_ex=str(low_ex),
+                    long_mkt="perp",
+                    short_ex=str(high_ex),
+                    short_mkt="perp",
+                )
+                if not ok_legs:
+                    self._insert_skipped_event(
+                        conn,
+                        event=event,
+                        leg_long_exchange=str(low_ex or ""),
+                        leg_short_exchange=str(high_ex or ""),
+                        reason=str(legs_reason or "exchange_symbol_unavailable"),
+                        payload={
+                            "decision": "skipped",
+                            "reason": str(legs_reason or "exchange_symbol_unavailable"),
+                            "symbol": symbol,
+                            "event_id": event_id,
+                            "picked_high_low": {"high": high_ex, "low": low_ex},
+                            "symbol_tradeable_guard": legs_payload,
                         },
                     )
                     continue
@@ -5521,6 +5945,70 @@ class LiveTradingManager:
         high_ex = str(confirm.get("short_exchange") or high_ex)
         low_ex = str(confirm.get("long_exchange") or low_ex)
 
+        ratio_ok, ratio_payload, ratio_reason = self._check_cross_exchange_price_ratio_guard(
+            symbol=symbol,
+            long_ex=low_ex,
+            short_ex=high_ex,
+            reval=reval if isinstance(reval, dict) else None,
+        )
+        if not ratio_ok:
+            self._bump_symbol_exchange_backoff(symbol, low_ex)
+            self._bump_symbol_exchange_backoff(symbol, high_ex)
+            client_base = f"wl{int(event['id'])}O{int(time.time())}"
+            payload = {
+                "event": {
+                    "id": int(event["id"]),
+                    "start_ts": str(event.get("start_ts")),
+                    "symbol": symbol,
+                    "signal_type": event.get("signal_type"),
+                    "trigger_details": event.get("trigger_details"),
+                },
+                "threshold": {
+                    "horizon_min": int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                    "pnl_threshold": float((pred_choice or {}).get("thr_pnl") or self.config.pnl_threshold),
+                    "win_prob_threshold": float((pred_choice or {}).get("thr_prob") or self.config.win_prob_threshold),
+                    "per_leg_notional_usdt": float(self.config.per_leg_notional_usdt),
+                },
+                "pred_choice": pred_choice,
+                "orderbook_revalidation": {
+                    "pnl_hat": reval.get("pnl_hat"),
+                    "win_prob": reval.get("win_prob"),
+                    "pnl_hat_eval": reval.get("pnl_hat_eval"),
+                    "win_prob_eval": reval.get("win_prob_eval"),
+                    "pred_source": reval.get("pred_source"),
+                    "pred_horizon_min": reval.get("pred_horizon_min"),
+                    "orderbook": reval.get("orderbook"),
+                },
+                "orderbook_confirm_open": confirm,
+                "price_ratio_guard": ratio_payload,
+            }
+            signal_id = self._insert_signal(
+                conn,
+                event=event,
+                leg_long_exchange=low_ex,
+                leg_short_exchange=high_ex,
+                pnl_hat=float((pred_choice or {}).get("pnl_hat") or 0.0),
+                win_prob=float((pred_choice or {}).get("win_prob") or 0.0),
+                pnl_hat_ob=float(reval.get("pnl_hat_eval") or 0.0),
+                win_prob_ob=float(reval.get("win_prob_eval") or 0.0),
+                horizon_min=int((pred_choice or {}).get("horizon_min") or self.config.horizon_min),
+                pred_source=str((pred_choice or {}).get("source") or "v1_240"),
+                payload=payload,
+                status="skipped",
+                reason=str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                client_order_id_base=client_base,
+            )
+            if signal_id:
+                self._record_error(
+                    conn,
+                    signal_id=signal_id,
+                    stage="price_ratio_guard",
+                    error_type="not_ok",
+                    message=str(ratio_reason or "cross_exchange_price_ratio_too_high"),
+                    context={"symbol": symbol, "event_id": int(event["id"]), "guard": ratio_payload},
+                )
+            return
+
         # Funding guard (Type B): re-check current funding before opening.
         f_ok, f_payload, f_reason = self._check_funding_guard(symbol=symbol, long_ex=low_ex, short_ex=high_ex, event=event)
         if not f_ok:
@@ -5650,21 +6138,12 @@ class LiveTradingManager:
                 context={"event_id": int(event["id"]), "symbol": symbol, "long_ex": low_ex, "short_ex": high_ex},
             )
             msg = str(exc)
-            msg_l = msg.lower()
-            status = (
-                "skipped"
-                if any(
-                    key in msg_l
-                    for key in (
-                        "common_target_qty_too_small",
-                        "entry spread too small",
-                        "non-tradable entry spread",
-                        "orderbook unavailable",
-                        "orderbook missing",
-                    )
-                )
-                else "failed"
-            )
+            status = "skipped" if self._is_open_trade_skip_error(msg) else "failed"
+            if status == "skipped":
+                self._bump_event_backoff(int(event["id"]), msg)
+                if self._is_invalid_symbol_error(msg):
+                    self._bump_symbol_exchange_backoff(symbol, str(low_ex))
+                    self._bump_symbol_exchange_backoff(symbol, str(high_ex))
             self._update_signal_status(conn, signal_id, status, reason=msg)
         except Exception as exc:
             self._record_error(
@@ -5814,6 +6293,20 @@ class LiveTradingManager:
         signal_type: Optional[str] = None,
     ) -> None:
         long_mkt, short_mkt = self._resolve_leg_market_types(signal_type or "")
+        legs_ok, legs_reason, legs_payload = self._validate_symbol_legs_tradeable(
+            symbol=symbol,
+            long_ex=long_ex,
+            long_mkt=long_mkt,
+            short_ex=short_ex,
+            short_mkt=short_mkt,
+        )
+        if not legs_ok:
+            raise TradeExecutionError(
+                f"{str(legs_reason or 'exchange_symbol_unavailable')} payload={json.dumps(legs_payload, ensure_ascii=False)}"
+            )
+        for ex in (str(long_ex), str(short_ex)):
+            if self._is_symbol_exchange_in_backoff(symbol, ex):
+                raise TradeExecutionError(f"symbol_exchange_backoff_active symbol={symbol} exchange={ex}")
         perp_notional = float(self.config.per_leg_notional_usdt)
         spot_notional = float(self.config.spot_per_leg_notional_usdt or perp_notional)
         if str(signal_type or "").strip().upper() == "C":

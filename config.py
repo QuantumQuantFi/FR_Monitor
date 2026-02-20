@@ -553,6 +553,20 @@ LIVE_TRADING_CONFIG = {
     'min_leg_notional_ratio': float(
         _get_private('LIVE_TRADING_MIN_LEG_NOTIONAL_RATIO', 'LIVE_TRADING_MIN_LEG_NOTIONAL_RATIO', '0.8')
     ),
+    # 明确屏蔽的币种（CSV，按基础币，例如 FUN,XYZ）。用于快速止血已知异常映射/下架币。
+    'blocked_symbols': _get_private(
+        'LIVE_TRADING_BLOCKED_SYMBOLS',
+        'LIVE_TRADING_BLOCKED_SYMBOLS',
+        'FUN',
+    ),
+    # 跨交易所价格守卫：若两腿可成交入场价的绝对比值超过该阈值，则跳过开仓。
+    'max_cross_exchange_price_ratio': float(
+        _get_private(
+            'LIVE_TRADING_MAX_CROSS_EXCHANGE_PRICE_RATIO',
+            'LIVE_TRADING_MAX_CROSS_EXCHANGE_PRICE_RATIO',
+            '3.0',
+        )
+    ),
     # 限制自动实盘允许使用的交易所（逗号分隔）；避免因为某个交易所接口变更/余额不足导致全局失败。
     'allowed_exchanges': _get_private(
         'LIVE_TRADING_ALLOWED_EXCHANGES',
