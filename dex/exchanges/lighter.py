@@ -598,9 +598,13 @@ class LighterMarketWebSocket:
         self.market_lookup = self._normalize_lookup(market_lookup or {})
         self._lookup_refresher = lookup_refresher
         self._on_stats = on_stats
-        self.ping_interval = max(10, int(ping_interval or 30))
+        # Some Lighter gateways close with `1008 no pong` when client-side ping is enabled.
+        # Allow disabling ping via ping_interval<=0 and use server traffic as keepalive.
+        self.ping_interval = int(ping_interval or 0)
         self._ws: Optional[websocket.WebSocketApp] = None
         self._closing = threading.Event()
+        self._rate_limited = threading.Event()
+        self._last_error_text: str = ""
         self.logger = logging.getLogger("LighterMarketWebSocket")
 
     def run_forever(self):
@@ -613,10 +617,11 @@ class LighterMarketWebSocket:
             on_close=self._on_close,
         )
         self.logger.info("Connecting to Lighter market stats: %s", self.url)
-        self._ws.run_forever(
-            ping_interval=self.ping_interval,
-            ping_timeout=max(5, self.ping_interval // 2),
-        )
+        kwargs = {}
+        if self.ping_interval and self.ping_interval > 0:
+            kwargs["ping_interval"] = self.ping_interval
+            kwargs["ping_timeout"] = max(5, self.ping_interval // 2)
+        self._ws.run_forever(**kwargs)
 
     def close(self):
         self._closing.set()
@@ -628,6 +633,12 @@ class LighterMarketWebSocket:
 
     def update_market_lookup(self, entries: Dict[int, str]):
         self.market_lookup = self._normalize_lookup(entries or {})
+
+    def consume_rate_limited(self) -> bool:
+        flagged = self._rate_limited.is_set()
+        if flagged:
+            self._rate_limited.clear()
+        return flagged
 
     # ------------------------------------------------------------------ #
     # Internal callbacks
@@ -649,6 +660,13 @@ class LighterMarketWebSocket:
                 self._handle_market_stats(stats)
             return
 
+        if payload.get('type') == 'ping':
+            try:
+                ws.send(json.dumps({'type': 'pong'}))
+            except Exception:
+                pass
+            return
+
         if payload.get('type') in ('connected', 'subscribed', 'pong'):
             self.logger.debug("Lighter WS事件: %s", payload)
             return
@@ -657,10 +675,18 @@ class LighterMarketWebSocket:
             self.logger.warning("Lighter WS错误: %s", payload)
 
     def _on_error(self, ws, error):
+        text = str(error)
+        self._last_error_text = text
+        if ('429' in text) or ('Too Many Requests' in text):
+            self._rate_limited.set()
         if not self._closing.is_set():
             self.logger.error("Lighter WebSocket错误: %s", error)
 
     def _on_close(self, ws, status_code, msg):
+        msg_text = f"{status_code} {msg}"
+        self._last_error_text = msg_text
+        if status_code == 429 or ('429' in msg_text) or ('Too Many Requests' in msg_text):
+            self._rate_limited.set()
         self.logger.warning("Lighter WebSocket关闭: %s %s", status_code, msg)
 
     def _subscribe(self, ws):

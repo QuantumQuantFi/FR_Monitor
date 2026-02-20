@@ -3,11 +3,14 @@ import asyncio
 import websocket
 import threading
 import time
+import logging
+import os
+from collections import deque
 from typing import Dict, Any
 from datetime import datetime, timedelta, timezone
-from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS, 
+from config import (EXCHANGE_WEBSOCKETS, DEFAULT_SYMBOL, SUPPORTED_SYMBOLS,
                    CURRENT_SUPPORTED_SYMBOLS, WS_UPDATE_INTERVAL, WS_CONNECTION_CONFIG,
-                   MEMORY_OPTIMIZATION_CONFIG, update_supported_symbols_async,
+                   MEMORY_OPTIMIZATION_CONFIG,
                    REST_ENABLED, REST_UPDATE_INTERVAL, REST_MERGE_POLICY,
                    GRVT_API_KEY, GRVT_API_SECRET, GRVT_TRADING_ACCOUNT_ID,
                    GRVT_WS_RATE_MS)
@@ -35,6 +38,10 @@ from funding_utils import (
     normalize_and_advance_next_funding_time,
     normalize_next_funding_time,
 )
+
+# websocket-client 内部会把瞬断打成 ERROR（缺少交易所上下文），
+# 这里压低到 CRITICAL，保留各交易所自有 logger 的可读告警。
+logging.getLogger("websocket").setLevel(logging.CRITICAL)
 
 class ExchangeDataCollector:
     def __init__(self):
@@ -80,7 +87,8 @@ class ExchangeDataCollector:
         
         # 币种列表更新控制
         self.symbols_update_thread = None
-        self.symbols_update_interval = 3600  # 1小时更新一次币种列表
+        # 交易所可交易币种列表刷新周期（默认 12 小时）
+        self.symbols_update_interval = float(os.getenv("SYMBOLS_UPDATE_INTERVAL_SECONDS", "43200"))
 
         # REST补充轮询
         self.rest_enabled = REST_ENABLED
@@ -96,13 +104,21 @@ class ExchangeDataCollector:
             'lighter': None,
             'hyperliquid': None,
         }
+        # 连接节流/冷却（用于避免被交易所限流后重连风暴）
+        self._connect_attempt_history = {}
+        self._lighter_rate_limit_per_minute = 40
+        self._lighter_min_reconnect_delay = 2.0
+        self._lighter_429_base_cooldown = 60.0
+        self._lighter_429_max_cooldown = 300.0
+        self._lighter_consecutive_429 = 0
+        self._connection_cooldown_until = {}
     
-    def _load_exchange_symbols(self):
+    def _load_exchange_symbols(self, *, force_refresh: bool = False):
         """加载各交易所特定的币种列表"""
         used_static_fallback = False
         try:
             print("正在获取各交易所实际支持的币种列表...")
-            self.exchange_symbols = get_exchange_symbols(force_refresh=False)
+            self.exchange_symbols = get_exchange_symbols(force_refresh=bool(force_refresh))
         except Exception as e:
             used_static_fallback = True
             print(f"⚠️ 获取交易所币种列表失败，使用默认列表: {e}")
@@ -294,37 +310,69 @@ class ExchangeDataCollector:
         return True
     
     def update_symbols_list(self):
-        """更新支持的币种列表"""
+        """更新交易所可交易币种列表与全局支持列表"""
         try:
-            new_symbols = update_supported_symbols_async()
-            if new_symbols and new_symbols != self.supported_symbols:
-                print(f"币种列表已更新: {len(self.supported_symbols)} -> {len(new_symbols)}")
-                old_symbols = set(self.supported_symbols)
-                new_symbols_set = set(new_symbols)
-                
-                # 添加新币种
-                added_symbols = new_symbols_set - old_symbols
+            old_symbols = set(self.supported_symbols or [])
+            self._load_exchange_symbols(force_refresh=True)
+            new_symbols = set(self.supported_symbols or [])
+            if new_symbols != old_symbols:
+                print(f"币种列表已更新: {len(old_symbols)} -> {len(new_symbols)}")
+                added_symbols = new_symbols - old_symbols
+                removed_symbols = old_symbols - new_symbols
                 if added_symbols:
                     print(f"新增币种: {list(added_symbols)}")
-                
-                # 移除不再支持的币种
-                removed_symbols = old_symbols - new_symbols_set
                 if removed_symbols:
                     print(f"移除币种: {list(removed_symbols)}")
-                
-                self.supported_symbols = new_symbols
                 self._rebuild_data_structure()
-                
-                # 如果当前显示的币种被移除，切换到默认币种
-                if self.current_symbol not in self.supported_symbols:
-                    if DEFAULT_SYMBOL in self.supported_symbols:
-                        self.current_symbol = DEFAULT_SYMBOL
-                    else:
-                        self.current_symbol = self.supported_symbols[0] if self.supported_symbols else 'BTC'
-                    print(f"当前币种已切换至: {self.current_symbol}")
-                
+
+            # 如果当前显示的币种被移除，切换到默认币种
+            if self.current_symbol not in self.supported_symbols:
+                if DEFAULT_SYMBOL in self.supported_symbols:
+                    self.current_symbol = DEFAULT_SYMBOL
+                else:
+                    self.current_symbol = self.supported_symbols[0] if self.supported_symbols else 'BTC'
+                print(f"当前币种已切换至: {self.current_symbol}")
         except Exception as e:
             print(f"更新币种列表失败: {e}")
+
+    def _mark_symbol_unavailable(self, exchange: str, symbol: str, market_type: str = "both", reason: str = ""):
+        """统一处理交易所下线/无效 symbol：同步更新可交易列表 + 运行时缓存。"""
+        ex = str(exchange or "").strip().lower()
+        sym = str(symbol or "").strip().upper()
+        if not ex or not sym:
+            return
+
+        removed_any = False
+        if ex in self.exchange_symbols and isinstance(self.exchange_symbols.get(ex), dict):
+            target_types = ["spot", "futures"] if market_type == "both" else [str(market_type)]
+            for mt in target_types:
+                cur = self.exchange_symbols[ex].get(mt) or []
+                if not isinstance(cur, list):
+                    continue
+                new_cur = [s for s in cur if str(s).strip().upper() != sym]
+                if len(new_cur) != len(cur):
+                    self.exchange_symbols[ex][mt] = new_cur
+                    removed_any = True
+
+        if sym in self.supported_symbols:
+            self.supported_symbols = [s for s in self.supported_symbols if str(s).strip().upper() != sym]
+            removed_any = True
+
+        # 清理该交易所下的陈旧快照，避免下线币继续触发信号。
+        try:
+            if ex in self.data and isinstance(self.data.get(ex), dict):
+                self.data[ex].pop(sym, None)
+            if ex in self.last_update_time and isinstance(self.last_update_time.get(ex), dict):
+                self.last_update_time[ex].pop(sym, None)
+        except Exception:
+            pass
+
+        if removed_any:
+            msg = f"⚠️ 检测到 {ex} 不可交易币种 {sym}，已从可交易列表剔除"
+            if reason:
+                msg += f" (reason={reason})"
+            print(msg)
+            print(f"⚠️ 当前有效币种数量: {len(self.supported_symbols)}个")
     
     def _rebuild_data_structure(self):
         """重建数据结构以适应新的币种列表"""
@@ -614,17 +662,50 @@ class ExchangeDataCollector:
         self.ws_connections.clear()
         self.reconnect_attempts.clear()
 
+    def _sleep_interruptible(self, seconds: float) -> bool:
+        """可中断睡眠，便于优雅停止。"""
+        remaining = max(0.0, float(seconds))
+        while self.running and remaining > 0:
+            step = min(1.0, remaining)
+            time.sleep(step)
+            remaining -= step
+        return self.running
+
     def _connect_with_retry(self, connection_name, connect_func):
         """优化的重连机制包装器 - 避免无限循环和资源耗尽"""
         self.connection_start_times[connection_name] = datetime.now()
-        
+        history = self._connect_attempt_history.setdefault(connection_name, deque(maxlen=512))
+
         while self.running:
+            now_mono = time.monotonic()
+            cooldown_until = float(self._connection_cooldown_until.get(connection_name, 0.0) or 0.0)
+            if cooldown_until > now_mono:
+                wait = cooldown_until - now_mono
+                print(f"[{connection_name}] 处于冷却期，等待 {wait:.1f} 秒后重试...")
+                if not self._sleep_interruptible(wait):
+                    break
+                continue
+
+            if connection_name == 'lighter':
+                # 保护上限：单实例每分钟最多 40 次连接尝试（低于官方阈值，留余量）
+                now_mono = time.monotonic()
+                while history and (now_mono - history[0]) > 60.0:
+                    history.popleft()
+                if len(history) >= self._lighter_rate_limit_per_minute:
+                    wait = max(0.5, 60.0 - (now_mono - history[0]) + 0.05)
+                    print(f"[{connection_name}] 达到本地限速 {self._lighter_rate_limit_per_minute}/min，等待 {wait:.1f} 秒...")
+                    if not self._sleep_interruptible(wait):
+                        break
+                    continue
+
+            started_at = time.monotonic()
             try:
+                history.append(time.monotonic())
                 print(f"[{connection_name}] 开始连接... (尝试 {self.reconnect_attempts.get(connection_name, 0) + 1}/{self.max_reconnect_attempts})")
                 connect_func()
-                # 连接成功，重置重连计数
-                self.reconnect_attempts[connection_name] = 0
-                print(f"[{connection_name}] 连接成功建立")
+                alive = time.monotonic() - started_at
+                # run_forever 返回意味着连接已结束，不应视为“成功”并立即重连。
+                raise RuntimeError(f"连接已断开（run_forever返回，存活 {alive:.1f}s）")
                 
             except Exception as e:
                 if not self.running:
@@ -633,6 +714,15 @@ class ExchangeDataCollector:
                     
                 self.reconnect_attempts[connection_name] = self.reconnect_attempts.get(connection_name, 0) + 1
                 current_attempt = self.reconnect_attempts[connection_name]
+                err_text = str(e)
+                is_429 = ('429' in err_text) or ('Too Many Requests' in err_text)
+                if connection_name == 'lighter':
+                    ws_client = self.ws_connections.get('lighter')
+                    if ws_client and hasattr(ws_client, 'consume_rate_limited'):
+                        try:
+                            is_429 = is_429 or bool(ws_client.consume_rate_limited())
+                        except Exception:
+                            pass
                 
                 print(f"[{connection_name}] 连接失败 (第{current_attempt}次): {e}")
                 
@@ -649,23 +739,23 @@ class ExchangeDataCollector:
                     )
                 else:
                     delay = self.base_reconnect_delay
+
+                if connection_name == 'lighter':
+                    delay = max(float(delay), float(self._lighter_min_reconnect_delay))
+                    if is_429:
+                        self._lighter_consecutive_429 += 1
+                        penalty = min(
+                            self._lighter_429_base_cooldown * (2 ** max(0, self._lighter_consecutive_429 - 1)),
+                            self._lighter_429_max_cooldown,
+                        )
+                        delay = max(delay, penalty)
+                    else:
+                        self._lighter_consecutive_429 = 0
+                    self._connection_cooldown_until[connection_name] = time.monotonic() + float(delay)
                 
                 print(f"[{connection_name}] 等待 {delay} 秒后重试...")
-                
-                # 分段睡眠，支持优雅停止
-                sleep_step = 5  # 每5秒检查一次是否需要停止
-                for _ in range(int(delay // sleep_step)):
-                    if not self.running:
-                        print(f"[{connection_name}] 等待期间程序停止，退出重连")
-                        return
-                    time.sleep(sleep_step)
-                
-                # 处理余数时间
-                remaining = delay % sleep_step
-                if remaining > 0 and self.running:
-                    time.sleep(remaining)
-                    
-                if not self.running:
+
+                if not self._sleep_interruptible(delay):
                     print(f"[{connection_name}] 等待期间程序停止，退出重连")
                     break
         
@@ -1199,13 +1289,9 @@ class ExchangeDataCollector:
                     invalid_symbol = symbol_match.group(1)
                     
                     # 从支持的币种列表中移除
-                    if invalid_symbol in self.supported_symbols:
-                        self.supported_symbols.remove(invalid_symbol)
-                        print(f"⚠️  检测到Bybit不支持的币种 {invalid_symbol}，已从监控列表中移除")
-                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
-                        
-                        # 重新订阅剩余的有效币种
-                        self._resubscribe_bybit(channel_type)
+                    self._mark_symbol_unavailable('bybit', invalid_symbol, market_type='both', reason='subscription_error')
+                    # 重新订阅剩余的有效币种
+                    self._resubscribe_bybit(channel_type)
                         
         except Exception as e:
             print(f"处理Bybit订阅错误时异常: {e}")
@@ -1276,13 +1362,9 @@ class ExchangeDataCollector:
                     invalid_symbol = symbol_match.group(1)
                     
                     # 从支持的币种列表中移除
-                    if invalid_symbol in self.supported_symbols:
-                        self.supported_symbols.remove(invalid_symbol)
-                        print(f"⚠️  检测到Bitget不支持的币种 {invalid_symbol}，已从监控列表中移除")
-                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
-                        
-                        # 重新订阅剩余的有效币种
-                        self._resubscribe_bitget()
+                    self._mark_symbol_unavailable('bitget', invalid_symbol, market_type='both', reason='subscription_error')
+                    # 重新订阅剩余的有效币种
+                    self._resubscribe_bitget()
                         
             # 处理没有错误消息但有arg字段的订阅失败
             elif 'arg' in error_data and 'instId' in error_data['arg']:
@@ -1292,13 +1374,9 @@ class ExchangeDataCollector:
                     invalid_symbol = inst_id[:-4]  # 移除 USDT 后缀
                     
                     # 从支持的币种列表中移除
-                    if invalid_symbol in self.supported_symbols:
-                        self.supported_symbols.remove(invalid_symbol)
-                        print(f"⚠️  检测到Bitget不支持的币种 {invalid_symbol}，已从监控列表中移除")
-                        print(f"⚠️  当前有效币种数量: {len(self.supported_symbols)}个")
-                        
-                        # 重新订阅剩余的有效币种
-                        self._resubscribe_bitget()
+                    self._mark_symbol_unavailable('bitget', invalid_symbol, market_type='both', reason='subscription_error')
+                    # 重新订阅剩余的有效币种
+                    self._resubscribe_bitget()
                         
         except Exception as e:
             print(f"处理Bitget订阅错误时异常: {e}")
@@ -1578,13 +1656,13 @@ class ExchangeDataCollector:
                 snapshot['next_funding_time'] = nft
 
             self.data['lighter'][symbol]['futures'] = snapshot
-            print(f"Lighter {symbol} 永续价格: {snapshot['price']}")
 
         ws_client = LighterMarketWebSocket(
             url=ws_url,
             market_lookup=get_lighter_market_lookup(),
             on_stats=handle_payload,
             lookup_refresher=get_lighter_market_lookup,
+            ping_interval=0,
         )
         self.ws_connections['lighter'] = ws_client
         ws_client.run_forever()
