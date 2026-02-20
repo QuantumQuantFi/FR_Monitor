@@ -1138,14 +1138,17 @@ def _run_async(coro):
 
 def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFilters:
     """Fetch and cache Binance quantity filters for ``symbol``."""
-    key = (base_url, symbol)
+    target_symbol = symbol.upper()
+    if not target_symbol.endswith("USDT"):
+        target_symbol = f"{target_symbol}USDT"
+    key = (base_url, target_symbol)
     now = time.time()
     cached = _BINANCE_FILTER_CACHE.get(key)
     if cached and now - cached.fetched_at < _BINANCE_FILTER_CACHE_TTL:
         return cached
 
     url = f"{base_url}/fapi/v1/exchangeInfo"
-    params: List[tuple[str, str]] = [("symbol", symbol)]
+    params: List[tuple[str, str]] = [("symbol", target_symbol)]
     response = _send_request("GET", url, params=params)
     data = _json_or_error(response)
     if response.status_code != 200:
@@ -1154,7 +1157,6 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
     symbols = data.get("symbols") or []
     if not symbols:
         raise TradeExecutionError(f"Binance exchange info payload missing symbol data: {data}")
-    target_symbol = symbol.upper()
     if len(symbols) > 1:
         symbol_info = next((item for item in symbols if item.get("symbol") == target_symbol), None)
         if symbol_info is None:
@@ -1192,7 +1194,7 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
         if raw_min_notional is not None:
             min_notional = Decimal(str(raw_min_notional))
 
-    LOGGER.info("binance_symbol_info symbol=%s payload=%s", symbol, symbol_info)
+    LOGGER.info("binance_symbol_info symbol=%s payload=%s", target_symbol, symbol_info)
 
     quantity_precision_raw = symbol_info.get("quantityPrecision")
     quantity_precision: Optional[int]
@@ -1211,7 +1213,7 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
     _BINANCE_FILTER_CACHE[key] = cached_filters
     LOGGER.info(
         "binance_filter_cache symbol=%s step=%s min_qty=%s min_notional=%s precision=%s",
-        symbol,
+        target_symbol,
         step_size,
         min_qty,
         min_notional,
@@ -1222,14 +1224,17 @@ def _get_binance_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFil
 
 def _get_binance_spot_symbol_filters(symbol: str, base_url: str) -> _BinanceSymbolFilters:
     """Fetch and cache Binance SPOT quantity filters for ``symbol``."""
-    key = (base_url, symbol)
+    target_symbol = symbol.upper()
+    if not target_symbol.endswith("USDT"):
+        target_symbol = f"{target_symbol}USDT"
+    key = (base_url, target_symbol)
     now = time.time()
     cached = _BINANCE_SPOT_FILTER_CACHE.get(key)
     if cached and now - cached.fetched_at < _BINANCE_SPOT_FILTER_CACHE_TTL:
         return cached
 
     url = f"{base_url}/api/v3/exchangeInfo"
-    params: List[tuple[str, str]] = [("symbol", symbol)]
+    params: List[tuple[str, str]] = [("symbol", target_symbol)]
     response = _send_request("GET", url, params=params)
     data = _json_or_error(response)
     if response.status_code != 200:
@@ -1238,7 +1243,6 @@ def _get_binance_spot_symbol_filters(symbol: str, base_url: str) -> _BinanceSymb
     symbols = data.get("symbols") or []
     if not symbols:
         raise TradeExecutionError(f"Binance spot exchange info missing symbol data: {data}")
-    target_symbol = symbol.upper()
     if len(symbols) > 1:
         symbol_info = next((item for item in symbols if item.get("symbol") == target_symbol), None)
         if symbol_info is None:
