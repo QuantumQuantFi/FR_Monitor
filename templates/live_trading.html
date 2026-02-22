@@ -60,6 +60,45 @@
       background: rgba(88,166,255,0.9);
       color: #0d1421;
     }
+    .col-pref-menu {
+      position: absolute;
+      top: 42px;
+      right: 0;
+      z-index: 8;
+      min-width: 360px;
+      max-height: 420px;
+      overflow: auto;
+      display: none;
+      padding: 10px;
+    }
+    .col-pref-row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      align-items: center;
+      padding: 4px 0;
+      border-bottom: 1px dashed rgba(99,110,123,0.35);
+    }
+    .col-pref-row:last-child { border-bottom: none; }
+    .col-pref-row.dragging { opacity: 0.45; background: rgba(88,166,255,0.1); }
+    .col-pref-row.drag-over { outline: 1px dashed rgba(88,166,255,0.95); border-radius: 6px; }
+    .col-pref-actions { display: inline-flex; gap: 6px; }
+    .col-pref-actions button { padding: 2px 8px; min-width: 30px; }
+    .drag-handle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 22px;
+      padding: 0 6px;
+      border: 1px solid #30363d;
+      border-radius: 6px;
+      color: #8b949e;
+      cursor: grab;
+      user-select: none;
+      font-size: 12px;
+      line-height: 18px;
+    }
+    .drag-handle:active { cursor: grabbing; }
   </style>
 </head>
 <body>
@@ -118,6 +157,16 @@
       <input id="filterExchange" placeholder="exchange(可选)" style="width: 120px;" />
       <button id="refreshBtn" class="secondary">立即刷新</button>
       <button id="resetBtn" class="secondary">清空筛选</button>
+      <div id="columnPrefWrap" style="position: relative;">
+        <button id="columnPrefBtn" class="secondary" type="button">列设置</button>
+        <div id="columnPrefMenu" class="card col-pref-menu">
+          <div class="row" style="justify-content: space-between; margin-bottom: 8px;">
+            <div class="muted">交易信号表列配置</div>
+            <button id="columnPrefResetBtn" class="secondary" type="button" style="padding: 4px 8px;">恢复默认</button>
+          </div>
+          <div id="columnPrefList"></div>
+        </div>
+      </div>
       <button id="posBtn" class="secondary">刷新持仓(私有API)</button>
     </div>
     <div class="row" style="margin-top: 8px;">
@@ -187,9 +236,9 @@
         <div class="muted">点击 Details 查看 orders/samples（含成交均价/数量摘要）</div>
       </div>
       <div class="table-wrap">
-        <table>
+        <table id="signalsTable">
           <thead>
-            <tr>
+            <tr id="signalsHeadRow">
               <th style="width: 64px;">ID</th>
               <th style="width: 90px;">event_id</th>
               <th style="width: 90px;">Symbol</th>
@@ -279,7 +328,7 @@
             </tr>
           </thead>
           <tbody id="signalsBody">
-            <tr><td colspan="38" class="muted">loading...</td></tr>
+            <tr><td colspan="40" class="muted">loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -391,6 +440,311 @@
     let refreshTimer = null;
     let positionsCache = [];
     let positionsSort = {key: null, dir: null};
+    const SIGNALS_TABLE_PREF_API_TABLE = 'signals';
+    const SIGNALS_COLUMNS = [
+      {key: 'id', label: 'ID'},
+      {key: 'event_id', label: 'event_id'},
+      {key: 'symbol', label: 'Symbol'},
+      {key: 'signal_type', label: 'Type'},
+      {key: 'pred_source', label: 'Source'},
+      {key: 'exchanges', label: 'Exchanges'},
+      {key: 'a_long_open', label: 'A Long 开仓价'},
+      {key: 'a_long_close', label: 'A Long 平仓价'},
+      {key: 'b_short_open', label: 'B Short 开仓价'},
+      {key: 'b_short_close', label: 'B Short 平仓价'},
+      {key: 'entry_spread_pct', label: '开仓价差%'},
+      {key: 'tp_exit_spread_pct', label: '止盈临界价差%'},
+      {key: 'realized_pnl', label: 'realized_pnl'},
+      {key: 'open_qty_delta', label: '开仓QtyΔ'},
+      {key: 'close_qty_delta', label: '平仓QtyΔ'},
+      {key: 'fee_pnl', label: 'FeePnL'},
+      {key: 'funding_pnl', label: 'FundingPnL'},
+      {key: 'net_pnl', label: 'NetPnL'},
+      {key: 'open_rate_l', label: '开仓费率L'},
+      {key: 'open_rate_s', label: '开仓费率S'},
+      {key: 'live_rate_l', label: '实时费率L'},
+      {key: 'live_rate_s', label: '实时费率S'},
+      {key: 'fund_rate_updated', label: '费率更新时间'},
+      {key: 'status', label: 'Status'},
+      {key: 'pnl_hat_ob', label: 'pnl_hat_ob'},
+      {key: 'tp_pnl', label: 'tp_pnl'},
+      {key: 'last_pnl', label: 'last_pnl'},
+      {key: 'close_trigger_spread', label: '平仓触发价差%'},
+      {key: 'created_at', label: 'created_at'},
+      {key: 'opened_at', label: 'opened_at'},
+      {key: 'open_long_at', label: 'open_long_at'},
+      {key: 'open_short_at', label: 'open_short_at'},
+      {key: 'close_decision_at', label: 'close_decision_at'},
+      {key: 'close_long_at', label: 'close_long_at'},
+      {key: 'close_short_at', label: 'close_short_at'},
+      {key: 'closed_at', label: 'closed_at'},
+      {key: 'force_close_at', label: 'force_close_at'},
+      {key: 'close_reason', label: 'close_reason'},
+      {key: 'reason', label: 'reason'},
+      {key: 'details', label: 'Details'},
+    ];
+    const SIGNALS_DEFAULT_ORDER = SIGNALS_COLUMNS.map(c => c.key);
+    let signalsColumnPrefs = {order: SIGNALS_DEFAULT_ORDER.slice(), hidden: []};
+    let signalsColumnPrefsLoaded = false;
+    let signalsColumnSaveTimer = null;
+    let signalsDraggingKey = null;
+
+    function _signalsNormalizePrefs(raw) {
+      const safe = (raw && typeof raw === 'object') ? raw : {};
+      const inOrder = Array.isArray(safe.order) ? safe.order : [];
+      const inHidden = Array.isArray(safe.hidden) ? safe.hidden : [];
+      const allowed = new Set(SIGNALS_DEFAULT_ORDER);
+
+      const order = [];
+      for (const k of inOrder) {
+        const key = String(k || '').trim();
+        if (!allowed.has(key)) continue;
+        if (!order.includes(key)) order.push(key);
+      }
+      for (const k of SIGNALS_DEFAULT_ORDER) {
+        if (!order.includes(k)) order.push(k);
+      }
+
+      const hidden = [];
+      for (const k of inHidden) {
+        const key = String(k || '').trim();
+        if (!allowed.has(key)) continue;
+        if (!hidden.includes(key)) hidden.push(key);
+      }
+      return {order, hidden};
+    }
+
+    function _signalsHiddenSet() {
+      return new Set((signalsColumnPrefs && signalsColumnPrefs.hidden) || []);
+    }
+
+    function _signalsVisibleColspan() {
+      const visible = SIGNALS_DEFAULT_ORDER.length - _signalsHiddenSet().size;
+      return Math.max(1, Math.min(SIGNALS_DEFAULT_ORDER.length, visible));
+    }
+
+    function renderSignalsPlaceholder(message) {
+      const body = document.getElementById('signalsBody');
+      if (!body) return;
+      body.innerHTML = `<tr><td colspan="${_signalsVisibleColspan()}" class="muted">${escapeHtml(message || '暂无数据')}</td></tr>`;
+      applySignalsColumnLayout();
+    }
+
+    async function loadSignalsColumnPrefs() {
+      try {
+        const resp = await fetchJson(`/api/live_trading/table_prefs?table=${encodeURIComponent(SIGNALS_TABLE_PREF_API_TABLE)}`);
+        signalsColumnPrefs = _signalsNormalizePrefs((resp && resp.prefs) || {});
+      } catch (e) {
+        signalsColumnPrefs = {order: SIGNALS_DEFAULT_ORDER.slice(), hidden: []};
+      }
+      signalsColumnPrefsLoaded = true;
+      renderSignalsColumnPrefsPanel();
+      applySignalsColumnLayout();
+    }
+
+    async function saveSignalsColumnPrefs() {
+      if (!signalsColumnPrefsLoaded) return;
+      if (signalsColumnSaveTimer) {
+        clearTimeout(signalsColumnSaveTimer);
+        signalsColumnSaveTimer = null;
+      }
+      const payload = {
+        table: SIGNALS_TABLE_PREF_API_TABLE,
+        prefs: _signalsNormalizePrefs(signalsColumnPrefs),
+      };
+      try {
+        await postJson('/api/live_trading/table_prefs', payload);
+      } catch (e) {
+        console.error('save table prefs failed', e);
+      }
+    }
+
+    function queueSaveSignalsColumnPrefs() {
+      if (signalsColumnSaveTimer) clearTimeout(signalsColumnSaveTimer);
+      signalsColumnSaveTimer = setTimeout(() => {
+        saveSignalsColumnPrefs().catch(err => console.error(err));
+      }, 250);
+    }
+
+    function applySignalsColumnLayout() {
+      const table = document.getElementById('signalsTable');
+      if (!table) return;
+      const headRow = document.getElementById('signalsHeadRow');
+      if (!headRow) return;
+      const body = document.getElementById('signalsBody');
+      const prefs = _signalsNormalizePrefs(signalsColumnPrefs);
+      signalsColumnPrefs = prefs;
+      const keyToIndex = new Map(SIGNALS_DEFAULT_ORDER.map((k, idx) => [k, idx]));
+      const orderIndexes = prefs.order.map(k => keyToIndex.get(k)).filter(v => Number.isInteger(v));
+      const hiddenSet = new Set(prefs.hidden);
+
+      const reorderRow = (row) => {
+        if (!row) return;
+        const cells = Array.from(row.children);
+        if (!cells.length) return;
+        if (cells.length === 1) {
+          const only = cells[0];
+          if (only && only.hasAttribute('colspan')) {
+            only.setAttribute('colspan', String(_signalsVisibleColspan()));
+          }
+          return;
+        }
+        if (cells.length < SIGNALS_DEFAULT_ORDER.length) return;
+        if (!row.dataset.colInit) {
+          for (let i = 0; i < cells.length; i++) {
+            cells[i].dataset.colDefaultIndex = String(i);
+          }
+          row.dataset.colInit = '1';
+        }
+        const byDefaultIndex = new Map();
+        for (const cell of cells) {
+          const di = Number(cell.dataset.colDefaultIndex);
+          if (Number.isInteger(di)) byDefaultIndex.set(di, cell);
+        }
+        for (const idx of orderIndexes) {
+          const cell = byDefaultIndex.get(idx);
+          if (cell) row.appendChild(cell);
+        }
+        const ordered = Array.from(row.children);
+        for (let i = 0; i < SIGNALS_DEFAULT_ORDER.length; i++) {
+          const key = prefs.order[i];
+          const c = ordered[i];
+          if (!c) continue;
+          c.style.display = hiddenSet.has(key) ? 'none' : '';
+        }
+      };
+
+      reorderRow(headRow);
+      if (body) {
+        const rows = Array.from(body.querySelectorAll('tr'));
+        for (const r of rows) reorderRow(r);
+      }
+    }
+
+    function moveSignalsColumn(key, delta) {
+      const order = signalsColumnPrefs.order.slice();
+      const idx = order.indexOf(key);
+      if (idx < 0) return;
+      const next = idx + delta;
+      if (next < 0 || next >= order.length) return;
+      const tmp = order[idx];
+      order[idx] = order[next];
+      order[next] = tmp;
+      signalsColumnPrefs = _signalsNormalizePrefs({order, hidden: signalsColumnPrefs.hidden});
+      renderSignalsColumnPrefsPanel();
+      applySignalsColumnLayout();
+      queueSaveSignalsColumnPrefs();
+    }
+
+    function moveSignalsColumnToBefore(dragKey, targetKey) {
+      const order = signalsColumnPrefs.order.slice();
+      const from = order.indexOf(dragKey);
+      const to = order.indexOf(targetKey);
+      if (from < 0 || to < 0 || from === to) return;
+      order.splice(from, 1);
+      const nextTo = order.indexOf(targetKey);
+      order.splice(nextTo, 0, dragKey);
+      signalsColumnPrefs = _signalsNormalizePrefs({order, hidden: signalsColumnPrefs.hidden});
+      renderSignalsColumnPrefsPanel();
+      applySignalsColumnLayout();
+      queueSaveSignalsColumnPrefs();
+    }
+
+    function toggleSignalsColumnHidden(key, checkedVisible) {
+      const hidden = new Set(signalsColumnPrefs.hidden || []);
+      if (checkedVisible) hidden.delete(key);
+      else hidden.add(key);
+      signalsColumnPrefs = _signalsNormalizePrefs({order: signalsColumnPrefs.order, hidden: Array.from(hidden)});
+      applySignalsColumnLayout();
+      queueSaveSignalsColumnPrefs();
+    }
+
+    function resetSignalsColumnPrefs() {
+      signalsColumnPrefs = {order: SIGNALS_DEFAULT_ORDER.slice(), hidden: []};
+      renderSignalsColumnPrefsPanel();
+      applySignalsColumnLayout();
+      queueSaveSignalsColumnPrefs();
+    }
+
+    function renderSignalsColumnPrefsPanel() {
+      const list = document.getElementById('columnPrefList');
+      if (!list) return;
+      const hidden = _signalsHiddenSet();
+      const labelMap = new Map(SIGNALS_COLUMNS.map(c => [c.key, c.label]));
+      list.innerHTML = signalsColumnPrefs.order.map((key) => {
+        const label = labelMap.get(key) || key;
+        const checked = hidden.has(key) ? '' : 'checked';
+        return `
+          <div class="col-pref-row" draggable="true" data-col-key="${escapeHtml(key)}">
+            <label class="muted" style="display:flex;align-items:center;gap:8px;">
+              <span class="drag-handle" title="拖拽排序">⋮⋮</span>
+              <input type="checkbox" data-col-visible="${escapeHtml(key)}" ${checked} />
+              <span>${escapeHtml(label)}</span>
+            </label>
+            <div class="col-pref-actions">
+              <button class="secondary" type="button" data-col-move-left="${escapeHtml(key)}">←</button>
+              <button class="secondary" type="button" data-col-move-right="${escapeHtml(key)}">→</button>
+            </div>
+          </div>
+        `;
+      }).join('');
+
+      for (const cb of list.querySelectorAll('input[data-col-visible]')) {
+        cb.addEventListener('change', (e) => {
+          const key = e.currentTarget?.getAttribute('data-col-visible') || '';
+          toggleSignalsColumnHidden(key, !!e.currentTarget?.checked);
+        });
+      }
+      for (const btn of list.querySelectorAll('button[data-col-move-left]')) {
+        btn.addEventListener('click', (e) => {
+          const key = e.currentTarget?.getAttribute('data-col-move-left') || '';
+          moveSignalsColumn(key, -1);
+        });
+      }
+      for (const btn of list.querySelectorAll('button[data-col-move-right]')) {
+        btn.addEventListener('click', (e) => {
+          const key = e.currentTarget?.getAttribute('data-col-move-right') || '';
+          moveSignalsColumn(key, 1);
+        });
+      }
+      for (const row of list.querySelectorAll('.col-pref-row[data-col-key]')) {
+        row.addEventListener('dragstart', (e) => {
+          const key = row.getAttribute('data-col-key') || '';
+          if (!key) return;
+          signalsDraggingKey = key;
+          row.classList.add('dragging');
+          try {
+            e.dataTransfer?.setData('text/plain', key);
+            if (e.dataTransfer) e.dataTransfer.effectAllowed = 'move';
+          } catch (_) {}
+        });
+        row.addEventListener('dragover', (e) => {
+          e.preventDefault();
+          if (!signalsDraggingKey) return;
+          const targetKey = row.getAttribute('data-col-key') || '';
+          if (!targetKey || targetKey === signalsDraggingKey) return;
+          row.classList.add('drag-over');
+          if (e.dataTransfer) e.dataTransfer.dropEffect = 'move';
+        });
+        row.addEventListener('dragleave', () => {
+          row.classList.remove('drag-over');
+        });
+        row.addEventListener('drop', (e) => {
+          e.preventDefault();
+          const targetKey = row.getAttribute('data-col-key') || '';
+          row.classList.remove('drag-over');
+          if (!signalsDraggingKey || !targetKey || targetKey === signalsDraggingKey) return;
+          moveSignalsColumnToBefore(signalsDraggingKey, targetKey);
+        });
+        row.addEventListener('dragend', () => {
+          signalsDraggingKey = null;
+          for (const n of list.querySelectorAll('.col-pref-row')) {
+            n.classList.remove('dragging');
+            n.classList.remove('drag-over');
+          }
+        });
+      }
+    }
 
 	    function fmt(v, nd=6) {
 	      if (v === null || v === undefined) return '-';
@@ -416,6 +770,11 @@
 
     function calcCloseExitSpreadPct(s) {
       if (!s) return null;
+      // "close_exit_spread_pct" is meaningful only after close has been requested/triggered.
+      // For open trades we should always show live monitor spread (or last_exit_spread_pct fallback).
+      const st = String(s.status || '').toLowerCase();
+      const hasCloseLifecycle = !!(s.close_requested_at || s.close_long_at || s.close_short_at || s.closed_at);
+      if (!(st === 'closing' || st === 'closed' || hasCloseLifecycle)) return null;
       const entry = Number(s.entry_spread_metric);
       const closePnl = Number(s.close_pnl_spread);
       if (!Number.isFinite(entry) || !Number.isFinite(closePnl)) return null;
@@ -544,8 +903,26 @@
 
 	      const body = document.getElementById('signalsBody');
 	      const signals = signalsResp.signals || [];
+        const signalSymbols = Array.from(new Set(signals.map(s => String(s?.symbol || '').trim().toUpperCase()).filter(v => v)));
+        let liveBboMap = {};
+        let liveBboStale = true;
+        let liveBboStaleReason = '';
+        if (signalSymbols.length) {
+          try {
+            const bboQs = new URLSearchParams();
+            for (const sym of signalSymbols) bboQs.append('symbol', sym);
+            const bboResp = await fetchJson(`/api/live_trading/bbo?${bboQs.toString()}`);
+            liveBboMap = (bboResp && typeof bboResp.bbo === 'object' && bboResp.bbo) ? bboResp.bbo : {};
+            liveBboStale = !!(bboResp && bboResp.is_stale);
+            liveBboStaleReason = String((bboResp && bboResp.stale_reason) || (bboResp && bboResp.monitor8010_error) || '').trim();
+          } catch (e) {
+            liveBboMap = {};
+            liveBboStale = true;
+            liveBboStaleReason = 'fetch_failed';
+          }
+        }
 	      if (!signals.length) {
-	        body.innerHTML = '<tr><td colspan="38" class="muted">暂无数据</td></tr>';
+	        renderSignalsPlaceholder('暂无数据');
 	        await refreshStats(false);
 	        return;
 	      }
@@ -567,7 +944,48 @@
 
 	      body.innerHTML = signals.map(s => {
         const [stText, stCls] = pillForStatus(s.status);
-        const ex = `${s.leg_long_exchange || '-'}(long) / ${s.leg_short_exchange || '-'}(short)`;
+        const symbolU = String(s.symbol || '').trim().toUpperCase();
+        const longEx = String(s.leg_long_exchange || '').trim().toLowerCase();
+        const shortEx = String(s.leg_short_exchange || '').trim().toLowerCase();
+        const bboBySymbol = (symbolU && liveBboMap && typeof liveBboMap === 'object') ? (liveBboMap[symbolU] || {}) : {};
+        const fmtLivePx = (v) => {
+          const n = Number(v);
+          if (!Number.isFinite(n) || n <= 0) return '-';
+          return n.toFixed(8);
+        };
+        const legBidAsk = (ex) => {
+          if (!ex) return {text: '-', title: '缺少交易所'};
+          const leg = (bboBySymbol && typeof bboBySymbol === 'object') ? (bboBySymbol[ex] || null) : null;
+          if (!leg || typeof leg !== 'object') {
+            const miss = liveBboStale ? `盘口缓存不可用: ${liveBboStaleReason || '-'}` : '暂无该腿盘口缓存';
+            return {text: '-', title: miss};
+          }
+          const bid = fmtLivePx(leg.bid_price);
+          const ask = fmtLivePx(leg.ask_price);
+          const src = String(leg.fallback_source || '').trim() || 'monitor8010_snapshot';
+          const ts = String(leg.fallback_ts || '').trim();
+          const srcLabel = src === 'live_trade_latest_bbo' ? 'live_trading_monitor' :
+                           (src === 'orderbook_bbo_pg_recent' ? 'monitor8010_pg_recent' : src);
+          const title = ts ? `盘口来源: ${srcLabel} @ ${ts}` : `盘口来源: ${srcLabel}`;
+          if (bid === '-' && ask === '-') return {text: '-', title};
+          return {text: `${bid}/${ask}`, title};
+        };
+        const longBidAsk = legBidAsk(longEx);
+        const shortBidAsk = legBidAsk(shortEx);
+        const calcLiveExitSpreadFromBbo = (longLeg, shortLeg) => {
+          if (!longLeg || !shortLeg || typeof longLeg !== 'object' || typeof shortLeg !== 'object') return null;
+          const longBid = Number(longLeg.bid_price);
+          const shortAsk = Number(shortLeg.ask_price);
+          if (!Number.isFinite(longBid) || !Number.isFinite(shortAsk) || longBid <= 0 || shortAsk <= 0) return null;
+          return (shortAsk / longBid) - 1.0;
+        };
+        const longLegObj = (bboBySymbol && typeof bboBySymbol === 'object') ? (bboBySymbol[longEx] || null) : null;
+        const shortLegObj = (bboBySymbol && typeof bboBySymbol === 'object') ? (bboBySymbol[shortEx] || null) : null;
+        const liveExitSpreadPct = calcLiveExitSpreadFromBbo(longLegObj, shortLegObj);
+        const ex = `
+          <div>${escapeHtml(s.leg_long_exchange || '-')} (long) <span class="muted hint" title="${escapeHtml(longBidAsk.title)}">bid/ask ${escapeHtml(longBidAsk.text)}</span></div>
+          <div>${escapeHtml(s.leg_short_exchange || '-')} (short) <span class="muted hint" title="${escapeHtml(shortBidAsk.title)}">bid/ask ${escapeHtml(shortBidAsk.text)}</span></div>
+        `;
         const aOpen = fmt(s.open_long_avg_price, 8);
         const aClose = fmt(s.close_long_avg_price, 8);
         const bOpen = fmt(s.open_short_avg_price, 8);
@@ -597,8 +1015,15 @@
 	        const closeDeltaTitle = `close_long_filled=${closeL} close_short_filled=${closeS} delta=${qtyCloseDelta ?? '-'}`;
 	        const feePnl = fmt(s.fee_pnl_usdt, 6);
 	        const closeExitSpreadPct = calcCloseExitSpreadPct(s);
-	        const exitSpreadRaw = closeExitSpreadPct !== null ? closeExitSpreadPct : s.last_exit_spread_pct;
+	        const exitSpreadRaw =
+            closeExitSpreadPct !== null
+              ? closeExitSpreadPct
+              : (liveExitSpreadPct !== null ? liveExitSpreadPct : s.last_exit_spread_pct);
 		        const exitSpreadPctNow = fmtPct(exitSpreadRaw, 4);
+          const exitSpreadSource =
+            closeExitSpreadPct !== null
+              ? 'close_exit_spread_pct'
+              : (liveExitSpreadPct !== null ? 'live_bbo(short_ask/long_bid-1)' : 'last_exit_spread_pct');
 	        const src = s.funding_source || {};
 	        const hasEst = (src.long === 'rate_estimate') || (src.short === 'rate_estimate') || (src.long === 'sqlite_estimate') || (src.short === 'sqlite_estimate');
 	        const fundingPnl = fmt(s.funding_pnl_usdt, 6);
@@ -684,7 +1109,7 @@
             <td>${fmt(s.pnl_hat_ob, 6)}</td>
             <td>${fmt(s.take_profit_pnl, 6)}</td>
             <td>${fmt(s.last_pnl_spread, 6)}</td>
-            <td class="muted" title="${closeExitSpreadPct !== null ? 'close_exit_spread_pct' : 'last_exit_spread_pct'}">${exitSpreadPctNow}</td>
+            <td class="muted" title="${escapeHtml(exitSpreadSource)}">${exitSpreadPctNow}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(createdAtUtc)}">${createdAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(openAtUtc)}">${openAt}</td>
 	            <td class="muted" title="UTC: ${escapeHtml(openLongAtUtc)}">${openLongAt}</td>
@@ -703,6 +1128,7 @@
           </tr>
         `;
 	      }).join('');
+	      applySignalsColumnLayout();
 	      await refreshStats(false);
 	    }
 
@@ -1243,6 +1669,16 @@
     }
 
     document.getElementById('refreshBtn').addEventListener('click', () => refresh().catch(err => console.error(err)));
+    document.getElementById('columnPrefBtn')?.addEventListener('click', (e) => {
+      e.preventDefault();
+      const menu = document.getElementById('columnPrefMenu');
+      if (!menu) return;
+      menu.style.display = (menu.style.display === 'none' || !menu.style.display) ? 'block' : 'none';
+      if (menu.style.display === 'block') renderSignalsColumnPrefsPanel();
+    });
+    document.getElementById('columnPrefResetBtn')?.addEventListener('click', () => {
+      resetSignalsColumnPrefs();
+    });
     function applyDefaultStatusFilter() {
       for (const cb of document.querySelectorAll('.status-cb')) cb.checked = false;
       const defaults = new Set(['open', 'closing', 'closed']);
@@ -1327,14 +1763,23 @@
     document.addEventListener('click', (e) => {
       const wrap = document.getElementById('statusFilterWrap');
       const menu = document.getElementById('statusFilterMenu');
-      if (!wrap || !menu) return;
-      if (menu.style.display !== 'none' && !wrap.contains(e.target)) toggleStatusMenu(false);
+      if (wrap && menu && menu.style.display !== 'none' && !wrap.contains(e.target)) toggleStatusMenu(false);
+      const colWrap = document.getElementById('columnPrefWrap');
+      const colMenu = document.getElementById('columnPrefMenu');
+      if (colWrap && colMenu && colMenu.style.display !== 'none' && !colWrap.contains(e.target)) {
+        colMenu.style.display = 'none';
+      }
     });
 	    updateStatusLabel();
+      renderSignalsColumnPrefsPanel();
 
-	    refresh().catch(err => console.error(err));
-	    refreshStats(true).catch(err => console.error(err));
-	    schedule();
+      async function initPage() {
+        await loadSignalsColumnPrefs();
+	      await refresh().catch(err => console.error(err));
+	      await refreshStats(true).catch(err => console.error(err));
+	      schedule();
+      }
+      initPage().catch(err => console.error(err));
 	  </script>
   </div>
 </body>
