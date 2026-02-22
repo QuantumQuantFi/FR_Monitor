@@ -250,6 +250,12 @@ class LiveTradingManager:
         self._symbol_exchange_backoff: Dict[str, float] = {}
         self._symbol_exchange_backoff_lock = threading.Lock()
         self._symbol_exchange_backoff_seconds = float(os.getenv("LIVE_TRADING_SYMBOL_BACKOFF_SECONDS", "21600"))
+        # Spot dust override cache: when exchange rejects tiny close quantities (e.g. Bitget 40808 size),
+        # treat that residual as effectively flat for a period to avoid infinite close retries.
+        # key: SYMBOL@exchange -> {"max_qty": float, "until_ts": float}
+        self._spot_dust_overrides: Dict[str, Dict[str, float]] = {}
+        self._spot_dust_overrides_lock = threading.Lock()
+        self._spot_dust_override_ttl_seconds = float(os.getenv("LIVE_TRADING_SPOT_DUST_TTL_SECONDS", "86400"))
         # Optional provider from runtime monitor (e.g. ExchangeDataCollector.exchange_symbols):
         # returns {exchange: {"spot":[...], "futures":[...]}}.
         self._exchange_symbols_provider: Optional[Callable[[], Dict[str, Dict[str, List[str]]]]] = None
@@ -324,6 +330,39 @@ class LiveTradingManager:
             return float(schedule[idx])
         except Exception:
             return float(schedule[-1])
+
+    @staticmethod
+    def _spot_dust_override_key(symbol: str, exchange: str) -> str:
+        return f"{str(symbol or '').upper()}@{str(exchange or '').lower()}"
+
+    def _remember_spot_dust_override(self, exchange: str, symbol: str, qty: float) -> None:
+        key = self._spot_dust_override_key(symbol, exchange)
+        if key == "@":
+            return
+        q = abs(float(qty or 0.0))
+        if q <= 0:
+            return
+        ttl_s = max(60.0, float(self._spot_dust_override_ttl_seconds))
+        until_ts = time.time() + ttl_s
+        with self._spot_dust_overrides_lock:
+            rec = self._spot_dust_overrides.get(key)
+            prev_q = float(rec.get("max_qty") or 0.0) if isinstance(rec, dict) else 0.0
+            self._spot_dust_overrides[key] = {"max_qty": max(prev_q, q), "until_ts": float(until_ts)}
+
+    def _get_spot_dust_override_qty(self, exchange: str, symbol: str) -> float:
+        key = self._spot_dust_override_key(symbol, exchange)
+        if key == "@":
+            return 0.0
+        now = time.time()
+        with self._spot_dust_overrides_lock:
+            rec = self._spot_dust_overrides.get(key)
+            if not isinstance(rec, dict):
+                return 0.0
+            until_ts = float(rec.get("until_ts") or 0.0)
+            if until_ts <= 0 or now >= until_ts:
+                self._spot_dust_overrides.pop(key, None)
+                return 0.0
+            return max(0.0, float(rec.get("max_qty") or 0.0))
 
     def _bump_signal_retry(
         self,
@@ -765,6 +804,7 @@ class LiveTradingManager:
                 )
             except Exception as exc:
                 if leg_mkt == "spot" and self._is_spot_min_qty_error(str(exc)):
+                    self._remember_spot_dust_override(ex, symbol_u, qty)
                     self.logger.info(
                         "close_spot_dust_ignored signal_id=%s symbol=%s exchange=%s qty=%s reason=%s",
                         sid,
@@ -1014,6 +1054,22 @@ class LiveTradingManager:
         CREATE INDEX IF NOT EXISTS idx_live_trade_balance_snapshot_ts
           ON watchlist.live_trade_balance_snapshot(ts DESC);
 
+        -- Latest executable bid/ask observed by live-trading monitor loop (open/closing only).
+        -- Keep only one latest row per symbol+exchange+market_type (no history growth).
+        CREATE TABLE IF NOT EXISTS watchlist.live_trade_latest_bbo (
+          symbol text NOT NULL,
+          exchange text NOT NULL,
+          market_type text NOT NULL DEFAULT 'perp',
+          ts timestamptz NOT NULL DEFAULT now(),
+          bid double precision,
+          ask double precision,
+          source text NOT NULL DEFAULT 'live_trading_monitor',
+          meta jsonb,
+          PRIMARY KEY (symbol, exchange, market_type)
+        );
+        CREATE INDEX IF NOT EXISTS idx_live_trade_latest_bbo_ts
+          ON watchlist.live_trade_latest_bbo(ts DESC);
+
         -- Backward-compatible schema upgrades (safe no-op when already present).
         ALTER TABLE watchlist.live_trade_signal
           ADD COLUMN IF NOT EXISTS entry_spread_metric double precision;
@@ -1113,6 +1169,94 @@ class LiveTradingManager:
                 self._apply_runtime_config_migrations(conn)
             except Exception as exc:
                 self.logger.warning("apply runtime config migrations failed: %s", exc)
+
+    def _persist_latest_leg_bbo(
+        self,
+        conn,
+        *,
+        symbol: str,
+        exchange: str,
+        market_type: str,
+        ob: Optional[Dict[str, Any]],
+        stage: str = "monitor_orderbook",
+    ) -> None:
+        if not isinstance(ob, dict):
+            return
+        sym_u = str(symbol or "").upper().strip()
+        ex_l = str(exchange or "").lower().strip()
+        mkt_l = str(market_type or "perp").lower().strip() or "perp"
+        if not sym_u or not ex_l:
+            return
+
+        bid = ob.get("sell")  # executable sell sweep ~= bid side
+        ask = ob.get("buy")   # executable buy sweep ~= ask side
+        try:
+            bid_f = float(bid) if bid is not None else None
+        except Exception:
+            bid_f = None
+        try:
+            ask_f = float(ask) if ask is not None else None
+        except Exception:
+            ask_f = None
+        if bid_f is None and ask_f is None:
+            return
+
+        meta: Dict[str, Any] = {
+            "error": ob.get("error"),
+            "raw_summary": ob.get("raw_summary"),
+            "meta": ob.get("meta"),
+            "stage": str(stage or "monitor_orderbook"),
+        }
+        conn.execute(
+            """
+            INSERT INTO watchlist.live_trade_latest_bbo(symbol, exchange, market_type, ts, bid, ask, source, meta)
+            VALUES (%s, %s, %s, now(), %s, %s, 'live_trading_monitor', %s::jsonb)
+            ON CONFLICT (symbol, exchange, market_type)
+            DO UPDATE
+               SET ts=EXCLUDED.ts,
+                   bid=EXCLUDED.bid,
+                   ask=EXCLUDED.ask,
+                   source=EXCLUDED.source,
+                   meta=EXCLUDED.meta;
+            """,
+            (sym_u, ex_l, mkt_l, bid_f, ask_f, _jsonb(meta)),
+        )
+
+    def _persist_latest_pair_bbo(
+        self,
+        conn,
+        *,
+        symbol: str,
+        long_ex: str,
+        short_ex: str,
+        long_market_type: str,
+        short_market_type: str,
+        ob_long: Optional[Dict[str, Any]],
+        ob_short: Optional[Dict[str, Any]],
+        stage: str = "monitor_orderbook",
+    ) -> None:
+        try:
+            self._persist_latest_leg_bbo(
+                conn,
+                symbol=symbol,
+                exchange=long_ex,
+                market_type=long_market_type,
+                ob=ob_long,
+                stage=stage,
+            )
+        except Exception:
+            pass
+        try:
+            self._persist_latest_leg_bbo(
+                conn,
+                symbol=symbol,
+                exchange=short_ex,
+                market_type=short_market_type,
+                ob=ob_short,
+                stage=stage,
+            )
+        except Exception:
+            pass
 
     def _dt_to_ms(self, value: Any) -> Optional[int]:
         if value is None:
@@ -2601,6 +2745,8 @@ class LiveTradingManager:
             "below binance spot minimum" in msg
             or "minimum order quantity" in msg
             or ("below" in msg and "spot minimum" in msg)
+            or "parameter verification exception size" in msg
+            or "'code': '40808'" in msg
         )
 
     @staticmethod
@@ -2644,6 +2790,10 @@ class LiveTradingManager:
             return None
         mkt = (market_type or "perp").lower().strip()
         size_f = float(size)
+        if mkt == "spot":
+            override_qty = self._get_spot_dust_override_qty(exchange, symbol)
+            if override_qty > 0 and abs(size_f) <= (override_qty + 1e-12):
+                return 0.0
         if mkt == "spot" and self._spot_qty_below_min(exchange, symbol, size_f):
             return 0.0
         return size_f
@@ -2718,6 +2868,8 @@ class LiveTradingManager:
                 ),
             )
         except Exception as exc:
+            if str(market_type or "perp").lower() == "spot" and self._is_spot_min_qty_error(str(exc)):
+                self._remember_spot_dust_override(str(exchange), str(symbol), qty)
             self._record_error(
                 conn,
                 signal_id=signal_id,
@@ -4306,7 +4458,12 @@ class LiveTradingManager:
             "thresholds": {"pnl": float(thr_pnl), "win_prob": float(thr_prob)},
         }
         if not ok:
-            if tp_needed is not None and float(entry_spread_metric) < float(tp_needed):
+            # Keep reason taxonomy aligned with Type B:
+            # 1) no_tradable_direction has highest priority when spread is non-positive;
+            # 2) entry_spread_too_small only applies when TP target is positive.
+            if float(tradable_spread) <= 0:
+                out["reason"] = "no_tradable_direction"
+            elif tp_needed is not None and float(tp_needed) > 0 and float(entry_spread_metric) < float(tp_needed):
                 out["reason"] = "entry_spread_too_small"
                 out["tp_needed"] = float(tp_needed)
             else:
@@ -7526,6 +7683,18 @@ class LiveTradingManager:
             qty_short,
             long_market_type=long_mkt,
             short_market_type=short_mkt,
+        )
+        # Persist latest executable BBO (best-effort) so UI can fall back when monitor8010 is unavailable.
+        self._persist_latest_pair_bbo(
+            conn,
+            symbol=symbol,
+            long_ex=long_ex,
+            short_ex=short_ex,
+            long_market_type=long_mkt,
+            short_market_type=short_mkt,
+            ob_long=ob_long,
+            ob_short=ob_short,
+            stage="monitor_orderbook",
         )
         if ob_long.get("error") or ob_short.get("error"):
             self._record_error(

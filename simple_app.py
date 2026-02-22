@@ -1,5 +1,6 @@
 from flask import Flask, render_template, jsonify, request
 import json
+import copy
 import threading
 import time
 import gc
@@ -134,6 +135,8 @@ WATCHLIST_BOOTSTRAP_MIN_INTERVAL_SEC = 15.0
 
 WATCHLIST_BBO_PG_READY = False
 WATCHLIST_BBO_PG_LOCK = threading.Lock()
+LIVE_UI_PREFS_PG_READY = False
+LIVE_UI_PREFS_PG_LOCK = threading.Lock()
 
 CHART_INTERVAL_OPTIONS = [
     ('1min', '1分钟'),
@@ -2034,6 +2037,51 @@ def _monitor_8010_keepalive_active_symbols(active_entries: List[Dict[str, Any]])
                 pass
 
 
+def _live_trading_open_closing_entries(limit: int = 200) -> List[Dict[str, Any]]:
+    """
+    Best-effort read of live trading active symbols from PG.
+    Returns lightweight entries compatible with monitor8010 keepalive/BBO builders:
+      [{"symbol": "BTC"}, ...]
+    """
+    if psycopg is None:
+        return []
+    dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+    if not dsn:
+        return []
+    out: List[Dict[str, Any]] = []
+    seen: set = set()
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(dsn, **conn_kwargs) as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol
+                  FROM watchlist.live_trade_signal
+                 WHERE status IN ('open','closing')
+                 ORDER BY opened_at DESC NULLS LAST, created_at DESC
+                 LIMIT %s;
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        for r in rows or []:
+            sym = ""
+            if isinstance(r, dict):
+                sym = str(r.get("symbol") or "").strip().upper()
+            elif isinstance(r, (list, tuple)) and r:
+                sym = str(r[0] or "").strip().upper()
+            else:
+                sym = str(getattr(r, "symbol", "") or "").strip().upper()
+            if not sym or sym in seen:
+                continue
+            seen.add(sym)
+            out.append({"symbol": sym})
+    except Exception:
+        return []
+    return out
+
+
 def _monitor_8010_supported_exchanges_for_display() -> List[str]:
     # Keep in sync with UI display ordering when possible.
     try:
@@ -2254,6 +2302,37 @@ def _ensure_watchlist_bbo_table_pg() -> bool:
             with psycopg.connect(dsn, autocommit=True) as conn:
                 conn.execute(ddl)
             WATCHLIST_BBO_PG_READY = True
+            return True
+        except Exception:
+            return False
+
+
+def _ensure_live_ui_prefs_table_pg() -> bool:
+    global LIVE_UI_PREFS_PG_READY
+    if LIVE_UI_PREFS_PG_READY:
+        return True
+    if psycopg is None:
+        return False
+    if not bool(WATCHLIST_PG_CONFIG.get("enabled", False)):
+        return False
+    dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+    if not dsn:
+        return False
+    with LIVE_UI_PREFS_PG_LOCK:
+        if LIVE_UI_PREFS_PG_READY:
+            return True
+        try:
+            ddl = """
+            CREATE SCHEMA IF NOT EXISTS watchlist;
+            CREATE TABLE IF NOT EXISTS watchlist.live_ui_table_prefs (
+              table_name text PRIMARY KEY,
+              pref_json jsonb NOT NULL,
+              updated_at timestamptz NOT NULL DEFAULT NOW()
+            );
+            """
+            with psycopg.connect(dsn, autocommit=True) as conn:
+                conn.execute(ddl)
+            LIVE_UI_PREFS_PG_READY = True
             return True
         except Exception:
             return False
@@ -2553,7 +2632,9 @@ def refresh_watchlist_orderbook_cache():
             prev_snapshot = WATCHLIST_ORDERBOOK_SNAPSHOT.copy()
             snapshot = watchlist_manager.snapshot()
             active_entries = [e for e in snapshot.get('entries', []) if e.get('status') == 'active']
-            if not active_entries:
+            live_active_entries = _live_trading_open_closing_entries(limit=300)
+            bbo_source_entries = active_entries + live_active_entries
+            if not bbo_source_entries:
                 WATCHLIST_ORDERBOOK_SNAPSHOT.update({
                     'orderbook': {},
                     'monitor8010_bbo': {},
@@ -2565,10 +2646,10 @@ def refresh_watchlist_orderbook_cache():
                 })
             else:
                 try:
-                    _monitor_8010_keepalive_active_symbols(active_entries)
+                    _monitor_8010_keepalive_active_symbols(bbo_source_entries)
                 except Exception:
                     pass
-                all_data = data_collector.get_all_data()
+                all_data = data_collector.get_all_data() if active_entries else {}
                 # 订单簿/扫单口径：
                 # - Type A：本地 REST 扫单订单簿（Binance spot/perp）。
                 # - Type B：使用 8010 的 L1 BBO（perp vs perp）。
@@ -2590,7 +2671,7 @@ def refresh_watchlist_orderbook_cache():
                 # For UI/DB: show/persist "as much data as available" per symbol across exchanges.
                 # 8010 /snapshot will only return pairs that are active in its own watchlist, so this stays bounded.
                 monitor8010_error = None
-                bbo_by_exchange = build_monitor_8010_bbo_by_exchange(active_entries) if active_entries else {}
+                bbo_by_exchange = build_monitor_8010_bbo_by_exchange(bbo_source_entries) if bbo_source_entries else {}
                 if bbo_by_exchange is None:
                     # 8010 timeout/unreachable: keep last good snapshot so UI doesn't go blank.
                     monitor8010_error = "monitor8010_snapshot_failed"
@@ -2605,7 +2686,7 @@ def refresh_watchlist_orderbook_cache():
                         _persist_monitor_8010_bbo_by_exchange_to_pg(bbo_by_exchange)
                 except Exception:
                     pass
-                cross_spreads = build_cross_spread_matrix(active_entries, all_data)
+                cross_spreads = build_cross_spread_matrix(active_entries, all_data) if active_entries else {}
                 WATCHLIST_ORDERBOOK_SNAPSHOT.update({
                     'orderbook': orderbook,
                     'monitor8010_bbo': bbo_by_exchange,
@@ -4149,6 +4230,315 @@ def live_trading_overview():
             },
             'signals': signals_out,
             'errors': errors_out,
+        }
+    )
+
+
+@app.route('/api/live_trading/bbo')
+def live_trading_bbo():
+    """
+    Read monitor8010 BBO from in-memory watchlist cache for live trading UI.
+    No direct exchange REST request here.
+    """
+    symbols_raw = request.args.getlist("symbol") or []
+    symbols: List[str] = []
+    for raw in symbols_raw:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            sym = part.strip().upper()
+            if sym and sym not in symbols:
+                symbols.append(sym)
+
+    exchanges_raw = request.args.getlist("exchange") or []
+    exchanges: List[str] = []
+    for raw in exchanges_raw:
+        if raw is None:
+            continue
+        for part in str(raw).split(","):
+            ex = part.strip().lower()
+            if ex and ex not in exchanges:
+                exchanges.append(ex)
+
+    snap = WATCHLIST_ORDERBOOK_SNAPSHOT.copy()
+    bbo_all = snap.get("monitor8010_bbo") or {}
+    if not isinstance(bbo_all, dict):
+        bbo_all = {}
+    else:
+        bbo_all = copy.deepcopy(bbo_all)
+
+    if symbols:
+        bbo_all = {k: v for k, v in bbo_all.items() if str(k or "").upper() in set(symbols)}
+
+    if exchanges:
+        ex_set = set(exchanges)
+        bbo_filtered: Dict[str, Any] = {}
+        for sym, ex_map in bbo_all.items():
+            if not isinstance(ex_map, dict):
+                continue
+            kept = {ex: val for ex, val in ex_map.items() if str(ex or "").lower() in ex_set}
+            if kept:
+                bbo_filtered[str(sym).upper()] = kept
+        bbo_all = bbo_filtered
+
+    source_ts = snap.get("timestamp")
+    stale_reason = snap.get("stale_reason")
+    monitor8010_error = snap.get("monitor8010_error")
+    is_stale = bool(stale_reason) or bool(monitor8010_error)
+
+    # Display-only fallback for live trading UI:
+    # Keep 8010 stale definition unchanged; only backfill missing per-leg BBO from DB cache.
+    # Priority:
+    #   1) monitor8010 snapshot in memory
+    #   2) recent monitor8010 rows in PG
+    #   3) live_trading monitor's latest row in PG (for open/closing positions)
+    fallback_used = False
+    fallback_max_age_seconds = 300.0
+    live_fallback_max_age_seconds = 180.0
+    try:
+        if psycopg is not None and symbols:
+            dsn = str(WATCHLIST_PG_CONFIG.get("dsn") or "").strip()
+            if dsn:
+                sym_list = sorted({str(s or "").upper() for s in symbols if s})
+                ex_list = [str(e or "").lower() for e in exchanges if e] if exchanges else None
+                conn_kwargs: Dict[str, Any] = {"autocommit": True}
+                if dict_row:
+                    conn_kwargs["row_factory"] = dict_row
+                with psycopg.connect(dsn, **conn_kwargs) as conn:
+                    if ex_list:
+                        rows_8010 = conn.execute(
+                            """
+                            SELECT DISTINCT ON (symbol, exchange)
+                                   symbol, exchange, ts, bid, ask
+                              FROM watchlist.orderbook_bbo
+                             WHERE source='monitor8010'
+                               AND symbol = ANY(%s)
+                               AND exchange = ANY(%s)
+                               AND ts >= now() - make_interval(secs => %s)
+                             ORDER BY symbol, exchange, ts DESC;
+                            """,
+                            (sym_list, ex_list, float(fallback_max_age_seconds)),
+                        ).fetchall()
+                        rows_live = conn.execute(
+                            """
+                            SELECT symbol, exchange, ts, bid, ask, source
+                              FROM watchlist.live_trade_latest_bbo
+                             WHERE symbol = ANY(%s)
+                               AND exchange = ANY(%s)
+                               AND ts >= now() - make_interval(secs => %s);
+                            """,
+                            (sym_list, ex_list, float(live_fallback_max_age_seconds)),
+                        ).fetchall()
+                    else:
+                        rows_8010 = conn.execute(
+                            """
+                            SELECT DISTINCT ON (symbol, exchange)
+                                   symbol, exchange, ts, bid, ask
+                              FROM watchlist.orderbook_bbo
+                             WHERE source='monitor8010'
+                               AND symbol = ANY(%s)
+                               AND ts >= now() - make_interval(secs => %s)
+                             ORDER BY symbol, exchange, ts DESC;
+                            """,
+                            (sym_list, float(fallback_max_age_seconds)),
+                        ).fetchall()
+                        rows_live = conn.execute(
+                            """
+                            SELECT symbol, exchange, ts, bid, ask, source
+                              FROM watchlist.live_trade_latest_bbo
+                             WHERE symbol = ANY(%s)
+                               AND ts >= now() - make_interval(secs => %s);
+                            """,
+                            (sym_list, float(live_fallback_max_age_seconds)),
+                        ).fetchall()
+
+                def _apply_fallback_rows(rows: Any, source_name: str) -> None:
+                    nonlocal fallback_used, bbo_all
+                    for r in rows or []:
+                        sym_u = str((r.get("symbol") if isinstance(r, dict) else None) or "").upper()
+                        ex_l = str((r.get("exchange") if isinstance(r, dict) else None) or "").lower()
+                        if not sym_u or not ex_l:
+                            continue
+                        bid = r.get("bid") if isinstance(r, dict) else None
+                        ask = r.get("ask") if isinstance(r, dict) else None
+                        ts_val = r.get("ts") if isinstance(r, dict) else None
+                        if bid is None and ask is None:
+                            continue
+                        cur_ex_map = bbo_all.get(sym_u)
+                        if not isinstance(cur_ex_map, dict):
+                            cur_ex_map = {}
+                        existing = cur_ex_map.get(ex_l)
+                        has_existing = (
+                            isinstance(existing, dict)
+                            and (
+                                existing.get("bid_price") is not None
+                                or existing.get("ask_price") is not None
+                            )
+                        )
+                        if has_existing:
+                            continue
+                        cur_ex_map[ex_l] = {
+                            "bid_price": float(bid) if bid is not None else None,
+                            "ask_price": float(ask) if ask is not None else None,
+                            "fallback_source": str(source_name),
+                            "fallback_ts": ts_val.astimezone(timezone.utc).isoformat()
+                            if isinstance(ts_val, datetime)
+                            else None,
+                        }
+                        bbo_all[sym_u] = cur_ex_map
+                        fallback_used = True
+
+                # Backfill only missing leg BBO; never override snapshot values.
+                _apply_fallback_rows(rows_8010, "orderbook_bbo_pg_recent")
+                _apply_fallback_rows(rows_live, "live_trade_latest_bbo")
+    except Exception:
+        # Best-effort display fallback; do not break API output.
+        pass
+
+    # Age-based staleness guard: if snapshot is too old, treat as stale.
+    max_age_seconds = max(30.0, float((WATCHLIST_CONFIG or {}).get("orderbook_refresh_seconds") or 10.0) * 3.0)
+    try:
+        if source_ts:
+            ts_dt = datetime.fromisoformat(str(source_ts).replace("Z", "+00:00"))
+            if ts_dt.tzinfo is None:
+                ts_dt = ts_dt.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - ts_dt.astimezone(timezone.utc)).total_seconds()
+            if age > max_age_seconds:
+                is_stale = True
+                if not stale_reason:
+                    stale_reason = "snapshot_too_old"
+    except Exception:
+        # keep best-effort output
+        pass
+
+    return jsonify(
+        {
+            "timestamp": now_utc_iso(),
+            "source_timestamp": source_ts,
+            "stale_reason": stale_reason,
+            "monitor8010_error": monitor8010_error,
+            "is_stale": bool(is_stale),
+            "max_age_seconds": max_age_seconds,
+            "fallback_used": bool(fallback_used),
+            "fallback_max_age_seconds": fallback_max_age_seconds,
+            "live_fallback_max_age_seconds": live_fallback_max_age_seconds,
+            "bbo": bbo_all,
+        }
+    )
+
+
+def _normalize_live_table_pref_name(raw_name: Any) -> Optional[str]:
+    name = str(raw_name or "").strip().lower()
+    if not name:
+        return None
+    alias = {
+        "signals": "live_trading_signals",
+        "live_trading_signals": "live_trading_signals",
+    }
+    return alias.get(name)
+
+
+def _sanitize_live_table_pref_payload(payload: Any) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"order": [], "hidden": []}
+    raw_order = payload.get("order")
+    raw_hidden = payload.get("hidden")
+    order: List[str] = []
+    hidden: List[str] = []
+    if isinstance(raw_order, list):
+        for v in raw_order:
+            s = str(v or "").strip()
+            if s and s not in order and len(s) <= 64:
+                order.append(s)
+    if isinstance(raw_hidden, list):
+        for v in raw_hidden:
+            s = str(v or "").strip()
+            if s and s not in hidden and len(s) <= 64:
+                hidden.append(s)
+    return {"order": order, "hidden": hidden}
+
+
+@app.route('/api/live_trading/table_prefs')
+def live_trading_table_prefs_get():
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _ensure_live_ui_prefs_table_pg():
+        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
+
+    table_name = _normalize_live_table_pref_name(request.args.get("table"))
+    if not table_name:
+        return jsonify({'error': 'invalid table', 'timestamp': now_utc_iso()}), 400
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        if dict_row:
+            conn_kwargs["row_factory"] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            row = conn.execute(
+                """
+                SELECT table_name, pref_json, updated_at
+                  FROM watchlist.live_ui_table_prefs
+                 WHERE table_name=%s
+                 LIMIT 1;
+                """,
+                (table_name,),
+            ).fetchone()
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    pref = {"order": [], "hidden": []}
+    updated_at = None
+    if row:
+        raw_pref = row.get("pref_json") if isinstance(row, dict) else None
+        pref = _sanitize_live_table_pref_payload(raw_pref)
+        updated_raw = row.get("updated_at") if isinstance(row, dict) else None
+        if isinstance(updated_raw, datetime):
+            updated_at = updated_raw.astimezone(timezone.utc).isoformat()
+
+    return jsonify(
+        {
+            "timestamp": now_utc_iso(),
+            "table": table_name,
+            "prefs": pref,
+            "updated_at": updated_at,
+        }
+    )
+
+
+@app.route('/api/live_trading/table_prefs', methods=['POST'])
+def live_trading_table_prefs_set():
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _ensure_live_ui_prefs_table_pg():
+        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
+
+    payload = request.get_json(silent=True) or {}
+    table_name = _normalize_live_table_pref_name(payload.get("table") or request.args.get("table"))
+    if not table_name:
+        return jsonify({'error': 'invalid table', 'timestamp': now_utc_iso()}), 400
+    prefs = _sanitize_live_table_pref_payload(payload.get("prefs"))
+
+    try:
+        conn_kwargs: Dict[str, Any] = {"autocommit": True}
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            conn.execute(
+                """
+                INSERT INTO watchlist.live_ui_table_prefs (table_name, pref_json, updated_at)
+                VALUES (%s, %s::jsonb, NOW())
+                ON CONFLICT (table_name)
+                DO UPDATE SET pref_json=EXCLUDED.pref_json, updated_at=NOW();
+                """,
+                (table_name, json.dumps(prefs)),
+            )
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    return jsonify(
+        {
+            "ok": True,
+            "timestamp": now_utc_iso(),
+            "table": table_name,
+            "prefs": prefs,
         }
     )
 
