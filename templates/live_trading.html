@@ -1064,7 +1064,7 @@ function renderGateStatus(statusData) {
 
 	      const body = document.getElementById('signalsBody');
 	      const signals = signalsResp.signals || [];
-        const signalSymbols = Array.from(new Set(signals.map(s => String(s?.symbol || '').trim().toUpperCase()).filter(v => v)));
+        const signalSymbols = Array.from(new Set(signals.map(s => String(s?.symbol || '').trim().toUpperCase()).filter(v => v))).slice(0, 60);
         let liveBboMap = {};
         let liveBboStale = true;
         let liveBboStaleReason = '';
@@ -1072,7 +1072,7 @@ function renderGateStatus(statusData) {
           try {
             const bboQs = new URLSearchParams();
             for (const sym of signalSymbols) bboQs.append('symbol', sym);
-            const bboResp = await fetchJson(`/api/live_trading/bbo?${bboQs.toString()}`, {timeoutMs: 20000, retries: 1});
+            const bboResp = await fetchJson(`/api/live_trading/bbo?${bboQs.toString()}`, {timeoutMs: 6000, retries: 0});
             liveBboMap = (bboResp && typeof bboResp.bbo === 'object' && bboResp.bbo) ? bboResp.bbo : {};
             liveBboStale = !!(bboResp && bboResp.is_stale);
             liveBboStaleReason = String((bboResp && bboResp.stale_reason) || (bboResp && bboResp.monitor8010_error) || '').trim();
@@ -1084,7 +1084,7 @@ function renderGateStatus(statusData) {
         }
 	      if (!signals.length) {
 	        renderSignalsPlaceholder('暂无数据');
-	        await refreshStats(false);
+	        refreshStats(false).catch(err => console.error(err));
 	        return;
 	      }
 
@@ -1290,7 +1290,7 @@ function renderGateStatus(statusData) {
         `;
 	      }).join('');
 	      applySignalsColumnLayout();
-	      await refreshStats(false);
+	      refreshStats(false).catch(err => console.error(err));
 	    }
 
 	    let balanceChart = null;
@@ -1939,7 +1939,7 @@ function renderGateStatus(statusData) {
         // 非关键接口：不要阻塞首屏信号加载
         loadSignalsColumnPrefs().catch(err => console.error('loadSignalsColumnPrefs failed', err));
 	      await refresh().catch(showRefreshError);
-	      await refreshStats(true).catch(err => console.error(err));
+	      refreshStats(true).catch(err => console.error(err));
 	      schedule();
       }
       initPage().catch(showRefreshError);
