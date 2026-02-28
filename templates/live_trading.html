@@ -1022,11 +1022,11 @@ function renderGateStatus(statusData) {
 }
 
     async function refresh() {
-      const overviewPromise = fetchJson('/api/live_trading/overview?limit=80', {timeoutMs: 45000, retries: 1});
-      const gatePromise = fetchJson('/api/live_trading/gate_status?hours=24&limit=80&include_pending=1', {timeoutMs: 45000, retries: 1})
-        .catch(() => null);
-      const [overview, gateStatus] = await Promise.all([overviewPromise, gatePromise]);
-      renderGateStatus(gateStatus);
+      const overview = await fetchJson('/api/live_trading/overview?limit=80', {timeoutMs: 45000, retries: 1});
+      // gate 状态异步拉取，避免 gate 查询慢导致主页面一直转圈。
+      fetchJson('/api/live_trading/gate_status?hours=24&limit=80&include_pending=1', {timeoutMs: 8000, retries: 0})
+        .then((gateStatus) => renderGateStatus(gateStatus))
+        .catch(() => renderGateStatus(null));
       const limit = Math.max(10, Math.min(2000, Number(document.getElementById('signalsLimit').value || 500)));
       const symbol = (document.getElementById('filterSymbol').value || '').trim();
       const statuses = Array.from(document.querySelectorAll('.status-cb:checked')).map(cb => (cb.value || '').trim()).filter(v => v);

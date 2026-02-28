@@ -1116,6 +1116,9 @@ data_collector = ExchangeDataCollector()
 # 数据库实例
 db = PriceDatabase()
 
+GATE_STATUS_CACHE = {}
+GATE_STATUS_CACHE_TTL_SECONDS = 30.0
+
 # 价差套利监控器
 arbitrage_monitor = ArbitrageMonitor(
     spread_threshold=0.6,
@@ -4273,6 +4276,17 @@ def live_trading_gate_status():
     limit = max(1, min(limit, 500))
 
     include_pending = str(request.args.get('include_pending', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    bypass_cache = str(request.args.get('refresh', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'on')
+    cache_key = (hours, limit, include_pending)
+    if not bypass_cache:
+        try:
+            entry = GATE_STATUS_CACHE.get(cache_key)
+            if entry and (time.time() - float(entry.get('ts') or 0)) <= GATE_STATUS_CACHE_TTL_SECONDS:
+                cached = entry.get('data')
+                if isinstance(cached, dict):
+                    return jsonify(cached)
+        except Exception:
+            pass
 
     gate_enabled = bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False))
     gate_mode = str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only') or 'reason_only').strip().lower()
@@ -4366,12 +4380,7 @@ def live_trading_gate_status():
                         LEFT JOIN watchlist.live_trade_signal s ON s.event_id = e.id
                        WHERE s.event_id IS NULL
                          AND e.signal_type IN ('B','C')
-                         AND COALESCE(
-                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                               e.start_ts
-                             ) >= now() - make_interval(hours => %s)
+                         AND e.start_ts >= now() - make_interval(hours => %s)
                     )
                     SELECT ob_reason, count(*) AS n
                       FROM c
@@ -4388,12 +4397,7 @@ def live_trading_gate_status():
                 pending_recent_rows = conn.execute(
                     """
                     SELECT e.id,
-                           COALESCE(
-                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                             e.start_ts
-                           ) AS decision_ts,
+                           e.start_ts AS decision_ts,
                            e.symbol,
                            e.signal_type,
                            lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason,
@@ -4446,12 +4450,7 @@ def live_trading_gate_status():
                              ) AS decision_ts
                         FROM watchlist.watch_signal_event e
                        WHERE e.signal_type IN ('B','C')
-                         AND COALESCE(
-                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                               e.start_ts
-                             ) >= now() - make_interval(hours => %s)
+                         AND e.start_ts >= now() - make_interval(hours => %s)
                     ),
                     live_window AS (
                       SELECT s.event_id, s.reason, s.opened_at, s.created_at
@@ -4502,20 +4501,10 @@ def live_trading_gate_status():
             rows_24h = conn.execute(
                 """
                 WITH raw AS (
-                  SELECT COALESCE(
-                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                           e.start_ts
-                         ) AS ts
+                  SELECT e.start_ts AS ts
                     FROM watchlist.watch_signal_event e
                    WHERE e.signal_type IN ('B','C')
-                     AND COALESCE(
-                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                           e.start_ts
-                         ) >= now() - interval '24 hours'
+                     AND e.start_ts >= now() - interval '24 hours'
                 ),
                 raw_h AS (
                   SELECT date_trunc('hour', ts) AS bucket, count(*) AS n
@@ -4570,27 +4559,12 @@ def live_trading_gate_status():
                 """
                 WITH raw AS (
                   SELECT (
-                           date_trunc('hour', COALESCE(
-                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                             e.start_ts
-                           ))
-                           + floor(extract(minute from COALESCE(
-                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                             e.start_ts
-                           )) / 5)::int * interval '5 minute'
+                           date_trunc('hour', e.start_ts)
+                           + floor(extract(minute from e.start_ts) / 5)::int * interval '5 minute'
                          ) AS bucket
                     FROM watchlist.watch_signal_event e
                    WHERE e.signal_type IN ('B','C')
-                     AND COALESCE(
-                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                           e.start_ts
-                         ) >= now() - interval '1 hour'
+                     AND e.start_ts >= now() - interval '1 hour'
                 ),
                 raw_b AS (
                   SELECT bucket, count(*) AS n FROM raw GROUP BY 1
@@ -4644,8 +4618,7 @@ def live_trading_gate_status():
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
-    return jsonify(
-        {
+    response_payload = {
             'timestamp': now_utc_iso(),
             'window_hours': hours,
             'gate_config': {
@@ -4670,7 +4643,12 @@ def live_trading_gate_status():
                 'series_1h_5m': flow_1h_5m,
             },
         }
-    )
+    try:
+        GATE_STATUS_CACHE[cache_key] = {'ts': time.time(), 'data': response_payload}
+    except Exception:
+        pass
+
+    return jsonify(response_payload)
 
 
 @app.route('/api/live_trading/bbo')
