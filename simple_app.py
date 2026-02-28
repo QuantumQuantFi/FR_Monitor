@@ -4233,6 +4233,10 @@ def live_trading_overview():
                 'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
                 'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
                 'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
+                'watchlist_orderbook_gate_enabled': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False)),
+                'watchlist_orderbook_gate_mode': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only') or 'reason_only'),
+                'watchlist_orderbook_gate_block_reasons': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_block_reasons') or ''),
+                'watchlist_orderbook_gate_record_skipped': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_record_skipped', True)),
                 'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
                 'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
                 'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
@@ -4242,6 +4246,209 @@ def live_trading_overview():
             },
             'signals': signals_out,
             'errors': errors_out,
+        }
+    )
+
+
+
+@app.route('/api/live_trading/gate_status')
+def live_trading_gate_status():
+    """
+    Gate status for watchlist->live orderbook filter.
+    Shows recent blocked signals and reason distribution.
+    """
+    if psycopg is None:
+        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+
+    try:
+        hours = int(request.args.get('hours', 24) or 24)
+    except Exception:
+        hours = 24
+    hours = max(1, min(hours, 24 * 14))
+
+    try:
+        limit = int(request.args.get('limit', 100) or 100)
+    except Exception:
+        limit = 100
+    limit = max(1, min(limit, 500))
+
+    include_pending = str(request.args.get('include_pending', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+
+    gate_enabled = bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False))
+    gate_mode = str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only') or 'reason_only').strip().lower()
+    gate_record_skipped = bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_record_skipped', True))
+    gate_block_reasons = [
+        x.strip().lower()
+        for x in str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_block_reasons') or '').split(',')
+        if x.strip()
+    ]
+
+    blocked_counts: List[Dict[str, Any]] = []
+    blocked_recent: List[Dict[str, Any]] = []
+    blocked_total = 0
+    pending_counts: List[Dict[str, Any]] = []
+    pending_recent: List[Dict[str, Any]] = []
+
+    try:
+        conn_kwargs: Dict[str, Any] = {'autocommit': True}
+        if dict_row:
+            conn_kwargs['row_factory'] = dict_row
+        with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+            row_total = conn.execute(
+                """
+                SELECT count(*) AS n
+                  FROM watchlist.live_trade_signal
+                 WHERE created_at >= now() - make_interval(hours => %s)
+                   AND reason LIKE 'watchlist_orderbook_gate_%%';
+                """,
+                (hours,),
+            ).fetchone()
+            if isinstance(row_total, dict):
+                blocked_total = int(row_total.get('n') or 0)
+
+            blocked_counts_rows = conn.execute(
+                """
+                SELECT reason, count(*) AS n
+                  FROM watchlist.live_trade_signal
+                 WHERE created_at >= now() - make_interval(hours => %s)
+                   AND reason LIKE 'watchlist_orderbook_gate_%%'
+                 GROUP BY reason
+                 ORDER BY n DESC, reason ASC;
+                """,
+                (hours,),
+            ).fetchall()
+            for r in blocked_counts_rows or []:
+                if isinstance(r, dict):
+                    blocked_counts.append({'reason': r.get('reason'), 'count': int(r.get('n') or 0)})
+
+            blocked_recent_rows = conn.execute(
+                """
+                SELECT id, event_id, created_at, symbol, signal_type, status, reason,
+                       leg_long_exchange, leg_short_exchange, payload
+                  FROM watchlist.live_trade_signal
+                 WHERE created_at >= now() - make_interval(hours => %s)
+                   AND reason LIKE 'watchlist_orderbook_gate_%%'
+                 ORDER BY created_at DESC
+                 LIMIT %s;
+                """,
+                (hours, limit),
+            ).fetchall()
+            for r in blocked_recent_rows or []:
+                if not isinstance(r, dict):
+                    continue
+                payload = r.get('payload') if isinstance(r.get('payload'), dict) else {}
+                gate_payload = payload.get('watchlist_orderbook_gate') if isinstance(payload, dict) else None
+                blocked_recent.append(
+                    {
+                        'id': r.get('id'),
+                        'event_id': r.get('event_id'),
+                        'created_at': r.get('created_at').astimezone(timezone.utc).isoformat() if isinstance(r.get('created_at'), datetime) else r.get('created_at'),
+                        'symbol': r.get('symbol'),
+                        'signal_type': r.get('signal_type'),
+                        'status': r.get('status'),
+                        'reason': r.get('reason'),
+                        'leg_long_exchange': r.get('leg_long_exchange'),
+                        'leg_short_exchange': r.get('leg_short_exchange'),
+                        'gate': gate_payload,
+                    }
+                )
+
+            if include_pending and gate_block_reasons:
+                pending_counts_rows = conn.execute(
+                    """
+                    WITH c AS (
+                      SELECT lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason
+                        FROM watchlist.watch_signal_event e
+                        LEFT JOIN watchlist.live_trade_signal s ON s.event_id = e.id
+                       WHERE s.event_id IS NULL
+                         AND e.signal_type IN ('B','C')
+                         AND COALESCE(
+                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                               e.start_ts
+                             ) >= now() - make_interval(hours => %s)
+                    )
+                    SELECT ob_reason, count(*) AS n
+                      FROM c
+                     WHERE ob_reason = ANY(%s)
+                     GROUP BY ob_reason
+                     ORDER BY n DESC, ob_reason ASC;
+                    """,
+                    (hours, gate_block_reasons),
+                ).fetchall()
+                for r in pending_counts_rows or []:
+                    if isinstance(r, dict):
+                        pending_counts.append({'reason': r.get('ob_reason'), 'count': int(r.get('n') or 0)})
+
+                pending_recent_rows = conn.execute(
+                    """
+                    SELECT e.id,
+                           COALESCE(
+                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                             e.start_ts
+                           ) AS decision_ts,
+                           e.symbol,
+                           e.signal_type,
+                           lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason,
+                           (e.features_agg #>> '{meta_last,orderbook_validation,ok}')::boolean AS ob_ok,
+                           (e.features_agg #> '{meta_last,orderbook_validation,chosen}') AS ob_chosen
+                      FROM watchlist.watch_signal_event e
+                      LEFT JOIN watchlist.live_trade_signal s ON s.event_id = e.id
+                     WHERE s.event_id IS NULL
+                       AND e.signal_type IN ('B','C')
+                       AND COALESCE(
+                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                             e.start_ts
+                           ) >= now() - make_interval(hours => %s)
+                       AND lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) = ANY(%s)
+                     ORDER BY decision_ts DESC
+                     LIMIT %s;
+                    """,
+                    (hours, gate_block_reasons, limit),
+                ).fetchall()
+                for r in pending_recent_rows or []:
+                    if not isinstance(r, dict):
+                        continue
+                    pending_recent.append(
+                        {
+                            'event_id': r.get('id'),
+                            'decision_ts': r.get('decision_ts').astimezone(timezone.utc).isoformat() if isinstance(r.get('decision_ts'), datetime) else r.get('decision_ts'),
+                            'symbol': r.get('symbol'),
+                            'signal_type': r.get('signal_type'),
+                            'ob_reason': r.get('ob_reason'),
+                            'ob_ok': r.get('ob_ok'),
+                            'ob_chosen': r.get('ob_chosen'),
+                        }
+                    )
+
+    except Exception as exc:
+        return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
+
+    return jsonify(
+        {
+            'timestamp': now_utc_iso(),
+            'window_hours': hours,
+            'gate_config': {
+                'enabled': gate_enabled,
+                'mode': gate_mode,
+                'block_reasons': gate_block_reasons,
+                'record_skipped': gate_record_skipped,
+            },
+            'blocked_signal_summary': {
+                'total': blocked_total,
+                'by_reason': blocked_counts,
+            },
+            'blocked_signal_recent': blocked_recent,
+            'pending_watchlist_blocked_summary': {
+                'include_pending': include_pending,
+                'by_reason': pending_counts,
+            },
+            'pending_watchlist_blocked_recent': pending_recent,
         }
     )
 
