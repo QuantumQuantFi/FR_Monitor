@@ -4275,7 +4275,7 @@ def live_trading_gate_status():
         limit = 100
     limit = max(1, min(limit, 500))
 
-    include_pending = str(request.args.get('include_pending', '1') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
+    include_pending = str(request.args.get('include_pending', '0') or '1').strip().lower() not in ('0', 'false', 'no', 'off')
     bypass_cache = str(request.args.get('refresh', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'on')
     cache_key = (hours, limit, include_pending)
     if not bypass_cache:
