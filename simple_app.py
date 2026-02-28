@@ -1221,6 +1221,18 @@ live_trading_manager = LiveTradingManager(
         candidate_limit=int(LIVE_TRADING_CONFIG.get('candidate_limit', 50)),
         per_symbol_top_k=int(LIVE_TRADING_CONFIG.get('per_symbol_top_k', 3)),
         max_symbols_per_scan=int(LIVE_TRADING_CONFIG.get('max_symbols_per_scan', 8)),
+        watchlist_orderbook_gate_enabled=bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False)),
+        watchlist_orderbook_gate_mode=str(
+            LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only')
+        ).strip().lower(),
+        watchlist_orderbook_gate_block_reasons=tuple(
+            x.strip().lower()
+            for x in str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_block_reasons') or '').split(',')
+            if x.strip()
+        ) or ('no_tradable_direction', 'orderbook_unavailable'),
+        watchlist_orderbook_gate_record_skipped=bool(
+            LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_record_skipped', True)
+        ),
         kick_driven=bool(LIVE_TRADING_CONFIG.get('kick_driven', True)),
     )
 )

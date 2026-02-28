@@ -582,6 +582,26 @@ LIVE_TRADING_CONFIG = {
     'watchlist_event_topk_exchanges': int(
         float(_get_private('LIVE_TRADING_WATCHLIST_EVENT_TOPK_EXCH', 'LIVE_TRADING_WATCHLIST_EVENT_TOPK_EXCH', '5'))
     ),
+    # watchlist->live 订单簿门槛（可开关）：用于在 live 阶段尽早拦截“明显不可交易”的事件，降低无效复核压力。
+    # - reason_only（推荐）：仅拦截 ob_reason 命中的事件（默认 no_tradable_direction,orderbook_unavailable）
+    # - reason_and_tradable：在 reason_only 基础上，若 event 携带 chosen 但 tradable_spread<=0 也拦截
+    # - strict_ok：仅允许 orderbook_validation.ok == true
+    'watchlist_orderbook_gate_enabled': _is_truthy(
+        _get_private('LIVE_TRADING_WL_OB_GATE_ENABLED', 'LIVE_TRADING_WL_OB_GATE_ENABLED', '1')
+    ),
+    'watchlist_orderbook_gate_mode': str(
+        _get_private('LIVE_TRADING_WL_OB_GATE_MODE', 'LIVE_TRADING_WL_OB_GATE_MODE', 'reason_only')
+    ).strip().lower(),
+    'watchlist_orderbook_gate_block_reasons': _get_private(
+        'LIVE_TRADING_WL_OB_GATE_BLOCK_REASONS',
+        'LIVE_TRADING_WL_OB_GATE_BLOCK_REASONS',
+        'no_tradable_direction,orderbook_unavailable',
+    ),
+    # 是否把被门槛拦截的事件写入 live_trade_signal(status=skipped)。
+    # 开启后可在前端看到被拦截明细；关闭则只在 watchlist_event 保留，不进入 live_trade_signal。
+    'watchlist_orderbook_gate_record_skipped': _is_truthy(
+        _get_private('LIVE_TRADING_WL_OB_GATE_RECORD_SKIPPED', 'LIVE_TRADING_WL_OB_GATE_RECORD_SKIPPED', '1')
+    ),
 }
 
 # 内存优化配置

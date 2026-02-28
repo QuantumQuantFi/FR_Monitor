@@ -155,6 +155,16 @@ class LiveTradingConfig:
     # 每次扫描最多评估多少个币种（每个币种至少会请求两家交易所各一次订单簿：2 次 REST）。
     # 该上限用于控制 Binance/OKX 等深度接口压力，避免 418 ban。
     max_symbols_per_scan: int = 8
+    # Optional gate at watchlist->live boundary using event.orderbook_validation.
+    # - reason_only: block when ob_reason in block_reasons
+    # - reason_and_tradable: reason_only + require chosen.tradable_spread > 0 when chosen exists
+    # - strict_ok: require orderbook_validation.ok == true
+    watchlist_orderbook_gate_enabled: bool = False
+    watchlist_orderbook_gate_mode: str = "reason_only"
+    watchlist_orderbook_gate_block_reasons: Tuple[str, ...] = ("no_tradable_direction", "orderbook_unavailable")
+    # If False, blocked events are silently dropped from live pipeline (still kept in watchlist.watch_signal_event).
+    # If True, blocked events are persisted to live_trade_signal as status=skipped for observability.
+    watchlist_orderbook_gate_record_skipped: bool = True
     monitor_interval_seconds: float = 60.0
     take_profit_ratio: float = 0.7
     orderbook_confirm_samples: int = 3
@@ -3937,6 +3947,84 @@ class LiveTradingManager:
             return str(high), str(low)
         return None
 
+    def _watchlist_orderbook_gate_check(self, event: Dict[str, Any]) -> Tuple[bool, Optional[str], Dict[str, Any]]:
+        """
+        Optional gate at watchlist->live boundary based on event.orderbook_validation.
+        Returns (allow, reason_if_blocked, debug_payload).
+        """
+        mode = str(getattr(self.config, "watchlist_orderbook_gate_mode", "reason_only") or "reason_only").strip().lower()
+        enabled = bool(getattr(self.config, "watchlist_orderbook_gate_enabled", False)) and mode not in {"", "off", "disabled", "false", "none"}
+        block_reasons = {
+            str(x).strip().lower()
+            for x in (getattr(self.config, "watchlist_orderbook_gate_block_reasons", ()) or ())
+            if str(x).strip()
+        }
+        payload: Dict[str, Any] = {
+            "enabled": bool(enabled),
+            "mode": mode,
+            "block_reasons": sorted(block_reasons),
+        }
+        if not enabled:
+            return True, None, payload
+
+        obv = event.get("orderbook_validation")
+        payload["orderbook_validation_present"] = isinstance(obv, dict)
+        if not isinstance(obv, dict):
+            # Keep backward compatibility for legacy events lacking obv payload.
+            if mode == "strict_ok":
+                payload["decision"] = "blocked"
+                payload["reason"] = "watchlist_orderbook_gate_missing_obv"
+                return False, "watchlist_orderbook_gate_missing_obv", payload
+            payload["decision"] = "allow"
+            payload["reason"] = "missing_obv_allowed"
+            return True, None, payload
+
+        reason = str(obv.get("reason") or "").strip().lower()
+        ok_flag = obv.get("ok") is True
+        chosen = obv.get("chosen") if isinstance(obv.get("chosen"), dict) else {}
+        chosen_long = str(chosen.get("long_exchange") or "").strip().lower()
+        chosen_short = str(chosen.get("short_exchange") or "").strip().lower()
+        try:
+            tradable_spread = float(chosen.get("tradable_spread")) if chosen.get("tradable_spread") is not None else None
+        except Exception:
+            tradable_spread = None
+
+        payload.update(
+            {
+                "ob_ok": bool(ok_flag),
+                "ob_reason": reason or None,
+                "chosen": {
+                    "long_exchange": chosen_long or None,
+                    "short_exchange": chosen_short or None,
+                    "tradable_spread": tradable_spread,
+                },
+            }
+        )
+
+        if mode == "strict_ok":
+            if ok_flag:
+                payload["decision"] = "allow"
+                return True, None, payload
+            payload["decision"] = "blocked"
+            payload["reason"] = "watchlist_orderbook_gate_strict_not_ok"
+            return False, "watchlist_orderbook_gate_strict_not_ok", payload
+
+        if reason and reason in block_reasons:
+            block_reason = f"watchlist_orderbook_gate_{reason}"
+            payload["decision"] = "blocked"
+            payload["reason"] = block_reason
+            return False, block_reason, payload
+
+        if mode == "reason_and_tradable":
+            has_direction = bool(chosen_long and chosen_short)
+            if has_direction and tradable_spread is not None and tradable_spread <= 0:
+                payload["decision"] = "blocked"
+                payload["reason"] = "watchlist_orderbook_gate_non_positive_tradable_spread"
+                return False, "watchlist_orderbook_gate_non_positive_tradable_spread", payload
+
+        payload["decision"] = "allow"
+        return True, None, payload
+
     def _chosen_reval_from_event(self, event: Dict[str, Any], pred_choice: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         obv = event.get("orderbook_validation")
         if not isinstance(obv, dict):
@@ -5440,6 +5528,38 @@ class LiveTradingManager:
                             "event_id": event_id,
                         },
                     )
+                    continue
+
+                gate_ok, gate_reason, gate_payload = self._watchlist_orderbook_gate_check(event)
+                if not gate_ok:
+                    chosen = {}
+                    try:
+                        chosen = (event.get("orderbook_validation") or {}).get("chosen") or {}
+                        if not isinstance(chosen, dict):
+                            chosen = {}
+                    except Exception:
+                        chosen = {}
+                    leg_long = str(chosen.get("long_exchange") or "")
+                    leg_short = str(chosen.get("short_exchange") or "")
+                    if bool(getattr(self.config, "watchlist_orderbook_gate_record_skipped", True)):
+                        self._insert_skipped_event(
+                            conn,
+                            event=event,
+                            leg_long_exchange=leg_long,
+                            leg_short_exchange=leg_short,
+                            reason=str(gate_reason or "watchlist_orderbook_gate_blocked"),
+                            payload={
+                                "decision": "skipped",
+                                "reason": str(gate_reason or "watchlist_orderbook_gate_blocked"),
+                                "symbol": symbol,
+                                "event_id": event_id,
+                                "pred_choice": pred_choice,
+                                "orderbook_validation": event.get("orderbook_validation"),
+                                "watchlist_orderbook_gate": gate_payload,
+                            },
+                            pred_choice=pred_choice,
+                        )
+                    self._bump_event_backoff(event_id, str(gate_reason or "watchlist_orderbook_gate_blocked"))
                     continue
 
                 signal_type = str(event.get("signal_type") or "").strip().upper()
