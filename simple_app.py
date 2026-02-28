@@ -4289,6 +4289,10 @@ def live_trading_gate_status():
     pending_counts: List[Dict[str, Any]] = []
     pending_recent: List[Dict[str, Any]] = []
 
+    window_metrics: Dict[str, Dict[str, Any]] = {}
+    flow_24h_hourly: List[Dict[str, Any]] = []
+    flow_1h_5m: List[Dict[str, Any]] = []
+
     try:
         conn_kwargs: Dict[str, Any] = {'autocommit': True}
         if dict_row:
@@ -4426,6 +4430,217 @@ def live_trading_gate_status():
                         }
                     )
 
+
+            # Flow metrics for small dashboard card/chart: 原始watchlist vs live信号 vs gate拦截。
+            for wh in (1, 24):
+                row_flow = conn.execute(
+                    """
+                    WITH raw AS (
+                      SELECT e.id,
+                             lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason,
+                             COALESCE(
+                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                               e.start_ts
+                             ) AS decision_ts
+                        FROM watchlist.watch_signal_event e
+                       WHERE e.signal_type IN ('B','C')
+                         AND COALESCE(
+                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                               e.start_ts
+                             ) >= now() - make_interval(hours => %s)
+                    ),
+                    live_window AS (
+                      SELECT s.event_id, s.reason, s.opened_at, s.created_at
+                        FROM watchlist.live_trade_signal s
+                       WHERE s.created_at >= now() - make_interval(hours => %s)
+                    ),
+                    live_any AS (
+                      SELECT DISTINCT event_id FROM watchlist.live_trade_signal
+                    )
+                    SELECT
+                      (SELECT count(*) FROM raw) AS raw_total,
+                      (SELECT count(*) FROM live_window) AS live_total,
+                      (SELECT count(*) FROM live_window WHERE reason LIKE 'watchlist_orderbook_gate_%%') AS gate_blocked_total,
+                      (SELECT count(*) FROM live_window WHERE opened_at IS NOT NULL) AS opened_total,
+                      (
+                        SELECT count(*)
+                          FROM raw r
+                          LEFT JOIN live_any la ON la.event_id = r.id
+                         WHERE la.event_id IS NULL
+                      ) AS raw_not_entered_live,
+                      (
+                        SELECT count(*)
+                          FROM raw r
+                          LEFT JOIN live_any la ON la.event_id = r.id
+                         WHERE la.event_id IS NULL
+                           AND r.ob_reason = ANY(%s)
+                      ) AS raw_pending_block_reasons;
+                    """,
+                    (wh, wh, gate_block_reasons),
+                ).fetchone()
+                if isinstance(row_flow, dict):
+                    raw_total = int(row_flow.get('raw_total') or 0)
+                    live_total = int(row_flow.get('live_total') or 0)
+                    blocked_n = int(row_flow.get('gate_blocked_total') or 0)
+                    opened_n = int(row_flow.get('opened_total') or 0)
+                    pending_n = int(row_flow.get('raw_not_entered_live') or 0)
+                    pending_block_n = int(row_flow.get('raw_pending_block_reasons') or 0)
+                    window_metrics[f"{wh}h"] = {
+                        'raw_total': raw_total,
+                        'live_total': live_total,
+                        'live_passed': max(0, live_total - blocked_n),
+                        'gate_blocked_total': blocked_n,
+                        'opened_total': opened_n,
+                        'raw_not_entered_live': pending_n,
+                        'raw_pending_block_reasons': pending_block_n,
+                    }
+
+            rows_24h = conn.execute(
+                """
+                WITH raw AS (
+                  SELECT COALESCE(
+                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                           e.start_ts
+                         ) AS ts
+                    FROM watchlist.watch_signal_event e
+                   WHERE e.signal_type IN ('B','C')
+                     AND COALESCE(
+                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                           e.start_ts
+                         ) >= now() - interval '24 hours'
+                ),
+                raw_h AS (
+                  SELECT date_trunc('hour', ts) AS bucket, count(*) AS n
+                    FROM raw
+                   GROUP BY 1
+                ),
+                live_h AS (
+                  SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                    FROM watchlist.live_trade_signal
+                   WHERE created_at >= now() - interval '24 hours'
+                   GROUP BY 1
+                ),
+                block_h AS (
+                  SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                    FROM watchlist.live_trade_signal
+                   WHERE created_at >= now() - interval '24 hours'
+                     AND reason LIKE 'watchlist_orderbook_gate_%%'
+                   GROUP BY 1
+                )
+                SELECT b.bucket,
+                       coalesce(r.n, 0) AS raw_count,
+                       coalesce(l.n, 0) AS live_count,
+                       coalesce(k.n, 0) AS blocked_count
+                  FROM generate_series(
+                         date_trunc('hour', now()) - interval '23 hours',
+                         date_trunc('hour', now()),
+                         interval '1 hour'
+                       ) AS b(bucket)
+                  LEFT JOIN raw_h r ON r.bucket = b.bucket
+                  LEFT JOIN live_h l ON l.bucket = b.bucket
+                  LEFT JOIN block_h k ON k.bucket = b.bucket
+                 ORDER BY b.bucket ASC;
+                """
+            ).fetchall()
+            for r in rows_24h or []:
+                if not isinstance(r, dict):
+                    continue
+                raw_n = int(r.get('raw_count') or 0)
+                live_n = int(r.get('live_count') or 0)
+                blk_n = int(r.get('blocked_count') or 0)
+                flow_24h_hourly.append(
+                    {
+                        'bucket': r.get('bucket').astimezone(timezone.utc).isoformat() if isinstance(r.get('bucket'), datetime) else r.get('bucket'),
+                        'raw_count': raw_n,
+                        'live_count': live_n,
+                        'blocked_count': blk_n,
+                        'live_passed': max(0, live_n - blk_n),
+                    }
+                )
+
+            rows_1h = conn.execute(
+                """
+                WITH raw AS (
+                  SELECT (
+                           date_trunc('hour', COALESCE(
+                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                             e.start_ts
+                           ))
+                           + floor(extract(minute from COALESCE(
+                             (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                             (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                             e.start_ts
+                           )) / 5)::int * interval '5 minute'
+                         ) AS bucket
+                    FROM watchlist.watch_signal_event e
+                   WHERE e.signal_type IN ('B','C')
+                     AND COALESCE(
+                           (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
+                           (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
+                           e.start_ts
+                         ) >= now() - interval '1 hour'
+                ),
+                raw_b AS (
+                  SELECT bucket, count(*) AS n FROM raw GROUP BY 1
+                ),
+                live_b AS (
+                  SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                         count(*) AS n
+                    FROM watchlist.live_trade_signal
+                   WHERE created_at >= now() - interval '1 hour'
+                   GROUP BY 1
+                ),
+                block_b AS (
+                  SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                         count(*) AS n
+                    FROM watchlist.live_trade_signal
+                   WHERE created_at >= now() - interval '1 hour'
+                     AND reason LIKE 'watchlist_orderbook_gate_%%'
+                   GROUP BY 1
+                )
+                SELECT b.bucket,
+                       coalesce(r.n, 0) AS raw_count,
+                       coalesce(l.n, 0) AS live_count,
+                       coalesce(k.n, 0) AS blocked_count
+                  FROM generate_series(
+                         date_trunc('minute', now()) - interval '55 minutes',
+                         date_trunc('minute', now()),
+                         interval '5 minutes'
+                       ) AS b(bucket)
+                  LEFT JOIN raw_b r ON r.bucket = b.bucket
+                  LEFT JOIN live_b l ON l.bucket = b.bucket
+                  LEFT JOIN block_b k ON k.bucket = b.bucket
+                 ORDER BY b.bucket ASC;
+                """
+            ).fetchall()
+            for r in rows_1h or []:
+                if not isinstance(r, dict):
+                    continue
+                raw_n = int(r.get('raw_count') or 0)
+                live_n = int(r.get('live_count') or 0)
+                blk_n = int(r.get('blocked_count') or 0)
+                flow_1h_5m.append(
+                    {
+                        'bucket': r.get('bucket').astimezone(timezone.utc).isoformat() if isinstance(r.get('bucket'), datetime) else r.get('bucket'),
+                        'raw_count': raw_n,
+                        'live_count': live_n,
+                        'blocked_count': blk_n,
+                        'live_passed': max(0, live_n - blk_n),
+                    }
+                )
+
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
@@ -4449,6 +4664,11 @@ def live_trading_gate_status():
                 'by_reason': pending_counts,
             },
             'pending_watchlist_blocked_recent': pending_recent,
+            'signal_flow': {
+                'windows': window_metrics,
+                'series_24h_hourly': flow_24h_hourly,
+                'series_1h_5m': flow_1h_5m,
+            },
         }
     )
 
