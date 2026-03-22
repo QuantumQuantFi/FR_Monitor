@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, InvalidOperation
 from typing import Any, Dict, List, Optional, Type, Union
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import requests
 
@@ -128,6 +128,11 @@ _LIGHTER_AUTH_CACHE: Dict[str, Any] = {"token": None, "expires_at": 0.0}
 
 def _exchange_proxy_url(exchange: str) -> Optional[str]:
     ex = (exchange or "").lower().strip()
+    if ex == "binance":
+        if not bool(getattr(config, "BINANCE_PROXY_ENABLED", False)):
+            return None
+        url = str(getattr(config, "BINANCE_PROXY_URL", "") or "").strip()
+        return url or None
     if ex == "lighter":
         if not bool(getattr(config, "LIGHTER_PROXY_ENABLED", False)):
             return None
@@ -138,6 +143,18 @@ def _exchange_proxy_url(exchange: str) -> Optional[str]:
             return None
         url = str(getattr(config, "GRVT_PROXY_URL", "") or "").strip()
         return url or None
+    return None
+
+
+def _proxy_url_for_request(url: str) -> Optional[str]:
+    """Resolve transport proxy for outbound HTTP request by target host."""
+    try:
+        host = str(urlparse(str(url)).hostname or "").lower().strip()
+    except Exception:
+        host = str(url or "").lower().strip()
+
+    if "binance.com" in host:
+        return _exchange_proxy_url("binance")
     return None
 
 
@@ -626,7 +643,18 @@ def _send_request(
     timeout: int = REQUEST_TIMEOUT,
 ) -> requests.Response:
     """Perform an HTTP request and normalise network errors."""
+    proxy_url = _proxy_url_for_request(url)
     try:
+        if proxy_url:
+            with _temporary_socks_proxy(proxy_url):
+                return requests.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    headers=headers,
+                    timeout=timeout,
+                )
         return requests.request(
             method=method,
             url=url,

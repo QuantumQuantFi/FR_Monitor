@@ -91,6 +91,9 @@ LIGHTER_MARKET_REFRESH_SECONDS = int(
 # SOCKS5 proxy support (optional; used for private trading APIs when exchanges block the server IP).
 # - If *_PROXY_URL is not set, it falls back to BINANCE_PROXY_URL for convenience.
 # - Set *_PROXY_ENABLED=0 or *_PROXY_URL="" to disable quickly after migrating servers.
+BINANCE_PROXY_URL = _get_private('BINANCE_PROXY_URL', 'BINANCE_PROXY_URL', '')
+BINANCE_PROXY_ENABLED = _is_truthy(_get_private('BINANCE_PROXY_ENABLED', 'BINANCE_PROXY_ENABLED', '1'))
+
 LIGHTER_PROXY_URL = _get_private(
     'LIGHTER_PROXY_URL',
     'LIGHTER_PROXY_URL',
