@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Binance 关注列表</title>
+    <title>FR Monitor Watchlist（Type A/B/C）</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <!-- 时间轴需要日期适配器，否则 time scale 无法解析 -->
@@ -319,8 +319,11 @@
             </div>
         </div>
         <div class="info-block" id="v2-info">
-            <h3>v2 因子说明（定量定义）</h3>
+            <h3>多因子模型说明（v1 + v2）</h3>
             <div class="info-grid">
+                <div class="info-item"><strong>v1 5 因子线性模型</strong>：仅用于 Type B/C 排序，输入 5 个事件后因子：<code>raw_slope_3m</code>、<code>raw_drift_ratio</code>、<code>spread_log_short_over_long</code>、<code>raw_crossings_1h</code>、<code>raw_best_buy_high_sell_low</code>；输出 <code>pnl_hat</code> 与近似 <code>win_prob</code>。</div>
+                <div class="info-item"><strong>v1 使用方式</strong>：先看事件是否真实可成交，再按 <code>pnl_hat</code> 排序；<code>win_prob</code> 的定义是 <code>P(pnl &gt; fee_threshold)</code> 的近似，不包含完整手续费、滑点和资金费。</div>
+                <div class="info-item"><strong>v1 系数（Top）</strong><br><span id="v1-model-coefs" class="muted">加载中...</span></div>
                 <div class="info-item"><strong>序列</strong>：spread_t = ln(P_short/P_long)（两腿 1min close，对齐容忍 ≤90s，最多 forward-fill 2 bars）；funding_edge_t = FR_short − FR_long（若某腿为 spot，则 funding=0）。</div>
                 <div class="info-item"><strong>收益/斜率</strong>：spread_ret_60m = spread_t − spread_{t−60m}；spread_slope_240m = OLS 斜率（窗口 241 个点，x=分钟索引，y=spread）。</div>
                 <div class="info-item"><strong>波动/形态</strong>：spread_vol_30m = std(Δspread) over 30m；spread_zscore_4h = (spread_t−mean_4h)/std_4h；exhaustion=1 当 |slope_5|&lt;|slope_30| 且 ret_5 与 ret_30 反向。</div>
@@ -459,6 +462,10 @@
             if (n % 60 === 0) return `${n / 60}h`;
             return `${n}m`;
         };
+
+        const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+        }[ch]));
 
         const describeV2Factor = (key) => {
             if (!key) return null;
@@ -649,6 +656,7 @@
 
             const v2 = (() => {
                 if (entryType !== 'B' && entryType !== 'C') return null;
+                if (!eventV2ReadsEnabled) return null;
                 const ev = (eventV2 && eventV2[symbol] && eventV2[symbol][entryType]) ? eventV2[symbol][entryType] : null;
                 if (!ev) return null;
                 return ev;
@@ -720,7 +728,7 @@
                 const obLine = ob.ts ? `orderbook_validation: ok=${ob.ok === true ? 'true' : 'false'} reason=${ob.reason || '-'} ts=${formatTime(ob.ts)}` : '';
                 return `
                     <div style="margin-top:14px;">
-                        <div style="font-weight:700;margin-bottom:6px;">v2 信号（来自 PG watch_signal_event）</div>
+                        <div style="font-weight:700;margin-bottom:6px;">v2 信号（来自本地 PG watch_signal_event）</div>
                         <div class="info-grid">
                             <div class="info-item"><strong>event</strong><br>#${v2.event_id || '-'} ${entryType}<br>decision_ts ${formatTime(v2.decision_ts || v2.start_ts)}</div>
                             ${renderPred('240')}
@@ -890,13 +898,28 @@
             return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
         };
 
-        const loadV2ModelInfo = async () => {
-            const el = document.getElementById('v2-model-coefs');
-            if (!el) return;
+        const loadModelInfo = async () => {
+            const v1El = document.getElementById('v1-model-coefs');
+            const v2El = document.getElementById('v2-model-coefs');
+            if (!v1El && !v2El) return;
             try {
                 const resp = await fetch('/api/watchlist/v2_model_info');
                 const data = await resp.json();
                 const models = data.models || {};
+                const v1 = data.v1 || {};
+                const v1Models = v1.models || {};
+                const renderV1 = (sig, h) => {
+                    const m = ((v1Models[sig] || {})[h]) || {};
+                    const beta = Array.isArray(m.beta) ? m.beta : [];
+                    if (!beta.length) return `${sig} ${h}m: model_not_loaded`;
+                    const coefLine = beta
+                        .slice(0, 5)
+                        .map((r) => `${(Number(r.coef) >= 0 ? '+' : '')}${Number(r.coef).toFixed(4)}·${r.feature}`)
+                        .join('；');
+                    const fee = m.fee_threshold !== undefined && m.fee_threshold !== null ? Number(m.fee_threshold).toFixed(4) : '-';
+                    const resid = m.resid_std !== undefined && m.resid_std !== null ? Number(m.resid_std).toFixed(4) : '-';
+                    return `${sig} ${h}m: fee_thr=${fee} resid=${resid}<br>${coefLine}`;
+                };
                 const renderOne = (h) => {
                     const m = models[h] || {};
                     if (!m.ok) return `${h}m: model_not_loaded`;
@@ -909,9 +932,15 @@
                     const logi = (m.logistic || {}).top_coef || [];
                     return `${h}m ridge: ${fmt(ridge)}<br>${h}m logit: ${fmt(logi)}`;
                 };
-                el.innerHTML = `${renderOne('240')}<br>${renderOne('1440')}`;
+                if (v1El) {
+                    v1El.innerHTML = `${renderV1('B', '240')}<br>${renderV1('C', '240')}`;
+                }
+                if (v2El) {
+                    v2El.innerHTML = `${renderOne('240')}<br>${renderOne('1440')}`;
+                }
             } catch (e) {
-                el.textContent = '加载失败';
+                if (v1El) v1El.textContent = '加载失败';
+                if (v2El) v2El.textContent = '加载失败';
             }
         };
 
@@ -936,7 +965,7 @@
 
             if (!v2ModelInfoLoaded) {
                 v2ModelInfoLoaded = true;
-                loadV2ModelInfo();
+                loadModelInfo();
             }
 
             const rows = activeEntries.map((item) => {
@@ -1237,7 +1266,7 @@
                         <td class="mono">
                             <span class="sym-cell">
                                 <span>${item.symbol}</span>
-                                <a class="mini-btn" href="/charts?symbol=${encodeURIComponent(item.symbol)}" target="_blank" rel="noopener" title="打开图表">图</a>
+                                <a class="mini-btn" href="${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(item.symbol)}" target="_blank" rel="noopener" title="打开图表">图</a>
                             </span>
                         </td>
                         <td title="${triggerDetails}">${entryType}</td>
@@ -1540,6 +1569,7 @@
         let seriesLoading = false;
         const loadSeriesData = async () => {};
         let eventV2 = {};
+        let eventV2ReadsEnabled = true;
 
         const loadWatchlist = async () => {
             btn.disabled = true;
@@ -1552,6 +1582,7 @@
                 exchangeOverview = data.exchange_overview || {};
                 crossSpreads = data.cross_spreads || {};
                 eventV2 = data.event_v2 || {};
+                eventV2ReadsEnabled = data.watch_signal_event_reads_enabled !== false;
                 const activeEntries = (data.entries || []).filter((i) => i.status === 'active');
                 const activeSymbols = activeEntries.map((i) => i.symbol);
                 lastActiveEntries = activeEntries;
@@ -1575,7 +1606,8 @@
                 if (refreshTimer) clearInterval(refreshTimer);
                 refreshTimer = setInterval(loadWatchlist, nextIntervalMs);
             } catch (err) {
-                bodyEl.innerHTML = `<tr><td colspan="21" class="muted">加载失败: ${err}</td></tr>`;
+                const msg = String(err && err.message ? err.message : err);
+                bodyEl.innerHTML = `<tr><td colspan="21" class="muted">加载失败: ${escapeHtml(msg)}</td></tr>`;
             } finally {
                 btn.disabled = false;
             }
@@ -1597,7 +1629,7 @@
             const chartBtn = event.target.closest('.chart-btn');
             if (chartBtn) {
                 const sym = chartBtn.getAttribute('data-sym');
-                window.open(`/watchlist/charts?symbol=${encodeURIComponent(sym)}`, '_blank');
+                window.open(`${window.frAppUrl('/watchlist/charts')}?symbol=${encodeURIComponent(sym)}`, '_blank');
                 return;
             }
             const detailBtn = event.target.closest('.detail-btn');
@@ -1616,7 +1648,7 @@
             }
         });
         chartsBtn.addEventListener('click', () => {
-            window.open('/watchlist/charts', '_blank');
+            window.open(window.frAppUrl('/watchlist/charts'), '_blank');
         });
         document.getElementById('modal-close').addEventListener('click', hideModal);
         document.getElementById('modal-overlay').addEventListener('click', (e) => {

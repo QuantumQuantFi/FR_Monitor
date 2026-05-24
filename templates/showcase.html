@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FR Monitor 研究展示与实盘归档</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: #0f1720;
+      color: #e8edf4;
+      font-family: Arial, "Microsoft YaHei", sans-serif;
+      line-height: 1.55;
+    }
+    a { color: #5ba7ff; text-decoration: none; }
+    .page { max-width: 1360px; margin: 0 auto; padding: 22px 16px 56px; }
+    .hero, .band, .card, .metric, .step, .report-link {
+      border: 1px solid #273243;
+      background: #121d2b;
+      border-radius: 8px;
+    }
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.32fr) minmax(330px, 0.68fr);
+      gap: 18px;
+      padding: 26px;
+      background:
+        linear-gradient(135deg, rgba(240,185,11,0.08), rgba(20,32,48,0.4)),
+        #121d2b;
+    }
+    .eyebrow { color: #f0b90b; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
+    h1 { margin: 10px 0 12px; font-size: clamp(30px, 4vw, 52px); line-height: 1.05; letter-spacing: 0; }
+    h2 { margin: 0 0 12px; font-size: 23px; letter-spacing: 0; }
+    h3 { margin: 0 0 8px; font-size: 16px; letter-spacing: 0; }
+    p { margin: 0 0 10px; }
+    .lead { color: #c2ccda; font-size: 16px; max-width: 920px; }
+    .muted { color: #95a1b2; }
+    .small { font-size: 12px; }
+    .band { margin-top: 18px; padding: 18px; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .metric, .card, .report-link, .step { padding: 14px; background: rgba(14,24,36,0.78); }
+    .metric .label { color: #9aa7b8; font-size: 12px; }
+    .metric b { display: block; margin: 5px 0; font-size: 28px; color: #fff; line-height: 1.05; }
+    .metric.good b { color: #7ee787; }
+    .metric.warn b { color: #f4d48a; }
+    .metric.bad b { color: #ffb4ad; }
+    .tag-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+    .tag { border: 1px solid rgba(91,167,255,.38); background: rgba(91,167,255,.1); color: #d9ecff; border-radius: 999px; padding: 4px 10px; font-size: 12px; }
+    .tag.gold { border-color: rgba(240,185,11,.55); background: rgba(240,185,11,.12); color: #f7d989; }
+    .tag.green { border-color: rgba(126,231,135,.55); background: rgba(126,231,135,.11); color: #b9f6c1; }
+    .tag.red { border-color: rgba(248,81,73,.55); background: rgba(248,81,73,.11); color: #ffb4ad; }
+    .flow { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; }
+    .step { position: relative; min-height: 148px; }
+    .step:after { content: ""; position: absolute; right: -10px; top: 48%; width: 10px; border-top: 1px solid rgba(240,185,11,.55); }
+    .step:last-child:after { display: none; }
+    .step .num { color: #f0b90b; font-size: 12px; font-weight: 800; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { padding: 10px; border-bottom: 1px solid #273243; text-align: left; vertical-align: top; }
+    th { color: #f0b90b; background: rgba(13,20,33,.55); }
+    code { color: #f5d78b; background: rgba(240,185,11,.09); padding: 1px 5px; border-radius: 4px; }
+    .callout { border-left: 3px solid #f0b90b; padding-left: 12px; color: #cfd8e6; }
+    .report-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+    .report-link strong { display: block; margin-bottom: 4px; color: #f5f8ff; }
+    .live-table td, .live-table th { font-size: 12px; }
+    .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 6px; background: #8b949e; }
+    .status-dot.on { background: #3fb950; }
+    .status-dot.warn { background: #d29922; }
+    .kbd { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; color: #dbe8ff; }
+    ul { margin: 8px 0 0; padding-left: 18px; }
+    li { margin: 4px 0; }
+    @media (max-width: 1100px) {
+      .hero, .grid, .grid.two, .grid.four, .flow, .report-grid { grid-template-columns: 1fr; }
+      .step:after { display: none; }
+    }
+  </style>
+</head>
+<body>
+  {% include '_app_nav.html' %}
+  <main class="page">
+    <section class="hero">
+      <div>
+        <div class="eyebrow">FR Monitor research archive · live system</div>
+        <h1>事件优先的 funding / basis 研究与实盘归档</h1>
+        <p class="lead">FR Monitor 已从资金费率看板演进为跨交易所行情底座、事件 Watchlist、订单簿复核、模型排序、对冲实盘执行与审计归档系统。当前版本已经脱离过期远程 PostgreSQL，改为本机 PostgreSQL 持久化，并已按旧参数恢复实盘扫描。</p>
+        <div class="tag-row">
+          <span class="tag green" id="tag-live-state"><span class="status-dot on"></span>读取实盘状态</span>
+          <span class="tag gold" id="tag-pg-state">本地 PG: 127.0.0.1:5432/watchlist</span>
+          <span class="tag">Type B: perp-perp 对冲</span>
+          <span class="tag">Type C: spot-perp 对冲</span>
+          <span class="tag red">订单簿复验后才下单</span>
+        </div>
+      </div>
+      <div class="grid" style="grid-template-columns: 1fr;">
+        <div class="metric good"><span class="label">Live trading</span><b id="m-live">加载中</b><p class="muted small" id="m-live-sub">读取 /api/showcase/summary</p></div>
+        <div class="metric"><span class="label">旧参数恢复</span><b><span id="m-concurrent">-</span> 组 / <span id="m-notional">-</span>U</b><p class="muted small">并发是对冲组合数量；每组仍是两条腿。</p></div>
+        <div class="metric warn"><span class="label">当前订单</span><b id="m-orders">-</b><p class="muted small">没有通过门控则不会真实下单。</p></div>
+      </div>
+    </section>
+
+    <section class="band">
+      <h2>当前实盘与数据落库</h2>
+      <div class="grid four">
+        <div class="metric"><span class="label">watch_signal_raw</span><b id="t-raw">-</b><p class="muted small">分钟级候选与盘口/因子快照。</p></div>
+        <div class="metric"><span class="label">watch_signal_event</span><b id="t-event">-</b><p class="muted small">连续触发归并后的交易机会。</p></div>
+        <div class="metric"><span class="label">live_trade_signal</span><b id="t-signal">-</b><p class="muted small">实盘扫描、跳过、开仓和平仓状态。</p></div>
+        <div class="metric"><span class="label">live_trade_error</span><b id="t-error">-</b><p class="muted small">实盘错误审计；当前应保持低位。</p></div>
+      </div>
+      <div class="grid two" style="margin-top: 12px;">
+        <div class="card">
+          <h3>最新实盘信号</h3>
+          <table class="live-table"><thead><tr><th>ID</th><th>Symbol</th><th>Type</th><th>Status</th><th>Reason</th><th>Score</th></tr></thead><tbody id="latest-signals"><tr><td colspan="6" class="muted">加载中</td></tr></tbody></table>
+        </div>
+        <div class="card">
+          <h3>最新 Watchlist 事件</h3>
+          <table class="live-table"><thead><tr><th>ID</th><th>Symbol</th><th>Type</th><th>Status</th><th>Legs</th><th>Count</th></tr></thead><tbody id="latest-events"><tr><td colspan="6" class="muted">加载中</td></tr></tbody></table>
+        </div>
+      </div>
+      <p class="muted small" style="margin-top: 10px;">页面数字来自 <code>/api/showcase/summary</code>，底层表在本地 PostgreSQL <code>watchlist</code> schema 中。旧远程 PG 已过期，不再作为运行依赖。</p>
+    </section>
+
+    <section class="band">
+      <h2>一句话策略逻辑</h2>
+      <p class="callout">先用事件发现找到可能有厚度的币，再用跨所或现货-永续结构降低方向暴露；候选必须经过 BBO 新鲜度、订单簿扫单价、费用、资金费率 interval、交易所可用性和审计字段校验，最后才允许小额 live。</p>
+      <div class="flow" style="margin-top: 14px;">
+        <div class="step"><span class="num">01</span><h3>事件发现</h3><p class="muted">涨跌幅榜、volume zscore、funding per hour、perp premium、跨所 dispersion、控盘/叙事币。</p></div>
+        <div class="step"><span class="num">02</span><h3>信号归并</h3><p class="muted">raw 行写入 <code>watch_signal_raw</code>，连续触发合并成 <code>watch_signal_event</code>。</p></div>
+        <div class="step"><span class="num">03</span><h3>结构表达</h3><p class="muted">Type B: 低价所 long perp + 高价所 short perp；Type C: long spot + short perp。</p></div>
+        <div class="step"><span class="num">04</span><h3>可成交验证</h3><p class="muted">不用 last/mark 直接判断；按目标名义金额 sweep 订单簿，检查深度、滑点、方向。</p></div>
+        <div class="step"><span class="num">05</span><h3>模型排序</h3><p class="muted">V1 5 因子和 V2 Ridge/Logistic 输出 <code>pnl_hat</code>、<code>win_prob</code>。</p></div>
+        <div class="step"><span class="num">06</span><h3>实盘审计</h3><p class="muted">信号、订单、费用、资金费、拒绝原因、余额快照和平仓原因全部落库。</p></div>
+      </div>
+    </section>
+
+    <section class="band">
+      <h2>已完成基础设施</h2>
+      <div class="grid two">
+        <div class="card"><h3>行情与数据底座</h3><p>Flask 主服务 <code>simple_app.py</code> 运行在 4002，采集多交易所 WebSocket/REST 行情；SQLite 保存历史价格，本地 PostgreSQL 保存 watchlist raw/event 和 live trading 审计。</p><p class="muted small">核心文件：<code>config.py</code>、<code>exchange_connectors.py</code>、<code>database.py</code>、<code>watchlist_pg_writer.py</code></p></div>
+        <div class="card"><h3>Watchlist 与事件池</h3><p><code>watchlist_manager.py</code> 生成 Type A/B/C 信号，并把 Type B/C 推送到 PG event、模型预测、订单簿复核和 live trading kick 链路。</p><p class="muted small">入口：<a href="{{ app_url('/watchlist') }}">Watchlist</a>、<a href="{{ app_url('/watchlist/charts') }}">Watchlist 图表</a>、<a href="{{ app_url('/watchlist/db') }}">DB 浏览</a></p></div>
+        <div class="card"><h3>订单簿与门控</h3><p>事件首次写入时按候选交易所抓订单簿，枚举 pair 与方向，选出真正可成交的 long/short 组合；实盘侧再次复验，失败则记录 <code>no_tradable_direction</code>、<code>below_threshold</code> 等原因。</p></div>
+        <div class="card"><h3>实盘执行与风控</h3><p><code>live_trading_manager.py</code> 负责候选读取、开仓、监控、止盈、超时平仓和余额快照；<code>trade_executor.py</code> 封装 Binance/OKX/Bybit/Bitget 等后端。</p><p class="muted small">当前旧参数：最多 10 组对冲，每腿 50U。</p></div>
+      </div>
+    </section>
+
+    <section class="band">
+      <h2>研究结果摘要</h2>
+      <table>
+        <thead><tr><th>研究线</th><th>结果</th><th>展示口径</th></tr></thead>
+        <tbody>
+          <tr><td>Event-first 主线</td><td>项目已从全市场薄因子转向“事件发现 → 可成交验证 → 结构化交易 → 审计”。目标是在控盘/榜单/拥挤事件中找更厚的 funding/basis 机会。</td><td>这是当前策略总框架，详见 <a href="{{ app_url('/archive/docs/STRATEGY_DECISION_2026-05-10_EVENT_FIRST_ALPHA.md') }}">Strategy Decision</a>。</td></tr>
+          <tr><td>IC/IR 因子</td><td><code>raw_slope_3m</code>、<code>raw_drift_ratio</code>、<code>raw_crossings_1h</code>、<code>spread_log_short_over_long</code> 等在多个 horizon 有排序价值。</td><td>作为事件后的排序/过滤器，不单独作为实盘充分条件。</td></tr>
+          <tr><td>V2 Ridge + Logistic</td><td>约 15k 个 B/C 样本；valid AUC: 60m 0.7165、240m 0.7228、480m 0.7240、1440m 0.7255。</td><td>说明模型有排序价值，但 valid window 只有 7 天，必须进入 paper/live 审计。详见 <a href="{{ app_url('/archive/reports/v2_ridge_logistic_summary.md') }}">V2 summary</a>。</td></tr>
+          <tr><td>5 因子 PnL 模型</td><td>Top 分位真实 mean pnl 与 win rate 更高；但 fee/slippage 仍是关键约束。</td><td>用于候选排序和阈值辅助，详见 <a href="{{ app_url('/archive/reports/pnl_linear_regression_5factors_fee10bps.md') }}">5 factor report</a>。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="band">
+      <h2>多因子模型如何落地</h2>
+      <div class="grid two">
+        <div class="card">
+          <h3>v1：5 因子线性回归</h3>
+          <p>v1 针对 Type B/C 读取事件后的 5 个基础因子，直接输出 <code>pnl_hat</code> 和近似 <code>win_prob</code>。它的价值是给候选做轻量排序，而不是替代盘口验证。</p>
+          <ul>
+            <li>因子：<code>raw_slope_3m</code>、<code>raw_drift_ratio</code>、<code>spread_log_short_over_long</code>、<code>raw_crossings_1h</code>、<code>raw_best_buy_high_sell_low</code></li>
+            <li>使用口径：先过事件和订单簿门控，再按 <code>pnl_hat</code> 排序；<code>win_prob</code> 只代表 <code>P(pnl &gt; fee_threshold)</code> 的近似。</li>
+          </ul>
+          <p class="muted small" id="showcase-v1-model">加载中...</p>
+        </div>
+        <div class="card">
+          <h3>v2：序列因子 + Ridge / Logistic</h3>
+          <p>v2 读取更完整的价差、资金费和质量特征，分别对 240m / 1440m 做收益和胜率建模。它能提供更细的排序信息，但仍然不直接决定是否下单。</p>
+          <ul>
+            <li>输入：spread 序列、funding edge、zscore、crossings、vol ratio、缺失率质量标签等。</li>
+            <li>使用口径：仅当 missing rate、订单簿方向和资金费门控都通过时，才把 v2 分数纳入 live 候选。</li>
+          </ul>
+          <p class="muted small" id="showcase-v2-model">加载中...</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band">
+      <h2>实盘业绩与当前结果</h2>
+      <div class="grid two">
+        <div class="card">
+          <h3>已恢复历史审计样例</h3>
+          <table>
+            <tbody>
+              <tr><th>Signal</th><td id="audit-signal">970 / RIVER / Type B</td></tr>
+              <tr><th>腿</th><td id="audit-legs">Bitget long + Bybit short</td></tr>
+              <tr><th>状态</th><td id="audit-status">closed</td></tr>
+              <tr><th>Realized PnL</th><td><code id="audit-realized">-0.0576 USDT</code></td></tr>
+              <tr><th>Funding / Fee</th><td id="audit-funding-fee">funding = 0；fee 缺失，严格 net PnL 为空</td></tr>
+            </tbody>
+          </table>
+          <p class="muted small">来源：<a id="audit-source" href="{{ app_url('/archive/reports/live_trading_audit_970.md') }}">reports/live_trading_audit_970.md</a>。旧远程 PG 不可用，因此历史完整交易流水暂时无法恢复，只能以本地归档为准。</p>
+        </div>
+        <div class="card">
+          <h3>当前实盘状态</h3>
+          <p id="live-status-copy">实盘扫描状态会从摘要 API 动态读取；订单簿/阈值门控未通过时不会真实下单。</p>
+          <p class="muted small">最新订单数：<span class="kbd" id="live-order-count">-</span>；错误数：<span class="kbd" id="live-error-count">-</span>；最新余额快照数：<span class="kbd" id="balance-count">-</span>；最近余额时间：<span class="kbd" id="balance-ts">-</span>。</p>
+          <div class="grid two" style="margin-top: 10px;">
+            <div>
+              <h3 style="font-size: 14px; margin-bottom: 6px;">当前状态分布</h3>
+              <table class="live-table"><thead><tr><th>Status</th><th>Count</th></tr></thead><tbody id="signal-status-body"><tr><td colspan="2" class="muted">加载中</td></tr></tbody></table>
+            </div>
+            <div>
+              <h3 style="font-size: 14px; margin-bottom: 6px;">主要跳过原因</h3>
+              <table class="live-table"><thead><tr><th>Reason</th><th>Count</th></tr></thead><tbody id="skip-reasons-body"><tr><td colspan="2" class="muted">加载中</td></tr></tbody></table>
+            </div>
+          </div>
+          <p><a href="{{ app_url('/live_trading') }}">打开 Live Trading 状态页</a></p>
+        </div>
+      </div>
+    </section>
+
+    <section class="band">
+      <h2>关键字段说明</h2>
+      <table>
+        <thead><tr><th>表/字段</th><th>含义</th><th>读数方式</th></tr></thead>
+        <tbody>
+          <tr><td><code>watch_signal_raw.triggered</code></td><td>分钟级候选是否触发 watchlist 条件。</td><td>用于生成事件池，不等于可下单。</td></tr>
+          <tr><td><code>watch_signal_event.features_agg</code></td><td>事件聚合特征，包含因子、预测、订单簿验证、trigger details。</td><td>实盘从这里读取候选质量和腿信息。</td></tr>
+          <tr><td><code>live_trade_signal.status</code></td><td><code>skipped/open/closing/closed/error</code> 等实盘生命周期。</td><td>判断信号是否进入真实订单路径。</td></tr>
+          <tr><td><code>reason</code></td><td>跳过或失败原因，例如 <code>no_tradable_direction</code>、<code>below_threshold</code>。</td><td>复盘策略门控是否过严或盘口确实不可成交。</td></tr>
+          <tr><td><code>pnl_hat / win_prob</code></td><td>模型预测收益与胜率。</td><td>只做排序和门控，不替代订单簿复验。</td></tr>
+          <tr><td><code>live_trade_order</code></td><td>真实订单审计表，记录开平仓腿、订单号、成交均价、数量、费用。</td><td>实盘业绩必须以订单表、费用、资金费共同确认。</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section class="band">
+      <h2>页面与报告索引</h2>
+      <div class="report-grid">
+        <a class="report-link" href="{{ app_url('/watchlist') }}"><strong>Watchlist 实时信号</strong><span class="muted">Type A/B/C 事件、预测分数、订单簿复核。</span></a>
+        <a class="report-link" href="{{ app_url('/live_trading') }}"><strong>Live Trading 状态页</strong><span class="muted">实盘信号、订单、余额、gate 流量和持仓检查。</span></a>
+        <a class="report-link" href="{{ app_url('/watchlist/db') }}"><strong>Watchlist DB</strong><span class="muted">本地 PG raw/event/live 数据浏览入口。</span></a>
+        <a class="report-link" href="{{ app_url('/charts') }}"><strong>跨交易所图表</strong><span class="muted">单币多所价格、资金费率、价差与交易面板。</span></a>
+        <a class="report-link" href="{{ app_url('/archive/docs/FR_MONITOR_STATE.md') }}"><strong>系统状态文档</strong><span class="muted">代码资产地图、风险和后续路线。</span></a>
+        <a class="report-link" href="{{ app_url('/archive/reports/v2_ridge_logistic_summary.md') }}"><strong>V2 模型报告</strong><span class="muted">Ridge/Logistic 多 horizon 评估。</span></a>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const fmt = (v) => (v === null || v === undefined || v === '') ? '-' : String(v);
+    const num = (v) => Number(v || 0).toLocaleString('en-US');
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+    }[ch]));
+    const score = (s) => {
+      const p = s.pnl_hat == null ? '-' : Number(s.pnl_hat).toFixed(4);
+      const w = s.win_prob == null ? '-' : Number(s.win_prob).toFixed(3);
+      return `${p} / ${w}`;
+    };
+    const fmtPct = (v, digits = 2) => {
+      if (v === null || v === undefined || v === '') return '-';
+      const n = Number(v);
+      if (!Number.isFinite(n)) return '-';
+      return `${(n * 100).toFixed(digits)}%`;
+    };
+
+    async function loadModelSummary() {
+      const v1El = document.getElementById('showcase-v1-model');
+      const v2El = document.getElementById('showcase-v2-model');
+      try {
+        const res = await fetch('{{ app_url('/api/watchlist/v2_model_info') }}', { cache: 'no-store' });
+        const data = await res.json();
+        const v1 = (data && data.v1) || {};
+        const v1Models = v1.models || {};
+        const renderV1 = (sig, horizon) => {
+          const model = (((v1Models[sig] || {})[horizon]) || {});
+          const beta = Array.isArray(model.beta) ? model.beta : [];
+          if (!beta.length) return `${sig} ${horizon}m: model_not_loaded`;
+          return `${sig} ${horizon}m · fee_thr ${fmtPct(model.fee_threshold, 2)} · resid ${fmt(model.resid_std)}<br>` +
+            beta.slice(0, 5).map((row) => `${Number(row.coef) >= 0 ? '+' : ''}${Number(row.coef).toFixed(4)}·${row.feature}`).join('；');
+        };
+        if (v1El) {
+          v1El.innerHTML = `${renderV1('B', '240')}<br>${renderV1('C', '240')}`;
+        }
+
+        const models = data.models || {};
+        const renderV2 = (h) => {
+          const m = models[h] || {};
+          if (!m.ok) return `${h}m: model_not_loaded`;
+          const top = (rows) => (rows || []).slice(0, 5).map((row) => `${Number(row.coef) >= 0 ? '+' : ''}${Number(row.coef).toFixed(4)}·${row.feature}`).join('；');
+          return `${h}m ridge: ${top((m.ridge || {}).top_coef)}<br>${h}m logit: ${top((m.logistic || {}).top_coef)}`;
+        };
+        if (v2El) {
+          v2El.innerHTML = `${renderV2('240')}<br>${renderV2('1440')}`;
+        }
+      } catch (err) {
+        if (v1El) v1El.textContent = `加载失败: ${String(err && err.message ? err.message : err)}`;
+        if (v2El) v2El.textContent = `加载失败: ${String(err && err.message ? err.message : err)}`;
+      }
+    }
+
+    async function loadSummary() {
+      const res = await fetch('{{ app_url('/api/showcase/summary') }}', { cache: 'no-store' });
+      const data = await res.json();
+      const cfg = data.live_trading_config || {};
+      const pg = data.postgres || {};
+      const tables = pg.tables || {};
+      const pgEnabled = pg.postgres_enabled === true;
+      const archiveMode = pg.archive || pg.mode === 'archive_no_postgres';
+
+      document.getElementById('m-live').textContent = data.service && data.service.live_trading_enabled ? 'ON' : 'OFF';
+      document.getElementById('m-live-sub').textContent = `scan ${fmt(cfg.scan_interval_seconds)}s · lookback ${fmt(cfg.event_lookback_minutes)}m`;
+      document.getElementById('tag-live-state').innerHTML = `<span class="status-dot ${data.service && data.service.live_trading_enabled ? 'on' : ''}"></span>${data.service && data.service.live_trading_enabled ? '实盘扫描已开启' : '实盘扫描未开启'}`;
+      document.getElementById('tag-pg-state').textContent = pgEnabled ? '本地 PG: 127.0.0.1:5432/watchlist' : '无 PG: 本地归档模式';
+      document.getElementById('live-status-copy').innerHTML = pgEnabled
+        ? '实盘扫描正在读取本地 PG 审计表；若信号处于 <code>skipped</code>，表示订单簿/阈值/可交易性门控没有允许真实下单。'
+        : '当前摘要 API 处于本地归档模式；页面展示可恢复的历史审计样例和空状态，不依赖已过期远程 PG。';
+      document.getElementById('m-concurrent').textContent = fmt(cfg.max_concurrent_trades);
+      document.getElementById('m-notional').textContent = fmt(cfg.per_leg_notional_usdt);
+      document.getElementById('m-orders').textContent = num(tables.live_trade_order);
+      document.getElementById('t-raw').textContent = num(tables.watch_signal_raw);
+      document.getElementById('t-event').textContent = num(tables.watch_signal_event);
+      document.getElementById('t-signal').textContent = num(tables.live_trade_signal);
+      document.getElementById('t-error').textContent = num(tables.live_trade_error);
+      document.getElementById('live-order-count').textContent = num(tables.live_trade_order);
+      document.getElementById('live-error-count').textContent = num(tables.live_trade_error);
+      document.getElementById('balance-count').textContent = num(tables.live_trade_balance_snapshot);
+      document.getElementById('balance-ts').textContent = fmt((pg.latest_balance || {}).ts);
+
+      const sigRows = (pg.latest_signals || []).map((s) => `
+        <tr>
+          <td>${escapeHtml(fmt(s.id))}</td><td>${escapeHtml(fmt(s.symbol))}</td><td>${escapeHtml(fmt(s.signal_type))}</td>
+          <td>${escapeHtml(fmt(s.status))}</td><td>${escapeHtml(fmt(s.reason))}</td><td>${escapeHtml(score(s))}</td>
+        </tr>`).join('');
+      document.getElementById('latest-signals').innerHTML = sigRows || '<tr><td colspan="6" class="muted">暂无 live signal</td></tr>';
+
+      const eventRows = (pg.latest_events || []).map((e) => `
+        <tr>
+          <td>${escapeHtml(fmt(e.id))}</td><td>${escapeHtml(fmt(e.symbol))}</td><td>${escapeHtml(fmt(e.signal_type))}</td>
+          <td>${escapeHtml(fmt(e.status))}</td><td>${escapeHtml(fmt(e.leg_a_exchange))} / ${escapeHtml(fmt(e.leg_b_exchange))}</td><td>${escapeHtml(fmt(e.triggered_count))}</td>
+        </tr>`).join('');
+      document.getElementById('latest-events').innerHTML = eventRows || '<tr><td colspan="6" class="muted">暂无 watch event</td></tr>';
+
+      const statusRows = (pg.signal_status || []).map((row) => `
+        <tr><td>${escapeHtml(fmt(row.status))}</td><td>${escapeHtml(fmt(row.n))}</td></tr>
+      `).join('');
+      document.getElementById('signal-status-body').innerHTML = statusRows || '<tr><td colspan="2" class="muted">暂无状态数据</td></tr>';
+
+      const reasonRows = (pg.skip_reasons || []).map((row) => `
+        <tr><td>${escapeHtml(fmt(row.reason))}</td><td>${escapeHtml(fmt(row.n))}</td></tr>
+      `).join('');
+      document.getElementById('skip-reasons-body').innerHTML = reasonRows || '<tr><td colspan="2" class="muted">暂无跳过原因</td></tr>';
+
+      const audit = data.historical_live_audit || {};
+      document.getElementById('audit-signal').textContent = `${fmt(audit.signal_id)} / ${fmt(audit.symbol)} / Type ${fmt(audit.signal_type)}`;
+      document.getElementById('audit-legs').textContent = `${fmt(audit.long_exchange)} long + ${fmt(audit.short_exchange)} short`;
+      document.getElementById('audit-status').textContent = fmt(audit.status);
+      document.getElementById('audit-realized').textContent = audit.realized_pnl_usdt === null || audit.realized_pnl_usdt === undefined
+        ? '-'
+        : `${Number(audit.realized_pnl_usdt).toFixed(4)} USDT`;
+      document.getElementById('audit-funding-fee').textContent =
+        `funding = ${audit.funding_pnl_usdt === null || audit.funding_pnl_usdt === undefined ? '-' : Number(audit.funding_pnl_usdt).toFixed(4)}；fee = ${audit.fee_total_usdt === null || audit.fee_total_usdt === undefined ? '缺失' : Number(audit.fee_total_usdt).toFixed(4)}；net = ${audit.net_pnl_usdt === null || audit.net_pnl_usdt === undefined ? '空' : Number(audit.net_pnl_usdt).toFixed(4)}`;
+      const auditSource = document.getElementById('audit-source');
+      if (auditSource && audit.source) {
+        auditSource.textContent = audit.source;
+        auditSource.href = '{{ app_url('/archive/reports/live_trading_audit_970.md') }}'.replace('live_trading_audit_970.md', encodeURIComponent(String(audit.source).split('/').pop() || 'live_trading_audit_970.md'));
+      }
+    }
+
+    loadSummary().catch((err) => {
+      document.getElementById('m-live-sub').textContent = `摘要加载失败: ${String(err && err.message ? err.message : err)}`;
+    });
+    loadModelSummary();
+  </script>
+</body>
+</html>

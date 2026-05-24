@@ -2,17 +2,35 @@
 {% set nav_symbol = (current_symbol or 'BTC') %}
 <nav class="app-nav">
   <div class="app-nav__brand">
-    <a href="/">FR Monitor</a>
+    <a href="{{ app_url('/') }}">FR Monitor</a>
     <span class="app-nav__subtitle">watchlist · live trading · charts</span>
   </div>
   <div class="app-nav__links">
-    <a class="app-nav__link {% if active_page == 'aggregated' %}active{% endif %}" href="/">聚合</a>
-    <a class="app-nav__link {% if active_page == 'exchanges' %}active{% endif %}" href="/exchanges">交易所</a>
-    <a class="app-nav__link {% if active_page == 'charts' %}active{% endif %}" href="/charts?symbol={{ nav_symbol }}">图表<span class="badge">{{ nav_symbol }}</span></a>
-    <a class="app-nav__link {% if active_page == 'watchlist' %}active{% endif %}" href="/watchlist">Watchlist</a>
-    <a class="app-nav__link {% if active_page == 'watchlist_charts' %}active{% endif %}" href="/watchlist/charts">Watchlist 图表</a>
-    <a class="app-nav__link {% if active_page == 'watchlist_db' %}active{% endif %}" href="/watchlist/db">Watchlist DB</a>
-    <a class="app-nav__link {% if active_page == 'live_trading' %}active{% endif %}" href="/live_trading">Live Trading</a>
+    <a class="app-nav__link {% if active_page == 'aggregated' %}active{% endif %}" href="{{ app_url('/') }}">聚合</a>
+    <a class="app-nav__link {% if active_page == 'exchanges' %}active{% endif %}" href="{{ app_url('/exchanges') }}">交易所</a>
+    <a class="app-nav__link {% if active_page == 'charts' %}active{% endif %}" href="{{ app_url('/charts') }}?symbol={{ nav_symbol }}">图表<span class="badge">{{ nav_symbol }}</span></a>
+    <a class="app-nav__link {% if active_page == 'watchlist' %}active{% endif %}" href="{{ app_url('/watchlist') }}">Watchlist</a>
+    <a class="app-nav__link {% if active_page == 'watchlist_charts' %}active{% endif %}" href="{{ app_url('/watchlist/charts') }}">Watchlist 图表</a>
+    <a class="app-nav__link {% if active_page == 'watchlist_db' %}active{% endif %}" href="{{ app_url('/watchlist/db') }}">Watchlist DB</a>
+    <a class="app-nav__link {% if active_page == 'live_trading' %}active{% endif %}" href="{{ app_url('/live_trading') }}">Live Trading</a>
+    <a class="app-nav__link {% if active_page == 'showcase' %}active{% endif %}" href="{{ app_url('/showcase') }}">研究展示</a>
   </div>
 </nav>
-
+<script>
+  window.FR_MONITOR_PREFIX = {{ (request.headers.get('X-Forwarded-Prefix') or '')|tojson }};
+  window.frAppUrl = function(path) {
+    const prefix = String(window.FR_MONITOR_PREFIX || '').replace(/\/$/, '');
+    const clean = '/' + String(path || '/').replace(/^\/+/, '');
+    return prefix ? prefix + clean : clean;
+  };
+  if (!window.__FR_MONITOR_FETCH_PATCHED__) {
+    const nativeFetch = window.fetch.bind(window);
+    window.fetch = function(input, init) {
+      if (typeof input === 'string' && input.startsWith('/api/')) {
+        return nativeFetch(window.frAppUrl(input), init);
+      }
+      return nativeFetch(input, init);
+    };
+    window.__FR_MONITOR_FETCH_PATCHED__ = true;
+  }
+</script>

@@ -1542,12 +1542,20 @@ def _fetch_price_map(
     use_futures: bool,
     hours: int = 12,
     limit: int = 2000,
+    conn: Optional[sqlite3.Connection] = None,
+    memo: Optional[Dict[Tuple[str, str, bool, int, int], Dict[str, float]]] = None,
 ) -> Dict[str, float]:
     """按 timestamp -> price 返回价格映射，方便做交集，仅取最近窗口以降低 IO。"""
+    cache_key = (str(symbol), str(exchange), bool(use_futures), int(hours), int(limit))
+    if memo is not None and cache_key in memo:
+        return memo[cache_key]
     field = "futures_price_close" if use_futures else "spot_price_close"
     out: Dict[str, float] = {}
+    own_conn = False
     try:
-        conn = sqlite3.connect(db_path, timeout=15.0)
+        if conn is None:
+            conn = sqlite3.connect(db_path, timeout=15.0)
+            own_conn = True
         cursor = conn.cursor()
         cutoff_sql = f"-{int(hours)} hours"
         cursor.execute(
@@ -1566,6 +1574,14 @@ def _fetch_price_map(
             out[ts_raw] = float(price)
     except Exception as exc:
         print(f"_fetch_price_map failed {symbol} {exchange}: {exc}")
+    finally:
+        if own_conn and conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if memo is not None:
+        memo[cache_key] = out
     return out
 
 
@@ -1635,6 +1651,8 @@ def _build_cross_points(
     *,
     hours: int = 12,
     limit: int = 2000,
+    conn: Optional[sqlite3.Connection] = None,
+    memo: Optional[Dict[Tuple[str, str, bool, int, int], Dict[str, float]]] = None,
 ) -> List[SpreadPoint]:
     """
     将 Type B/C 的跨所价差转换为 SpreadPoint 序列，便于复用 Type A 的指标计算。
@@ -1656,8 +1674,12 @@ def _build_cross_points(
         if len(pair) != 2:
             return points
         a_ex, b_ex = pair
-        price_a = _fetch_price_map(db_path, symbol, a_ex, use_futures=True, hours=hours, limit=limit)
-        price_b = _fetch_price_map(db_path, symbol, b_ex, use_futures=True, hours=hours, limit=limit)
+        price_a = _fetch_price_map(
+            db_path, symbol, a_ex, use_futures=True, hours=hours, limit=limit, conn=conn, memo=memo
+        )
+        price_b = _fetch_price_map(
+            db_path, symbol, b_ex, use_futures=True, hours=hours, limit=limit, conn=conn, memo=memo
+        )
         common_ts = sorted(set(price_a.keys()) & set(price_b.keys()))
         funding_map = trigger.get("funding") or {}
         for ts_raw in common_ts:
@@ -1691,8 +1713,12 @@ def _build_cross_points(
         fut_ex = trigger.get("futures_exchange")
         if not spot_ex or not fut_ex:
             return points
-        spot_prices = _fetch_price_map(db_path, symbol, spot_ex, use_futures=False, hours=hours, limit=limit)
-        fut_prices = _fetch_price_map(db_path, symbol, fut_ex, use_futures=True, hours=hours, limit=limit)
+        spot_prices = _fetch_price_map(
+            db_path, symbol, spot_ex, use_futures=False, hours=hours, limit=limit, conn=conn, memo=memo
+        )
+        fut_prices = _fetch_price_map(
+            db_path, symbol, fut_ex, use_futures=True, hours=hours, limit=limit, conn=conn, memo=memo
+        )
         common_ts = sorted(set(spot_prices.keys()) & set(fut_prices.keys()))
         funding_map = trigger.get("funding") or {}
         for ts_raw in common_ts:
@@ -1765,14 +1791,23 @@ def compute_series_for_entries(db_path: str, entries: List[Dict[str, Any]]) -> D
     range_long_h = int(WATCHLIST_METRICS_CONFIG.get("range_hours_long", 6))
     if type_a_symbols:
         out.update(compute_series_with_signals(db_path, type_a_symbols))
-    for entry in cross_entries:
-        sym = entry.get("symbol")
-        points = _build_cross_points(db_path, entry, hours=range_long_h)
-        series = _series_from_points(points, entry_type=entry.get("entry_type") or "B")
-        trigger = entry.get("trigger_details") or {}
-        if entry.get("entry_type") == "B":
-            series["pair_exchanges"] = trigger.get("pair") or []
-        elif entry.get("entry_type") == "C":
-            series["pair_exchanges"] = [trigger.get("spot_exchange"), trigger.get("futures_exchange")]
-        out[sym] = series
+    if cross_entries:
+        conn = sqlite3.connect(db_path, timeout=15.0)
+        try:
+            price_memo: Dict[Tuple[str, str, bool, int, int], Dict[str, float]] = {}
+            for entry in cross_entries:
+                sym = entry.get("symbol")
+                points = _build_cross_points(db_path, entry, hours=range_long_h, conn=conn, memo=price_memo)
+                series = _series_from_points(points, entry_type=entry.get("entry_type") or "B")
+                trigger = entry.get("trigger_details") or {}
+                if entry.get("entry_type") == "B":
+                    series["pair_exchanges"] = trigger.get("pair") or []
+                elif entry.get("entry_type") == "C":
+                    series["pair_exchanges"] = [trigger.get("spot_exchange"), trigger.get("futures_exchange")]
+                out[sym] = series
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
     return out

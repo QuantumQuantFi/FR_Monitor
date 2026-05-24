@@ -1,4 +1,4 @@
-from flask import Flask, render_template, jsonify, request
+from flask import Flask, render_template, jsonify, request, url_for, send_from_directory, abort
 import json
 import copy
 import threading
@@ -85,6 +85,7 @@ from funding_utils import (
     normalize_next_funding_time,
 )
 from rest_collectors import get_hyperliquid_funding_map
+import local_live_store
 import requests
 # optional PG browse
 try:
@@ -164,6 +165,20 @@ CHART_MAX_HOURS = 168  # 图表查询最大时间范围（小时），避免拉�
 CHART_PREWARM_ITEMS = [
     {'symbol': 'AIA', 'hours': 168, 'interval': '15min'},
 ]
+WATCH_SIGNAL_EVENT_READS_ENABLED = str(
+    os.environ.get("SIMPLE_APP_WATCH_SIGNAL_EVENT_READS", "0")
+).strip().lower() in ("1", "true", "yes", "on")
+WATCHLIST_CACHE_TTL_SECONDS = 5.0
+WATCHLIST_CACHE_KEY = "default"
+_watchlist_cache: Dict[str, Dict[str, Any]] = {}
+_watchlist_cache_lock = threading.Lock()
+WATCHLIST_SERIES_CACHE_TTL_SECONDS = 20.0
+WATCHLIST_SERIES_CACHE_KEY = "default"
+_watchlist_series_cache: Dict[str, Dict[str, Any]] = {}
+_watchlist_series_cache_lock = threading.Lock()
+EXCHANGE_DETAILS_CACHE_TTL_SECONDS = 30.0
+_exchange_details_cache: Dict[tuple, Dict[str, Any]] = {}
+_exchange_details_cache_lock = threading.Lock()
 _chart_cache = {}
 _chart_cache_lock = threading.Lock()
 
@@ -189,6 +204,77 @@ def _set_chart_cache_entry(cache_key, payload):
             oldest_key = min(_chart_cache.items(), key=lambda item: item[1]['timestamp'])[0]
             _chart_cache.pop(oldest_key, None)
         _chart_cache[cache_key] = {'timestamp': now, 'payload': payload}
+
+
+def _get_exchange_details_cached(symbols: List[str]) -> Dict[str, Any]:
+    """Cache exchange detail aggregation briefly to avoid repeated public REST fan-out."""
+    cache_key = tuple(sorted({str(symbol or "").upper() for symbol in symbols if symbol}))
+    if not cache_key:
+        return {}
+    now = time.time()
+    with _exchange_details_cache_lock:
+        entry = _exchange_details_cache.get(cache_key)
+        if entry and now - float(entry.get("timestamp") or 0.0) <= EXCHANGE_DETAILS_CACHE_TTL_SECONDS:
+            cached_payload = entry.get("payload")
+            if isinstance(cached_payload, dict):
+                return copy.deepcopy(cached_payload)
+    payload = fetch_exchange_details(list(cache_key)) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    with _exchange_details_cache_lock:
+        _exchange_details_cache[cache_key] = {"timestamp": now, "payload": payload}
+    return copy.deepcopy(payload)
+
+
+def _get_watchlist_cache_entry() -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _watchlist_cache_lock:
+        entry = _watchlist_cache.get(WATCHLIST_CACHE_KEY)
+        if not entry:
+            return None
+        if now - float(entry.get("timestamp") or 0.0) > WATCHLIST_CACHE_TTL_SECONDS:
+            _watchlist_cache.pop(WATCHLIST_CACHE_KEY, None)
+            return None
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_watchlist_cache_entry(payload: Dict[str, Any]) -> None:
+    with _watchlist_cache_lock:
+        _watchlist_cache[WATCHLIST_CACHE_KEY] = {
+            "timestamp": time.time(),
+            "payload": copy.deepcopy(payload),
+        }
+
+
+def _get_watchlist_series_cache_entry() -> Optional[Dict[str, Any]]:
+    now = time.time()
+    with _watchlist_series_cache_lock:
+        entry = _watchlist_series_cache.get(WATCHLIST_SERIES_CACHE_KEY)
+        if not entry:
+            return None
+        if now - float(entry.get("timestamp") or 0.0) > WATCHLIST_SERIES_CACHE_TTL_SECONDS:
+            _watchlist_series_cache.pop(WATCHLIST_SERIES_CACHE_KEY, None)
+            return None
+        payload = entry.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_watchlist_series_cache_entry(payload: Dict[str, Any]) -> None:
+    with _watchlist_series_cache_lock:
+        _watchlist_series_cache[WATCHLIST_SERIES_CACHE_KEY] = {
+            "timestamp": time.time(),
+            "payload": copy.deepcopy(payload),
+        }
+
+
+def _clear_watchlist_series_cache() -> None:
+    with _watchlist_series_cache_lock:
+        _watchlist_series_cache.pop(WATCHLIST_SERIES_CACHE_KEY, None)
 
 
 def prewarm_chart_cache(items=None):
@@ -373,6 +459,18 @@ class PrecisionJSONEncoder(json.JSONEncoder):
         return super().iterencode(processed_obj, _one_shot)
 
 app = Flask(__name__)
+
+
+@app.context_processor
+def inject_app_urls():
+    def app_url(path: str = "/") -> str:
+        prefix = str(request.headers.get("X-Forwarded-Prefix") or "").strip().rstrip("/")
+        clean_path = "/" + str(path or "/").lstrip("/")
+        if clean_path == "/":
+            return f"{prefix}/" if prefix else "/"
+        return f"{prefix}{clean_path}" if prefix else clean_path
+
+    return {"app_url": app_url}
 
 # 配置Flask应用使用自定义JSON编码器
 app.json_encoder = PrecisionJSONEncoder
@@ -1116,8 +1214,48 @@ data_collector = ExchangeDataCollector()
 # 数据库实例
 db = PriceDatabase()
 
+OVERVIEW_CACHE: Dict[int, Dict[str, Any]] = {}
+OVERVIEW_CACHE_TTL_SECONDS = 5.0
 GATE_STATUS_CACHE = {}
-GATE_STATUS_CACHE_TTL_SECONDS = 30.0
+GATE_STATUS_CACHE_TTL_SECONDS = 90.0
+
+
+def _pg_runtime_enabled() -> bool:
+    return bool(WATCHLIST_PG_CONFIG.get('enabled', False)) and psycopg is not None and bool(str(WATCHLIST_PG_CONFIG.get('dsn') or '').strip())
+
+
+def _archived_live_signal() -> Dict[str, Any]:
+    signals = local_live_store.list_signals(limit=1)
+    return signals[0] if signals else {}
+
+
+def _archived_live_payload() -> Dict[str, Any]:
+    signals = local_live_store.list_signals(limit=200)
+    summary = local_live_store.summary()
+    return {
+        'timestamp': now_utc_iso(),
+        'mode': 'archive_no_postgres',
+        'local_store': str(local_live_store.DEFAULT_DB_PATH),
+        'postgres_enabled': False,
+        'live_trading_enabled': False,
+        'live_trading_config': {
+            'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
+            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+            'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+        },
+        'summary': {**summary, 'note': 'PostgreSQL 已停用；这里显示本地 SQLite live store。当前已导入归档审计样例，fee 缺失时严格 net PnL 为空。'},
+        'research_backtest_summary': {
+            'source': 'reports/pnl_linear_regression_5factors_fee10bps.md',
+            'scope': 'Type B/C in-sample future_outcome, not account live PnL',
+            'type_b_240_q5_win_rate': 0.9112,
+            'type_b_240_q5_mean_pnl_minus_fee': 0.009969,
+            'type_c_240_q5_win_rate': 0.9018,
+            'type_c_240_q5_mean_pnl_minus_fee': 0.008985,
+        },
+        'signals': signals,
+        'errors': [],
+    }
 
 # 价差套利监控器
 arbitrage_monitor = ArbitrageMonitor(
@@ -1252,11 +1390,7 @@ def _start_live_trading_components() -> bool:
     pg_writer_enabled = bool(pg_writer and pg_writer.config.enabled)
 
     if not live_enabled and not pg_writer_enabled:
-        # Best-effort: keep tables for UI even when auto-trading is disabled.
-        try:
-            live_trading_manager.ensure_schema()
-        except Exception as exc:
-            logger.warning("live trading schema init failed: %s", exc)
+        logger.info("live trading and PG writer disabled; skip PG schema initialization")
         return True
 
     errors: List[str] = []
@@ -3095,8 +3229,178 @@ def watchlist_charts():
 
 @app.route('/live_trading')
 def live_trading_view():
-    """实盘交易（Type B）状态页：信号、订单、价差监听与平仓状态。"""
+    """实盘交易（Type B/C）状态页：信号、订单、价差监听与平仓状态。"""
     return render_template('live_trading.html', active_page='live_trading')
+
+
+def _showcase_jsonable(val: Any) -> Any:
+    if isinstance(val, datetime):
+        return val.astimezone(timezone.utc).isoformat()
+    if isinstance(val, Decimal):
+        return float(val)
+    return val
+
+
+def _showcase_pg_summary() -> Dict[str, Any]:
+    summary: Dict[str, Any] = {
+        'postgres_enabled': bool(WATCHLIST_PG_CONFIG.get('enabled', False)),
+        'postgres_dsn_host': '127.0.0.1:5432/watchlist' if str(WATCHLIST_PG_CONFIG.get('dsn') or '').strip() else None,
+        'tables': {},
+        'latest_signals': [],
+        'latest_events': [],
+        'signal_status': [],
+        'skip_reasons': [],
+        'latest_balance': None,
+    }
+    if not _pg_runtime_enabled():
+        summary['postgres_enabled'] = False
+        summary['archive'] = _archived_live_payload().get('summary')
+        return summary
+
+    conn_kwargs: Dict[str, Any] = {"autocommit": True}
+    if dict_row:
+        conn_kwargs["row_factory"] = dict_row
+    with psycopg.connect(WATCHLIST_PG_CONFIG['dsn'], **conn_kwargs) as conn:
+        count_rows = conn.execute(
+            """
+            SELECT 'watch_signal_raw' AS table_name, count(*)::bigint AS n FROM watchlist.watch_signal_raw
+            UNION ALL SELECT 'watch_signal_event', count(*)::bigint FROM watchlist.watch_signal_event
+            UNION ALL SELECT 'live_trade_signal', count(*)::bigint FROM watchlist.live_trade_signal
+            UNION ALL SELECT 'live_trade_order', count(*)::bigint FROM watchlist.live_trade_order
+            UNION ALL SELECT 'live_trade_error', count(*)::bigint FROM watchlist.live_trade_error
+            UNION ALL SELECT 'live_trade_balance_snapshot', count(*)::bigint FROM watchlist.live_trade_balance_snapshot;
+            """
+        ).fetchall()
+        for row in count_rows or []:
+            r = dict(row) if isinstance(row, dict) else {'table_name': row[0], 'n': row[1]}
+            summary['tables'][str(r['table_name'])] = int(r['n'] or 0)
+
+        status_rows = conn.execute(
+            """
+            SELECT status, count(*)::bigint AS n
+              FROM watchlist.live_trade_signal
+             GROUP BY status
+             ORDER BY n DESC, status;
+            """
+        ).fetchall()
+        summary['signal_status'] = [dict(r) if isinstance(r, dict) else {'status': r[0], 'n': int(r[1] or 0)} for r in status_rows or []]
+
+        reason_rows = conn.execute(
+            """
+            SELECT COALESCE(reason, 'unknown') AS reason, count(*)::bigint AS n
+              FROM watchlist.live_trade_signal
+             GROUP BY COALESCE(reason, 'unknown')
+             ORDER BY n DESC, reason
+             LIMIT 8;
+            """
+        ).fetchall()
+        summary['skip_reasons'] = [dict(r) if isinstance(r, dict) else {'reason': r[0], 'n': int(r[1] or 0)} for r in reason_rows or []]
+
+        signal_rows = conn.execute(
+            """
+            SELECT id, event_id, symbol, signal_type, status, reason, leg_long_exchange, leg_short_exchange,
+                   pnl_hat, win_prob, pred_source, created_at, updated_at, opened_at, closed_at
+              FROM watchlist.live_trade_signal
+             ORDER BY created_at DESC
+             LIMIT 6;
+            """
+        ).fetchall()
+        summary['latest_signals'] = [
+            {k: _showcase_jsonable(v) for k, v in (dict(r) if isinstance(r, dict) else {}).items()}
+            for r in signal_rows or []
+        ]
+
+        event_rows = conn.execute(
+            """
+            SELECT id, symbol, signal_type, status, start_ts, end_ts, triggered_count, leg_a_exchange, leg_b_exchange,
+                   features_agg #>> '{meta_last,orderbook_validation,reason}' AS ob_reason
+              FROM watchlist.watch_signal_event
+             ORDER BY id DESC
+             LIMIT 6;
+            """
+        ).fetchall()
+        summary['latest_events'] = [
+            {k: _showcase_jsonable(v) for k, v in (dict(r) if isinstance(r, dict) else {}).items()}
+            for r in event_rows or []
+        ]
+
+        balance_rows = conn.execute(
+            """
+            SELECT ts, source, balances, totals, context
+              FROM watchlist.live_trade_balance_snapshot
+             ORDER BY ts DESC
+             LIMIT 1;
+            """
+        ).fetchall()
+        if balance_rows:
+            bal = dict(balance_rows[0]) if isinstance(balance_rows[0], dict) else {}
+            balances = bal.get('balances') if isinstance(bal.get('balances'), list) else []
+            summary['latest_balance'] = {
+                'ts': _showcase_jsonable(bal.get('ts')),
+                'source': bal.get('source'),
+                'totals': bal.get('totals') if isinstance(bal.get('totals'), dict) else {},
+                'context': bal.get('context') if isinstance(bal.get('context'), dict) else {},
+                'balances_count': len(balances),
+                'exchanges': [str(x.get('exchange')) for x in balances if isinstance(x, dict) and x.get('exchange')],
+            }
+    return summary
+
+
+@app.route('/api/showcase/summary')
+def showcase_summary():
+    try:
+        pg_summary = _showcase_pg_summary()
+    except Exception as exc:
+        pg_summary = {'error': str(exc), 'postgres_enabled': _pg_runtime_enabled(), 'tables': {}}
+    return jsonify({
+        'timestamp': now_utc_iso(),
+        'service': {
+            'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
+            'watchlist_pg_enabled': bool(WATCHLIST_PG_CONFIG.get('enabled')),
+            'local_pg_dsn': '127.0.0.1:5432/watchlist',
+        },
+        'live_trading_config': {
+            'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
+            'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.01)),
+            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+            'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
+            'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 10.0)),
+            'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 3)),
+        },
+        'postgres': pg_summary,
+        'historical_live_audit': {
+            'signal_id': 970,
+            'symbol': 'RIVER',
+            'signal_type': 'B',
+            'long_exchange': 'bitget',
+            'short_exchange': 'bybit',
+            'status': 'closed',
+            'realized_pnl_usdt': -0.05759999999999507,
+            'funding_pnl_usdt': 0.0,
+            'fee_total_usdt': None,
+            'net_pnl_usdt': None,
+            'source': 'reports/live_trading_audit_970.md',
+        },
+    })
+
+
+@app.route('/archive/<section>/<path:filename>')
+def showcase_archive_file(section: str, filename: str):
+    allowed = {
+        'reports': os.path.join(os.getcwd(), 'reports'),
+        'docs': os.path.join(os.getcwd(), 'docs'),
+    }
+    root = allowed.get(str(section or '').strip())
+    if not root:
+        abort(404)
+    return send_from_directory(root, filename, as_attachment=False)
+
+
+@app.route('/showcase')
+def showcase_view():
+    """研究展示与归档页：面向汇报，汇总策略逻辑、研究结果、实盘状态与基础设施。"""
+    return render_template('showcase.html', active_page='showcase')
 
 
 @app.route('/api/data')
@@ -3134,6 +3438,12 @@ def get_all_data():
 @app.route('/api/watchlist')
 def get_watchlist():
     """获取基于资金费率的Binance关注列表"""
+    force_refresh = str(request.args.get("refresh", "0")).strip().lower() in ("1", "true", "yes", "on")
+    if not force_refresh:
+        cached_payload = _get_watchlist_cache_entry()
+        if cached_payload is not None:
+            return precision_jsonify(cached_payload)
+
     payload = watchlist_manager.snapshot()
 
     # On cold start, background threads may not have finished the first refresh yet.
@@ -3241,10 +3551,11 @@ def get_watchlist():
             overview[sym] = {'rows': rows, 'best_perp_spread': best}
         payload['exchange_overview'] = overview
 
-        # Attach the latest v2 inference snapshot for active Type B/C symbols (from PG watch_signal_event).
-        # This keeps watchlist UI lightweight while still exposing v2 signals/meta.
         payload["event_v2"] = {}
-        if psycopg is not None:
+        payload["watch_signal_event_reads_enabled"] = WATCH_SIGNAL_EVENT_READS_ENABLED
+        # Attach the latest v2 inference snapshot for active Type B/C symbols (from PG watch_signal_event).
+        # This is optional and can be disabled to reduce PG load on the watchlist page.
+        if WATCH_SIGNAL_EVENT_READS_ENABLED and psycopg is not None:
             try:
                 v2_syms = sorted(
                     {
@@ -3378,11 +3689,13 @@ def get_watchlist():
         try:
             symbols = [e.get('symbol') for e in active_entries if e.get('symbol')]
             if symbols:
-                payload['exchange_details'] = fetch_exchange_details(symbols)
+                payload['exchange_details'] = _get_exchange_details_cached(symbols)
         except Exception as exc:
             payload['exchange_details_error'] = str(exc)
     except Exception as exc:
         payload['orderbook_error'] = str(exc)
+    if not force_refresh:
+        _set_watchlist_cache_entry(payload)
     return precision_jsonify(payload)
 
 
@@ -3395,6 +3708,7 @@ def trigger_watchlist_refresh():
         all_data = data_collector.get_all_data()
         exchange_symbols = getattr(data_collector, 'exchange_symbols', {})
         watchlist_manager.refresh(all_data, exchange_symbols, WATCHLIST_ORDERBOOK_SNAPSHOT)
+        _clear_watchlist_series_cache()
         _kick_live_trading("api_watchlist_refresh")
         return jsonify({'message': 'ok', 'timestamp': now_utc_iso(), 'summary': watchlist_manager.snapshot().get('summary')})
     except Exception as exc:
@@ -3488,7 +3802,7 @@ def api_monitor8010_watchlist_remove():
 def watchlist_db_view():
     """
     简易的 watchlist PG 浏览页面，随用随查。
-    - 支持 raw/event/outcome 三张核心表。
+    - 支持 watchlist raw/event/outcome 和 live trading 审计表。
     - 默认每页 10 条，可通过 ?page=2&limit=20 翻页。
     """
     if psycopg is None:
@@ -3504,6 +3818,10 @@ def watchlist_db_view():
         'raw': ('watchlist.watch_signal_raw', 'ts'),
         'event': ('watchlist.watch_signal_event', 'start_ts'),
         'outcome': ('watchlist.future_outcome', 'event_id'),
+        'live_signal': ('watchlist.live_trade_signal', 'created_at'),
+        'live_order': ('watchlist.live_trade_order', 'created_at'),
+        'live_error': ('watchlist.live_trade_error', 'ts'),
+        'live_balance': ('watchlist.live_trade_balance_snapshot', 'ts'),
     }
     if table_key not in table_map:
         table_key = 'raw'
@@ -3539,6 +3857,8 @@ def watchlist_db_view():
             order_sql = f"ORDER BY {order_col} DESC"
             if table_key == 'outcome':
                 order_sql = "ORDER BY event_id DESC, horizon_min ASC"
+            elif table_key == 'live_order':
+                order_sql = "ORDER BY created_at DESC, id DESC"
             cur = conn.execute(
                 f"SELECT * FROM {table_name} {order_sql} LIMIT %s OFFSET %s",
                 (limit, offset),
@@ -3565,6 +3885,7 @@ def watchlist_db_view():
         limit=limit,
         has_next=has_next,
         total_count=total_count,
+        table_options=list(table_map.keys()),
         error=error,
         active_page='watchlist_db',
     )
@@ -3603,12 +3924,14 @@ def _load_json_file_cached(path: str) -> Optional[Dict[str, Any]]:
 @app.route('/api/watchlist/v2_model_info')
 def get_watchlist_v2_model_info():
     """
-    v2 模型结构说明（用于 watchlist 页面展示）：
+    多因子模型结构说明（用于 watchlist / showcase 页面展示）：
+    - v1: 5 因子线性回归，预测 pnl_hat / win_prob
     - Ridge: 预测 pnl_hat
     - Logistic: 预测 win_prob
     """
     try:
         import config as _cfg  # local import
+        import watchlist_pnl_regression_model as _v1
 
         cfg = getattr(_cfg, "WATCHLIST_V2_PRED_CONFIG", {}) or {}
         out: Dict[str, Any] = {"timestamp": now_utc_iso(), "enabled": bool(cfg.get("enabled"))}
@@ -3652,6 +3975,28 @@ def get_watchlist_v2_model_info():
             }
         out["models"] = models
         out["max_missing_ratio"] = cfg.get("max_missing_ratio")
+        v1_models: Dict[str, Any] = {}
+        for sig, horizon_map in (_v1.MODELS or {}).items():
+            sig_key = str(sig or "").upper()
+            if sig_key not in ("B", "C"):
+                continue
+            v1_models[sig_key] = {}
+            for horizon, model in (horizon_map or {}).items():
+                beta_rows: List[Dict[str, Any]] = []
+                for name, coef in sorted((model.beta or {}).items(), key=lambda kv: abs(float(kv[1])), reverse=True):
+                    beta_rows.append({"feature": str(name), "coef": float(coef)})
+                v1_models[sig_key][str(int(horizon))] = {
+                    "model_name": getattr(model, "model_name", None),
+                    "intercept": getattr(model, "intercept", None),
+                    "resid_std": getattr(model, "resid_std", None),
+                    "fee_threshold": getattr(model, "fee_threshold", None),
+                    "beta": beta_rows,
+                }
+        out["v1"] = {
+            "model_version": getattr(_v1, "MODEL_VERSION", None),
+            "fee_threshold": getattr(_v1, "DEFAULT_FEE_THRESHOLD", None),
+            "models": v1_models,
+        }
         return jsonify(out), 200
     except Exception as exc:
         return jsonify({"timestamp": now_utc_iso(), "error": str(exc)}), 500
@@ -3662,13 +4007,18 @@ def get_watchlist_series():
     返回 active 符号的 6h 价差序列及信号点，仅用于前端可视化。
     """
     try:
+        cached_payload = _get_watchlist_series_cache_entry()
+        if cached_payload is not None:
+            return jsonify(cached_payload)
         snapshot = watchlist_manager.snapshot()
         active_entries = [entry for entry in snapshot.get('entries', []) if entry.get('status') == 'active']
         active_symbols = [entry['symbol'] for entry in active_entries]
         if not active_entries:
             return jsonify({'series': {}, 'symbols': [], 'timestamp': now_utc_iso()})
         series = compute_series_for_entries(db.db_path, active_entries)
-        return jsonify({'series': series, 'symbols': active_symbols, 'timestamp': now_utc_iso()})
+        payload = {'series': series, 'symbols': active_symbols, 'timestamp': now_utc_iso()}
+        _set_watchlist_series_cache_entry(payload)
+        return jsonify(payload)
     except Exception as exc:
         return jsonify({'error': str(exc), 'timestamp': now_utc_iso()}), 500
 
@@ -4168,10 +4518,25 @@ def live_trading_overview():
       - watchlist.live_trade_order
       - watchlist.live_trade_error
     """
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        payload = _archived_live_payload()
+        try:
+            OVERVIEW_CACHE[0] = {'ts': time.time(), 'data': payload}
+        except Exception:
+            pass
+        return jsonify(payload)
 
     limit = min(max(int(request.args.get('limit', 50) or 50), 1), 200)
+    bypass_cache = str(request.args.get('refresh', '0') or '0').strip().lower() in ('1', 'true', 'yes', 'on')
+    if not bypass_cache:
+        try:
+            entry = OVERVIEW_CACHE.get(limit)
+            if entry and (time.time() - float(entry.get('ts') or 0)) <= OVERVIEW_CACHE_TTL_SECONDS:
+                cached = entry.get('data')
+                if isinstance(cached, dict):
+                    return jsonify(cached)
+        except Exception:
+            pass
     rows: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
     try:
@@ -4219,38 +4584,41 @@ def live_trading_overview():
         else:
             errors_out.append(r)
 
-    return jsonify(
-        {
-            'timestamp': now_utc_iso(),
-            'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
-	            'live_trading_config': {
-                'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
-                'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
-                'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
-                'v2_enabled': bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
-                'v2_pnl_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.0065)),
-                'v2_win_prob_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.72)),
-                'v2_pnl_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_1440', 0.0055)),
-                'v2_win_prob_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.75)),
-                'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
-                'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
-                'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
-                'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
-                'watchlist_orderbook_gate_enabled': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False)),
-                'watchlist_orderbook_gate_mode': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only') or 'reason_only'),
-                'watchlist_orderbook_gate_block_reasons': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_block_reasons') or ''),
-                'watchlist_orderbook_gate_record_skipped': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_record_skipped', True)),
-                'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
-                'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
-                'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
-                'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
-                'max_abs_funding': float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.0)),
-                'max_neg_net_funding_per_hour_1h': float(LIVE_TRADING_CONFIG.get('max_neg_net_funding_per_hour_1h', 0.0)),
-            },
-            'signals': signals_out,
-            'errors': errors_out,
-        }
-    )
+    response_payload = {
+        'timestamp': now_utc_iso(),
+        'live_trading_enabled': bool(LIVE_TRADING_CONFIG.get('enabled')),
+        'live_trading_config': {
+            'horizon_min': int(LIVE_TRADING_CONFIG.get('horizon_min', 240)),
+            'pnl_threshold': float(LIVE_TRADING_CONFIG.get('pnl_threshold', 0.0085)),
+            'win_prob_threshold': float(LIVE_TRADING_CONFIG.get('win_prob_threshold', 0.85)),
+            'v2_enabled': bool(LIVE_TRADING_CONFIG.get('v2_enabled', True)),
+            'v2_pnl_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_240', 0.0065)),
+            'v2_win_prob_threshold_240': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_240', 0.72)),
+            'v2_pnl_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_pnl_threshold_1440', 0.0055)),
+            'v2_win_prob_threshold_1440': float(LIVE_TRADING_CONFIG.get('v2_win_prob_threshold_1440', 0.75)),
+            'per_leg_notional_usdt': float(LIVE_TRADING_CONFIG.get('per_leg_notional_usdt', 50.0)),
+            'event_lookback_minutes': int(LIVE_TRADING_CONFIG.get('event_lookback_minutes', 30)),
+            'max_concurrent_trades': int(LIVE_TRADING_CONFIG.get('max_concurrent_trades', 10)),
+            'allowed_exchanges': str(LIVE_TRADING_CONFIG.get('allowed_exchanges') or ''),
+            'watchlist_orderbook_gate_enabled': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_enabled', False)),
+            'watchlist_orderbook_gate_mode': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_mode', 'reason_only') or 'reason_only'),
+            'watchlist_orderbook_gate_block_reasons': str(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_block_reasons') or ''),
+            'watchlist_orderbook_gate_record_skipped': bool(LIVE_TRADING_CONFIG.get('watchlist_orderbook_gate_record_skipped', True)),
+            'scan_interval_seconds': float(LIVE_TRADING_CONFIG.get('scan_interval_seconds', 20.0)),
+            'monitor_interval_seconds': float(LIVE_TRADING_CONFIG.get('monitor_interval_seconds', 60.0)),
+            'take_profit_ratio': float(LIVE_TRADING_CONFIG.get('take_profit_ratio', 0.7)),
+            'max_hold_days': int(LIVE_TRADING_CONFIG.get('max_hold_days', 7)),
+            'max_abs_funding': float(LIVE_TRADING_CONFIG.get('max_abs_funding', 0.0)),
+            'max_neg_net_funding_per_hour_1h': float(LIVE_TRADING_CONFIG.get('max_neg_net_funding_per_hour_1h', 0.0)),
+        },
+        'signals': signals_out,
+        'errors': errors_out,
+    }
+    try:
+        OVERVIEW_CACHE[limit] = {'ts': time.time(), 'data': response_payload}
+    except Exception:
+        pass
+    return jsonify(response_payload)
 
 
 
@@ -4260,8 +4628,22 @@ def live_trading_gate_status():
     Gate status for watchlist->live orderbook filter.
     Shows recent blocked signals and reason distribution.
     """
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'watch_signal_event_reads_enabled': False,
+            'gate_config': {'enabled': False, 'mode': 'disabled'},
+            'flow_summary': {
+                '1h': {'raw_total': 0, 'live_total': 0, 'gate_blocked_total': 0, 'opened_total': 0, 'raw_not_entered_live': 0, 'raw_pending_block_reasons': 0},
+                '24h': {'raw_total': 0, 'live_total': 0, 'gate_blocked_total': 0, 'opened_total': 0, 'raw_not_entered_live': 0, 'raw_pending_block_reasons': 0},
+            },
+            'flow_series_24h': [],
+            'flow_series_1h': [],
+            'blocked_recent': [],
+            'pending_watchlist_blocked_recent': [],
+            'note': 'PostgreSQL disabled; gate flow history unavailable.',
+        })
 
     try:
         hours = int(request.args.get('hours', 24) or 24)
@@ -4371,7 +4753,7 @@ def live_trading_gate_status():
                     }
                 )
 
-            if include_pending and gate_block_reasons:
+            if WATCH_SIGNAL_EVENT_READS_ENABLED and include_pending and gate_block_reasons:
                 pending_counts_rows = conn.execute(
                     """
                     WITH c AS (
@@ -4435,52 +4817,66 @@ def live_trading_gate_status():
                     )
 
 
-            # Flow metrics for small dashboard card/chart: 原始watchlist vs live信号 vs gate拦截。
+            # Flow metrics for dashboard: when watch_signal_event read-side is disabled,
+            # fall back to live_trade_signal-only counters to keep the page responsive.
             for wh in (1, 24):
-                row_flow = conn.execute(
-                    """
-                    WITH raw AS (
-                      SELECT e.id,
-                             lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason,
-                             COALESCE(
-                               (e.features_agg #>> '{meta_last,orderbook_validation,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,pred_v2_meta,ts}')::timestamptz,
-                               (e.features_agg #>> '{meta_last,factors_v2_meta,ts}')::timestamptz,
-                               e.start_ts
-                             ) AS decision_ts
-                        FROM watchlist.watch_signal_event e
-                       WHERE e.signal_type IN ('B','C')
-                         AND e.start_ts >= now() - make_interval(hours => %s)
-                    ),
-                    live_window AS (
-                      SELECT s.event_id, s.reason, s.opened_at, s.created_at
-                        FROM watchlist.live_trade_signal s
-                       WHERE s.created_at >= now() - make_interval(hours => %s)
-                    ),
-                    live_any AS (
-                      SELECT DISTINCT event_id FROM watchlist.live_trade_signal
-                    )
-                    SELECT
-                      (SELECT count(*) FROM raw) AS raw_total,
-                      (SELECT count(*) FROM live_window) AS live_total,
-                      (SELECT count(*) FROM live_window WHERE reason LIKE 'watchlist_orderbook_gate_%%') AS gate_blocked_total,
-                      (SELECT count(*) FROM live_window WHERE opened_at IS NOT NULL) AS opened_total,
-                      (
-                        SELECT count(*)
-                          FROM raw r
-                          LEFT JOIN live_any la ON la.event_id = r.id
-                         WHERE la.event_id IS NULL
-                      ) AS raw_not_entered_live,
-                      (
-                        SELECT count(*)
-                          FROM raw r
-                          LEFT JOIN live_any la ON la.event_id = r.id
-                         WHERE la.event_id IS NULL
-                           AND r.ob_reason = ANY(%s)
-                      ) AS raw_pending_block_reasons;
-                    """,
-                    (wh, wh, gate_block_reasons),
-                ).fetchone()
+                if WATCH_SIGNAL_EVENT_READS_ENABLED:
+                    row_flow = conn.execute(
+                        """
+                        WITH raw AS (
+                          SELECT e.id,
+                                 lower(coalesce(e.features_agg #>> '{meta_last,orderbook_validation,reason}', '')) AS ob_reason
+                            FROM watchlist.watch_signal_event e
+                           WHERE e.signal_type IN ('B','C')
+                             AND e.start_ts >= now() - make_interval(hours => %s)
+                        ),
+                        live_window AS (
+                          SELECT s.event_id, s.reason, s.opened_at, s.created_at
+                            FROM watchlist.live_trade_signal s
+                           WHERE s.created_at >= now() - make_interval(hours => %s)
+                        ),
+                        live_any AS (
+                          SELECT DISTINCT event_id FROM watchlist.live_trade_signal
+                        )
+                        SELECT
+                          (SELECT count(*) FROM raw) AS raw_total,
+                          (SELECT count(*) FROM live_window) AS live_total,
+                          (SELECT count(*) FROM live_window WHERE reason LIKE 'watchlist_orderbook_gate_%%') AS gate_blocked_total,
+                          (SELECT count(*) FROM live_window WHERE opened_at IS NOT NULL) AS opened_total,
+                          (
+                            SELECT count(*)
+                              FROM raw r
+                              LEFT JOIN live_any la ON la.event_id = r.id
+                             WHERE la.event_id IS NULL
+                          ) AS raw_not_entered_live,
+                          (
+                            SELECT count(*)
+                              FROM raw r
+                              LEFT JOIN live_any la ON la.event_id = r.id
+                             WHERE la.event_id IS NULL
+                               AND r.ob_reason = ANY(%s)
+                          ) AS raw_pending_block_reasons;
+                        """,
+                        (wh, wh, gate_block_reasons),
+                    ).fetchone()
+                else:
+                    row_flow = conn.execute(
+                        """
+                        WITH live_window AS (
+                          SELECT s.reason, s.opened_at, s.created_at
+                            FROM watchlist.live_trade_signal s
+                           WHERE s.created_at >= now() - make_interval(hours => %s)
+                        )
+                        SELECT
+                          0 AS raw_total,
+                          (SELECT count(*) FROM live_window) AS live_total,
+                          (SELECT count(*) FROM live_window WHERE reason LIKE 'watchlist_orderbook_gate_%%') AS gate_blocked_total,
+                          (SELECT count(*) FROM live_window WHERE opened_at IS NOT NULL) AS opened_total,
+                          0 AS raw_not_entered_live,
+                          0 AS raw_pending_block_reasons;
+                        """,
+                        (wh,),
+                    ).fetchone()
                 if isinstance(row_flow, dict):
                     raw_total = int(row_flow.get('raw_total') or 0)
                     live_total = int(row_flow.get('live_total') or 0)
@@ -4498,47 +4894,78 @@ def live_trading_gate_status():
                         'raw_pending_block_reasons': pending_block_n,
                     }
 
-            rows_24h = conn.execute(
-                """
-                WITH raw AS (
-                  SELECT e.start_ts AS ts
-                    FROM watchlist.watch_signal_event e
-                   WHERE e.signal_type IN ('B','C')
-                     AND e.start_ts >= now() - interval '24 hours'
-                ),
-                raw_h AS (
-                  SELECT date_trunc('hour', ts) AS bucket, count(*) AS n
-                    FROM raw
-                   GROUP BY 1
-                ),
-                live_h AS (
-                  SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
-                    FROM watchlist.live_trade_signal
-                   WHERE created_at >= now() - interval '24 hours'
-                   GROUP BY 1
-                ),
-                block_h AS (
-                  SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
-                    FROM watchlist.live_trade_signal
-                   WHERE created_at >= now() - interval '24 hours'
-                     AND reason LIKE 'watchlist_orderbook_gate_%%'
-                   GROUP BY 1
-                )
-                SELECT b.bucket,
-                       coalesce(r.n, 0) AS raw_count,
-                       coalesce(l.n, 0) AS live_count,
-                       coalesce(k.n, 0) AS blocked_count
-                  FROM generate_series(
-                         date_trunc('hour', now()) - interval '23 hours',
-                         date_trunc('hour', now()),
-                         interval '1 hour'
-                       ) AS b(bucket)
-                  LEFT JOIN raw_h r ON r.bucket = b.bucket
-                  LEFT JOIN live_h l ON l.bucket = b.bucket
-                  LEFT JOIN block_h k ON k.bucket = b.bucket
-                 ORDER BY b.bucket ASC;
-                """
-            ).fetchall()
+            if WATCH_SIGNAL_EVENT_READS_ENABLED:
+                rows_24h = conn.execute(
+                    """
+                    WITH raw AS (
+                      SELECT e.start_ts AS ts
+                        FROM watchlist.watch_signal_event e
+                       WHERE e.signal_type IN ('B','C')
+                         AND e.start_ts >= now() - interval '24 hours'
+                    ),
+                    raw_h AS (
+                      SELECT date_trunc('hour', ts) AS bucket, count(*) AS n
+                        FROM raw
+                       GROUP BY 1
+                    ),
+                    live_h AS (
+                      SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '24 hours'
+                       GROUP BY 1
+                    ),
+                    block_h AS (
+                      SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '24 hours'
+                         AND reason LIKE 'watchlist_orderbook_gate_%%'
+                       GROUP BY 1
+                    )
+                    SELECT b.bucket,
+                           coalesce(r.n, 0) AS raw_count,
+                           coalesce(l.n, 0) AS live_count,
+                           coalesce(k.n, 0) AS blocked_count
+                      FROM generate_series(
+                             date_trunc('hour', now()) - interval '23 hours',
+                             date_trunc('hour', now()),
+                             interval '1 hour'
+                           ) AS b(bucket)
+                      LEFT JOIN raw_h r ON r.bucket = b.bucket
+                      LEFT JOIN live_h l ON l.bucket = b.bucket
+                      LEFT JOIN block_h k ON k.bucket = b.bucket
+                     ORDER BY b.bucket ASC;
+                    """
+                ).fetchall()
+            else:
+                rows_24h = conn.execute(
+                    """
+                    WITH live_h AS (
+                      SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '24 hours'
+                       GROUP BY 1
+                    ),
+                    block_h AS (
+                      SELECT date_trunc('hour', created_at) AS bucket, count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '24 hours'
+                         AND reason LIKE 'watchlist_orderbook_gate_%%'
+                       GROUP BY 1
+                    )
+                    SELECT b.bucket,
+                           0 AS raw_count,
+                           coalesce(l.n, 0) AS live_count,
+                           coalesce(k.n, 0) AS blocked_count
+                      FROM generate_series(
+                             date_trunc('hour', now()) - interval '23 hours',
+                             date_trunc('hour', now()),
+                             interval '1 hour'
+                           ) AS b(bucket)
+                      LEFT JOIN live_h l ON l.bucket = b.bucket
+                      LEFT JOIN block_h k ON k.bucket = b.bucket
+                     ORDER BY b.bucket ASC;
+                    """
+                ).fetchall()
             for r in rows_24h or []:
                 if not isinstance(r, dict):
                     continue
@@ -4555,50 +4982,83 @@ def live_trading_gate_status():
                     }
                 )
 
-            rows_1h = conn.execute(
-                """
-                WITH raw AS (
-                  SELECT (
-                           date_trunc('hour', e.start_ts)
-                           + floor(extract(minute from e.start_ts) / 5)::int * interval '5 minute'
-                         ) AS bucket
-                    FROM watchlist.watch_signal_event e
-                   WHERE e.signal_type IN ('B','C')
-                     AND e.start_ts >= now() - interval '1 hour'
-                ),
-                raw_b AS (
-                  SELECT bucket, count(*) AS n FROM raw GROUP BY 1
-                ),
-                live_b AS (
-                  SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
-                         count(*) AS n
-                    FROM watchlist.live_trade_signal
-                   WHERE created_at >= now() - interval '1 hour'
-                   GROUP BY 1
-                ),
-                block_b AS (
-                  SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
-                         count(*) AS n
-                    FROM watchlist.live_trade_signal
-                   WHERE created_at >= now() - interval '1 hour'
-                     AND reason LIKE 'watchlist_orderbook_gate_%%'
-                   GROUP BY 1
-                )
-                SELECT b.bucket,
-                       coalesce(r.n, 0) AS raw_count,
-                       coalesce(l.n, 0) AS live_count,
-                       coalesce(k.n, 0) AS blocked_count
-                  FROM generate_series(
-                         date_trunc('minute', now()) - interval '55 minutes',
-                         date_trunc('minute', now()),
-                         interval '5 minutes'
-                       ) AS b(bucket)
-                  LEFT JOIN raw_b r ON r.bucket = b.bucket
-                  LEFT JOIN live_b l ON l.bucket = b.bucket
-                  LEFT JOIN block_b k ON k.bucket = b.bucket
-                 ORDER BY b.bucket ASC;
-                """
-            ).fetchall()
+            if WATCH_SIGNAL_EVENT_READS_ENABLED:
+                rows_1h = conn.execute(
+                    """
+                    WITH raw AS (
+                      SELECT (
+                               date_trunc('hour', e.start_ts)
+                               + floor(extract(minute from e.start_ts) / 5)::int * interval '5 minute'
+                             ) AS bucket
+                        FROM watchlist.watch_signal_event e
+                       WHERE e.signal_type IN ('B','C')
+                         AND e.start_ts >= now() - interval '1 hour'
+                    ),
+                    raw_b AS (
+                      SELECT bucket, count(*) AS n FROM raw GROUP BY 1
+                    ),
+                    live_b AS (
+                      SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                             count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '1 hour'
+                       GROUP BY 1
+                    ),
+                    block_b AS (
+                      SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                             count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '1 hour'
+                         AND reason LIKE 'watchlist_orderbook_gate_%%'
+                       GROUP BY 1
+                    )
+                    SELECT b.bucket,
+                           coalesce(r.n, 0) AS raw_count,
+                           coalesce(l.n, 0) AS live_count,
+                           coalesce(k.n, 0) AS blocked_count
+                      FROM generate_series(
+                             date_trunc('minute', now()) - interval '55 minutes',
+                             date_trunc('minute', now()),
+                             interval '5 minutes'
+                           ) AS b(bucket)
+                      LEFT JOIN raw_b r ON r.bucket = b.bucket
+                      LEFT JOIN live_b l ON l.bucket = b.bucket
+                      LEFT JOIN block_b k ON k.bucket = b.bucket
+                     ORDER BY b.bucket ASC;
+                    """
+                ).fetchall()
+            else:
+                rows_1h = conn.execute(
+                    """
+                    WITH live_b AS (
+                      SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                             count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '1 hour'
+                       GROUP BY 1
+                    ),
+                    block_b AS (
+                      SELECT (date_trunc('hour', created_at) + floor(extract(minute from created_at) / 5)::int * interval '5 minute') AS bucket,
+                             count(*) AS n
+                        FROM watchlist.live_trade_signal
+                       WHERE created_at >= now() - interval '1 hour'
+                         AND reason LIKE 'watchlist_orderbook_gate_%%'
+                       GROUP BY 1
+                    )
+                    SELECT b.bucket,
+                           0 AS raw_count,
+                           coalesce(l.n, 0) AS live_count,
+                           coalesce(k.n, 0) AS blocked_count
+                      FROM generate_series(
+                             date_trunc('minute', now()) - interval '55 minutes',
+                             date_trunc('minute', now()),
+                             interval '5 minutes'
+                           ) AS b(bucket)
+                      LEFT JOIN live_b l ON l.bucket = b.bucket
+                      LEFT JOIN block_b k ON k.bucket = b.bucket
+                     ORDER BY b.bucket ASC;
+                    """
+                ).fetchall()
             for r in rows_1h or []:
                 if not isinstance(r, dict):
                     continue
@@ -4621,6 +5081,7 @@ def live_trading_gate_status():
     response_payload = {
             'timestamp': now_utc_iso(),
             'window_hours': hours,
+            'watch_signal_event_reads_enabled': WATCH_SIGNAL_EVENT_READS_ENABLED,
             'gate_config': {
                 'enabled': gate_enabled,
                 'mode': gate_mode,
@@ -4877,14 +5338,19 @@ def _sanitize_live_table_pref_payload(payload: Any) -> Dict[str, Any]:
 
 @app.route('/api/live_trading/table_prefs')
 def live_trading_table_prefs_get():
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
-    if not _ensure_live_ui_prefs_table_pg():
-        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
-
     table_name = _normalize_live_table_pref_name(request.args.get("table"))
     if not table_name:
         return jsonify({'error': 'invalid table', 'timestamp': now_utc_iso()}), 400
+    if not _pg_runtime_enabled():
+        return jsonify({
+            "timestamp": now_utc_iso(),
+            "mode": "archive_no_postgres",
+            "table": table_name,
+            "prefs": {"order": [], "hidden": []},
+            "updated_at": None,
+        })
+    if not _ensure_live_ui_prefs_table_pg():
+        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
@@ -4924,16 +5390,22 @@ def live_trading_table_prefs_get():
 
 @app.route('/api/live_trading/table_prefs', methods=['POST'])
 def live_trading_table_prefs_set():
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
-    if not _ensure_live_ui_prefs_table_pg():
-        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
-
     payload = request.get_json(silent=True) or {}
     table_name = _normalize_live_table_pref_name(payload.get("table") or request.args.get("table"))
     if not table_name:
         return jsonify({'error': 'invalid table', 'timestamp': now_utc_iso()}), 400
     prefs = _sanitize_live_table_pref_payload(payload.get("prefs"))
+    if not _pg_runtime_enabled():
+        return jsonify({
+            "ok": True,
+            "timestamp": now_utc_iso(),
+            "mode": "archive_no_postgres",
+            "table": table_name,
+            "prefs": prefs,
+            "note": "PostgreSQL disabled; prefs accepted for this request but not persisted.",
+        })
+    if not _ensure_live_ui_prefs_table_pg():
+        return jsonify({'error': '偏好表初始化失败', 'timestamp': now_utc_iso()}), 500
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
@@ -4989,8 +5461,13 @@ def _bucket_dt(dt: datetime, granularity: str) -> datetime:
 @app.route('/api/live_trading/stats/balance')
 def live_trading_stats_balance():
     """Return balance/equity curve from watchlist.live_trade_balance_snapshot (hourly/manual persisted)."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'points': [],
+            'note': 'PostgreSQL disabled; no local balance snapshot table is available.',
+        })
 
     granularity = str(request.args.get("granularity") or "hour").strip().lower()
     if granularity not in ("hour", "day"):
@@ -5108,8 +5585,17 @@ def live_trading_stats_pnl():
     Return realized PnL curve aggregated from closed signals.
     NetPnL definition: realized_pnl_usdt + funding_pnl_usdt - fee_pnl_usdt (best-effort).
     """
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        points = local_live_store.pnl_points(granularity='hour' if str(request.args.get("granularity") or "day").lower() == 'hour' else 'day')
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'local_store': str(local_live_store.DEFAULT_DB_PATH),
+            'granularity': 'hour' if str(request.args.get("granularity") or "day").lower() == 'hour' else 'day',
+            'points': points,
+            'summary': _archived_live_payload()['summary'],
+            'note': 'SQLite live store result. Imported archive has missing fee, so strict net PnL may be null.',
+        })
 
     granularity = str(request.args.get("granularity") or "day").strip().lower()
     if granularity not in ("hour", "day"):
@@ -5342,6 +5828,17 @@ def live_trading_stats_pnl():
 def live_trading_candidates():
     """Debug: list top watchlist candidates + orderbook revalidation (no orders placed)."""
     try:
+        if not WATCH_SIGNAL_EVENT_READS_ENABLED:
+            return jsonify(
+                {
+                    'candidates': [],
+                    'disabled': True,
+                    'reason': 'watch_signal_event reads disabled',
+                    'watch_signal_event_reads_enabled': WATCH_SIGNAL_EVENT_READS_ENABLED,
+                    'timestamp': now_utc_iso(),
+                }
+            ), 200
+
         if not live_trading_manager or not getattr(live_trading_manager, "config", None):
             return jsonify({'candidates': [], 'error': 'live trading manager not initialized', 'timestamp': now_utc_iso()}), 200
 
@@ -5454,10 +5951,16 @@ def live_trading_candidates():
 @app.route('/api/live_trading/signals')
 def live_trading_signals():
     """Query live trading signals with lightweight filters."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
-
     limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
+    if not _pg_runtime_enabled():
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'local_store': str(local_live_store.DEFAULT_DB_PATH),
+            'signals': local_live_store.list_signals(limit=limit),
+            'note': 'PostgreSQL disabled; reading local SQLite live store.',
+        })
+
     signal_id = request.args.get('signal_id')
     event_id = request.args.get('event_id')
     # Multi-status filter: accept repeated ?status=... or comma-separated list.
@@ -5874,8 +6377,8 @@ def live_trading_signals():
 @app.route('/api/live_trading/samples')
 def live_trading_samples():
     """Return recent spread monitor samples."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        return jsonify({'timestamp': now_utc_iso(), 'mode': 'archive_no_postgres', 'samples': [], 'note': 'No local spread sample archive without PostgreSQL.'})
 
     signal_id = request.args.get('signal_id')
     if not signal_id:
@@ -5920,14 +6423,22 @@ def live_trading_positions():
     Query live positions/balances (REST) for exchanges.
     Note: this endpoint calls exchange private APIs using config_private credentials.
     """
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
-
     signal_id = request.args.get('signal_id')
     limit = min(max(int(request.args.get('limit', 50) or 50), 1), 100)
     query_all = str(request.args.get('all') or '').lower() in {'1', 'true', 'yes', 'y'}
     only_nonzero = str(request.args.get('nonzero') or '1').lower() not in {'0', 'false', 'no', 'n'}
     persist_balances = str(request.args.get('persist') or '1').lower() not in {'0', 'false', 'no', 'n'}
+    if not _pg_runtime_enabled():
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'only_nonzero': only_nonzero,
+            'targets': [],
+            'results': [],
+            'balance_totals': {},
+            'balance_snapshot_id': None,
+            'note': 'PostgreSQL disabled; no live position targets are available from the local archive.',
+        })
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
@@ -6584,8 +7095,8 @@ def live_trading_positions():
 @app.route('/api/live_trading/force_close', methods=['POST'])
 def live_trading_force_close():
     """Manual one-click flatten for a live trade signal (best-effort)."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        return jsonify({'error': 'PostgreSQL disabled; no active live signal can be force-closed from archive mode.', 'timestamp': now_utc_iso()}), 400
 
     payload = request.get_json(silent=True) or {}
     signal_id = payload.get('signal_id') or request.args.get('signal_id')
@@ -6606,8 +7117,8 @@ def live_trading_force_close():
 @app.route('/api/live_trading/flatten_position', methods=['POST'])
 def live_trading_flatten_position():
     """Manual flatten a single exchange+symbol position (best-effort, safe)."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
+    if not _pg_runtime_enabled():
+        return jsonify({'error': 'PostgreSQL disabled; no live position can be flattened from archive mode.', 'timestamp': now_utc_iso()}), 400
 
     payload = request.get_json(silent=True) or {}
     exchange = (payload.get('exchange') or '').strip().lower()
@@ -6627,11 +7138,15 @@ def live_trading_flatten_position():
 @app.route('/api/live_trading/orders')
 def live_trading_orders():
     """Return recent live-trade order records (optionally filter by signal_id)."""
-    if psycopg is None:
-        return jsonify({'error': 'psycopg 未安装，无法连接 PG', 'timestamp': now_utc_iso()}), 500
-
     limit = min(max(int(request.args.get('limit', 200) or 200), 1), 500)
     signal_id = request.args.get('signal_id')
+    if not _pg_runtime_enabled():
+        return jsonify({
+            'timestamp': now_utc_iso(),
+            'mode': 'archive_no_postgres',
+            'orders': [],
+            'note': 'PostgreSQL disabled; no local order archive is available.',
+        })
 
     try:
         conn_kwargs: Dict[str, Any] = {"autocommit": True}
