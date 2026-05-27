@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>实盘交易（Type B）</title>
+  <title>实盘交易（Type B/C）</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
   <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
@@ -106,12 +106,12 @@
   <div class="page-container">
   <div class="row" style="justify-content: space-between; margin-bottom: 12px;">
     <div>
-      <div style="font-size: 18px; font-weight: 700;">实盘交易（Type B）</div>
-      <div class="muted" style="margin-top: 4px;">订单簿 1min 监听 → 达到 0.8*pnl_hat 止盈 / 1 天强平 → 平仓下单 → 落库</div>
+      <div style="font-size: 18px; font-weight: 700;">实盘交易（Type B/C 对冲）</div>
+      <div class="muted" style="margin-top: 4px;">事件候选 → 订单簿复验 → 双腿对冲开仓 → 价差/资金费/余额监控 → 达标或超时平仓 → 本地 PG 审计</div>
     </div>
     <div class="row">
-      <a href="/watchlist">Watchlist</a>
-      <a href="/watchlist/db">PG DB</a>
+      <a href="{{ app_url('/watchlist') }}">Watchlist</a>
+      <a href="{{ app_url('/watchlist/db') }}">PG DB</a>
     </div>
   </div>
 
@@ -121,7 +121,7 @@
       <span class="muted">更新时间：</span><span id="ts" class="muted">-</span>
       <span class="muted" style="margin-left: 12px;">配置：</span><span id="cfg" class="muted">-</span>
       <span class="muted" style="margin-left: 12px;">刷新间隔(s)：</span>
-      <input id="refreshSec" type="number" min="2" max="300" value="10" style="width: 90px;" />
+      <input id="refreshSec" type="number" min="2" max="300" value="20" style="width: 90px;" />
       <span class="muted" style="margin-left: 12px;">信号条数：</span>
       <input id="signalsLimit" type="number" min="10" max="2000" value="30" style="width: 90px;" />
       <span class="muted" style="margin-left: 12px;">筛选：</span>
@@ -263,7 +263,7 @@
         <option value="v2">仅 v2</option>
       </select>
       <button id="statsRefreshBtn" class="secondary">刷新统计</button>
-      <button id="statsUnrealBtn" class="secondary" title="会调用私有持仓接口，可能较慢">刷新未实现</button>
+      <button id="statsUnrealBtn" class="secondary" title="会调用私有持仓接口，可能较慢">刷新未实现盈亏</button>
       <span class="muted" style="margin-left: 12px;">钱包/权益(稳定币)：</span><span id="statsWallet" style="font-weight: 700;">-</span>
       <span class="muted" style="margin-left: 12px;">已实现累计(筛选后)：</span><span id="statsRealCum" style="font-weight: 700;">-</span>
       <span class="muted" style="margin-left: 12px;">当前未实现(USDT)：</span><span id="statsUpnl" style="font-weight: 700;">-</span>
@@ -489,6 +489,7 @@
 
   <script>
     let refreshTimer = null;
+    let lastGateFetchAtMs = 0;
     let positionsCache = [];
     let positionsSort = {key: null, dir: null};
     const SIGNALS_TABLE_PREF_API_TABLE = 'signals';
@@ -887,7 +888,7 @@
     function chartBtn(symbol) {
       const sym = String(symbol || '').trim();
       if (!sym) return '';
-      return `<a class="mini-btn" href="/charts?symbol=${encodeURIComponent(sym)}" target="_blank" rel="noopener" title="打开图表">图</a>`;
+      return `<a class="mini-btn" href="${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(sym)}" target="_blank" rel="noopener" title="打开图表">图</a>`;
     }
 
     function pillForStatus(status) {
@@ -1023,10 +1024,14 @@ function renderGateStatus(statusData) {
 
     async function refresh() {
       const overview = await fetchJson('/api/live_trading/overview?limit=80', {timeoutMs: 12000, retries: 0});
-      // gate 状态异步拉取，避免 gate 查询慢导致主页面一直转圈。
-      fetchJson('/api/live_trading/gate_status?hours=24&limit=80&include_pending=0', {timeoutMs: 8000, retries: 0})
-        .then((gateStatus) => renderGateStatus(gateStatus))
-        .catch(() => renderGateStatus(null));
+      // gate 状态变化慢且查询较重，默认最多每 60s 拉一次。
+      const nowMs = Date.now();
+      if (!lastGateStatus || (nowMs - lastGateFetchAtMs) >= 60_000) {
+        lastGateFetchAtMs = nowMs;
+        fetchJson('/api/live_trading/gate_status?hours=24&limit=80&include_pending=0', {timeoutMs: 8000, retries: 0})
+          .then((gateStatus) => renderGateStatus(gateStatus))
+          .catch(() => renderGateStatus(lastGateStatus));
+      }
       // 统计图异步先跑，避免被信号表渲染阻塞
       refreshStats(false).catch(err => console.error(err));
       const limit = Math.max(10, Math.min(2000, Number(document.getElementById('signalsLimit').value || 500)));
@@ -1817,9 +1822,10 @@ function renderGateStatus(statusData) {
         document.getElementById('posTs').textContent = `更新时间：${pos.timestamp || '-'}`;
         renderPositionsAndBalances(pos);
       } catch (e) {
-        document.getElementById('posTs').textContent = String(e);
-        document.getElementById('balancesBody').innerHTML = `<tr><td colspan="5" class="muted">${String(e)}</td></tr>`;
-        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="14" class="muted">${String(e)}</td></tr>`;
+        const msg = String(e && e.message ? e.message : e);
+        document.getElementById('posTs').textContent = msg;
+        document.getElementById('balancesBody').innerHTML = `<tr><td colspan="5" class="muted">${escapeHtml(msg)}</td></tr>`;
+        document.getElementById('positionsBody').innerHTML = `<tr><td colspan="14" class="muted">${escapeHtml(msg)}</td></tr>`;
       }
     }
 

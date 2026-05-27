@@ -33,7 +33,7 @@
         <div class="muted" id="subtitle">基于关注列表的 12h 价差与价格时序，支持按 Symbol 过滤。</div>
         <div class="actions">
             <button id="refresh-btn">手动刷新</button>
-            <button id="back-btn" onclick="window.open('/watchlist','_self')">返回 Watchlist</button>
+            <button id="back-btn" onclick="window.open(window.frAppUrl('/watchlist'),'_self')">返回 Watchlist</button>
             <span class="muted" id="status">准备就绪</span>
         </div>
     </div>
@@ -49,6 +49,10 @@
     let charts = {};
     let chartSeries = {};
     let refreshTimer = null;
+
+    const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (ch) => ({
+        '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+    }[ch]));
 
     const destroyCharts = () => {
         Object.values(charts).forEach((entry) => {
@@ -82,11 +86,11 @@
             if (!series || !series.points || !series.points.length) return;
             const card = document.createElement('div');
             card.className = 'card';
-            card.innerHTML = `<h3>${formatTitle(entry, series)}<span class="muted">${(series.funding_interval_hours || '-') + 'h'}</span></h3><div class="pair"><canvas id="spread-${entry.symbol}" height="240"></canvas><canvas id="price-${entry.symbol}" height="240"></canvas></div>`;
+            card.innerHTML = `<h3>${escapeHtml(formatTitle(entry, series))}<span class="muted">${escapeHtml((series.funding_interval_hours || '-') + 'h')}</span></h3><div class="pair"><canvas data-chart="spread" height="240"></canvas><canvas data-chart="price" height="240"></canvas></div>`;
             grid.appendChild(card);
 
-            const ctxSpread = card.querySelector(`#spread-${entry.symbol}`).getContext('2d');
-            const ctxPrice = card.querySelector(`#price-${entry.symbol}`).getContext('2d');
+            const ctxSpread = card.querySelector('canvas[data-chart="spread"]').getContext('2d');
+            const ctxPrice = card.querySelector('canvas[data-chart="price"]').getContext('2d');
             const toPts = (arr, factor = 1) => arr.map((p) => ({ x: new Date(p.t), y: p.v * factor }));
             const entryPts = (series.entry_signals || []).map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
             const exitTpPts = (series.exit_signals || []).filter((p) => p.type === 'tp').map((p) => ({ x: new Date(p.t), y: p.v * 100 }));
@@ -174,7 +178,7 @@
             statusEl.textContent = `活跃 ${filtered.length} / 总计 ${(watchlist.entries || []).length} | 下次刷新 ${Math.round(next/1000)}s`;
             refreshTimer = setTimeout(loadData, next);
         } catch (err) {
-            statusEl.textContent = `加载失败: ${err}`;
+            statusEl.textContent = `加载失败: ${String(err && err.message ? err.message : err)}`;
         } finally {
             refreshBtn.disabled = false;
         }

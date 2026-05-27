@@ -491,7 +491,7 @@
                 <button class="control-btn" onclick="refreshData()">🔄 刷新</button>
                 <button class="control-btn" onclick="toggleAutoRefresh()">⏸️ 暂停</button>
                 <button class="control-btn" onclick="togglePriceDiffSort()" id="priceDiffBtn">📊 价差排序</button>
-                <button class="control-btn" onclick="window.open('/exchanges', '_blank')">📊 交易所视图</button>
+                <button class="control-btn" onclick="window.open(window.frAppUrl('/exchanges'), '_blank')">📊 交易所视图</button>
                 <button class="control-btn" onclick="toggleAutoResort()" id="autoResortBtn">排序: 开</button>
                 <button class="control-btn active" id="spotFilterBtn" onclick="toggleSpotFutureFilter()">🚫 屏蔽高现货-低期货</button>
             </div>
@@ -547,7 +547,7 @@
     </div>
 
     <div class="footer-info">
-        💡 支持搜索币种名称 | 🔄 每秒自动刷新 | 📊 实时价格和资金费率监控<br>
+        💡 支持搜索币种名称 | 🔄 每 5 秒自动刷新 | 📊 实时价格和资金费率监控<br>
         支持的交易所: {{ exchange_order | map('upper') | join('、') }}
     </div>
 
@@ -1210,7 +1210,7 @@
                     fetchSystemStatus();
                     fetchArbitrageSignals();
                 }
-            }, 1000); // 1秒刷新
+            }, 5000); // 5 秒刷新，降低聚合页轮询压力
         }
 
         // 初始化事件监听器
@@ -1253,7 +1253,7 @@
 
         // 跳转到币种详情页面
         function goToSymbolDetails(symbol) {
-            window.location.href = `/charts?symbol=${symbol}`;
+            window.location.href = `${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(symbol)}`;
         }
 
         function toggleSpotFutureFilter() {

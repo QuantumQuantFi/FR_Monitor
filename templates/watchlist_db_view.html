@@ -6,28 +6,38 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='app_nav.css') }}">
     <style>
         * { box-sizing: border-box; }
-        body { font-family: Arial, sans-serif; padding: 0; background: #f7f9fb; color: #111; }
-        .page-container { padding: 16px; }
-        h2 { margin-top: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; padding: 0; background: #0d1421; color: #e5e7eb; }
+        .page-container { padding: 18px 20px 28px; }
+        h2 { margin: 0 0 14px; color: #f8fafc; }
         form { margin-bottom: 12px; display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+        label { color: #cbd5e1; }
+        select, input, button {
+            border: 1px solid #334155;
+            background: #111827;
+            color: #f8fafc;
+            border-radius: 7px;
+            padding: 7px 9px;
+        }
+        button { cursor: pointer; background: #f0b90b; color: #111827; border-color: #f0b90b; font-weight: 700; }
         .table-wrap {
             margin-top: 10px;
-            border: 1px solid #d1d5db;
+            border: 1px solid #263445;
             border-radius: 8px;
-            background: #fff;
-            box-shadow: 0 10px 30px rgba(0,0,0,0.06);
+            background: #111827;
+            box-shadow: 0 14px 32px rgba(0,0,0,0.28);
             overflow: auto;
             max-height: 75vh;
         }
         table { border-collapse: collapse; width: 100%; min-width: 960px; font-size: 13px; table-layout: fixed; }
-        th, td { border-bottom: 1px solid #e5e7eb; padding: 8px 10px; vertical-align: top; }
-        th { background: #f3f4f6; position: sticky; top: 0; z-index: 2; text-align: left; }
-        tbody tr:nth-child(even) td { background: #fafbfc; }
-        tbody tr:hover td { background: #f6f8fb; }
-        .error { color: #c00; margin-bottom: 10px; }
+        th, td { border-bottom: 1px solid #263445; padding: 8px 10px; vertical-align: top; }
+        th { background: #172033; color: #f8fafc; position: sticky; top: 0; z-index: 2; text-align: left; }
+        td { color: #d1d5db; }
+        tbody tr:nth-child(even) td { background: #0f172a; }
+        tbody tr:hover td { background: #1e293b; }
+        .error { color: #fca5a5; margin-bottom: 10px; }
         .pager { margin-top: 8px; }
-        .pager a { margin-right: 12px; text-decoration: none; color: #0366d6; }
-        .meta { color: #555; }
+        .pager a { margin-right: 12px; text-decoration: none; color: #f0b90b; }
+        .meta { color: #94a3b8; }
         .cell-box {
             white-space: pre-wrap;
             word-break: break-word;
@@ -36,7 +46,7 @@
             font-family: "SFMono-Regular", Menlo, Consolas, monospace;
             line-height: 1.35;
         }
-        .tip { color: #6b7280; font-size: 12px; margin-top: 4px; line-height: 1.45; }
+        .tip { color: #94a3b8; font-size: 12px; margin-top: 4px; line-height: 1.45; }
     </style>
 </head>
 <body>
@@ -50,6 +60,7 @@
     {% set total_count = total_count|default(None) %}
     {% set rows = rows|default([]) %}
     {% set columns = columns|default([]) %}
+    {% set table_options = table_options|default(['raw','event','outcome','live_signal','live_order','live_error','live_balance']) %}
     <h2>Watchlist 数据库浏览</h2>
     <form method="get">
         <label>表：
@@ -57,6 +68,10 @@
                 <option value="raw" {% if table_key == 'raw' %}selected{% endif %}>watch_signal_raw</option>
                 <option value="event" {% if table_key == 'event' %}selected{% endif %}>watch_signal_event</option>
                 <option value="outcome" {% if table_key == 'outcome' %}selected{% endif %}>future_outcome</option>
+                <option value="live_signal" {% if table_key == 'live_signal' %}selected{% endif %}>live_trade_signal</option>
+                <option value="live_order" {% if table_key == 'live_order' %}selected{% endif %}>live_trade_order</option>
+                <option value="live_error" {% if table_key == 'live_error' %}selected{% endif %}>live_trade_error</option>
+                <option value="live_balance" {% if table_key == 'live_balance' %}selected{% endif %}>live_trade_balance_snapshot</option>
             </select>
         </label>
         <label style="margin-left:10px;">每页
@@ -75,9 +90,10 @@
         <div class="meta">总行数：{{ total_count }} （可能略有延迟）</div>
     {% endif %}
     <div class="tip">
-        提示：长文本（如 meta/features_agg）已允许换行和滚动，鼠标悬停可查看完整内容。<br>
+        提示：长文本（如 meta/features_agg/payload/balances）已允许换行和滚动，鼠标悬停可查看完整内容。live_* 表用于当前实盘审计。<br>
         outcome 表字段含义：pnl = spread_change + funding_change，其中 spread_change = (legA_end-legB_end)/legA_end - (legA_start-legB_start)/legA_start，
         funding_change 为两条永续腿在区间内的资金费结算累加（spot 腿资金费视为 0）。方向采用 legA 为基准价差，未做杠杆/仓位倍数放大。
+        若本地新 PG 尚未创建/回填 future_outcome，会显示空表或错误提示，不影响 live_* 审计表。
     </div>
 
     <div class="table-wrap">

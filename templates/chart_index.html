@@ -2371,7 +2371,7 @@
         // 切换币种 => 直接跳转
         function switchSymbol(symbol) {
             if (!symbol) return;
-            window.location.href = `/charts?symbol=${encodeURIComponent(symbol.toUpperCase())}`;
+            window.location.href = `${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(symbol.toUpperCase())}`;
         }
 
         function goSearch() {
@@ -2421,7 +2421,7 @@
                 if (!allSymbols.includes(sym)) return;
                 const a = document.createElement('a');
                 a.className = 'chip';
-                a.href = `/charts?symbol=${encodeURIComponent(sym)}`;
+                a.href = `${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(sym)}`;
                 a.textContent = sym;
                 container.appendChild(a);
             });
@@ -2444,7 +2444,7 @@
             grid.innerHTML = '';
             list.forEach(sym => {
                 const a = document.createElement('a');
-                a.href = `/charts?symbol=${encodeURIComponent(sym)}`;
+                a.href = `${window.frAppUrl('/charts')}?symbol=${encodeURIComponent(sym)}`;
                 a.textContent = sym;
                 grid.appendChild(a);
             });
@@ -2499,9 +2499,9 @@
             // 设置定时刷新（窗口越大刷新越慢，7天按15分钟刷新）
             scheduleChartRefresh();
 
-            // 单币种卡片每秒刷新一次
+            // 单币种卡片按 5 秒刷新，主图按时间窗口独立调度。
             fetchAndRenderSymbolCard();
-            cardInterval = setInterval(fetchAndRenderSymbolCard, 1000);
+            cardInterval = setInterval(fetchAndRenderSymbolCard, 5000);
         });
         
         // 双击重置缩放
@@ -2513,7 +2513,7 @@
                 if (cardInterval) clearInterval(cardInterval);
             } else {
                 fetchAndRenderSymbolCard();
-                cardInterval = setInterval(fetchAndRenderSymbolCard, 1000);
+                cardInterval = setInterval(fetchAndRenderSymbolCard, 5000);
             }
         });
     </script>

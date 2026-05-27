@@ -6,6 +6,10 @@
     <span class="app-nav__subtitle">watchlist · live trading · charts</span>
   </div>
   <div class="app-nav__links">
+    <a class="app-nav__link" href="/showcase/">Showcase</a>
+    <a class="app-nav__link" href="/arbitragebot/">Arbitrage</a>
+    <a class="app-nav__link" href="/option/">Option</a>
+    <a class="app-nav__link" href="/momentum/">Momentum</a>
     <a class="app-nav__link {% if active_page == 'aggregated' %}active{% endif %}" href="{{ app_url('/') }}">聚合</a>
     <a class="app-nav__link {% if active_page == 'exchanges' %}active{% endif %}" href="{{ app_url('/exchanges') }}">交易所</a>
     <a class="app-nav__link {% if active_page == 'charts' %}active{% endif %}" href="{{ app_url('/charts') }}?symbol={{ nav_symbol }}">图表<span class="badge">{{ nav_symbol }}</span></a>
