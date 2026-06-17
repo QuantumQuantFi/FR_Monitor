@@ -35,3 +35,9 @@
 - rate limits: tune `WS_UPDATE_INTERVAL` and `WS_CONNECTION_CONFIG` backoff to avoid bans.
 - data: do not commit large SQLite DBs; they are generated locally.
 - cache: `dynamic_symbols_cache.json` refreshes hourly; delete to force rebuild or use refresh tests/endpoints.
+
+## Cursor Cloud specific instructions
+- Python: use `python3` (there is no `python` on PATH); commands in this doc/scripts that say `python` should be invoked as `python3`. Dependencies are pre-installed by the VM update script (`pip install -r requirements.txt`).
+- Run the app: `python3 simple_app.py` → Flask on `:4002` (pages `/`, `/aggregated`, `/exchanges`, `/charts`; live JSON at `/api/data`). Quick checks: `python3 verify_config.py`, `python3 test_rest_apis.py`.
+- Postgres is OPTIONAL. Without a local Postgres on `127.0.0.1:5432`, startup logs repeat `pg_writer ... connection refused` and `live trading/pg writer start failed` — these are harmless; the core monitor stores to SQLite (`market_data.db`, auto-created). Only the watchlist/live-trading pipeline (`watchlist_pg_writer.py`, `/api/live_trading/*`, `/api/watchlist`) needs Postgres.
+- Exchange reachability from this VM region: OKX, Bitget, GRVT, Hyperliquid work; Binance (HTTP 451) and Bybit (HTTP 403) are geo-blocked, and Lighter WebSocket returns "restricted jurisdiction". Expect those exchanges' panes to stay empty — this is environmental, not a bug. Live data does populate from the reachable exchanges.
